@@ -173,3 +173,10 @@
   is a palette result; "Remove this page's bookmark" is a palette command; saved per profile (0600) and
   read defensively. The sidebar is now a list of rows (labels, items, an empty state) with long titles
   ending in "…". Key events carry the Option modifier.
+- Sidebar (#9): pinned tabs and tab groups, shown under section labels and kept in that order (so ⌘1 … ⌘9
+  match the screen); folding a group (its label, or the palette) hides all but its active tab; dragging a row
+  reorders tabs, with a 2px drop line, and a tab joins the section it lands in; the list scrolls under the
+  profile row and search field, and follows the active tab; the right edge resizes the sidebar from 200 to
+  320 points, laying the page out once when released; pins, groups, folds and the width are saved in the
+  session. Labels and titles end with "…" when long. The window reports drags, releases and where a scroll
+  happened.

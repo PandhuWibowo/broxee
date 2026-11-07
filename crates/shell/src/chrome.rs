@@ -20,8 +20,13 @@ const FIELD_TOP: f32 = 5.0;
 const FIELD_HEIGHT: f32 = 26.0;
 const FIELD_PADDING: f32 = 10.0;
 
-/// Sidebar width in points (DESIGN.md, section 7).
+/// Sidebar width in points (DESIGN.md, section 7): 240 by default, resizable from 200 to 320.
 pub const SIDEBAR_WIDTH: f32 = 240.0;
+pub const SIDEBAR_MIN: f32 = 200.0;
+pub const SIDEBAR_MAX: f32 = 320.0;
+/// The resize handle: this many points inside the sidebar's edge, and one point past it, so
+/// clicks on the page's left edge still reach the page.
+const EDGE_GRAB: f32 = 5.0;
 /// The profile switcher row at the top of the sidebar.
 const PROFILE_ROW: f32 = 40.0;
 /// "Search or go to ⌘K": opens the palette.
@@ -129,18 +134,41 @@ pub enum SidebarItem {
     CloseRow(usize),
     /// The line after the list ("+ New tab").
     Footer,
+    /// A section label (a tab group: clicking folds it).
+    Label(usize),
+    /// The sidebar's right edge, which resizes it.
+    Edge,
 }
 
-/// What is at (x, y) in the sidebar, in points, for a list of `rows` and, with `footer`, a
-/// line after it.
-pub fn sidebar_hit(x: f32, y: f32, rows: &[ListRow], footer: bool) -> Option<SidebarItem> {
-    if !(0.0..SIDEBAR_WIDTH).contains(&x) || y < 0.0 {
+/// The top of the list's first row, in points: rows are `TAB_ROW` apart below it.
+pub const LIST_TOP: f32 = TABS_TOP;
+
+/// How far the list can scroll: its rows (and footer) past the window's `height`.
+pub fn sidebar_max_scroll(rows: usize, footer: bool, height: f32) -> f32 {
+    let content = TAB_ROW * (rows + usize::from(footer)) as f32 + 8.0;
+    (content - (height - TABS_TOP)).max(0.0)
+}
+
+/// What is at (x, y) in a sidebar `width` points wide whose list is scrolled by `scroll`, for
+/// `rows` and, with `footer`, a line after them.
+pub fn sidebar_hit(
+    x: f32,
+    y: f32,
+    width: f32,
+    scroll: f32,
+    rows: &[ListRow],
+    footer: bool,
+) -> Option<SidebarItem> {
+    if (width - EDGE_GRAB..width + 1.0).contains(&x) && y >= 0.0 {
+        return Some(SidebarItem::Edge);
+    }
+    if !(0.0..width).contains(&x) || y < 0.0 {
         return None;
     }
     if y < PROFILE_ROW {
         return Some(SidebarItem::Profile);
     }
-    if !(ROW_INSET..=SIDEBAR_WIDTH - ROW_INSET).contains(&x) {
+    if !(ROW_INSET..=width - ROW_INSET).contains(&x) {
         return None;
     }
     if (SEARCH_TOP..SEARCH_TOP + SEARCH_HEIGHT).contains(&y) {
@@ -149,11 +177,11 @@ pub fn sidebar_hit(x: f32, y: f32, rows: &[ListRow], footer: bool) -> Option<Sid
     if y < TABS_TOP {
         return None;
     }
-    let row = ((y - TABS_TOP) / TAB_ROW) as usize;
+    let row = ((y - TABS_TOP + scroll) / TAB_ROW) as usize;
     match rows.get(row) {
-        Some(ListRow::Label(_)) => None,
+        Some(ListRow::Label(_)) => Some(SidebarItem::Label(row)),
         Some(ListRow::Item { closable, .. }) => {
-            let on_close = x >= SIDEBAR_WIDTH - ROW_INSET - CLOSE_SIZE;
+            let on_close = x >= width - ROW_INSET - CLOSE_SIZE;
             Some(if *closable && on_close {
                 SidebarItem::CloseRow(row)
             } else {
@@ -165,10 +193,16 @@ pub fn sidebar_hit(x: f32, y: f32, rows: &[ListRow], footer: bool) -> Option<Sid
     }
 }
 
+/// Where a row dragged to `y` would land: before row `n` of the list (`n == rows` for the end).
+pub fn sidebar_drop(y: f32, scroll: f32, rows: usize) -> usize {
+    (((y - TABS_TOP + scroll) / TAB_ROW).round().max(0.0) as usize).min(rows)
+}
+
 /// A row of the sidebar's list.
 pub enum ListRow<'a> {
-    /// A section label, 12px semibold in `muted` (DESIGN.md, section 4): a bookmark folder.
-    Label(&'a str),
+    /// A section label, 12px semibold in `muted` (DESIGN.md, section 4): "Pinned", a tab
+    /// group, a bookmark folder.
+    Label(Cow<'a, str>),
     Item {
         title: &'a str,
         /// Drawn in `muted`: a sleeping tab.
@@ -186,6 +220,10 @@ pub struct SidebarView<'a> {
     pub selected: Option<usize>,
     /// The line after the list, if any ("+ New tab").
     pub footer: Option<&'a str>,
+    /// How far the list is scrolled, in points.
+    pub scroll: f32,
+    /// While a row is dragged: the 2px line showing where it lands (before this row).
+    pub drop_at: Option<usize>,
     /// Shown when the list is empty: a line, and a quieter one that may hold ⌘ keys.
     pub empty: Option<(&'a str, &'a str)>,
 }
@@ -619,7 +657,8 @@ impl Chrome {
         );
     }
 
-    /// Draw the sidebar into `frame` (its full height, `frame.width` device pixels wide).
+    /// Draw the sidebar into `frame` (its full height, `frame.width` device pixels wide). The
+    /// list scrolls under the profile row and the search field, which stay put.
     pub fn draw_sidebar(
         &mut self,
         painter: &mut Painter,
@@ -631,128 +670,66 @@ impl Chrome {
         let t = self.theme;
         let s = frame.scale;
         let w = frame.width as i32;
+        let sw = frame.width as f32 / s;
         let rows = (frame.pixels.len() / frame.stride) as i32;
         let px = |v: f32| (v * s).round() as i32;
-        let row_w = px(SIDEBAR_WIDTH - 2.0 * ROW_INSET) as u32;
+        let hair = px(1.0).max(1);
+        let row_w = px(sw - 2.0 * ROW_INSET) as u32;
         let row_h = px(TAB_ROW - 2.0) as u32;
         let icon_px = px(ICON) as u32;
+        let key_px = px(KEY_ICON) as u32;
+        let search = (row_w, px(SEARCH_HEIGHT) as u32);
+        let search_inner = (search.0 - 2 * hair as u32, search.1 - 2 * hair as u32);
         self.masks
             .entry((Shape::Close, icon_px, icon_px))
             .or_insert_with(|| icon(Shape::Close, s));
         self.masks
-            .entry((Shape::Rounded, row_w, row_h))
-            .or_insert_with(|| rounded_rect(row_w, row_h, 6.0 * s));
-
-        let mut ops = vec![
-            Op::Fill {
-                x0: 0,
-                y0: 0,
-                x1: w,
-                y1: rows,
-                color: t.canvas,
-            },
-            // Hairline between the sidebar and the pane.
-            Op::Fill {
-                x0: w - px(1.0).max(1),
-                y0: 0,
-                x1: w,
-                y1: rows,
-                color: t.line,
-            },
-            // The profile switcher carries the same edge as the panes.
-            Op::Fill {
-                x0: 0,
-                y0: 0,
-                x1: w - px(1.0).max(1),
-                y1: px(EDGE).max(1),
-                color: t.profile(view.hue),
-            },
-        ];
-        let mut text_ops = Vec::new();
-        text_ops.push(Op::Text {
-            x: ROW_TEXT * s,
-            baseline: px(26.0) as f32,
-            text: view.profile,
-            size: 13.0 * s,
-            bold: true,
-            color: t.text,
-        });
-        // "Search or go to ⌘K": a field look-alike that opens the palette.
-        let search = (row_w, px(SEARCH_HEIGHT) as u32);
-        let key_px = px(KEY_ICON) as u32;
-        self.masks
             .entry((Shape::Command, key_px, key_px))
             .or_insert_with(|| key_icon(Shape::Command, s));
-        for (mw, mh, radius) in [
-            (search.0, search.1, 6.0),
-            (
-                search.0 - 2 * px(1.0).max(1) as u32,
-                search.1 - 2 * px(1.0).max(1) as u32,
-                5.0,
-            ),
-        ] {
+        for (size, radius) in [((row_w, row_h), 6.0), (search, 6.0), (search_inner, 5.0)] {
             self.masks
-                .entry((Shape::Rounded, mw, mh))
-                .or_insert_with(|| rounded_rect(mw, mh, radius * s));
+                .entry((Shape::Rounded, size.0, size.1))
+                .or_insert_with(|| rounded_rect(size.0, size.1, radius * s));
         }
-        let hair = px(1.0).max(1);
-        ops.push(Op::Mask {
-            x: px(ROW_INSET),
-            y: px(SEARCH_TOP),
-            mask: &self.masks[&(Shape::Rounded, search.0, search.1)],
-            color: t.line,
-        });
-        ops.push(Op::Mask {
-            x: px(ROW_INSET) + hair,
-            y: px(SEARCH_TOP) + hair,
-            mask: &self.masks[&(
-                Shape::Rounded,
-                search.0 - 2 * hair as u32,
-                search.1 - 2 * hair as u32,
-            )],
-            color: t.surface,
-        });
-        text_ops.push(Op::Text {
-            x: ROW_TEXT * s,
-            baseline: px(SEARCH_TOP + 19.5) as f32,
-            text: "Search or go to",
-            size: 13.0 * s,
-            bold: false,
-            color: t.text_2,
-        });
-        // Past the titles' clip, so it goes with the shapes.
-        let hint_x =
-            px(SIDEBAR_WIDTH - ROW_INSET - 10.0) as f32 - keys_width("⌘K", s, 12.0, metrics);
-        push_keys(
-            &mut ops,
-            &self.masks,
-            "⌘K",
-            (hint_x, px(SEARCH_TOP + 19.5) as f32),
-            (s, 12.0),
-            t.text_2,
-            metrics,
-        );
-        let row_top = |i: usize| TABS_TOP + TAB_ROW * i as f32;
         let masks = &self.masks;
-        // Titles end with "…" before the close button or the edge.
+
+        // The list, scrolled; only rows that can be seen are drawn.
+        let row_top = |i: usize| TABS_TOP + TAB_ROW * i as f32 - view.scroll;
+        let visible = |i: usize| row_top(i) + TAB_ROW > TABS_TOP && row_top(i) < rows as f32 / s;
         let fitted: Vec<Cow<str>> = view
             .rows
             .iter()
-            .map(|row| match row {
-                ListRow::Label(text) => Cow::Borrowed(*text),
+            .enumerate()
+            .map(|(i, row)| match row {
+                _ if !visible(i) => Cow::Borrowed(""),
+                ListRow::Label(text) => {
+                    let room = (sw - ROW_INSET - 8.0 - ROW_TEXT) * s;
+                    fit_in(text, room, 12.0 * s, true, metrics)
+                }
                 ListRow::Item {
                     title, closable, ..
                 } => {
                     let right = if *closable { CLOSE_SIZE } else { 8.0 };
-                    let room = (SIDEBAR_WIDTH - ROW_INSET - right - ROW_TEXT) * s;
+                    let room = (sw - ROW_INSET - right - ROW_TEXT) * s;
                     fit(title, room, 13.0 * s, metrics)
                 }
             })
             .collect();
+        let mut list = vec![Op::Fill {
+            x0: 0,
+            y0: 0,
+            x1: w,
+            y1: rows,
+            color: t.canvas,
+        }];
+        let mut list_text = Vec::new();
         for (i, (row, text)) in view.rows.iter().zip(&fitted).enumerate() {
+            if !visible(i) {
+                continue;
+            }
             let selected = view.selected == Some(i);
             match row {
-                ListRow::Label(_) => text_ops.push(Op::Text {
+                ListRow::Label(_) => list_text.push(Op::Text {
                     x: ROW_TEXT * s,
                     baseline: px(row_top(i) + 20.0) as f32,
                     text,
@@ -764,7 +741,7 @@ impl Chrome {
                     muted, closable, ..
                 } => {
                     if selected {
-                        ops.push(Op::Mask {
+                        list.push(Op::Mask {
                             x: px(ROW_INSET),
                             y: px(row_top(i) + 1.0),
                             mask: &masks[&(Shape::Rounded, row_w, row_h)],
@@ -772,10 +749,8 @@ impl Chrome {
                         });
                     }
                     if *closable {
-                        ops.push(Op::Mask {
-                            x: px(
-                                SIDEBAR_WIDTH - ROW_INSET - CLOSE_SIZE + (CLOSE_SIZE - ICON) / 2.0
-                            ),
+                        list.push(Op::Mask {
+                            x: px(sw - ROW_INSET - CLOSE_SIZE + (CLOSE_SIZE - ICON) / 2.0),
                             y: px(row_top(i) + (TAB_ROW - ICON) / 2.0),
                             mask: &masks[&(Shape::Close, icon_px, icon_px)],
                             color: t.text_2,
@@ -783,7 +758,7 @@ impl Chrome {
                     }
                     // `muted` never sits on `selected` (DESIGN.md, section 3).
                     let color = if *muted && !selected { t.muted } else { t.text };
-                    text_ops.push(Op::Text {
+                    list_text.push(Op::Text {
                         x: ROW_TEXT * s,
                         baseline: px(row_top(i) + 19.5) as f32,
                         text,
@@ -795,7 +770,7 @@ impl Chrome {
             }
         }
         if let (true, Some((line, second))) = (view.rows.is_empty(), view.empty) {
-            text_ops.push(Op::Text {
+            list_text.push(Op::Text {
                 x: ROW_TEXT * s,
                 baseline: px(row_top(0) + 19.5) as f32,
                 text: line,
@@ -804,7 +779,7 @@ impl Chrome {
                 color: t.text_2,
             });
             push_keys(
-                &mut ops,
+                &mut list,
                 masks,
                 second,
                 (ROW_TEXT * s, px(row_top(0) + 37.5) as f32),
@@ -814,7 +789,7 @@ impl Chrome {
             );
         }
         if let Some(footer) = view.footer {
-            text_ops.push(Op::Text {
+            list_text.push(Op::Text {
                 x: ROW_TEXT * s,
                 baseline: px(row_top(view.rows.len()) + 19.5) as f32,
                 text: footer,
@@ -823,35 +798,106 @@ impl Chrome {
                 color: t.text_2,
             });
         }
+        if let Some(at) = view.drop_at {
+            let y = px(row_top(at)) - px(1.0);
+            list.push(Op::Fill {
+                x0: px(ROW_INSET),
+                y0: y,
+                x1: px(sw - ROW_INSET),
+                y1: y + px(2.0).max(1),
+                color: t.accent,
+            });
+        }
+
+        // The top stays put: it covers whatever of the list scrolled under it.
+        let mut top = vec![
+            Op::Fill {
+                x0: 0,
+                y0: 0,
+                x1: w,
+                y1: px(TABS_TOP - 4.0),
+                color: t.canvas,
+            },
+            // The profile switcher carries the same edge as the panes.
+            Op::Fill {
+                x0: 0,
+                y0: 0,
+                x1: w - hair,
+                y1: px(EDGE).max(1),
+                color: t.profile(view.hue),
+            },
+            Op::Mask {
+                x: px(ROW_INSET),
+                y: px(SEARCH_TOP),
+                mask: &masks[&(Shape::Rounded, search.0, search.1)],
+                color: t.line,
+            },
+            Op::Mask {
+                x: px(ROW_INSET) + hair,
+                y: px(SEARCH_TOP) + hair,
+                mask: &masks[&(Shape::Rounded, search_inner.0, search_inner.1)],
+                color: t.surface,
+            },
+            // Hairline between the sidebar and the pane.
+            Op::Fill {
+                x0: w - hair,
+                y0: 0,
+                x1: w,
+                y1: rows,
+                color: t.line,
+            },
+        ];
+        let hint_x = px(sw - ROW_INSET - 10.0) as f32 - keys_width("⌘K", s, 12.0, metrics);
+        push_keys(
+            &mut top,
+            masks,
+            "⌘K",
+            (hint_x, px(SEARCH_TOP + 19.5) as f32),
+            (s, 12.0),
+            t.text_2,
+            metrics,
+        );
+        let top_text = [
+            Op::Text {
+                x: ROW_TEXT * s,
+                baseline: px(26.0) as f32,
+                text: view.profile,
+                size: 13.0 * s,
+                bold: true,
+                color: t.text,
+            },
+            Op::Text {
+                x: ROW_TEXT * s,
+                baseline: px(SEARCH_TOP + 19.5) as f32,
+                text: "Search or go to",
+                size: 13.0 * s,
+                bold: false,
+                color: t.text_2,
+            },
+        ];
+
         let (stride, left) = (frame.stride, frame.left);
-        painter.overlay(
-            Target {
-                pixels: &mut *frame.pixels,
-                stride,
-                bgra: true,
-                left,
-            },
-            frame.width,
-            (0, w),
-            fonts,
-            metrics,
-            &ops,
-        );
-        // Titles were fitted to their room; this only keeps text inside the sidebar.
-        let text_clip = (px(ROW_INSET), px(SIDEBAR_WIDTH - ROW_INSET));
-        painter.overlay(
-            Target {
-                pixels: frame.pixels,
-                stride,
-                bgra: true,
-                left,
-            },
-            frame.width,
-            text_clip,
-            fonts,
-            metrics,
-            &text_ops,
-        );
+        let inside = (px(ROW_INSET), px(sw - ROW_INSET));
+        for (ops, clip) in [
+            (&list[..], (0, w)),
+            (&list_text[..], inside),
+            (&top[..], (0, w)),
+            (&top_text[..], inside),
+        ] {
+            painter.overlay(
+                Target {
+                    pixels: &mut *frame.pixels,
+                    stride,
+                    bgra: true,
+                    left,
+                },
+                frame.width,
+                clip,
+                fonts,
+                metrics,
+                ops,
+            );
+        }
     }
 
     /// Draw the ⌘K palette over the pane. `frame` is every row of the window, from the pane's
@@ -1330,10 +1376,20 @@ pub fn fill(pixels: &mut [u8], stride: usize, left: usize, width: usize, color: 
 
 /// `text` cut to fit `max` device pixels at `size`, ending with "…" when cut.
 fn fit<'t>(text: &'t str, max: f32, size: f32, metrics: &dyn TextMetrics) -> Cow<'t, str> {
-    if metrics.width(text, size, false) <= max {
+    fit_in(text, max, size, false, metrics)
+}
+
+fn fit_in<'t>(
+    text: &'t str,
+    max: f32,
+    size: f32,
+    bold: bool,
+    metrics: &dyn TextMetrics,
+) -> Cow<'t, str> {
+    if metrics.width(text, size, bold) <= max {
         return Cow::Borrowed(text);
     }
-    let room = max - metrics.width("…", size, false);
+    let room = max - metrics.width("…", size, bold);
     // The most characters, ending on a char boundary, that leave room for the ellipsis.
     // `ends[k - 1]` is the byte length of the first `k` characters.
     let ends: Vec<usize> = text
@@ -1345,7 +1401,7 @@ fn fit<'t>(text: &'t str, max: f32, size: f32, metrics: &dyn TextMetrics) -> Cow
     let (mut lo, mut hi) = (0, ends.len());
     while lo < hi {
         let mid = (lo + hi).div_ceil(2);
-        if metrics.width(&text[..ends[mid - 1]], size, false) <= room {
+        if metrics.width(&text[..ends[mid - 1]], size, bold) <= room {
             lo = mid;
         } else {
             hi = mid - 1;
@@ -1630,10 +1686,10 @@ mod tests {
                 muted: false,
                 closable: true,
             },
-            ListRow::Label("Folder"),
+            ListRow::Label("Folder".into()),
             item("c"),
         ];
-        let hit = |x, y| sidebar_hit(x, y, &rows, true);
+        let hit = |x, y| sidebar_hit(x, y, 240.0, 0.0, &rows, true);
         assert_eq!(hit(100.0, 10.0), Some(SidebarItem::Profile));
         assert_eq!(hit(100.0, 50.0), Some(SidebarItem::Search));
         assert_eq!(hit(100.0, 78.0), None, "gap above the list");
@@ -1644,10 +1700,38 @@ mod tests {
             "no close button"
         );
         assert_eq!(hit(220.0, 120.0), Some(SidebarItem::CloseRow(1)));
-        assert_eq!(hit(100.0, 150.0), None, "a label is not a row to open");
+        assert_eq!(
+            hit(100.0, 150.0),
+            Some(SidebarItem::Label(2)),
+            "a label folds its group"
+        );
         assert_eq!(hit(100.0, 180.0), Some(SidebarItem::Row(3)));
         assert_eq!(hit(100.0, 210.0), Some(SidebarItem::Footer));
-        assert_eq!(sidebar_hit(100.0, 210.0, &rows, false), None, "no footer");
+        assert_eq!(
+            sidebar_hit(100.0, 210.0, 240.0, 0.0, &rows, false),
+            None,
+            "no footer"
+        );
+        assert_eq!(hit(238.0, 150.0), Some(SidebarItem::Edge));
+        assert_eq!(
+            hit(240.5, 150.0),
+            Some(SidebarItem::Edge),
+            "and a point past it"
+        );
+        assert_eq!(hit(242.0, 150.0), None, "the page's edge stays the page's");
+        assert_eq!(
+            sidebar_hit(100.0, 90.0, 240.0, 60.0, &rows, true),
+            Some(SidebarItem::Label(2)),
+            "scrolled by two rows"
+        );
+        assert_eq!(sidebar_drop(90.0, 0.0, 4), 0);
+        assert_eq!(sidebar_drop(130.0, 0.0, 4), 2, "nearest gap between rows");
+        assert_eq!(sidebar_drop(900.0, 0.0, 4), 4);
+        assert_eq!(sidebar_max_scroll(4, true, 300.0), 0.0);
+        assert_eq!(
+            sidebar_max_scroll(20, true, 300.0),
+            30.0 * 21.0 + 8.0 - 218.0
+        );
         assert_eq!(hit(100.0, 245.0), None);
         assert_eq!(hit(250.0, 90.0), None, "the pane");
     }

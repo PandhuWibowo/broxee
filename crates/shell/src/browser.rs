@@ -12,6 +12,7 @@
 //! The browser draws through the `Screen` trait: the real window on macOS, an in-memory screen
 //! in tests. Tests drive it with synthetic events and local files, never the real desktop.
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::sync::Arc;
@@ -23,7 +24,8 @@ use platform::{Event, Key, KeyEvent};
 
 use crate::chrome::{
     self, Button, Chrome, DialogView, FieldView, Frame, HeaderView, HintView, Hue, ListRow,
-    PaletteHit, PaletteRow, PaletteView, SidebarItem, SidebarView, HEADER_HEIGHT, SIDEBAR_WIDTH,
+    PaletteHit, PaletteRow, PaletteView, SidebarItem, SidebarView, HEADER_HEIGHT, SIDEBAR_MAX,
+    SIDEBAR_MIN, SIDEBAR_WIDTH,
 };
 use crate::engine::{self, FontStore, Loaded, Settings};
 use crate::hibernate::{Stored, TabStore};
@@ -137,6 +139,10 @@ struct Tab {
     /// The link that had keyboard focus when the tab went to sleep; the page is rebuilt
     /// identically from its snapshot, so the node id still names it.
     focused_link: Option<NodeId>,
+    /// Kept at the top of the list.
+    pinned: bool,
+    /// The tab group it belongs to, by name.
+    group: Option<String>,
 }
 
 impl Tab {
@@ -194,14 +200,32 @@ struct Bookmark {
     folder: String,
 }
 
-/// ⌘D's dialog: the page's name and folder.
-struct BookmarkDialog {
-    url: net::Url,
-    /// Name, then folder.
-    fields: [Field; 2],
+/// A small dialog over the pane: ⌘D's bookmark (name, folder) or a tab's group (name).
+struct Dialog {
+    kind: DialogKind,
+    fields: Vec<Field>,
     active: usize,
-    /// Editing this bookmark rather than adding one.
-    existing: Option<usize>,
+}
+
+enum DialogKind {
+    Bookmark {
+        url: net::Url,
+        /// Editing this bookmark rather than adding one.
+        existing: Option<usize>,
+    },
+    /// Move the visible tab to a group; an empty name takes it out of its group.
+    Group,
+}
+
+/// A press in the sidebar that may become a drag.
+#[derive(Clone, Copy, Debug)]
+enum Drag {
+    /// On a tab row; it becomes a move once the pointer travels a few points.
+    Pressed { tab: usize, y: f32 },
+    /// A tab being moved; it lands before row `drop` of the list.
+    Moving { tab: usize, drop: usize },
+    /// The sidebar's edge, resizing it.
+    Resizing,
 }
 
 /// What the sidebar lists.
@@ -212,11 +236,22 @@ enum SidebarList {
 }
 
 /// What a sidebar row stands for.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum RowTarget {
     Tab(usize),
     Bookmark(usize),
     Folder,
+    /// A section label of the tab list.
+    Section(Section),
+}
+
+/// Where a tab sits in the list.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Section {
+    Pinned,
+    /// The group of tab `n` (its first tab).
+    Group(usize),
+    Rest,
 }
 
 /// A closed tab ⌘⇧T can bring back: its history, not its page.
@@ -240,6 +275,39 @@ struct Profile {
     bookmarks: Vec<Bookmark>,
     /// Preselected in ⌘D's dialog (DESIGN.md, section 7).
     last_folder: String,
+    /// Tab groups shown folded, by name.
+    folded: Vec<String>,
+}
+
+impl Profile {
+    /// Keep tabs in the order the sidebar shows them: pinned tabs, then each group (in the
+    /// order groups first appear), then the rest. The sort is stable and the active tab stays
+    /// active, so `⌘1` … `⌘9` follow what is on screen.
+    fn normalize(&mut self) {
+        let mut groups: Vec<String> = Vec::new();
+        for tab in &self.tabs {
+            if let Some(g) = tab.group.as_ref().filter(|_| !tab.pinned) {
+                if !groups.contains(g) {
+                    groups.push(g.clone());
+                }
+            }
+        }
+        let key = |tab: &Tab| match (&tab.group, tab.pinned) {
+            (_, true) => 0,
+            (Some(g), false) => 1 + groups.iter().position(|x| x == g).unwrap_or(0),
+            (None, false) => usize::MAX,
+        };
+        let mut order: Vec<usize> = (0..self.tabs.len()).collect();
+        order.sort_by_key(|&i| key(&self.tabs[i]));
+        let active = order.iter().position(|&i| i == self.active).unwrap_or(0);
+        let mut old: Vec<Option<Tab>> = std::mem::take(&mut self.tabs)
+            .into_iter()
+            .map(Some)
+            .collect();
+        self.tabs = order.iter().filter_map(|&i| old[i].take()).collect();
+        self.active = active;
+        self.folded.retain(|f| groups.contains(f));
+    }
 }
 
 impl Profile {
@@ -253,6 +321,7 @@ impl Profile {
             cookies: Arc::new(net::Cookies::new()),
             bookmarks: Vec::new(),
             last_folder: DEFAULT_FOLDER.into(),
+            folded: Vec::new(),
         }
     }
 }
@@ -345,7 +414,12 @@ struct Browser<S: Screen> {
     store: Option<TabStore>,
     field: Option<Field>,
     palette: Option<Palette>,
-    dialog: Option<BookmarkDialog>,
+    dialog: Option<Dialog>,
+    /// Sidebar width in points, 200 to 320.
+    sidebar_width: f32,
+    /// How far the sidebar's list is scrolled.
+    sidebar_scroll: f32,
+    drag: Option<Drag>,
     list: SidebarList,
     /// The bookmark row chosen with ↑ ↓ while the bookmarks panel is open.
     bookmark_row: Option<usize>,
@@ -410,6 +484,9 @@ impl<S: Screen> Browser<S> {
             field: None,
             palette: None,
             dialog: None,
+            sidebar_width: SIDEBAR_WIDTH,
+            sidebar_scroll: 0.0,
+            drag: None,
             list: SidebarList::Tabs,
             bookmark_row: None,
             focus: None,
@@ -432,7 +509,7 @@ impl<S: Screen> Browser<S> {
     /// Left edge of the pane, in points.
     fn pane_left(&self) -> f32 {
         if self.sidebar {
-            SIDEBAR_WIDTH.min(self.width)
+            self.sidebar_width.min(self.width)
         } else {
             0.0
         }
@@ -503,14 +580,20 @@ impl<S: Screen> Browser<S> {
             .as_ref()
             .and_then(|p| std::fs::read_to_string(p).ok())
         {
-            if let Some((profiles, visible)) = parse_session(&text) {
-                for (profile, (tabs, active)) in self.profiles.iter_mut().zip(profiles) {
-                    if !tabs.is_empty() {
-                        profile.active = active.min(tabs.len() - 1);
-                        profile.tabs = tabs;
+            if let Some(session) = parse_session(&text) {
+                for (profile, saved) in self.profiles.iter_mut().zip(session.profiles) {
+                    if !saved.tabs.is_empty() {
+                        profile.active = saved.active.min(saved.tabs.len() - 1);
+                        profile.tabs = saved.tabs;
+                        profile.folded = saved.folded;
+                        profile.normalize();
                     }
                 }
-                self.profile = visible.min(self.profiles.len() - 1);
+                self.profile = session.visible.min(self.profiles.len() - 1);
+                if let Some((width, shown)) = session.sidebar {
+                    self.sidebar_width = width;
+                    self.sidebar = shown;
+                }
             }
         }
         let targets: Vec<String> = std::iter::once(&self.opts.target)
@@ -566,7 +649,17 @@ impl<S: Screen> Browser<S> {
     /// Apply one event; returns whether the frame needs repainting.
     fn handle(&mut self, event: Event) -> bool {
         match event {
-            Event::Scroll { dy } => self.scroll_by(-(dy as f32)),
+            Event::Scroll { dy, x, .. } if (x as f32) < self.pane_left() => {
+                let rows = self.sidebar_rows();
+                let max =
+                    chrome::sidebar_max_scroll(rows.rows.len(), rows.footer.is_some(), self.height);
+                let before = self.sidebar_scroll;
+                self.sidebar_scroll = (self.sidebar_scroll - dy as f32).clamp(0.0, max);
+                self.sidebar_scroll != before
+            }
+            Event::Scroll { dy, .. } => self.scroll_by(-(dy as f32)),
+            Event::Drag { x, y } => self.drag_to(x as f32, y as f32),
+            Event::Release { x, y } => self.release(x as f32, y as f32),
             Event::Resize {
                 width,
                 height,
@@ -668,29 +761,46 @@ impl<S: Screen> Browser<S> {
             }
             self.close_palette();
         }
-        if x < left {
-            self.field = None;
-            self.focus = None;
+        let in_sidebar = self.sidebar && x < left + 1.0;
+        if in_sidebar {
             let hit = {
                 let list = self.sidebar_rows();
-                chrome::sidebar_hit(x, y, &list.rows, list.footer.is_some()).map(
-                    |item| match item {
-                        SidebarItem::Row(r) | SidebarItem::CloseRow(r) => {
-                            (item, Some(list.targets[r]))
-                        }
-                        _ => (item, None),
-                    },
+                chrome::sidebar_hit(
+                    x,
+                    y,
+                    left,
+                    self.sidebar_scroll,
+                    &list.rows,
+                    list.footer.is_some(),
                 )
+                .map(|item| match item {
+                    SidebarItem::Row(r) | SidebarItem::CloseRow(r) | SidebarItem::Label(r) => {
+                        (item, Some(list.targets[r]))
+                    }
+                    _ => (item, None),
+                })
             };
-            return match hit {
-                Some((SidebarItem::Profile, _)) => self.switch_profile(),
-                Some((SidebarItem::Search, _)) => self.open_palette(),
-                Some((SidebarItem::CloseRow(_), _)) => self.close_tab(),
-                Some((SidebarItem::Footer, _)) => self.new_tab(),
-                Some((_, Some(RowTarget::Tab(i)))) => self.select_tab(i),
-                Some((_, Some(RowTarget::Bookmark(i)))) => self.open_bookmark(i),
-                _ => false,
-            };
+            if let Some((SidebarItem::Edge, _)) = hit {
+                self.drag = Some(Drag::Resizing);
+                return false;
+            }
+            if x < left {
+                self.field = None;
+                self.focus = None;
+                return match hit {
+                    Some((SidebarItem::Profile, _)) => self.switch_profile(),
+                    Some((SidebarItem::Search, _)) => self.open_palette(),
+                    Some((SidebarItem::CloseRow(_), _)) => self.close_tab(),
+                    Some((SidebarItem::Footer, _)) => self.new_tab(),
+                    Some((_, Some(RowTarget::Tab(i)))) => {
+                        self.drag = Some(Drag::Pressed { tab: i, y });
+                        self.select_tab(i)
+                    }
+                    Some((_, Some(RowTarget::Bookmark(i)))) => self.open_bookmark(i),
+                    Some((_, Some(RowTarget::Section(Section::Group(i))))) => self.fold_group(i),
+                    _ => false,
+                };
+            }
         }
         let x = x - left;
         if y < HEADER_HEIGHT {
@@ -985,6 +1095,27 @@ impl<S: Screen> Browser<S> {
                 }
                 removed
             }
+            Command::TogglePin => {
+                let p = &mut self.profiles[self.profile];
+                let tab = &mut p.tabs[p.active];
+                tab.pinned = !tab.pinned;
+                p.normalize();
+                self.reveal_active_tab();
+                self.save_session();
+                true
+            }
+            Command::MoveToGroup => {
+                let group = self.tab().group.clone().unwrap_or_default();
+                self.open_dialog(DialogKind::Group, vec![group]);
+                true
+            }
+            Command::FoldGroup => {
+                let p = &self.profiles[self.profile];
+                match p.tabs[p.active].group.is_some() {
+                    true => self.fold_group(p.active),
+                    false => false,
+                }
+            }
             Command::ClearCookies => {
                 let cookies = &self.profiles[self.profile].cookies;
                 cookies.clear();
@@ -1025,21 +1156,29 @@ impl<S: Screen> Browser<S> {
             Some(i) => (p.bookmarks[i].title.clone(), p.bookmarks[i].folder.clone()),
             None => (title, p.last_folder.clone()),
         };
-        let field = |text: String, selected| Field {
-            cursor: text.len(),
-            text,
-            all_selected: selected,
-        };
+        self.open_dialog(DialogKind::Bookmark { url, existing }, vec![name, folder]);
+        true
+    }
+
+    /// Open a dialog with these field values; the first is selected, so typing replaces it.
+    fn open_dialog(&mut self, kind: DialogKind, values: Vec<String>) {
         self.close_palette();
         self.field = None;
         self.focus = None;
-        self.dialog = Some(BookmarkDialog {
-            url,
-            fields: [field(name, true), field(folder, false)],
+        let fields = values
+            .into_iter()
+            .enumerate()
+            .map(|(i, text)| Field {
+                cursor: text.len(),
+                text,
+                all_selected: i == 0,
+            })
+            .collect();
+        self.dialog = Some(Dialog {
+            kind,
+            fields,
             active: 0,
-            existing,
         });
-        true
     }
 
     fn dialog_key(&mut self, k: KeyEvent) -> bool {
@@ -1062,7 +1201,7 @@ impl<S: Screen> Browser<S> {
             }
             Key::Tab | Key::Up | Key::Down => {
                 field.all_selected = false;
-                d.active = 1 - d.active;
+                d.active = (d.active + 1) % d.fields.len();
                 // Typing replaces the field just reached, as in macOS dialogs.
                 d.fields[d.active].all_selected = true;
             }
@@ -1070,20 +1209,35 @@ impl<S: Screen> Browser<S> {
                 self.dialog = None;
                 self.chrome.forget_palette();
             }
-            Key::Enter => return self.save_bookmark_dialog(),
+            Key::Enter => return self.finish_dialog(),
             _ => return false,
         }
         true
     }
 
-    fn save_bookmark_dialog(&mut self) -> bool {
+    /// Enter in a dialog: save what it edits.
+    fn finish_dialog(&mut self) -> bool {
         let Some(d) = self.dialog.take() else {
             return false;
         };
         self.chrome.forget_palette();
         let clean = |s: &str| s.trim().replace(['\t', '\n', '\r'], " ");
+        let (url, existing) = match d.kind {
+            DialogKind::Bookmark { url, existing } => (url, existing),
+            DialogKind::Group => {
+                let name = clean(&d.fields[0].text);
+                let p = &mut self.profiles[self.profile];
+                let tab = &mut p.tabs[p.active];
+                tab.group = (!name.is_empty()).then_some(name);
+                tab.pinned = false;
+                p.normalize();
+                self.reveal_active_tab();
+                self.save_session();
+                return true;
+            }
+        };
         let title = match clean(&d.fields[0].text) {
-            t if t.is_empty() => d.url.to_string(),
+            t if t.is_empty() => url.to_string(),
             t => t,
         };
         let folder = match clean(&d.fields[1].text) {
@@ -1093,15 +1247,161 @@ impl<S: Screen> Browser<S> {
         let p = &mut self.profiles[self.profile];
         let bookmark = Bookmark {
             title,
-            url: d.url,
+            url,
             folder: folder.clone(),
         };
-        match d.existing.filter(|&i| i < p.bookmarks.len()) {
+        match existing.filter(|&i| i < p.bookmarks.len()) {
             Some(i) => p.bookmarks[i] = bookmark,
             None => p.bookmarks.push(bookmark),
         }
         p.last_folder = folder;
         self.save_bookmarks();
+        true
+    }
+
+    /// Fold or unfold the group of tab `tab`.
+    fn fold_group(&mut self, tab: usize) -> bool {
+        let p = &mut self.profiles[self.profile];
+        let Some(group) = p.tabs.get(tab).and_then(|t| t.group.clone()) else {
+            return false;
+        };
+        match p.folded.iter().position(|g| *g == group) {
+            Some(i) => {
+                p.folded.remove(i);
+            }
+            None => p.folded.push(group),
+        }
+        let max = {
+            let rows = self.sidebar_rows();
+            chrome::sidebar_max_scroll(rows.rows.len(), rows.footer.is_some(), self.height)
+        };
+        self.sidebar_scroll = self.sidebar_scroll.min(max);
+        self.save_session();
+        true
+    }
+
+    /// Scroll the sidebar so the active tab's row is in view.
+    fn reveal_active_tab(&mut self) {
+        if self.list != SidebarList::Tabs {
+            return;
+        }
+        let active = self.profiles[self.profile].active;
+        let (row, count, footer) = {
+            let rows = self.sidebar_rows();
+            let row = rows
+                .targets
+                .iter()
+                .position(|t| *t == RowTarget::Tab(active));
+            (row, rows.rows.len(), rows.footer.is_some())
+        };
+        let Some(row) = row else {
+            return;
+        };
+        let view = self.height - chrome::LIST_TOP;
+        let top = chrome::TAB_ROW * row as f32;
+        if top < self.sidebar_scroll {
+            self.sidebar_scroll = top;
+        } else if top + chrome::TAB_ROW > self.sidebar_scroll + view {
+            self.sidebar_scroll = top + chrome::TAB_ROW - view;
+        }
+        let max = chrome::sidebar_max_scroll(count, footer, self.height);
+        self.sidebar_scroll = self.sidebar_scroll.clamp(0.0, max);
+    }
+
+    /// The pointer moved with the button down: resize the sidebar or move a tab.
+    fn drag_to(&mut self, x: f32, y: f32) -> bool {
+        match self.drag {
+            Some(Drag::Resizing) => {
+                let width = x.round().clamp(SIDEBAR_MIN, SIDEBAR_MAX);
+                let changed = width != self.sidebar_width;
+                self.sidebar_width = width;
+                changed
+            }
+            Some(Drag::Pressed { tab, y: from }) if (y - from).abs() > 4.0 => {
+                let rows = self.sidebar_rows().rows.len();
+                let drop = chrome::sidebar_drop(y, self.sidebar_scroll, rows);
+                self.drag = Some(Drag::Moving { tab, drop });
+                true
+            }
+            Some(Drag::Moving { tab, drop }) => {
+                let rows = self.sidebar_rows().rows.len();
+                let to = chrome::sidebar_drop(y, self.sidebar_scroll, rows);
+                self.drag = Some(Drag::Moving { tab, drop: to });
+                to != drop
+            }
+            _ => false,
+        }
+    }
+
+    /// The button came up: finish a resize or a move.
+    fn release(&mut self, _x: f32, _y: f32) -> bool {
+        match self.drag.take() {
+            Some(Drag::Resizing) => {
+                // The page is laid out again once, for the final width.
+                self.relayout();
+                self.save_session();
+                true
+            }
+            Some(Drag::Moving { tab, drop }) => self.move_tab(tab, drop),
+            _ => false,
+        }
+    }
+
+    /// Move tab `tab` to land before row `drop` of the tab list. It joins the section it
+    /// lands in: pinned, a group, or neither.
+    fn move_tab(&mut self, tab: usize, drop: usize) -> bool {
+        let targets = self.sidebar_rows().targets;
+        let p = &mut self.profiles[self.profile];
+        if tab >= p.tabs.len() {
+            return false;
+        }
+        // The section of the row just above the landing point (or the first row's).
+        let above = drop.checked_sub(1).or((!targets.is_empty()).then_some(0));
+        let section = match above.and_then(|r| targets.get(r)) {
+            Some(RowTarget::Section(section)) => *section,
+            Some(&RowTarget::Tab(i)) if p.tabs[i].pinned => Section::Pinned,
+            Some(&RowTarget::Tab(i)) => match p.tabs[i].group {
+                Some(_) => Section::Group(i),
+                None => Section::Rest,
+            },
+            _ => Section::Rest,
+        };
+        let group = match section {
+            Section::Group(i) => p.tabs[i].group.clone(),
+            _ => None,
+        };
+        // Where it goes among the other tabs: after the tab above, or first in a section.
+        let after = targets[..drop.min(targets.len())]
+            .iter()
+            .rev()
+            .find_map(|t| match t {
+                RowTarget::Tab(i) if *i != tab => Some(*i),
+                _ => None,
+            });
+        let active_was = p.active;
+        let moved = p.tabs.remove(tab);
+        let index = |i: usize| if i > tab { i - 1 } else { i };
+        let at = match after {
+            Some(i) => index(i) + 1,
+            None => 0,
+        };
+        p.tabs.insert(at.min(p.tabs.len()), moved);
+        let tab_now = at.min(p.tabs.len() - 1);
+        p.tabs[tab_now].pinned = section == Section::Pinned;
+        p.tabs[tab_now].group = group;
+        // Keep the active tab active wherever it went.
+        p.active = if active_was == tab {
+            tab_now
+        } else {
+            let a = index(active_was);
+            if a >= tab_now {
+                a + 1
+            } else {
+                a
+            }
+        };
+        p.normalize();
+        self.save_session();
         true
     }
 
@@ -1675,6 +1975,7 @@ impl<S: Screen> Browser<S> {
         self.sleep();
         self.profiles[self.profile].active = i;
         self.wake();
+        self.reveal_active_tab();
         true
     }
 
@@ -1684,6 +1985,7 @@ impl<S: Screen> Browser<S> {
         p.tabs.push(Tab::default());
         p.active = p.tabs.len() - 1;
         self.wake();
+        self.reveal_active_tab();
         true
     }
 
@@ -1790,7 +2092,11 @@ impl<S: Screen> Browser<S> {
         let Some(path) = &self.session else {
             return;
         };
-        let text = write_session(&self.profiles, self.profile);
+        let text = write_session(
+            &self.profiles,
+            self.profile,
+            (self.sidebar_width, self.sidebar),
+        );
         // History is private: the file is this user's only, like the cookies.
         if let Err(e) = write_private(path, text.as_bytes()) {
             self.window
@@ -1896,30 +2202,54 @@ impl<S: Screen> Browser<S> {
             focused: self.focus,
         };
         let list = sidebar_rows(profile, self.list, self.bookmark_row);
+        let drop_at = match self.drag {
+            Some(Drag::Moving { drop, .. }) => Some(drop),
+            _ => None,
+        };
         let sidebar = (sidebar_px > 0).then_some(SidebarView {
             profile: profile.name,
             hue: profile.hue,
             rows: &list.rows,
             selected: list.selected,
             footer: list.footer,
+            scroll: self.sidebar_scroll,
+            drop_at,
             empty: list.empty,
         });
+        let (labels, heading, help): (&[&str], &str, &str) =
+            match self.dialog.as_ref().map(|d| &d.kind) {
+                Some(DialogKind::Bookmark {
+                    existing: Some(_), ..
+                }) => (
+                    &["Name", "Folder"],
+                    "Edit bookmark",
+                    "Enter to save · Tab for the other field · Esc to cancel",
+                ),
+                Some(DialogKind::Bookmark { .. }) => (
+                    &["Name", "Folder"],
+                    "Bookmark this page",
+                    "Enter to save · Tab for the other field · Esc to cancel",
+                ),
+                Some(DialogKind::Group) => (
+                    &["Group"],
+                    "Move this tab to a group",
+                    "Enter to move · an empty name takes it out · Esc to cancel",
+                ),
+                None => (&[], "", ""),
+            };
         let dialog_fields: Vec<(&str, &str, usize)> =
             self.dialog.as_ref().map_or(Vec::new(), |d| {
-                vec![
-                    ("Name", d.fields[0].text.as_str(), d.fields[0].cursor),
-                    ("Folder", d.fields[1].text.as_str(), d.fields[1].cursor),
-                ]
+                d.fields
+                    .iter()
+                    .zip(labels)
+                    .map(|(f, label)| (*label, f.text.as_str(), f.cursor))
+                    .collect()
             });
         let dialog_view = self.dialog.as_ref().map(|d| DialogView {
-            heading: if d.existing.is_some() {
-                "Edit bookmark"
-            } else {
-                "Bookmark this page"
-            },
+            heading,
             fields: &dialog_fields,
             active: d.active,
-            help: "Enter to save · Tab for the other field · Esc to cancel",
+            help,
         });
         let palette_rows: Vec<PaletteRow> = self.palette.as_ref().map_or(Vec::new(), |p| {
             p.items
@@ -2052,22 +2382,70 @@ fn sidebar_rows(
     bookmark_row: Option<usize>,
 ) -> SidebarRows<'_> {
     match list {
-        SidebarList::Tabs => SidebarRows {
-            rows: profile
-                .tabs
-                .iter()
-                .enumerate()
-                .map(|(i, t)| ListRow::Item {
-                    title: t.title(),
+        SidebarList::Tabs => {
+            // Tabs are kept in this order (`Profile::normalize`): pinned, groups, the rest.
+            // Labels appear once there is more than one kind of section.
+            let sectioned = profile.tabs.iter().any(|t| t.pinned || t.group.is_some());
+            let mut rows = Vec::new();
+            let mut targets = Vec::new();
+            let mut current: Option<Section> = None;
+            for (i, tab) in profile.tabs.iter().enumerate() {
+                let section = match (&tab.group, tab.pinned) {
+                    (_, true) => Section::Pinned,
+                    (Some(_), false) => match current {
+                        Some(Section::Group(first)) if profile.tabs[first].group == tab.group => {
+                            Section::Group(first)
+                        }
+                        _ => Section::Group(i),
+                    },
+                    (None, false) => Section::Rest,
+                };
+                let folded = matches!(section, Section::Group(_))
+                    && tab
+                        .group
+                        .as_ref()
+                        .is_some_and(|g| profile.folded.contains(g));
+                if sectioned && current != Some(section) {
+                    let label = match section {
+                        Section::Pinned => Cow::Borrowed("Pinned"),
+                        Section::Rest => Cow::Borrowed("Tabs"),
+                        Section::Group(_) => {
+                            let name = tab.group.as_deref().unwrap_or_default();
+                            if folded {
+                                let count =
+                                    profile.tabs.iter().filter(|t| t.group == tab.group).count();
+                                Cow::Owned(format!("{name} ({count})"))
+                            } else {
+                                Cow::Borrowed(name)
+                            }
+                        }
+                    };
+                    rows.push(ListRow::Label(label));
+                    targets.push(RowTarget::Section(section));
+                    current = Some(section);
+                }
+                // A folded group still shows its active tab.
+                if folded && i != profile.active {
+                    continue;
+                }
+                rows.push(ListRow::Item {
+                    title: tab.title(),
                     muted: i != profile.active,
                     closable: i == profile.active,
-                })
-                .collect(),
-            targets: (0..profile.tabs.len()).map(RowTarget::Tab).collect(),
-            selected: Some(profile.active),
-            footer: Some("+ New tab"),
-            empty: None,
-        },
+                });
+                targets.push(RowTarget::Tab(i));
+            }
+            let selected = targets
+                .iter()
+                .position(|t| *t == RowTarget::Tab(profile.active));
+            SidebarRows {
+                rows,
+                targets,
+                selected,
+                footer: Some("+ New tab"),
+                empty: None,
+            }
+        }
         SidebarList::Bookmarks => {
             // Folders in name order; bookmarks in the order they were saved.
             let mut folders: Vec<&str> = profile
@@ -2080,7 +2458,7 @@ fn sidebar_rows(
             let mut rows = Vec::new();
             let mut targets = Vec::new();
             for folder in folders {
-                rows.push(ListRow::Label(folder));
+                rows.push(ListRow::Label(Cow::Borrowed(folder)));
                 targets.push(RowTarget::Folder);
                 for (i, b) in profile.bookmarks.iter().enumerate() {
                     if b.folder == folder {
@@ -2180,13 +2558,26 @@ fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
 
 /// The session as text: one line per profile, tab and history entry, tab-separated. Pages
 /// are not saved; restored tabs reload when selected.
-fn write_session(profiles: &[Profile], visible: usize) -> String {
+fn write_session(profiles: &[Profile], visible: usize, sidebar: (f32, bool)) -> String {
     let clean = |s: &str| s.replace(['\t', '\n', '\r'], " ");
-    let mut out = format!("broxee-session 1\nvisible\t{visible}\n");
+    let mut out = format!(
+        "broxee-session 1\nvisible\t{visible}\nsidebar\t{}\t{}\n",
+        sidebar.0,
+        u8::from(sidebar.1)
+    );
     for profile in profiles {
         out += &format!("profile\t{}\t{}\n", profile.active, profile.name);
+        for group in &profile.folded {
+            out += &format!("folded\t{}\n", clean(group));
+        }
         for tab in &profile.tabs {
             out += &format!("tab\t{}\t{}\n", tab.index, clean(&tab.title));
+            if tab.pinned {
+                out += "pinned\n";
+            }
+            if let Some(group) = &tab.group {
+                out += &format!("group\t{}\n", clean(group));
+            }
             for entry in &tab.history {
                 out += &format!(
                     "entry\t{}\t{}\t{}\n",
@@ -2200,34 +2591,75 @@ fn write_session(profiles: &[Profile], visible: usize) -> String {
     out
 }
 
-type SessionProfile = (Vec<Tab>, usize);
+/// A profile as saved: its tabs, the active one and its folded groups.
+#[derive(Default)]
+struct SavedProfile {
+    tabs: Vec<Tab>,
+    active: usize,
+    folded: Vec<String>,
+}
+
+struct Session {
+    profiles: Vec<SavedProfile>,
+    visible: usize,
+    /// Sidebar width and whether it is shown.
+    sidebar: Option<(f32, bool)>,
+}
 
 /// Read a session written by `write_session`; anything malformed is skipped, never trusted.
-fn parse_session(text: &str) -> Option<(Vec<SessionProfile>, usize)> {
+fn parse_session(text: &str) -> Option<Session> {
     let mut lines = text.lines();
     if lines.next()? != "broxee-session 1" {
         return None;
     }
     let mut visible = 0;
-    let mut profiles: Vec<SessionProfile> = Vec::new();
+    let mut sidebar = None;
+    let mut profiles: Vec<SavedProfile> = Vec::new();
     for line in lines {
         let mut parts = line.splitn(3, '\t');
         let (kind, a, b) = (parts.next()?, parts.next(), parts.next());
         let number = a.and_then(|a| a.parse::<usize>().ok()).unwrap_or(0);
+        let name = a.map(str::trim).filter(|n| !n.is_empty()).map(String::from);
         match kind {
             "visible" => visible = number,
-            "profile" => profiles.push((Vec::new(), number)),
+            "sidebar" => {
+                let width = a
+                    .and_then(|a| a.parse::<f32>().ok())
+                    .filter(|w| w.is_finite());
+                if let Some(width) = width {
+                    sidebar = Some((width.clamp(SIDEBAR_MIN, SIDEBAR_MAX), b != Some("0")));
+                }
+            }
+            "profile" => profiles.push(SavedProfile {
+                active: number,
+                ..SavedProfile::default()
+            }),
+            "folded" => {
+                if let (Some(p), Some(name)) = (profiles.last_mut(), name) {
+                    p.folded.push(name);
+                }
+            }
             "tab" => {
-                if let Some((tabs, _)) = profiles.last_mut().filter(|p| p.0.len() < SESSION_TABS) {
-                    tabs.push(Tab {
+                if let Some(p) = profiles.last_mut().filter(|p| p.tabs.len() < SESSION_TABS) {
+                    p.tabs.push(Tab {
                         index: number,
                         title: b.unwrap_or_default().to_string(),
                         ..Tab::default()
                     });
                 }
             }
+            "pinned" => {
+                if let Some(tab) = profiles.last_mut().and_then(|p| p.tabs.last_mut()) {
+                    tab.pinned = true;
+                }
+            }
+            "group" => {
+                if let Some(tab) = profiles.last_mut().and_then(|p| p.tabs.last_mut()) {
+                    tab.group = name;
+                }
+            }
             "entry" => {
-                let tab = profiles.last_mut().and_then(|p| p.0.last_mut());
+                let tab = profiles.last_mut().and_then(|p| p.tabs.last_mut());
                 // "url" or, since titles are kept, "url<tab>title".
                 let (url, title) = match b.map(|b| b.split_once('\t')) {
                     Some(Some((url, title))) => (Some(url), title),
@@ -2250,12 +2682,16 @@ fn parse_session(text: &str) -> Option<(Vec<SessionProfile>, usize)> {
             _ => {}
         }
     }
-    for (tabs, _) in &mut profiles {
-        for tab in tabs.iter_mut() {
+    for p in &mut profiles {
+        for tab in p.tabs.iter_mut() {
             tab.index = tab.index.min(tab.history.len().saturating_sub(1));
         }
     }
-    Some((profiles, visible))
+    Some(Session {
+        profiles,
+        visible,
+        sidebar,
+    })
 }
 
 /// The nearest `<a href>` at or above `node`, resolved against the page URL. Only links Broxee
@@ -2614,7 +3050,14 @@ mod tests {
         let bottom = b.scroll;
         assert!(!act(&mut b, key(Key::Down)), "already at the bottom");
         assert!((bottom - b.max_scroll()).abs() < 0.01);
-        assert!(act(&mut b, Event::Scroll { dy: 10_000.0 }));
+        assert!(act(
+            &mut b,
+            Event::Scroll {
+                dy: 10_000.0,
+                x: 400.0,
+                y: 100.0
+            }
+        ));
         assert_eq!(b.scroll, 0.0, "scrolling up past the top stops at 0");
         act(&mut b, key(Key::PageDown));
 
@@ -3023,14 +3466,15 @@ mod tests {
     fn reads_damaged_sessions_safely() {
         assert!(parse_session("").is_none());
         assert!(parse_session("something else\nvisible\t1").is_none());
-        let (profiles, visible) = parse_session(
+        let session = parse_session(
             "broxee-session 1\nvisible\t7\nentry\t0\thttps://orphan.example/\n\
              profile\t0\tPersonal\ntab\t9\tKept\nentry\tNaN\thttps://a.example/\n\
              entry\t5\tnot a url\nbogus line\n",
         )
         .unwrap();
-        assert_eq!(visible, 7, "clamped by the caller");
-        let tab = &profiles[0].0[0];
+        assert_eq!(session.visible, 7, "clamped by the caller");
+        assert_eq!(session.sidebar, None);
+        let tab = &session.profiles[0].tabs[0];
         assert_eq!(
             (tab.title.as_str(), tab.index, tab.history.len()),
             ("Kept", 0, 1)
@@ -3044,9 +3488,23 @@ mod tests {
             scroll: 12.5,
             title: "Page\tX".into(),
         });
-        let text = write_session(&[personal], 0);
-        let (profiles, _) = parse_session(&text).unwrap();
-        let tab = &profiles[0].0[0];
+        personal.tabs[0].pinned = true;
+        personal.tabs.push(Tab {
+            group: Some("Re\tsearch".into()),
+            ..Tab::default()
+        });
+        personal.folded.push("Research".into());
+        let text = write_session(&[personal], 0, (999.0, false));
+        let session = parse_session(&text).unwrap();
+        assert_eq!(
+            session.sidebar,
+            Some((SIDEBAR_MAX, false)),
+            "width kept in range"
+        );
+        let saved = &session.profiles[0];
+        assert_eq!(saved.folded, ["Research"]);
+        assert!(saved.tabs[0].pinned && saved.tabs[1].group.as_deref() == Some("Re search"));
+        let tab = &saved.tabs[0];
         assert_eq!(tab.title, "A tab name");
         assert_eq!(tab.history[0].scroll, 12.5);
         assert_eq!(tab.history[0].title, "Page X");
@@ -3501,7 +3959,13 @@ mod tests {
 
         // ⌘D on a saved page edits it; Esc leaves it as it was.
         act(&mut b, command('d'));
-        assert_eq!(b.dialog.as_ref().unwrap().existing, Some(1));
+        assert!(matches!(
+            b.dialog.as_ref().unwrap().kind,
+            DialogKind::Bookmark {
+                existing: Some(1),
+                ..
+            }
+        ));
         type_text(&mut b, "x");
         act(&mut b, key(Key::Escape));
         assert_eq!(b.profiles[0].bookmarks[1].title, "Second page");
@@ -3593,6 +4057,184 @@ mod tests {
         assert_eq!(marks[1].title, "C\twith tab");
         let text = write_bookmarks(&marks, "F");
         assert_eq!(parse_bookmarks(&text).0, marks);
+    }
+
+    /// The tab list as labels in brackets and tab titles, as drawn.
+    fn sidebar_text(b: &Browser<FakeScreen>) -> Vec<String> {
+        b.sidebar_rows()
+            .rows
+            .iter()
+            .map(|r| match r {
+                ListRow::Label(l) => format!("[{l}]"),
+                ListRow::Item { title, .. } => title.to_string(),
+            })
+            .collect()
+    }
+
+    fn row_center(row: usize) -> f64 {
+        f64::from(chrome::LIST_TOP + chrome::TAB_ROW * row as f32 + 15.0)
+    }
+
+    fn run_palette(b: &mut Browser<FakeScreen>, text: &str) {
+        act(b, command('k'));
+        type_text(b, text);
+        act(b, key(Key::Enter));
+    }
+
+    #[test]
+    fn tabs_can_be_pinned_grouped_folded_dragged_and_restored() {
+        let (a, bpath) = site("organise");
+        let session = a.with_file_name("organise-session");
+        let _ = std::fs::remove_file(&session);
+        let mut b = browser_with(&a, Some(session.clone()));
+        act(&mut b, command('t'));
+        open(&mut b, &bpath);
+        act(&mut b, command('t'));
+        open(&mut b, &a);
+        assert_eq!(sidebar_text(&b), ["Page A", "Page B", "Page A"]);
+
+        // Pinning moves the tab to the top, under a label, and ⌘1 follows the new order.
+        run_palette(&mut b, "pin or unpin");
+        assert_eq!(
+            sidebar_text(&b),
+            ["[Pinned]", "Page A", "[Tabs]", "Page A", "Page B"]
+        );
+        assert_eq!(b.profiles[0].active, 0, "the pinned tab stays active");
+
+        // A group, through its dialog.
+        act(&mut b, command('2'));
+        run_palette(&mut b, "move this tab");
+        assert!(matches!(b.dialog.as_ref().unwrap().kind, DialogKind::Group));
+        type_text(&mut b, "Research");
+        act(&mut b, key(Key::Enter));
+        assert_eq!(
+            sidebar_text(&b),
+            [
+                "[Pinned]",
+                "Page A",
+                "[Research]",
+                "Page A",
+                "[Tabs]",
+                "Page B"
+            ]
+        );
+
+        // Folding hides the group's tabs except the active one; a click on the label folds.
+        act(&mut b, command('3'));
+        assert!(act(
+            &mut b,
+            Event::Click {
+                x: 100.0,
+                y: row_center(2)
+            }
+        ));
+        assert_eq!(
+            sidebar_text(&b),
+            ["[Pinned]", "Page A", "[Research (1)]", "[Tabs]", "Page B"]
+        );
+        assert!(act(
+            &mut b,
+            Event::Click {
+                x: 100.0,
+                y: row_center(2)
+            }
+        ));
+        assert_eq!(sidebar_text(&b).len(), 6, "unfolded");
+
+        // Dragging Page B (row 5) to just under the Research label joins the group.
+        act(
+            &mut b,
+            Event::Click {
+                x: 100.0,
+                y: row_center(5),
+            },
+        );
+        assert!(act(
+            &mut b,
+            Event::Drag {
+                x: 100.0,
+                y: row_center(5) - 20.0
+            }
+        ));
+        assert!(act(
+            &mut b,
+            Event::Drag {
+                x: 100.0,
+                y: row_center(3) - 15.0
+            }
+        ));
+        assert!(matches!(b.drag, Some(Drag::Moving { drop: 3, .. })));
+        b.render();
+        assert!(act(
+            &mut b,
+            Event::Release {
+                x: 100.0,
+                y: row_center(3) - 15.0
+            }
+        ));
+        assert_eq!(
+            sidebar_text(&b),
+            ["[Pinned]", "Page A", "[Research]", "Page B", "Page A"]
+        );
+        assert_eq!(
+            title(&b),
+            "Page B",
+            "the dragged tab is still the one shown"
+        );
+
+        // Resizing by the edge lays the page out once, at the end.
+        assert!(!act(&mut b, Event::Click { x: 238.0, y: 200.0 }));
+        assert!(act(&mut b, Event::Drag { x: 300.0, y: 200.0 }));
+        assert!(act(&mut b, Event::Drag { x: 900.0, y: 200.0 }));
+        assert_eq!(b.sidebar_width, SIDEBAR_MAX);
+        assert!(act(&mut b, Event::Release { x: 900.0, y: 200.0 }));
+        assert_eq!(b.page.as_ref().unwrap().layout.width, 640.0 - SIDEBAR_MAX);
+        drop(b);
+
+        // All of it comes back.
+        let b = browser_with(Path::new(""), Some(session));
+        assert_eq!(b.sidebar_width, SIDEBAR_MAX);
+        assert_eq!(
+            sidebar_text(&b),
+            ["[Pinned]", "Page A", "[Research]", "Page B", "Page A"]
+        );
+    }
+
+    #[test]
+    fn the_sidebar_scrolls_and_keeps_the_active_tab_in_view() {
+        let (a, _) = site("sidebar-scroll");
+        let mut b = browser(&a);
+        for _ in 0..12 {
+            act(&mut b, command('t'));
+            act(&mut b, key(Key::Escape));
+        }
+        // 13 tabs and "+ New tab" in 218 points: the list scrolls, and showed the new tab.
+        assert!(b.sidebar_scroll > 0.0);
+        let bottom = b.sidebar_scroll;
+        assert!(act(&mut b, command('1')));
+        assert_eq!(b.sidebar_scroll, 0.0, "⌘1 scrolls back to the first tab");
+        assert!(act(
+            &mut b,
+            Event::Scroll {
+                dy: -1000.0,
+                x: 100.0,
+                y: 200.0
+            }
+        ));
+        // Revealing a tab shows its row at the bottom edge; the wheel goes on to the footer.
+        assert_eq!(bottom, chrome::TAB_ROW * 13.0 - (300.0 - chrome::LIST_TOP));
+        let max = chrome::sidebar_max_scroll(13, true, 300.0);
+        assert_eq!(
+            b.sidebar_scroll, max,
+            "the wheel scrolls to the end, no further"
+        );
+        assert_eq!(b.scroll, 0.0, "the page did not scroll");
+        b.render();
+        // Clicks land on the rows as scrolled.
+        let first_visible = (b.sidebar_scroll / chrome::TAB_ROW).ceil() as usize;
+        let y = row_center(first_visible) - f64::from(b.sidebar_scroll);
+        assert!(act(&mut b, Event::Click { x: 100.0, y }));
+        assert_eq!(b.profiles[0].active, first_visible);
     }
 
     #[test]

@@ -415,7 +415,15 @@ extern "C" fn should_terminate_after_last_window(_this: Id, _sel: Sel, _app: Id)
     true
 }
 
-extern "C" fn scroll_wheel(_this: Id, _sel: Sel, event: Id) {
+/// Where `event` happened, in content points from the top left.
+fn location(view: Id, event: Id) -> (f64, f64) {
+    // SAFETY: `event` is an NSEvent with a location (mouse or scroll), `view` our content view.
+    let (point, rect) = unsafe { (send!(CGPoint; event, c"locationInWindow"), bounds(view)) };
+    // Window coordinates have their origin at the bottom left of the content area.
+    (point.x, rect.height - point.y)
+}
+
+extern "C" fn scroll_wheel(this: Id, _sel: Sel, event: Id) {
     // SAFETY: `event` is the NSEvent AppKit passes to scrollWheel:.
     let (dy, precise) = unsafe {
         (
@@ -423,20 +431,28 @@ extern "C" fn scroll_wheel(_this: Id, _sel: Sel, event: Id) {
             send!(bool; event, c"hasPreciseScrollingDeltas"),
         )
     };
+    let (x, y) = location(this, event);
     // Mouse wheels report lines; trackpads report points.
     emit(Event::Scroll {
         dy: if precise { dy } else { dy * 16.0 },
+        x,
+        y,
     });
 }
 
 extern "C" fn mouse_down(this: Id, _sel: Sel, event: Id) {
-    // SAFETY: `event` is the NSEvent passed to mouseDown:, `this` is our content view.
-    let (point, rect) = unsafe { (send!(CGPoint; event, c"locationInWindow"), bounds(this)) };
-    // Window coordinates have their origin at the bottom left of the content area.
-    emit(Event::Click {
-        x: point.x,
-        y: rect.height - point.y,
-    });
+    let (x, y) = location(this, event);
+    emit(Event::Click { x, y });
+}
+
+extern "C" fn mouse_dragged(this: Id, _sel: Sel, event: Id) {
+    let (x, y) = location(this, event);
+    emit(Event::Drag { x, y });
+}
+
+extern "C" fn mouse_up(this: Id, _sel: Sel, event: Id) {
+    let (x, y) = location(this, event);
+    emit(Event::Release { x, y });
 }
 
 extern "C" fn key_down(_this: Id, _sel: Sel, event: Id) {
@@ -624,6 +640,8 @@ pub fn run_app(
                 ),
                 (c"scrollWheel:", scroll_wheel as *const c_void, c"v@:@"),
                 (c"mouseDown:", mouse_down as *const c_void, c"v@:@"),
+                (c"mouseDragged:", mouse_dragged as *const c_void, c"v@:@"),
+                (c"mouseUp:", mouse_up as *const c_void, c"v@:@"),
                 (c"keyDown:", key_down as *const c_void, c"v@:@"),
             ],
         );
