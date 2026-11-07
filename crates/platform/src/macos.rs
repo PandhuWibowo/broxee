@@ -33,11 +33,31 @@ struct CGPoint {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
+struct CGSize {
+    width: f64,
+    height: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
 struct CGRect {
     x: f64,
     y: f64,
     width: f64,
     height: f64,
+}
+
+// libSystem (always linked): `size_t malloc_zone_pressure_relief(malloc_zone_t *zone, size_t goal)`.
+extern "C" {
+    fn malloc_zone_pressure_relief(zone: *mut c_void, goal: usize) -> usize;
+}
+
+/// Give memory that has been freed but is still held by the allocator back to the system.
+/// Loading a page frees a lot (stylesheet text, parse scratch); without this it keeps counting
+/// against the process until the system runs short.
+pub fn release_free_memory() -> usize {
+    // SAFETY: a null zone means every zone; a goal of 0 means as much as possible.
+    unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) }
 }
 
 #[link(name = "objc")]
@@ -148,17 +168,23 @@ unsafe fn rust_string(ns: Id) -> String {
 
 /// `-[NSView bounds]`. A 32-byte struct return: registers on arm64, a hidden pointer on x86_64.
 unsafe fn bounds(view: Id) -> CGRect {
+    rect_of(view, c"bounds")
+}
+
+/// Call a no-argument method returning `CGRect` (`- (NSRect)bounds`, `frame`, `visibleFrame`).
+/// x86_64 returns structs this large through a hidden pointer (`objc_msgSend_stret`).
+unsafe fn rect_of(object: Id, selector: &CStr) -> CGRect {
     #[cfg(target_arch = "x86_64")]
     {
         let f: unsafe extern "C" fn(*mut CGRect, Id, Sel) =
             std::mem::transmute(objc_msgSend_stret as unsafe extern "C" fn());
         let mut rect = CGRect::default();
-        f(&mut rect, view, sel(c"bounds"));
+        f(&mut rect, object, sel(selector));
         rect
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        send!(CGRect; view, c"bounds")
+        send!(CGRect; object, selector)
     }
 }
 
@@ -263,6 +289,25 @@ impl Window {
             dispatch_async_f(&_dispatch_main_q, surface, surface_on_main);
         }
         Ok(())
+    }
+}
+
+impl Window {
+    /// Release the frame surface that is not on screen. Double buffering needs it only while
+    /// frames are being drawn; idle, it is 16 MB of a Retina window doing nothing. The next
+    /// frame creates it again.
+    pub fn release_spare(&self) {
+        release_free_memory();
+        let mut pool = self.pool.borrow_mut();
+        let last = pool.last;
+        pool.surfaces.retain(|&s| {
+            if s == last {
+                return true;
+            }
+            // SAFETY: the pool owns one reference to each surface; the layer keeps its own.
+            unsafe { CFRelease(s) };
+            false
+        });
     }
 }
 
@@ -543,7 +588,6 @@ pub fn run_app(
             rect => CGRect, TITLED_CLOSABLE_MINIATURIZABLE_RESIZABLE => u64, BACKING_BUFFERED => u64, false => bool);
         send!((); window, c"setTitle:", ns_string(title) => Id);
         send!((); window, c"setBackgroundColor:", send!(Id; class(c"NSColor"), c"whiteColor") => Id);
-        send!((); window, c"center");
 
         let window_delegate_class = make_class(
             c"NSObject",
@@ -581,6 +625,27 @@ pub fn run_app(
         );
         let view = send!(Id; send!(Id; view_class, c"alloc"), c"initWithFrame:", rect => CGRect);
         send!((); window, c"setContentView:", view => Id);
+
+        // Fit the window on screen now. macOS would shrink it later anyway, and the resize
+        // would rebuild every frame surface and lay the page out again right after loading.
+        let screen = send!(Id; class(c"NSScreen"), c"mainScreen");
+        if !screen.is_null() {
+            let visible = rect_of(screen, c"visibleFrame");
+            let frame = rect_of(window, c"frame");
+            let content = bounds(view);
+            let fitted = CGSize {
+                width: content
+                    .width
+                    .min(visible.width - (frame.width - content.width)),
+                height: content
+                    .height
+                    .min(visible.height - (frame.height - content.height)),
+            };
+            if fitted.width < content.width || fitted.height < content.height {
+                send!((); window, c"setContentSize:", fitted => CGSize);
+            }
+        }
+        send!((); window, c"center");
         send!((); view, c"setWantsLayer:", true => bool);
         let layer = send!(Id; view, c"layer");
         let scale = send!(f64; window, c"backingScaleFactor");
@@ -599,10 +664,12 @@ pub fn run_app(
         send!(bool; window, c"makeFirstResponder:", view => Id);
         send!((); app, c"activateIgnoringOtherApps:", true => bool);
 
+        // The size the window really got, so the first frames already match it.
+        let shown = bounds(view);
         let handle = Window {
             scale,
-            width,
-            height,
+            width: shown.width,
+            height: shown.height,
             dark,
             pool: RefCell::new(Pool {
                 width: 0,

@@ -556,6 +556,16 @@ fn is_void(tag: &str) -> bool {
 
 /// Elements whose start tag implicitly closes an open element (e.g. `<li>` closes the previous `<li>`).
 fn close_implied(dom: &Dom, stack: &mut Vec<NodeId>, tag: &str) {
+    // A new row group or caption closes whatever is open inside the current table.
+    if matches!(tag, "tbody" | "thead" | "tfoot" | "caption" | "colgroup") {
+        if let Some(table) = stack
+            .iter()
+            .rposition(|&id| dom.tag_name(id) == Some("table"))
+        {
+            stack.truncate(table + 1);
+        }
+        return;
+    }
     let (targets, boundaries): (&[&str], &[&str]) = match tag {
         "li" => (&["li"], &["ul", "ol"]),
         "dt" | "dd" => (&["dt", "dd"], &["dl"]),
@@ -602,6 +612,21 @@ mod tests {
         dom.children(id)
             .filter_map(|c| dom.tag_name(c).map(str::to_string))
             .collect()
+    }
+
+    #[test]
+    fn new_row_groups_close_open_rows_and_cells() {
+        let dom = parse("<table><tr><td>a<tbody><tr><td>b</table>");
+        let table = dom.find_first("table").unwrap();
+        let children: Vec<&str> = dom
+            .children(table)
+            .filter_map(|c| dom.tag_name(c))
+            .collect();
+        assert_eq!(
+            children,
+            ["tr", "tbody"],
+            "the tbody is the table's child, not the cell's"
+        );
     }
 
     #[test]

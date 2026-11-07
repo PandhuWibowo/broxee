@@ -28,7 +28,7 @@ thread) and, later, the JavaScript event loop (single-threaded, as in every brow
 | 3 | Parse HTML into the DOM | whole body | sequential (streaming later) | engine | done |
 | 4 | Discover stylesheets and images | DOM | sequential scan, document order recorded | engine | done |
 | 5 | Fetch stylesheets, then images | URLs from 4 | **parallel**, bounded to 6, stylesheets queued first; images keep compressed bytes and their header size only | fetch pool | done |
-| 6 | Parse each stylesheet | its own body | **parallel**, inside its fetch thread | fetch pool | done |
+| 6 | Parse each stylesheet | its own body + the DOM's tags, ids and classes | **parallel**, inside its fetch thread; rules that cannot match the document are skipped | fetch pool | done |
 | 7 | Join | all of 6 | **barrier**: sheets back in document order | engine | done |
 | 8 | Cascade | DOM + every sheet, in order | sequential (parallel per subtree is possible later: style sharing, the matched-rule cache and the bloom filter are per-thread state) | engine | done |
 | 9 | Layout | styles + fonts (1 joined here) | sequential: a block's position depends on its previous siblings; flex items need their siblings' sizes. Each box is laid out once | engine | done |

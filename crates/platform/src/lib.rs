@@ -8,7 +8,7 @@
 mod macos;
 
 #[cfg(target_os = "macos")]
-pub use macos::{run_app, Window};
+pub use macos::{release_free_memory, run_app, Window};
 
 /// Input from the user, in window points with the origin at the top left of the content area.
 #[derive(Clone, Debug, PartialEq)]

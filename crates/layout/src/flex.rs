@@ -565,6 +565,9 @@ impl Engine<'_> {
     fn intrinsic_content(&mut self, id: NodeId) -> (f32, f32) {
         let s = self.style(id);
         let dom = self.dom;
+        if s.display.is_table() {
+            return self.table_intrinsic(id);
+        }
         if s.display.is_flex() {
             let row = s.flex_direction.is_row();
             let gap = match s.gap[1] {

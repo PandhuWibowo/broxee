@@ -601,7 +601,16 @@ pub fn cascade(dom: &Dom, sheets: &[(Origin, &Stylesheet)], media: &Media) -> St
             // `style` attribute. Without the attribute, elements that match the same rules under
             // the same parent style get the same result: skip computing and interning it.
             // (The root element sets the `rem` base, so it always computes.)
-            let cache_key = (attr_value(&element, names.style).is_none() && parent != Dom::ROOT)
+            // Presentational hints (bgcolor, width="85%", ...) sit between the user-agent and
+            // author rules. They depend on attributes, so elements with hints skip the cache.
+            let hints = crate::hints::hints(dom, id)
+                .map(|css| parse_declarations(&css))
+                .unwrap_or_default();
+            let author_start =
+                matched.partition_point(|&n| index.entries[n as usize].origin == Origin::UserAgent);
+            let cache_key = (attr_value(&element, names.style).is_none()
+                && hints.is_empty()
+                && parent != Dom::ROOT)
                 .then(|| (parent_style, hash_ids(&matched)));
             let cached = cache_key.and_then(|key| rule_cache.get(key, &matched));
             let style_id = match cached {
@@ -611,9 +620,12 @@ pub fn cascade(dom: &Dom, sheets: &[(Origin, &Stylesheet)], media: &Media) -> St
                         .map(parse_declarations)
                         .unwrap_or_default();
                     let declarations = || {
-                        matched
+                        let entry = |&n: &u32| index.entries[n as usize].decls;
+                        matched[..author_start]
                             .iter()
-                            .flat_map(|&n| index.entries[n as usize].decls)
+                            .flat_map(entry)
+                            .chain(&hints)
+                            .chain(matched[author_start..].iter().flat_map(entry))
                             .chain(&inline)
                     };
                     // Pass 1: custom properties, which `var()` in pass 2 reads. The set depends only on
@@ -1031,6 +1043,9 @@ fn compute(
         // Not inherited in CSS, but an invisible group hides its whole subtree and no
         // descendant can undo it, so carrying the flag down is equivalent.
         transparent: parent.transparent,
+        border_spacing: parent.border_spacing,
+        border_collapse: parent.border_collapse,
+        caption_bottom: parent.caption_bottom,
         ..ComputedStyle::initial()
     };
 
@@ -1135,6 +1150,27 @@ fn compute(
     }
     if let Some(Value::Number(n)) = get(Prop::Opacity) {
         s.transparent |= n <= 0.01;
+    }
+    match get(Prop::VerticalAlign) {
+        Some(Value::VAlign(v)) => s.vertical_align = v,
+        Some(Value::Inherit) => s.vertical_align = parent.vertical_align,
+        _ => {}
+    }
+    for (i, prop) in [Prop::BorderSpacingH, Prop::BorderSpacingV]
+        .into_iter()
+        .enumerate()
+    {
+        if let Some(Value::Length(l)) = get(prop) {
+            if let Length::Px(px) = length(l) {
+                s.border_spacing[i] = px;
+            }
+        }
+    }
+    if let Some(Value::Collapse(c)) = get(Prop::BorderCollapse) {
+        s.border_collapse = c;
+    }
+    if let Some(Value::CaptionBottom(bottom)) = get(Prop::CaptionSide) {
+        s.caption_bottom = bottom;
     }
     if let Some(Value::BorderBox(b)) = get(Prop::BoxSizing) {
         s.border_box = b;
@@ -1650,6 +1686,28 @@ mod tests {
         assert_eq!(map.style(ps[2]).align_self, Align::Stretch);
         assert_eq!(map.style(ps[2]).order, -2);
         assert_eq!(map.style(ps[0]).align_self, Align::Auto);
+    }
+
+    #[test]
+    fn hints_sit_between_user_agent_and_author_rules() {
+        let (dom, map) = styled(
+            "<table><tr><th align=left>a</th><td bgcolor=red class=x>b</td><td bgcolor=red>c</td></tr></table>",
+            ".x { background-color: blue }",
+        );
+        assert_eq!(
+            first(&dom, &map, "th").text_align,
+            TextAlign::Left,
+            "beats the UA's centered th"
+        );
+        let tds = all(&dom, "td");
+        assert_eq!(
+            map.style(tds[0]).background_color,
+            BLUE,
+            "loses to the author"
+        );
+        assert_eq!(map.style(tds[1]).background_color, RED);
+        assert_eq!(first(&dom, &map, "table").border_spacing, [Px::new(2.0); 2]);
+        assert_eq!(map.style(tds[1]).display, Display::TableCell);
     }
 
     #[test]

@@ -2,6 +2,7 @@ use crate::grid::{expand_grid, is_grid_property, GridSlot, GridValue};
 use crate::media::{Media, MediaList};
 use crate::selector::{parse_selector_list, Selector};
 use crate::values::*;
+use crate::vocabulary::Vocabulary;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Decl {
@@ -57,6 +58,8 @@ pub struct Rule {
 #[derive(Debug, Default)]
 pub struct Stylesheet {
     pub rules: Vec<Rule>,
+    /// Rules dropped because no selector could match the document (see `Vocabulary`).
+    pub skipped: usize,
     /// Each condition is the media lists of every enclosing `@media`; all must match.
     pub conditions: Vec<Vec<MediaList>>,
 }
@@ -88,14 +91,28 @@ pub fn parse_stylesheet(src: &str) -> Stylesheet {
 
 /// Like `parse_stylesheet`, reusing the caller's buffer instead of copying a fetched sheet.
 pub fn parse_stylesheet_owned(src: String) -> Stylesheet {
+    parse_with(src, None)
+}
+
+/// Parse a stylesheet for one document, keeping only rules that could match it.
+pub fn parse_stylesheet_for(src: String, vocabulary: &Vocabulary) -> Stylesheet {
+    parse_with(src, Some(vocabulary))
+}
+
+fn parse_with(src: String, vocabulary: Option<&Vocabulary>) -> Stylesheet {
     let src = blank_comments(src);
     let mut sheet = Stylesheet::default();
-    parse_rules(&src, None, &mut sheet);
+    parse_rules(&src, None, &mut sheet, vocabulary);
     sheet.rules.shrink_to_fit();
     sheet
 }
 
-fn parse_rules(s: &str, condition: Option<u32>, sheet: &mut Stylesheet) {
+fn parse_rules(
+    s: &str,
+    condition: Option<u32>,
+    sheet: &mut Stylesheet,
+    vocabulary: Option<&Vocabulary>,
+) {
     let b = s.as_bytes();
     let mut i = 0;
     while i < b.len() {
@@ -121,14 +138,14 @@ fn parse_rules(s: &str, condition: Option<u32>, sheet: &mut Stylesheet) {
                             lists.push(MediaList::parse(rest));
                             sheet.conditions.push(lists);
                             let nested = (sheet.conditions.len() - 1) as u32;
-                            parse_rules(body, Some(nested), sheet);
+                            parse_rules(body, Some(nested), sheet, vocabulary);
                         }
                         "supports"
                             if !rest.trim_start().to_ascii_lowercase().starts_with("not") =>
                         {
-                            parse_rules(body, condition, sheet);
+                            parse_rules(body, condition, sheet, vocabulary);
                         }
-                        "layer" => parse_rules(body, condition, sheet),
+                        "layer" => parse_rules(body, condition, sheet, vocabulary),
                         _ => {}
                     }
                     i = close + 1;
@@ -143,6 +160,14 @@ fn parse_rules(s: &str, condition: Option<u32>, sheet: &mut Stylesheet) {
         };
         let close = block_end(s, open);
         let mut selectors = parse_selector_list(&s[i..open]);
+        if let Some(vocabulary) = vocabulary {
+            let before = selectors.len();
+            selectors.retain(|selector| vocabulary.could_match(selector));
+            if before > 0 && selectors.is_empty() {
+                // Its declarations are never parsed.
+                sheet.skipped += 1;
+            }
+        }
         if !selectors.is_empty() {
             let mut decls = parse_declarations(&s[open + 1..close]);
             if !decls.is_empty() {
@@ -281,6 +306,21 @@ fn expand(name: &str, v: &str, sink: &mut Sink) {
         "font" => font(v, sink),
         "text-decoration-line" => expand("text-decoration", v, sink),
         "flex" => flex(v, sink),
+        "border-spacing" => {
+            let parts: Vec<SpecLength> = match v
+                .split_whitespace()
+                .map(|t| parse_length(t).filter(|l| non_negative(l) && *l != SpecLength::Auto))
+                .collect::<Option<Vec<_>>>()
+            {
+                Some(p) if (1..=2).contains(&p.len()) => p,
+                _ => return,
+            };
+            sink.set(Prop::BorderSpacingH, Value::Length(parts[0]));
+            sink.set(
+                Prop::BorderSpacingV,
+                Value::Length(*parts.last().unwrap_or(&parts[0])),
+            );
+        }
         "flex-flow" => {
             for token in v.split_whitespace() {
                 for prop in [Prop::FlexDirection, Prop::FlexWrap] {
@@ -333,6 +373,7 @@ fn longhands(name: &str) -> Vec<Prop> {
         ],
         "text-decoration-line" => vec![Prop::TextDecoration],
         "flex" => vec![Prop::FlexGrow, Prop::FlexShrink, Prop::FlexBasis],
+        "border-spacing" => vec![Prop::BorderSpacingH, Prop::BorderSpacingV],
         "flex-flow" => vec![Prop::FlexDirection, Prop::FlexWrap],
         "gap" | "grid-gap" => vec![Prop::RowGap, Prop::ColumnGap],
         _ => match name.strip_prefix("border-").and_then(side_index) {
@@ -380,6 +421,9 @@ fn single_prop(name: &str) -> Option<Prop> {
         "row-gap" | "grid-row-gap" => Prop::RowGap,
         "column-gap" | "grid-column-gap" => Prop::ColumnGap,
         "order" => Prop::Order,
+        "vertical-align" => Prop::VerticalAlign,
+        "border-collapse" => Prop::BorderCollapse,
+        "caption-side" => Prop::CaptionSide,
         _ => {
             if let Some(side) = name.strip_prefix("margin-").and_then(side_index) {
                 return Some(MARGIN[side]);
@@ -508,6 +552,22 @@ fn parse_for(prop: Prop, v: &str) -> Option<Value> {
                 .map(Value::Length),
         },
         Order => v.parse::<i32>().ok().map(|n| Value::Number(n as f32)),
+        VerticalAlign => Some(Value::VAlign(match v {
+            "top" => VAlign::Top,
+            "middle" => VAlign::Middle,
+            "bottom" => VAlign::Bottom,
+            _ => VAlign::Baseline,
+        })),
+        CaptionSide => match v {
+            "bottom" => Some(Value::CaptionBottom(true)),
+            "top" => Some(Value::CaptionBottom(false)),
+            _ => None,
+        },
+        BorderCollapse => match v {
+            "collapse" => Some(Value::Collapse(true)),
+            "separate" => Some(Value::Collapse(false)),
+            _ => None,
+        },
         // `auto` and `scroll` stay unclipped until boxes can scroll their own content.
         Overflow => match v {
             "hidden" | "clip" => Some(Value::Clips(true)),
@@ -741,10 +801,18 @@ fn flex(v: &str, sink: &mut Sink) {
 
 fn parse_display(v: &str) -> Option<Display> {
     Some(match v {
-        "block" | "flow-root" | "table" | "table-row" | "table-row-group"
-        | "table-header-group" | "table-footer-group" | "table-caption" => Display::Block,
+        "block" | "flow-root" => Display::Block,
+        "table" => Display::Table,
+        "inline-table" => Display::InlineTable,
+        "table-row-group" => Display::TableRowGroup,
+        "table-header-group" => Display::TableHeaderGroup,
+        "table-footer-group" => Display::TableFooterGroup,
+        "table-row" => Display::TableRow,
+        "table-cell" => Display::TableCell,
+        "table-caption" => Display::TableCaption,
+        "table-column" | "table-column-group" => Display::TableColumn,
         "inline" | "contents" => Display::Inline,
-        "inline-block" | "inline-table" | "table-cell" => Display::InlineBlock,
+        "inline-block" => Display::InlineBlock,
         "grid" => Display::Grid,
         "inline-grid" => Display::InlineGrid,
         "list-item" => Display::ListItem,
@@ -759,7 +827,8 @@ fn parse_text_align(v: &str) -> Option<TextAlign> {
     Some(match v {
         "left" | "start" => TextAlign::Left,
         "right" | "end" => TextAlign::Right,
-        "center" | "-webkit-center" => TextAlign::Center,
+        "center" => TextAlign::Center,
+        "-webkit-center" | "-moz-center" => TextAlign::WebkitCenter,
         "justify" => TextAlign::Justify,
         _ => return None,
     })

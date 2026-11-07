@@ -75,8 +75,32 @@
 - `net`: `data:` URLs.
 - Images on pages: fetched with stylesheets, sized by layout as replaced elements, decoded in parallel when
   visible at their drawn size, cached up to 8 MB of pixels (on-screen images are always kept).
+- Tables (`layout/table.rs`): automatic column widths, spans, row groups, anonymous rows, spacing, row
+  backgrounds, vertical alignment, `inline-table`. `css`: table display values, `vertical-align`,
+  `border-spacing`, `border-collapse`.
+- Presentational hints (`css/hints.rs`), quirks-mode table reset (`quirks.css`), `text-align: -webkit-center`
+  for `<center>`. `html`: a new `tbody`/`thead`/`tfoot`/`caption` closes open rows and cells.
+- Inline elements with margins, padding, borders or backgrounds: they take space on the line and get one box
+  per line they span (`<code>` on Wikipedia, the Hacker News header gap).
+- Tables: non-table content goes in anonymous cells (Wikipedia's `figure { display: table }` lost its image);
+  `caption-side: bottom`.
+- `platform`: `Window::release_spare`, `release_free_memory`; the window is fitted to the screen before showing.
+- `image`: progressive JPEG (spectral selection, successive approximation, end-of-band runs, restarts; partial
+  files show what arrived), keeping only the frequencies the drawn size needs.
+- `flate`: Brotli decoding (RFC 7932: prefix codes, context modeling, block switching, static dictionary and
+  transforms), verified byte for byte against the reference encoder and live GitHub, Cloudflare and MDN streams.
+  `net` asks for `br` first.
 
 ### Changed
+- gzip decoding twice as fast (237 → 478 MB/s): CRC-32 with ARMv8 instructions or slicing-by-8, output allocated
+  from the gzip size trailer, 8-byte match copies, 8-byte bit refills.
+- Every JPEG drawn smaller than its size decodes with a k-point inverse DCT (libjpeg's scaling): a 12 MP baseline
+  photo at 400 px went from 172 to 21 ms.
+- Rule pruning also checks attributes and exact attribute values, dropping unused themes.
+- Window: GitHub peak 74 → 58 MB, idle 43 MB; a resize that changes nothing no longer restyles and repaints.
+- Stylesheets are parsed against the document's tags, ids and classes; rules that cannot match are skipped.
+  GitHub: 28,170 of 30,309 rules, peak 43.7 → 25.3 MB unpainted and 60.2 → 40.5 MB painted at 2x.
+- Layout: `<center>` checks once per container, image checks by atom.
 - The PNG writer streams rows into the file: a 1280x3000 render peaks at 48 MB instead of 69 MB.
 - GitHub's stylesheets load in 0.23 s instead of 0.72 s, Wikipedia's in 69 ms instead of 207 ms.
 - Fetched stylesheets are parsed in the buffer they arrived in, and comments are blanked in place, instead of two

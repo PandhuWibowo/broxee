@@ -16,13 +16,14 @@
 
 mod flex;
 mod grid;
+mod table;
 
 use std::collections::HashMap;
 use std::ops::Range;
 
 use css::{
     Align, ComputedStyle, Display, Justify, Length, LineHeight, Position, StyleMap, TextAlign,
-    WhiteSpace,
+    VAlign, WhiteSpace,
 };
 use font::TextMetrics;
 use html::{ChunkVec, Dom, FastBuildHasher, NodeId, NodeKind};
@@ -181,6 +182,8 @@ pub fn layout(
         measuring: false,
         atomics: Vec::new(),
         line_width: width,
+        centering: false,
+        img: dom.atom("img"),
         viewport: Rect {
             x: 0.0,
             y: 0.0,
@@ -231,6 +234,12 @@ struct Engine<'a> {
     atomics: Vec<(Range<usize>, Range<usize>, Range<usize>)>,
     /// Width of the line box being collected: what inline blocks shrink to fit.
     line_width: f32,
+    /// The container being laid out is `<center>`-like (`text-align: -webkit-center`): its
+    /// narrower block children are centered. Set once per container, not looked up per child.
+    centering: bool,
+    /// The interned name of `img`, if the document has any: replaced-element checks compare
+    /// one integer per box instead of a tag name.
+    img: Option<html::Atom>,
     /// The initial containing block, and the containing block of fixed boxes.
     viewport: Rect,
     /// Where the current inline run started: the static position of out-of-flow inlines.
@@ -289,6 +298,21 @@ enum Item {
         /// Width of the collapsed space after it, 0 if none.
         space_after: f32,
     },
+    /// The start of an inline element with margin, border, padding or a background:
+    /// `margin` is its left margin, `width` that plus its left border and padding.
+    Open {
+        node: NodeId,
+        margin: f32,
+        width: f32,
+        space_after: f32,
+    },
+    /// The end of such an element: right padding, border and margin (`margin` of `width`).
+    Close {
+        node: NodeId,
+        margin: f32,
+        width: f32,
+        space_after: f32,
+    },
     Break,
 }
 
@@ -314,12 +338,23 @@ impl<'a> Engine<'a> {
                 match s.display {
                     Display::None => Level::Skip,
                     _ if s.position.is_out_of_flow() => Level::OutOfFlow,
-                    Display::Block | Display::ListItem | Display::Flex | Display::Grid => {
-                        Level::Block
-                    }
-                    Display::InlineBlock | Display::InlineFlex | Display::InlineGrid => {
-                        Level::Inline
-                    }
+                    Display::TableColumn => Level::Skip,
+                    Display::Block
+                    | Display::ListItem
+                    | Display::Flex
+                    | Display::Grid
+                    | Display::Table
+                    // Table parts outside a table are laid out as blocks.
+                    | Display::TableRowGroup
+                    | Display::TableHeaderGroup
+                    | Display::TableFooterGroup
+                    | Display::TableRow
+                    | Display::TableCell
+                    | Display::TableCaption => Level::Block,
+                    Display::InlineBlock
+                    | Display::InlineFlex
+                    | Display::InlineGrid
+                    | Display::InlineTable => Level::Inline,
                     // An inline element that directly holds a block (an <a> around a <div>) is
                     // laid out as a block so its block child gets a proper box.
                     Display::Inline
@@ -344,6 +379,9 @@ impl<'a> Engine<'a> {
         width: f32,
         definite_height: Option<f32>,
     ) -> f32 {
+        let centering = self.dom.element(node).is_some()
+            && self.style(node).text_align == TextAlign::WebkitCenter;
+        let outer_centering = std::mem::replace(&mut self.centering, centering);
         let mut cursor = y;
         let mut pending_margin = 0.0;
         // The open inline run as a sibling range (first, count): no allocation per box.
@@ -392,6 +430,7 @@ impl<'a> Engine<'a> {
                 pending_margin = 0.0;
             }
         }
+        self.centering = outer_centering;
         cursor + pending_margin - y
     }
 
@@ -418,6 +457,11 @@ impl<'a> Engine<'a> {
             (cb_width - margin_left.unwrap_or(0.0) - margin_right.unwrap_or(0.0) - extra).max(0.0);
         let content_width = if self.is_replaced(id) {
             self.replaced_size(id, s, Some(cb_width), cb_height).0
+        } else if s.display.is_table() && s.width == Length::Auto {
+            // Tables shrink to their columns, up to the available width.
+            let (min, max) = self.intrinsic_width(id);
+            let available = cb_width - margin_left.unwrap_or(0.0) - margin_right.unwrap_or(0.0);
+            (max.min(available).max(min) - extra).max(0.0)
         } else {
             clamp_width(
                 s,
@@ -432,9 +476,11 @@ impl<'a> Engine<'a> {
             - extra
             - margin_left.unwrap_or(0.0)
             - margin_right.unwrap_or(0.0);
+        let centered = self.centering;
         let margin_left = match (margin_left, margin_right) {
             (None, None) => (free / 2.0).max(0.0),
             (None, Some(_)) => free,
+            (Some(m), _) if centered && free > 0.0 => m + free / 2.0,
             (Some(m), _) => m,
         };
 
@@ -497,6 +543,8 @@ impl<'a> Engine<'a> {
             self.layout_flex(id, content_x, content_y, content_width, own_height)
         } else if s.display.is_grid() {
             self.layout_grid(id, content_x, content_y, content_width, own_height)
+        } else if s.display.is_table() {
+            self.layout_table(id, content_x, content_y, content_width)
         } else {
             self.layout_children(id, content_x, content_y, content_width, own_height)
         };
@@ -547,7 +595,8 @@ impl<'a> Engine<'a> {
 
     /// Images are replaced elements: sized by their file, not by children.
     fn is_replaced(&self, id: NodeId) -> bool {
-        self.dom.tag_name(id) == Some("img")
+        self.img
+            .is_some_and(|img| self.dom.element(id).is_some_and(|e| e.tag == img))
     }
 
     /// A `width`/`height` attribute in px.
@@ -853,7 +902,7 @@ impl<'a> Engine<'a> {
         let container_style = self.style(container);
         let strut = self.extent(container_style);
         let align = match container_style.text_align {
-            TextAlign::Center => 0.5,
+            TextAlign::Center | TextAlign::WebkitCenter => 0.5,
             TextAlign::Right => 1.0,
             TextAlign::Left | TextAlign::Justify => 0.0,
         };
@@ -861,6 +910,8 @@ impl<'a> Engine<'a> {
         let items = std::mem::take(&mut self.items);
         let mut line_top = y;
         let mut start = 0;
+        // Decorated inline elements open on this line: (node, its box on this line, start x).
+        let mut open: Vec<(NodeId, usize, f32)> = Vec::new();
         while start < items.len() {
             // Greedy line breaking: take items until the next one would overflow.
             let mut end = start;
@@ -878,7 +929,8 @@ impl<'a> Engine<'a> {
                     0.0
                 };
                 let fits = line_width + gap + item_width(&item) <= width;
-                if end > start && !fits && breakable(&items[end - 1]) {
+                let before_close = matches!(item, Item::Close { .. });
+                if end > start && !fits && breakable(&items[end - 1]) && !before_close {
                     break;
                 }
                 line_width += gap + item_width(&item);
@@ -894,6 +946,12 @@ impl<'a> Engine<'a> {
             let baseline = line_top + extent.above;
             let mut pen = x + (width - line_width).max(0.0) * align;
             let mut last_text: Option<usize> = None;
+            // Elements continuing from the previous line get a new box here, before this
+            // line's content, so their background paints underneath it.
+            for entry in open.iter_mut() {
+                entry.1 = self.inline_placeholder(entry.0);
+                entry.2 = pen;
+            }
             for (i, item) in items[start..end].iter().enumerate() {
                 if i > 0 {
                     pen += space_after(&items[start + i - 1]);
@@ -959,8 +1017,39 @@ impl<'a> Engine<'a> {
                         last_text = None;
                         pen += w;
                     }
+                    Item::Open {
+                        node,
+                        margin,
+                        width: w,
+                        ..
+                    } => {
+                        // Margins only take space; a box is drawn (and clickable) only with a
+                        // background, border or padding.
+                        if self.inline_needs_box(self.style(node)) {
+                            let index = self.inline_placeholder(node);
+                            open.push((node, index, pen + margin));
+                        }
+                        last_text = None;
+                        pen += w;
+                    }
+                    Item::Close {
+                        node,
+                        margin,
+                        width: w,
+                        ..
+                    } => {
+                        if let Some(at) = open.iter().rposition(|e| e.0 == node) {
+                            let (node, index, from) = open.remove(at);
+                            self.inline_box(index, node, from, pen + w - margin, baseline);
+                        }
+                        last_text = None;
+                        pen += w;
+                    }
                     Item::Break => {}
                 }
+            }
+            for &(node, index, from) in &open {
+                self.inline_box(index, node, from, pen, baseline);
             }
             line_top = baseline + extent.below;
             if !self.in_fixed {
@@ -975,6 +1064,55 @@ impl<'a> Engine<'a> {
         self.items = items;
         self.atomics.truncate(atomics_start);
         line_top - y
+    }
+
+    /// Whether an inline element draws anything or takes space of its own; plain ones (most
+    /// `<a>`, `<b>`, `<span>`) add no items and no boxes.
+    fn decorated_inline(&self, s: &ComputedStyle) -> bool {
+        self.inline_needs_box(s)
+            || [s.margin[1], s.margin[3]]
+                .iter()
+                .any(|m| !matches!(m, Length::Auto) && *m != Length::ZERO)
+    }
+
+    fn inline_needs_box(&self, s: &ComputedStyle) -> bool {
+        s.background_color.a > 0
+            || s.border_width.iter().any(|w| *w != css::Px::ZERO)
+            || s.padding.iter().any(|p| *p != Length::ZERO)
+    }
+
+    /// Horizontal margin, and border plus padding, on side 3 (left) or 1 (right).
+    fn inline_sides(&self, s: &ComputedStyle, side: usize) -> (f32, f32) {
+        let edges = Edges::of(s, self.line_width);
+        let margin = resolve(s.margin[side], self.line_width).unwrap_or(0.0);
+        (margin, edges.padding[side] + edges.border[side])
+    }
+
+    /// Reserve the box of an inline element on the current line; `inline_box` sizes it.
+    fn inline_placeholder(&mut self, node: NodeId) -> usize {
+        self.out.boxes.push(BoxFragment {
+            node,
+            rect: Rect::default(),
+        });
+        self.out.boxes.len() - 1
+    }
+
+    /// Size an inline element's box on one line: from `x0` to `x1` horizontally, and its font's
+    /// ascent and descent plus vertical padding and border around the baseline. It does not
+    /// change the line's height (CSS 2.1 10.6.1).
+    fn inline_box(&mut self, index: usize, node: NodeId, x0: f32, x1: f32, baseline: f32) {
+        let s = self.style(node);
+        let size = s.font_size.to_f32();
+        let edges = Edges::of(s, self.line_width);
+        let top = baseline - self.metrics.ascent_em() * size - edges.padding[0] - edges.border[0];
+        let bottom =
+            baseline + self.metrics.descent_em() * size + edges.padding[2] + edges.border[2];
+        self.out.boxes[index].rect = Rect {
+            x: x0,
+            y: top,
+            width: (x1 - x0).max(0.0),
+            height: bottom - top,
+        };
     }
 
     /// An `inline-block` or `inline-flex` element: shrink-to-fit width, laid out now at the
@@ -1084,9 +1222,28 @@ impl<'a> Engine<'a> {
                         if block_inside {
                             self.items.push(Item::Break);
                         }
+                        let decorated = !block_inside && self.decorated_inline(s);
+                        if decorated {
+                            let (margin, edge) = self.inline_sides(s, 3);
+                            self.items.push(Item::Open {
+                                node: id,
+                                margin,
+                                width: margin + edge,
+                                space_after: 0.0,
+                            });
+                        }
                         let dom = self.dom;
                         for child in dom.children(id) {
                             self.collect(child);
+                        }
+                        if decorated {
+                            let (margin, edge) = self.inline_sides(s, 1);
+                            self.items.push(Item::Close {
+                                node: id,
+                                margin,
+                                width: margin + edge,
+                                space_after: 0.0,
+                            });
                         }
                         if block_inside {
                             self.items.push(Item::Break);
@@ -1158,8 +1315,12 @@ impl<'a> Engine<'a> {
 
     /// Collapsible white space: at most one space between words, none at the start of the run.
     fn mark_space(&mut self, width: f32) {
-        if let Some(Item::Word { space_after, .. } | Item::Atomic { space_after, .. }) =
-            self.items.last_mut()
+        if let Some(
+            Item::Word { space_after, .. }
+            | Item::Atomic { space_after, .. }
+            | Item::Open { space_after, .. }
+            | Item::Close { space_after, .. },
+        ) = self.items.last_mut()
         {
             *space_after = width;
         }
@@ -1188,29 +1349,41 @@ impl<'a> Engine<'a> {
                 above,
                 below: height - above,
             },
-            Item::Break => Extent::default(),
+            // Inline padding and borders do not make the line taller.
+            Item::Open { .. } | Item::Close { .. } | Item::Break => Extent::default(),
         }
     }
 }
 
 fn item_width(item: &Item) -> f32 {
     match *item {
-        Item::Word { width, .. } | Item::Atomic { width, .. } => width,
+        Item::Word { width, .. }
+        | Item::Atomic { width, .. }
+        | Item::Open { width, .. }
+        | Item::Close { width, .. } => width,
         Item::Break => 0.0,
     }
 }
 
 fn space_after(item: &Item) -> f32 {
     match *item {
-        Item::Word { space_after, .. } | Item::Atomic { space_after, .. } => space_after,
+        Item::Word { space_after, .. }
+        | Item::Atomic { space_after, .. }
+        | Item::Open { space_after, .. }
+        | Item::Close { space_after, .. } => space_after,
         Item::Break => 0.0,
     }
 }
 
+/// Whether a line may break after this item.
 fn breakable(item: &Item) -> bool {
     match *item {
         Item::Word { breakable, .. } => breakable,
-        _ => true,
+        // Never between an element's start and its first content; after its end only where
+        // white space follows (`foo</b>bar` is one word).
+        Item::Open { .. } => false,
+        Item::Close { space_after, .. } => space_after > 0.0,
+        Item::Atomic { .. } | Item::Break => true,
     }
 }
 
@@ -2027,6 +2200,163 @@ mod tests {
             (by_id(&dom, &l, "x").width, by_id(&dom, &l, "x").height),
             (40.0, 10.0),
             "unloaded: the attributes"
+        );
+    }
+
+    #[test]
+    fn tables_size_columns_to_their_content() {
+        let (dom, l) = run(
+            "<table id=t><tr><td id=a>a</td><td id=b>bbbb</td></tr><tr><td id=c>cc</td><td id=d>d</td></tr></table><p id=after>x</p>",
+            "body { margin: 0 } p { margin: 0 }",
+            400.0,
+        );
+        let r = |id| by_id(&dom, &l, id);
+        // Columns: max(a, cc) + 2px padding = 18, bbbb + 2 = 34; 2px spacing around them.
+        assert_eq!(
+            r("t").width,
+            2.0 + 18.0 + 2.0 + 34.0 + 2.0,
+            "shrinks to its columns"
+        );
+        assert_eq!((r("a").x, r("a").width), (2.0, 18.0));
+        assert_eq!((r("b").x, r("b").width), (22.0, 34.0));
+        assert_eq!(
+            (r("c").x, r("c").y),
+            (2.0, r("a").y + r("a").height + 2.0),
+            "second row below the spacing"
+        );
+        assert_eq!(r("d").x, r("b").x, "columns line up");
+        assert_eq!(r("after").y, r("t").y + r("t").height);
+    }
+
+    #[test]
+    fn tables_fill_widths_spans_and_align_cells() {
+        let (dom, l) = run(
+            "<table id=t width=85% align=center cellspacing=0 cellpadding=0 bgcolor=#ff6600>\
+               <tr id=row bgcolor=#eeeeee><td id=wide colspan=2>header</td><td id=tall rowspan=2>a<br>b<br>c<br>d</td></tr>\
+               <tr><td id=x>x</td><td id=y valign=bottom>y</td></tr></table>",
+            "body { margin: 0 } td { line-height: 10px }",
+            400.0,
+        );
+        let r = |id| by_id(&dom, &l, id);
+        assert_eq!(
+            (r("t").x, r("t").width),
+            (30.0, 340.0),
+            "85% wide, centered"
+        );
+        assert_eq!(r("wide").x, 0.0 + 30.0);
+        assert_eq!(
+            r("wide").width,
+            r("x").width + r("y").width,
+            "spans two columns"
+        );
+        let tall = r("tall");
+        assert_eq!(tall.height, 40.0, "four lines over two rows");
+        assert_eq!(
+            r("x").y + r("x").height,
+            tall.y + tall.height,
+            "the rows share the spanning cell's height"
+        );
+        let row = r("row");
+        assert_eq!(
+            (row.x, row.width),
+            (30.0, 340.0),
+            "the row's box spans the table for its background"
+        );
+        let text = |w: &str| *l.texts.iter().find(|t| l.text(t) == w).unwrap();
+        let y_cell = r("y");
+        assert!(
+            text("y").baseline > y_cell.y + y_cell.height - 10.0,
+            "valign=bottom"
+        );
+        let x_cell = r("x");
+        let middle = x_cell.y + x_cell.height / 2.0;
+        assert!(
+            (text("x").baseline - 5.0 - middle).abs() < 4.0,
+            "td is vertically centered by default"
+        );
+    }
+
+    #[test]
+    fn inline_margins_padding_and_backgrounds_take_space_and_draw() {
+        let (dom, l) = run(
+            "<p>ab <span class=m>cd</span> ef <em class=pad>gh</em> <b>plain</b></p>",
+            "body { margin: 0 } p { margin: 0 } .m { margin: 0 10px } \
+             .pad { padding: 2px 4px; background-color: #eee; border: 1px solid }",
+            400.0,
+        );
+        let text = |w: &str| *l.texts.iter().find(|t| l.text(t) == w).unwrap();
+        // "ab " is 20px; the span's left margin adds 10.
+        assert_eq!(text("cd").x, 30.0);
+        assert_eq!(
+            text("ef").x,
+            30.0 + 16.0 + 10.0 + 4.0,
+            "right margin, then the space"
+        );
+        let em = dom.find_first("em").unwrap();
+        let boxes: Vec<Rect> = l
+            .boxes
+            .iter()
+            .filter(|b| b.node == em)
+            .map(|b| b.rect)
+            .collect();
+        assert_eq!(boxes.len(), 1);
+        let gh = text("gh");
+        assert_eq!(boxes[0].x, gh.x - 5.0, "border and padding before the text");
+        assert_eq!(boxes[0].width, 16.0 + 10.0);
+        assert!(boxes[0].y < gh.baseline - 10.0 && boxes[0].y + boxes[0].height > gh.baseline);
+        let span = dom.find_first("span").unwrap();
+        let b = dom.find_first("b").unwrap();
+        assert!(
+            l.boxes.iter().all(|x| x.node != span && x.node != b),
+            "margins alone or nothing: no box"
+        );
+    }
+
+    #[test]
+    fn decorated_inlines_split_across_lines_and_keep_words_whole() {
+        let (dom, l) = run(
+            "<p>aaaa <span class=hl>bb cc dd</span> e</p><p>xx<i class=p>yy</i>zz</p>",
+            "body { margin: 0 } p { margin: 0; width: 60px } .hl { background-color: yellow } \
+             .p { padding: 0 1px }",
+            400.0,
+        );
+        let span = dom.find_first("span").unwrap();
+        let pieces: Vec<Rect> = l
+            .boxes
+            .iter()
+            .filter(|b| b.node == span)
+            .map(|b| b.rect)
+            .collect();
+        assert_eq!(pieces.len(), 2, "one box per line: {pieces:?}");
+        assert!(pieces[1].y > pieces[0].y);
+        assert_eq!(
+            pieces[1].x, 0.0,
+            "the continuation starts at the line start"
+        );
+        // "xx", "yy" and "zz" touch: no line break may fall between them.
+        let y = |w: &str| l.texts.iter().find(|t| l.text(t) == w).unwrap().baseline;
+        assert_eq!(y("xx"), y("zz"));
+    }
+
+    #[test]
+    fn non_table_content_in_a_table_gets_an_anonymous_cell() {
+        let (dom, l) = run_with_images(
+            "<figure><a href=x><img id=i></a><figcaption id=c>caption</figcaption></figure>\
+             <table><form><tr><td id=f>in form</td></tr></form></table>",
+            "body { margin: 0 } figure { display: table; margin: 0 } \
+             figcaption { display: table-caption; caption-side: bottom } a { display: block }",
+            400.0,
+        );
+        let r = |id| by_id(&dom, &l, id);
+        assert_eq!(
+            (r("i").width, r("i").height),
+            (200.0, 100.0),
+            "the image is laid out"
+        );
+        assert!(r("c").y >= r("i").y + r("i").height, "caption-side: bottom");
+        assert!(
+            r("f").width > 0.0,
+            "rows wrapped in a form still form the table"
         );
     }
 

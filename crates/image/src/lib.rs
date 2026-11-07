@@ -10,6 +10,7 @@
 
 mod jpeg;
 mod png;
+mod progressive;
 
 use std::fmt;
 

@@ -49,11 +49,15 @@ pub struct Target<'a> {
     pub stride: usize,
     /// Blue, green, red, alpha byte order (what macOS surfaces use) instead of RGBA.
     pub bgra: bool,
+    /// First column drawn into, in device pixels: a pane right of the sidebar starts there.
+    pub left: usize,
 }
 
 #[derive(Clone, Copy)]
 struct Band {
     width: usize,
+    /// Column offset of x = 0 within each row.
+    left: usize,
     stride: usize,
     canvas: Color,
     bgra: bool,
@@ -260,6 +264,7 @@ impl Painter {
             pixels: &mut pixels,
             stride: width * 4,
             bgra: false,
+            left: 0,
         };
         let stats = self.paint_into(page, view, target);
         (
@@ -276,7 +281,10 @@ impl Painter {
     /// directly. The target must hold `view.device_size()` pixels at the given stride.
     pub fn paint_into(&mut self, page: &Page, view: Viewport, target: Target) -> PaintStats {
         let (width, height) = view.device_size();
-        assert!(target.stride >= width * 4, "stride shorter than a row");
+        assert!(
+            target.stride >= (target.left + width) * 4,
+            "stride shorter than a row"
+        );
         assert!(
             target.pixels.len() >= target.stride * height,
             "target smaller than the frame"
@@ -328,6 +336,7 @@ impl Painter {
         let rows_per_band = height.div_ceil(threads).max(1);
         let band = Band {
             width,
+            left: target.left,
             stride: target.stride,
             canvas,
             bgra: target.bgra,
@@ -422,6 +431,7 @@ impl Painter {
         }
         let band = Band {
             width,
+            left: target.left,
             stride: target.stride,
             canvas: Color::TRANSPARENT,
             bgra: target.bgra,
@@ -731,13 +741,13 @@ fn composite_band(
     let canvas = order(band.canvas);
     if band.fill_canvas {
         for row in rows.chunks_mut(band.stride) {
-            for px in row[..band.width * 4].chunks_exact_mut(4) {
+            for px in row[band.left * 4..(band.left + band.width) * 4].chunks_exact_mut(4) {
                 px.copy_from_slice(&[canvas.r, canvas.g, canvas.b, 255]);
             }
         }
     }
     let (lo, hi) = (band.clip.0.max(0), band.clip.1.min(band.width as i32));
-    let pixel = |x: i32, y: i32| y as usize * band.stride + x as usize * 4;
+    let pixel = |x: i32, y: i32| y as usize * band.stride + (band.left + x as usize) * 4;
     for item in items {
         match *item {
             Item::Fill {
@@ -834,7 +844,7 @@ fn draw_image(
             } else {
                 (p[0], p[1], p[2])
             };
-            let at = ry as usize * band.stride + x as usize * 4;
+            let at = ry as usize * band.stride + (band.left + x as usize) * 4;
             let dst = &mut rows[at..at + 4];
             if a == 255 {
                 dst.copy_from_slice(&[r, g, b, 255]);
@@ -882,7 +892,7 @@ fn draw_mask(
             if cov == 0 {
                 continue;
             }
-            let at = by as usize * band.stride + bx as usize * 4;
+            let at = by as usize * band.stride + (band.left + bx as usize) * 4;
             blend(&mut rows[at..at + 4], color, cov * u32::from(color.a) / 255);
         }
     }
@@ -1038,6 +1048,7 @@ mod tests {
             pixels: &mut pixels,
             stride: 16,
             bgra: true,
+            left: 0,
         };
         Painter::new().paint_into(
             &page,
@@ -1052,6 +1063,31 @@ mod tests {
         assert_eq!(&pixels[0..4], &[0x30, 0x20, 0x10, 255], "blue first");
         assert_eq!(&pixels[12..16], &[7, 7, 7, 7], "row padding untouched");
         assert_eq!(&pixels[16..20], &[0x30, 0x20, 0x10, 255]);
+
+        // The same page as a pane two pixels in from the left of a 6-pixel-wide frame.
+        let mut pixels = vec![7u8; 24 * 2];
+        let viewport = Viewport {
+            width: 3.0,
+            height: 2.0,
+            scale: 1.0,
+            scroll_y: 0.0,
+        };
+        let target = Target {
+            pixels: &mut pixels,
+            stride: 24,
+            bgra: true,
+            left: 2,
+        };
+        Painter::new().paint_into(&page, viewport, target);
+        for row in [0, 24] {
+            assert_eq!(&pixels[row..row + 8], &[7; 8], "left of the pane untouched");
+            assert_eq!(&pixels[row + 8..row + 12], &[0x30, 0x20, 0x10, 255]);
+            assert_eq!(
+                &pixels[row + 20..row + 24],
+                &[7; 4],
+                "right of the pane untouched"
+            );
+        }
     }
 
     #[test]
@@ -1083,6 +1119,7 @@ mod tests {
             pixels: &mut pixels,
             stride: 16,
             bgra: false,
+            left: 0,
         };
         Painter::new().overlay(target, 4, (0, 3), None, &Approximate, &ops);
         assert_eq!(&pixels[0..4], &[0, 0, 255, 255], "mask pixel");

@@ -98,12 +98,33 @@ pub enum Display {
     InlineFlex,
     Grid,
     InlineGrid,
+    Table,
+    InlineTable,
+    TableRowGroup,
+    TableHeaderGroup,
+    TableFooterGroup,
+    TableRow,
+    TableCell,
+    TableCaption,
+    /// `table-column` and `table-column-group`: they carry widths in browsers, nothing here.
+    TableColumn,
     None,
 }
 
 impl Display {
     pub fn is_flex(self) -> bool {
         matches!(self, Display::Flex | Display::InlineFlex)
+    }
+
+    pub fn is_table(self) -> bool {
+        matches!(self, Display::Table | Display::InlineTable)
+    }
+
+    pub fn is_row_group(self) -> bool {
+        matches!(
+            self,
+            Display::TableRowGroup | Display::TableHeaderGroup | Display::TableFooterGroup
+        )
     }
 
     pub fn is_grid(self) -> bool {
@@ -114,7 +135,7 @@ impl Display {
     pub fn is_atomic_inline(self) -> bool {
         matches!(
             self,
-            Display::InlineBlock | Display::InlineFlex | Display::InlineGrid
+            Display::InlineBlock | Display::InlineFlex | Display::InlineGrid | Display::InlineTable
         )
     }
 }
@@ -164,6 +185,16 @@ pub enum Align {
     Baseline,
 }
 
+/// `vertical-align`, used for table cells. Other values (lengths, `sub`, `text-top`) act as
+/// `baseline`, which cells lay out as `top`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum VAlign {
+    Baseline,
+    Top,
+    Middle,
+    Bottom,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Position {
     Static,
@@ -196,6 +227,9 @@ pub enum TextAlign {
     Right,
     Center,
     Justify,
+    /// `-webkit-center`, what `<center>` uses: centers text, and block children narrower than
+    /// their container too.
+    WebkitCenter,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -261,6 +295,13 @@ pub struct ComputedStyle {
     /// `row-gap`, `column-gap`.
     pub gap: [Length; 2],
     pub order: i16,
+    pub vertical_align: VAlign,
+    /// `border-spacing` (horizontal, vertical); inherited.
+    pub border_spacing: [Px; 2],
+    /// `border-collapse: collapse` (inherited): no spacing between cells.
+    pub border_collapse: bool,
+    /// `caption-side: bottom` (inherited).
+    pub caption_bottom: bool,
     /// Grid container template, an index into `StyleMap`'s grid tables (0: none).
     pub grid: u32,
     /// Grid item placement, an index into `StyleMap`'s grid tables (0: auto).
@@ -311,6 +352,10 @@ impl ComputedStyle {
             flex_basis: Length::Auto,
             gap: [Length::ZERO; 2],
             order: 0,
+            vertical_align: VAlign::Baseline,
+            border_spacing: [Px::ZERO; 2],
+            border_collapse: false,
+            caption_bottom: false,
             grid: 0,
             grid_item: 0,
             custom: 0,
@@ -373,6 +418,9 @@ pub enum Value {
     Wrap(bool),
     Justify(Justify),
     Align(Align),
+    VAlign(VAlign),
+    Collapse(bool),
+    CaptionBottom(bool),
 }
 
 /// Longhand properties Broxee understands. Shorthands expand into these while parsing.
@@ -414,6 +462,11 @@ pub enum Prop {
     RowGap,
     ColumnGap,
     Order,
+    VerticalAlign,
+    BorderSpacingH,
+    BorderSpacingV,
+    BorderCollapse,
+    CaptionSide,
     MarginTop,
     MarginRight,
     MarginBottom,
@@ -591,6 +644,6 @@ mod tests {
         // Styles are deduplicated (a page has hundreds, nodes hold a 4-byte index), so size is
         // not a per-node cost; it is still hashed once per style computed. Grow it deliberately.
         let size = std::mem::size_of::<ComputedStyle>();
-        assert!(size <= 256, "ComputedStyle grew to {size} bytes");
+        assert!(size <= 272, "ComputedStyle grew to {size} bytes");
     }
 }

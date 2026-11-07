@@ -6,6 +6,11 @@
 //! fall back to walking the canonical code lengths. Output is capped by the caller, so a small
 //! compressed body cannot expand into gigabytes.
 
+mod brotli;
+mod brotli_tables;
+
+pub use brotli::brotli;
+
 use std::fmt;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -31,8 +36,11 @@ impl fmt::Display for Error {
     }
 }
 
-const CRC_TABLE: [u32; 256] = {
-    let mut table = [0u32; 256];
+/// CRC-32 tables for slicing-by-8 (as zlib does): `TABLES[0]` is the classic byte table, and
+/// `TABLES[k][b]` is the CRC of byte `b` followed by `k` zero bytes. Eight input bytes then cost
+/// eight independent lookups instead of eight dependent steps. 8 KiB, built at compile time.
+const CRC_TABLES: [[u32; 256]; 8] = {
+    let mut tables = [[0u32; 256]; 8];
     let mut n = 0;
     while n < 256 {
         let mut c = n as u32;
@@ -45,10 +53,20 @@ const CRC_TABLE: [u32; 256] = {
             };
             k += 1;
         }
-        table[n] = c;
+        tables[0][n] = c;
         n += 1;
     }
-    table
+    let mut n = 0;
+    while n < 256 {
+        let mut t = 1;
+        while t < 8 {
+            let previous = tables[t - 1][n];
+            tables[t][n] = (previous >> 8) ^ tables[0][(previous & 0xff) as usize];
+            t += 1;
+        }
+        n += 1;
+    }
+    tables
 };
 
 /// CRC-32 (ISO 3309) over the concatenation of `parts`.
@@ -58,9 +76,49 @@ pub fn crc32(parts: &[&[u8]]) -> u32 {
 
 /// Continue a CRC-32 over more data (start from 0), as zlib's `crc32()` does.
 pub fn crc32_update(crc: u32, data: &[u8]) -> u32 {
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("crc") {
+        // SAFETY: the CPU has the ARMv8 CRC32 instructions, checked just above.
+        return unsafe { crc32_arm(crc, data) };
+    }
+    crc32_tables(crc, data)
+}
+
+/// ARMv8's CRC32 instructions compute this same CRC (the reflected 0xEDB88320 polynomial, not
+/// CRC-32C), 8 bytes per instruction. Every Apple Silicon Mac has them.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "crc")]
+unsafe fn crc32_arm(crc: u32, data: &[u8]) -> u32 {
+    use std::arch::aarch64::{__crc32b, __crc32d};
     let mut c = !crc;
-    for &b in data {
-        c = CRC_TABLE[((c ^ u32::from(b)) & 0xFF) as usize] ^ (c >> 8);
+    let mut chunks = data.chunks_exact(8);
+    for chunk in &mut chunks {
+        c = __crc32d(c, u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8])));
+    }
+    for &b in chunks.remainder() {
+        c = __crc32b(c, b);
+    }
+    !c
+}
+
+fn crc32_tables(crc: u32, data: &[u8]) -> u32 {
+    let t = &CRC_TABLES;
+    let mut c = !crc;
+    let mut chunks = data.chunks_exact(8);
+    for chunk in &mut chunks {
+        let lo = c ^ u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let hi = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+        c = t[7][(lo & 0xff) as usize]
+            ^ t[6][((lo >> 8) & 0xff) as usize]
+            ^ t[5][((lo >> 16) & 0xff) as usize]
+            ^ t[4][(lo >> 24) as usize]
+            ^ t[3][(hi & 0xff) as usize]
+            ^ t[2][((hi >> 8) & 0xff) as usize]
+            ^ t[1][((hi >> 16) & 0xff) as usize]
+            ^ t[0][(hi >> 24) as usize];
+    }
+    for &b in chunks.remainder() {
+        c = t[0][((c ^ u32::from(b)) & 0xff) as usize] ^ (c >> 8);
     }
     !c
 }
@@ -118,7 +176,12 @@ pub fn gunzip(data: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
         at += 2;
     }
     let body = data.get(at..).ok_or(Error::Truncated)?;
-    let (out, used) = inflate_with_len(body, limit, None)?;
+    // The trailer ends with the uncompressed size (mod 4 GiB): allocate the output once.
+    let size_hint = data
+        .len()
+        .checked_sub(4)
+        .map(|i| u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as usize);
+    let (out, used) = inflate_with_len(body, limit, None, size_hint)?;
     let trailer = body.get(used..used + 8).ok_or(Error::Truncated)?;
     let crc = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
     let size = u32::from_le_bytes([trailer[4], trailer[5], trailer[6], trailer[7]]);
@@ -131,7 +194,7 @@ pub fn gunzip(data: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
 /// Decompress a zlib stream (PNG `IDAT`, and what most servers send as `deflate`).
 pub fn zlib_decompress(data: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
     zlib_header(data)?;
-    let (out, used) = inflate_with_len(&data[2..], limit, None)?;
+    let (out, used) = inflate_with_len(&data[2..], limit, None, None)?;
     check_adler(data, used, adler32(&out))?;
     Ok(out)
 }
@@ -150,7 +213,7 @@ pub fn zlib_stream(
         adler = adler32_update(adler, bytes);
         sink(bytes)
     };
-    let (_, used) = inflate_with_len(&data[2..], limit, Some(&mut counting))?;
+    let (_, used) = inflate_with_len(&data[2..], limit, Some(&mut counting), None)?;
     check_adler(data, used, adler)
 }
 
@@ -178,7 +241,7 @@ fn check_adler(data: &[u8], used: usize, adler: u32) -> Result<(), Error> {
 
 /// Decompress raw DEFLATE data.
 pub fn inflate(data: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
-    inflate_with_len(data, limit, None).map(|(out, _)| out)
+    inflate_with_len(data, limit, None, None).map(|(out, _)| out)
 }
 
 type Sink<'s> = &'s mut dyn FnMut(&[u8]) -> Result<(), Error>;
@@ -188,14 +251,17 @@ const WINDOW: usize = 32 * 1024;
 
 /// Decompress raw DEFLATE data; also returns how many input bytes the stream used. With a
 /// sink, output goes there in pieces and the returned buffer is empty.
+/// `size_hint`: the expected output size, when the container says (gzip's trailer).
 fn inflate_with_len(
     data: &[u8],
     limit: usize,
     sink: Option<Sink>,
+    size_hint: Option<usize>,
 ) -> Result<(Vec<u8>, usize), Error> {
-    let capacity = match sink {
-        Some(_) => 3 * WINDOW,
-        None => (data.len() * 4).min(limit),
+    let capacity = match (&sink, size_hint) {
+        (Some(_), _) => 3 * WINDOW,
+        (None, Some(size)) => size.min(limit),
+        (None, None) => (data.len() * 4).min(limit),
     };
     let mut inflater = Inflater {
         bits: Bits::new(data),
@@ -224,6 +290,38 @@ fn inflate_with_len(
     Ok((inflater.out, used))
 }
 
+/// Append `len` bytes copied from `distance` bytes back (a DEFLATE or Brotli match). Matches
+/// are mostly a few to a few dozen bytes: 8-byte chunks beat a `memmove` call per match.
+#[inline]
+pub(crate) fn copy_back(out: &mut Vec<u8>, distance: usize, len: usize) {
+    let start = out.len() - distance;
+    if distance == 1 {
+        // A run of one byte (spaces, zeros).
+        let b = out[start];
+        out.resize(out.len() + len, b);
+    } else if distance >= 8 {
+        // Each 8-byte chunk lies wholly in bytes already written, overlapping or not.
+        let mut from = start;
+        let end = start + len;
+        while from + 8 <= end {
+            let chunk: [u8; 8] = out[from..from + 8].try_into().unwrap_or([0; 8]);
+            out.extend_from_slice(&chunk);
+            from += 8;
+        }
+        while from < end {
+            let b = out[from];
+            out.push(b);
+            from += 1;
+        }
+    } else {
+        // Short repeating patterns.
+        for k in 0..len {
+            let b = out[start + k];
+            out.push(b);
+        }
+    }
+}
+
 /// Little-endian bit reader.
 struct Bits<'a> {
     data: &'a [u8],
@@ -244,6 +342,17 @@ impl<'a> Bits<'a> {
 
     #[inline]
     fn refill(&mut self) {
+        // Eight bytes at once while there are eight to read: OR them in above the bits held,
+        // and count only the whole bytes that fit. The bytes past those are ORed in again,
+        // unchanged, next time, so the extra bits do no harm.
+        if let Some(chunk) = self.data.get(self.pos..self.pos + 8) {
+            let word = u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8]));
+            self.buf |= word << self.count;
+            let bytes = (63 - self.count) >> 3;
+            self.pos += bytes as usize;
+            self.count += bytes * 8;
+            return;
+        }
         while self.count <= 56 {
             let Some(&b) = self.data.get(self.pos) else {
                 return;
@@ -275,6 +384,12 @@ impl<'a> Bits<'a> {
             self.refill();
         }
         (self.buf & ((1u64 << n) - 1)) as u32
+    }
+
+    /// Forget bits read ahead of `count`. Needed before moving `pos` directly (raw bytes):
+    /// the word-at-a-time refill relies on them matching the bytes that follow.
+    fn discard_ahead(&mut self) {
+        self.buf &= (1u64 << self.count).wrapping_sub(1);
     }
 
     fn align_to_byte(&mut self) {
@@ -455,6 +570,7 @@ impl Inflater<'_, '_> {
             self.out.push(b);
             remaining -= 1;
         }
+        self.bits.discard_ahead();
         let start = self.bits.pos;
         let bytes = self
             .bits
@@ -538,16 +654,7 @@ impl Inflater<'_, '_> {
                         return Err(Error::Corrupt("distance before start"));
                     }
                     self.room(len)?;
-                    let start = self.out.len() - distance;
-                    if distance >= len {
-                        self.out.extend_from_within(start..start + len);
-                    } else {
-                        // Overlapping copy: the run repeats the last `distance` bytes.
-                        for k in 0..len {
-                            let b = self.out[start + k];
-                            self.out.push(b);
-                        }
-                    }
+                    copy_back(&mut self.out, distance, len);
                 }
                 _ => return Err(Error::Corrupt("literal/length symbol")),
             }
@@ -669,9 +776,24 @@ mod tests {
                 streamed.extend_from_slice(p);
                 Ok(())
             }),
+            None,
         )
         .unwrap();
         assert_eq!(streamed, include_bytes!("testdata/dynamic.txt"));
+    }
+
+    #[test]
+    fn hardware_and_table_crcs_agree() {
+        let data: Vec<u8> = (0..10_007u32).map(|i| (i * 31 + i / 7) as u8).collect();
+        for len in [0, 1, 7, 8, 9, 63, 64, 1000, data.len()] {
+            assert_eq!(
+                crc32_update(0, &data[..len]),
+                crc32_tables(0, &data[..len]),
+                "length {len}"
+            );
+        }
+        let split = crc32_update(crc32_update(0, &data[..333]), &data[333..]);
+        assert_eq!(split, crc32_tables(0, &data));
     }
 
     #[test]

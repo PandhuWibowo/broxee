@@ -17,7 +17,7 @@ use paint::{Painter, Viewport};
 use engine::{FontStore, Settings};
 
 const USAGE: &str =
-    "usage: broxee <url-or-file> [--window | --png FILE | --paint] [--tree | --styles | --layout] \
+    "usage: broxee [<url-or-file>] [--window | --png FILE | --paint] [--tree | --styles | --layout] \
                      [--depth N] [--width PX] [--height PX] [--scale N] [--no-css-fetch]";
 
 #[derive(Clone)]
@@ -84,15 +84,16 @@ fn main() -> ExitCode {
             }
         }
     }
+    if opts.window {
+        // Without an address the window brings back the last session.
+        opts.target = target.unwrap_or_default();
+        return run_window(opts);
+    }
     let Some(target) = target else {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
     opts.target = target;
-
-    if opts.window {
-        return run_window(opts);
-    }
     match run(&opts) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -154,6 +155,7 @@ fn run(opts: &Options) -> Result<(), String> {
 
     let css = &page.css;
     let rules: usize = css.sheets.iter().map(css::Stylesheet::len).sum();
+    let skipped: usize = css.sheets.iter().map(|s| s.skipped).sum();
     println!("url       {}", page.url);
     println!("status    {}", page.status);
     println!(
@@ -169,7 +171,7 @@ fn run(opts: &Options) -> Result<(), String> {
     println!("fetch     {:.1} ms", page.fetch_ms);
     println!("parse     {:.2} ms", page.parse_ms);
     println!(
-        "css       {} sheets ({} fetched, {} failed), {rules} rules, {:.1} ms wall ({:.1} ms parsing across threads)",
+        "css       {} sheets ({} fetched, {} failed), {rules} rules ({skipped} skipped: no match possible), {:.1} ms wall ({:.1} ms parsing across threads)",
         css.sheets.len(),
         css.fetched,
         css.failed,

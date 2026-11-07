@@ -7,20 +7,30 @@
 
 mod cascade;
 pub mod grid;
+mod hints;
 mod media;
 mod parser;
 mod selector;
 mod values;
+mod vocabulary;
 
 use std::sync::OnceLock;
 
 pub use cascade::{cascade, Origin, StyleMap};
 pub use media::{Media, MediaList};
 pub use parser::{
-    parse_declarations, parse_stylesheet, parse_stylesheet_owned, Decl, Rule, Stylesheet,
+    parse_declarations, parse_stylesheet, parse_stylesheet_for, parse_stylesheet_owned, Decl, Rule,
+    Stylesheet,
 };
 pub use selector::{parse_selector_list, Combinator, Compound, Selector};
 pub use values::*;
+pub use vocabulary::Vocabulary;
+
+/// Extra user-agent rules for quirks mode: documents with no doctype.
+pub fn quirks_stylesheet() -> &'static Stylesheet {
+    static SHEET: OnceLock<Stylesheet> = OnceLock::new();
+    SHEET.get_or_init(|| parse_stylesheet(include_str!("quirks.css")))
+}
 
 /// Browser defaults: which elements are blocks, heading sizes, list indents, link color.
 pub fn user_agent_stylesheet() -> &'static Stylesheet {

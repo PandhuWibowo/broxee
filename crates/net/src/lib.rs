@@ -1,7 +1,7 @@
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rustls::pki_types::ServerName;
@@ -207,7 +207,48 @@ pub struct Response {
     pub url: Url,
     pub status: u16,
     pub headers: Vec<(String, String)>,
+    /// The body, decoded.
     pub body: Vec<u8>,
+    /// The body as it arrived, when it was compressed: the smallest form to keep (a sleeping
+    /// tab keeps this instead of the page). `Encoding::Identity` and empty otherwise.
+    pub wire: Wire,
+}
+
+/// A body in its `Content-Encoding`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Wire {
+    pub encoding: Encoding,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Encoding {
+    #[default]
+    Identity,
+    Brotli,
+    Gzip,
+    Deflate,
+}
+
+impl Wire {
+    /// Decode, refusing anything past `limit` bytes.
+    pub fn decode(&self, limit: usize) -> Result<Vec<u8>, String> {
+        decode(self.encoding, &self.bytes, limit)
+    }
+}
+
+fn decode(encoding: Encoding, bytes: &[u8], limit: usize) -> Result<Vec<u8>, String> {
+    match encoding {
+        Encoding::Identity => Ok(bytes.to_vec()),
+        // Brotli first in Accept-Encoding: about a quarter smaller than gzip for HTML and up to
+        // half for CSS, and it decodes faster here too.
+        Encoding::Brotli => flate::brotli(bytes, limit).map_err(|e| e.to_string()),
+        Encoding::Gzip => flate::gunzip(bytes, limit).map_err(|e| e.to_string()),
+        // "deflate" is meant to be zlib-wrapped, but some servers send raw DEFLATE.
+        Encoding::Deflate => flate::zlib_decompress(bytes, limit)
+            .or_else(|_| flate::inflate(bytes, limit))
+            .map_err(|e| e.to_string()),
+    }
 }
 
 impl Response {
@@ -289,6 +330,7 @@ fn fetch_once(url: &Url) -> Result<Response, FetchError> {
             status: 200,
             headers: Vec::new(),
             body,
+            wire: Wire::default(),
         });
     }
     let key = (url.scheme.clone(), url.host.clone(), url.port);
@@ -324,7 +366,7 @@ fn request(conn: &mut Conn, url: &Url) -> Result<(Response, bool), FetchError> {
     };
     let request = format!(
         "GET {} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: {USER_AGENT}\r\n\
-         Accept: text/html,*/*;q=0.8\r\nAccept-Encoding: gzip, deflate\r\n\
+         Accept: text/html,*/*;q=0.8\r\nAccept-Encoding: br, gzip, deflate\r\n\
          Connection: keep-alive\r\n\r\n",
         url.path
     );
@@ -503,19 +545,28 @@ fn finish(url: &Url, raw: RawResponse) -> Result<Response, String> {
         url: url.clone(),
         status: raw.status,
         headers: raw.headers,
-        body: raw.body,
+        body: Vec::new(),
+        wire: Wire::default(),
     };
-    let encoding = resp.header("content-encoding").map(str::to_ascii_lowercase);
-    resp.body = match encoding.as_deref().map(str::trim) {
-        Some("gzip" | "x-gzip") => {
-            flate::gunzip(&resp.body, MAX_BODY).map_err(|e| e.to_string())?
-        }
-        // "deflate" is meant to be zlib-wrapped, but some servers send raw DEFLATE.
-        Some("deflate") => flate::zlib_decompress(&resp.body, MAX_BODY)
-            .or_else(|_| flate::inflate(&resp.body, MAX_BODY))
-            .map_err(|e| e.to_string())?,
-        _ => resp.body,
+    let encoding = match resp
+        .header("content-encoding")
+        .map(|e| e.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("br") => Encoding::Brotli,
+        Some("gzip" | "x-gzip") => Encoding::Gzip,
+        Some("deflate") => Encoding::Deflate,
+        _ => Encoding::Identity,
     };
+    if encoding == Encoding::Identity {
+        resp.body = raw.body;
+    } else {
+        resp.body = decode(encoding, &raw.body, MAX_BODY)?;
+        resp.wire = Wire {
+            encoding,
+            bytes: raw.body,
+        };
+    }
     Ok(resp)
 }
 
@@ -622,10 +673,13 @@ fn put_idle(key: Key, conn: Conn) {
     }
 }
 
+/// The TLS configuration, and with it the session-resumption cache.
+static CONFIG: Mutex<Option<Arc<ClientConfig>>> = Mutex::new(None);
+
 fn tls_config() -> Arc<ClientConfig> {
-    static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
-    CONFIG
-        .get_or_init(|| {
+    let mut config = CONFIG.lock().unwrap_or_else(|e| e.into_inner());
+    config
+        .get_or_insert_with(|| {
             let mut roots = RootCertStore::empty();
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -637,6 +691,21 @@ fn tls_config() -> Arc<ClientConfig> {
             Arc::new(config)
         })
         .clone()
+}
+
+/// Close idle connections and forget TLS sessions, so nothing a server could use to link two
+/// requests carries over (switching profile). Requests already in flight finish normally.
+pub fn forget_sessions() {
+    if let Ok(mut idle) = IDLE.lock() {
+        idle.clear();
+    }
+    let mut config = CONFIG.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(current) = config.as_mut() {
+        let mut fresh = ClientConfig::clone(current);
+        // A new in-memory store: tickets from before are unreachable and dropped with it.
+        fresh.resumption = rustls::client::Resumption::default();
+        *current = Arc::new(fresh);
+    }
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {

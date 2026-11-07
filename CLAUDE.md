@@ -26,17 +26,19 @@ and macOS.
 
 ```
 crates/
-  flate/   DEFLATE, zlib and gzip decoding, CRC-32, Adler-32 (HTTP bodies now, PNG images next)
+  flate/   DEFLATE, zlib, gzip and Brotli decoding (brotli.rs; RFC 7932 dictionary and tables as
+           data, CRC-checked in tests), CRC-32, Adler-32
   net/     URL parse + join, HTTP/1.1 over TCP, TLS (rustls), keep-alive pool, chunked bodies, gzip,
            redirects, file://
   html/    tokenizer.rs (byte-oriented, raw-text elements), entities.rs, lib.rs (tree builder + arena DOM,
            fast hasher shared with css, layout and paint)
   css/     parser.rs (rules, declarations, shorthands, @media), media.rs (query evaluation), grid.rs,
+           hints.rs (presentational attributes), vocabulary.rs (rules that cannot match), quirks.css,
            selector.rs, values.rs (specified + computed values), cascade.rs, ua.css
   font/    TrueType/OpenType metrics (advances, ascent/descent, cmap 4/12, .ttc), TextMetrics trait,
            Approximate fallback used by tests
   layout/  block + inline layout into BoxFragment / TextFragment lists, one shared text buffer;
-           flex.rs (flex containers, intrinsic widths), grid.rs (grid containers)
+           flex.rs (flex containers, intrinsic widths), grid.rs (grid containers), table.rs (tables)
   image/   PNG and baseline JPEG decoders that scale while decoding, header probes (GIF, WebP sizes)
   paint/   display list, glyph rasterizer + cache, image cache + parallel decode, band compositing,
            streaming PNG writer
@@ -62,17 +64,29 @@ casts), not taken from binding crates. Ask before proposing any dependency.
   without locks.
 - **Images are never decoded at full size.** Decoders stream rows into `image::Scaler`, which outputs the
   drawn size; only visible images are decoded, and the pixel cache stays under `IMAGE_CACHE_BYTES`. A new
-  decoder (progressive JPEG, GIF, WebP) must keep that: memory proportional to the output, not the file.
+  decoder (GIF, WebP) must keep that: memory proportional to the output, not the file. Progressive JPEG keeps
+  only the k x k coefficients the drawn size needs plus a non-zero mask per block, one decode at a time.
 - **Every `send!` states the method's exact C signature.** A wrong type is undefined behaviour, not an error.
 - **AppKit calls happen on the main thread only.** The engine thread hands work over with `dispatch_async_f`.
 - **Paint into the window's `IOSurface`, never into a separate buffer that is then copied.** At most two
-  surfaces per window.
+  surfaces per window; the spare one is released when idle (`Window::release_spare`).
+- **Window memory is measured with `footprint <pid>` on a real window** (idle and `phys_footprint_peak`), not
+  only with the CLI: frame surfaces (16 MB each at Retina) and AppKit are on top of the page.
 
 ### Testing the browser
 
 - **Never send synthetic input to the real desktop** (osascript keystrokes, clicks). The owner works on this
   machine; keystrokes can land in another app. Drive `Browser` through `FakeScreen` in `browser.rs` tests with
   local files, and render PNGs from it when a visual check is needed.
+
+### Compression invariants
+
+- **Measure before adding a format or a cache.** README's "Compression" table records each decision with its
+  numbers (why Brotli and not zstd, why decoded pixels are not compressed, why `opt-level = 3`).
+- **The bit reader refills 8 bytes at a time** and keeps bits read ahead. Anything that moves `Bits::pos`
+  directly (raw/stored bytes) must call `discard_ahead` first.
+- **`unsafe` in `flate` is only the ARMv8 CRC32 intrinsics**, behind a runtime feature check, with the table
+  version as fallback and a test that the two agree.
 
 ### Layout invariants
 
@@ -94,6 +108,11 @@ casts), not taken from binding crates. Ask before proposing any dependency.
 
 ### CSS invariants
 
+- **Stylesheets are parsed against the document's vocabulary** (`css::Vocabulary`): rules needing a tag, id,
+  class, attribute or exact attribute value (`[data-theme=dark]`) the DOM lacks are dropped. Correct only while the DOM cannot gain names. When scripts arrive, keep the
+  source text and re-parse without a vocabulary (or add the new names and re-parse) before restyling.
+- **Presentational hints** (`hints.rs`) apply between UA and author rules; elements with hints skip the
+  matched-rule cache because the result depends on attributes.
 - **Unsupported selectors are dropped, never approximated.** A selector Broxee cannot evaluate must not match;
   a wrong match is worse than a missing one.
 - **Style sharing is off when any rule looks at siblings or position** (`RuleIndex::sibling_dependent`).

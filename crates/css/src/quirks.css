@@ -1,0 +1,11 @@
+/* Quirks mode (documents without a doctype): tables do not inherit text styles, as in every
+   browser. Hacker News, for one, depends on this. */
+
+table {
+  text-align: start;
+  white-space: normal;
+  line-height: normal;
+  font-weight: normal;
+  font-style: normal;
+  font-size: 16px;
+}

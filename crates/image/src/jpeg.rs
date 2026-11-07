@@ -4,9 +4,12 @@
 //! The image is decoded one row of MCUs at a time: blocks go through the inverse DCT into a
 //! strip a few block rows tall, which is color converted and handed to the scaler.
 //!
-//! Not yet: progressive and arithmetic-coded files, 12-bit samples, CMYK, non-interleaved
-//! scans of color images, EXIF orientation.
+//! Progressive files are decoded in `progressive.rs`.
+//!
+//! Not yet: arithmetic-coded and differential files, 12-bit samples, CMYK, non-interleaved
+//! scans of baseline color images, EXIF orientation.
 
+use crate::progressive::{Progressive, Scan};
 use crate::{Bitmap, Error, Format, Info, Scaler, MAX_SIDE};
 
 pub(crate) fn probe(data: &[u8]) -> Option<Info> {
@@ -34,18 +37,18 @@ pub(crate) fn probe(data: &[u8]) -> Option<Info> {
     None
 }
 
-const ZIGZAG: [usize; 64] = [
+pub(crate) const ZIGZAG: [usize; 64] = [
     0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20,
     13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59,
     52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
 ];
 
 #[derive(Clone, Copy, Default)]
-struct Component {
-    id: u8,
-    h: usize,
-    v: usize,
-    quant: usize,
+pub(crate) struct Component {
+    pub(crate) id: u8,
+    pub(crate) h: usize,
+    pub(crate) v: usize,
+    pub(crate) quant: usize,
     dc: usize,
     ac: usize,
     pred: i32,
@@ -59,6 +62,11 @@ pub(crate) fn decode(data: &[u8], target: (u32, u32)) -> Result<Bitmap, Error> {
     let (mut width, mut height) = (0usize, 0usize);
     let mut restart_interval = 0usize;
     let mut adobe_transform: Option<u8> = None;
+    let mut progressive_frame = false;
+    let mut progressive: Option<Progressive> = None;
+    let is_rgb = |adobe: Option<u8>, components: &[Component]| {
+        adobe == Some(0) || (components.len() == 3 && components.iter().map(|c| c.id).eq(*b"RGB"))
+    };
 
     if !data.starts_with(&[0xff, 0xd8]) {
         return Err(Error::Corrupt("not a JPEG"));
@@ -68,10 +76,13 @@ pub(crate) fn decode(data: &[u8], target: (u32, u32)) -> Result<Bitmap, Error> {
         while data.get(at) == Some(&0xff) && data.get(at + 1) == Some(&0xff) {
             at += 1;
         }
-        let (&ff, &marker) = (
-            data.get(at).ok_or(Error::Truncated)?,
-            data.get(at + 1).ok_or(Error::Truncated)?,
-        );
+        let (Some(&ff), Some(&marker)) = (data.get(at), data.get(at + 1)) else {
+            // A progressive file cut short still shows the scans that arrived.
+            return match progressive {
+                Some(p) => p.finish(&quant, is_rgb(adobe_transform, &components), target),
+                None => Err(Error::Truncated),
+            };
+        };
         if ff != 0xff {
             return Err(Error::Corrupt("expected a marker"));
         }
@@ -80,7 +91,10 @@ pub(crate) fn decode(data: &[u8], target: (u32, u32)) -> Result<Bitmap, Error> {
             continue;
         }
         if marker == 0xd9 {
-            return Err(Error::Corrupt("no image data"));
+            return match progressive {
+                Some(p) => p.finish(&quant, is_rgb(adobe_transform, &components), target),
+                None => Err(Error::Corrupt("no image data")),
+            };
         }
         let len = usize::from(u16::from_be_bytes([
             *data.get(at + 2).ok_or(Error::Truncated)?,
@@ -124,7 +138,8 @@ pub(crate) fn decode(data: &[u8], target: (u32, u32)) -> Result<Bitmap, Error> {
                     s = &s[17 + total..];
                 }
             }
-            0xc0 | 0xc1 => {
+            0xc0..=0xc2 => {
+                progressive_frame = marker == 0xc2;
                 if seg.len() < 6 || seg[0] != 8 {
                     return Err(Error::Unsupported(
                         "JPEG sample precision other than 8 bits",
@@ -152,7 +167,7 @@ pub(crate) fn decode(data: &[u8], target: (u32, u32)) -> Result<Bitmap, Error> {
                     });
                 }
             }
-            0xc2 | 0xc6 | 0xca | 0xce => return Err(Error::Unsupported("progressive JPEG")),
+            0xc6 | 0xca | 0xce => return Err(Error::Unsupported("differential JPEG")),
             0xc3 | 0xc5 | 0xc7 | 0xc9 | 0xcb | 0xcd | 0xcf => {
                 return Err(Error::Unsupported(
                     "lossless, hierarchical or arithmetic JPEG",
@@ -165,6 +180,61 @@ pub(crate) fn decode(data: &[u8], target: (u32, u32)) -> Result<Bitmap, Error> {
                 ]));
             }
             0xee if seg.starts_with(b"Adobe") && seg.len() >= 12 => adobe_transform = Some(seg[11]),
+            0xda if progressive_frame => {
+                if components.is_empty() {
+                    return Err(Error::Corrupt("scan before frame"));
+                }
+                let n = usize::from(*seg.first().ok_or(Error::Truncated)?);
+                let mut scan = Scan {
+                    components: Vec::with_capacity(n),
+                    dc_tables: Vec::with_capacity(n),
+                    ac_tables: Vec::with_capacity(n),
+                    start: 0,
+                    end: 0,
+                    high: 0,
+                    low: 0,
+                };
+                for i in 0..n {
+                    let s = seg.get(1 + i * 2..3 + i * 2).ok_or(Error::Truncated)?;
+                    let c = components
+                        .iter()
+                        .position(|c| c.id == s[0])
+                        .ok_or(Error::Corrupt("scan names an unknown component"))?;
+                    scan.components.push(c);
+                    scan.dc_tables.push(usize::from(s[1] >> 4) & 3);
+                    scan.ac_tables.push(usize::from(s[1] & 15) & 3);
+                }
+                let tail = seg.get(1 + n * 2..4 + n * 2).ok_or(Error::Truncated)?;
+                scan.start = usize::from(tail[0]);
+                scan.end = usize::from(tail[1]);
+                scan.high = u32::from(tail[2] >> 4);
+                scan.low = u32::from(tail[2] & 15);
+                if scan.low > 13 || scan.high > 13 {
+                    return Err(Error::Corrupt("successive approximation"));
+                }
+                if progressive.is_none() {
+                    if width == 0
+                        || height == 0
+                        || width > MAX_SIDE as usize
+                        || height > MAX_SIDE as usize
+                    {
+                        return Err(Error::TooLarge);
+                    }
+                    progressive =
+                        Some(Progressive::new(width, height, components.clone(), target)?);
+                }
+                let p = progressive.as_mut().ok_or(Error::Corrupt("no frame"))?;
+                let entropy = at + 2 + len;
+                let used = p.decode_scan(
+                    &data[entropy..],
+                    &scan,
+                    &dc_tables,
+                    &ac_tables,
+                    restart_interval,
+                )?;
+                at = entropy + used;
+                continue;
+            }
             0xda => {
                 let n = usize::from(*seg.first().ok_or(Error::Truncated)?);
                 if components.is_empty() {
@@ -187,8 +257,7 @@ pub(crate) fn decode(data: &[u8], target: (u32, u32)) -> Result<Bitmap, Error> {
                     dc: &dc_tables,
                     ac: &ac_tables,
                 };
-                let rgb = adobe_transform == Some(0)
-                    || (components.len() == 3 && components.iter().map(|c| c.id).eq(*b"RGB"));
+                let rgb = is_rgb(adobe_transform, &components);
                 let frame = Frame {
                     width,
                     height,
@@ -204,13 +273,13 @@ pub(crate) fn decode(data: &[u8], target: (u32, u32)) -> Result<Bitmap, Error> {
     }
 }
 
-struct Frame {
-    width: usize,
-    height: usize,
-    components: Vec<Component>,
-    restart_interval: usize,
+pub(crate) struct Frame {
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) components: Vec<Component>,
+    pub(crate) restart_interval: usize,
     /// Samples are R, G, B rather than Y, Cb, Cr.
-    rgb: bool,
+    pub(crate) rgb: bool,
 }
 
 struct Tables<'a> {
@@ -248,16 +317,49 @@ fn decode_scan(
         }
     }
 
+    // Decode straight to k/8 of the size when the image is drawn smaller: every block is still
+    // read, but only its k x k lowest frequencies go through the inverse DCT.
+    let k = luma_scale(w, h, target);
+    let scales: Vec<usize> = frame
+        .components
+        .iter()
+        .map(|c| plane_scale(k, hmax, vmax, c))
+        .collect();
+    let (out_w, out_h) = ((w * k).div_ceil(8), (h * k).div_ceil(8));
+    let out = Frame {
+        width: out_w,
+        height: out_h,
+        components: frame
+            .components
+            .iter()
+            .zip(&scales)
+            .map(|(c, &s)| {
+                let mut scaled = *c;
+                scaled.h = c.h * s;
+                scaled.v = c.v * s;
+                scaled
+            })
+            .collect(),
+        restart_interval: 0,
+        rgb: frame.rgb,
+    };
     // One strip per component, one MCU row tall.
-    let strides: Vec<usize> = frame.components.iter().map(|c| mcus_x * c.h * 8).collect();
+    let strides: Vec<usize> = frame
+        .components
+        .iter()
+        .zip(&scales)
+        .map(|(c, &s)| mcus_x * c.h * s)
+        .collect();
     let mut strips: Vec<Vec<u8>> = frame
         .components
         .iter()
+        .zip(&scales)
         .zip(&strides)
-        .map(|(c, &stride)| vec![0u8; stride * c.v * 8])
+        .map(|((c, &s), &stride)| vec![0u8; stride * c.v * s])
         .collect();
-    let mut scaler = Scaler::new(w as u32, h as u32, target);
-    let mut rgba = vec![0u8; w * 4];
+    let mut scaler = Scaler::new(out_w as u32, out_h as u32, target);
+    let mut rgba = vec![0u8; out_w * 4];
+    let mut reduced = [0f32; 64];
     let mut bits = BitReader::new(entropy);
     let mut coefs = [0i32; 64];
     let mut mcu = 0usize;
@@ -281,18 +383,26 @@ fn decode_scan(
                 for by in 0..c.v {
                     for bx in 0..c.h {
                         let only_dc = decode_block(&mut bits, dc, ac, &mut c.pred, q, &mut coefs)?;
-                        let stride = strides[ci];
-                        let x = (mx * c.h + bx) * 8;
-                        let offset = by * 8 * stride + x;
-                        idct(&coefs, only_dc, &mut strips[ci][offset..], stride);
+                        let (stride, s) = (strides[ci], scales[ci]);
+                        let offset = by * s * stride + (mx * c.h + bx) * s;
+                        if s == 8 || only_dc {
+                            idct_block(&coefs, only_dc, s, &mut strips[ci][offset..], stride);
+                        } else {
+                            for v in 0..s {
+                                for u in 0..s {
+                                    reduced[v * s + u] = coefs[v * 8 + u] as f32;
+                                }
+                            }
+                            idct_scaled(&reduced[..s * s], s, &mut strips[ci][offset..], stride);
+                        }
                     }
                 }
             }
             mcu += 1;
         }
-        let rows = (8 * vmax).min(h - my * 8 * vmax);
+        let rows = (k * vmax).min(out_h.saturating_sub(my * k * vmax));
         for r in 0..rows {
-            color_row(&frame, &strips, &strides, r, hmax, vmax, &mut rgba);
+            color_row(&out, &strips, &strides, r, hmax * k, vmax * k, &mut rgba);
             scaler.push(&rgba);
         }
     }
@@ -301,7 +411,7 @@ fn decode_scan(
 
 /// Convert row `r` of the current MCU strip to RGBA, replicating subsampled chroma.
 #[allow(clippy::too_many_arguments)]
-fn color_row(
+pub(crate) fn color_row(
     frame: &Frame,
     strips: &[Vec<u8>],
     strides: &[usize],
@@ -385,7 +495,7 @@ fn decode_block(
 }
 
 /// A `size`-bit magnitude category value as a signed coefficient (F.2.2.1).
-fn extend(v: u32, size: u32) -> i32 {
+pub(crate) fn extend(v: u32, size: u32) -> i32 {
     let v = v as i32;
     if v < 1 << (size - 1) {
         v - (1 << size) + 1
@@ -409,6 +519,19 @@ static COS: std::sync::LazyLock<[[f32; 8]; 8]> = std::sync::LazyLock::new(|| {
     }
     t
 });
+
+/// Inverse DCT of one block at scale `s` (8 is full size). A block with only a DC term is
+/// flat at any scale.
+fn idct_block(coefs: &[i32; 64], only_dc: bool, s: usize, out: &mut [u8], stride: usize) {
+    if only_dc {
+        let v = (coefs[0] as f32 / 8.0 + 128.0).round().clamp(0.0, 255.0) as u8;
+        for row in 0..s {
+            out[row * stride..row * stride + s].fill(v);
+        }
+        return;
+    }
+    idct(coefs, false, out, stride);
+}
 
 /// Inverse DCT of one block into 8 rows of `out` spaced `stride` apart, level-shifted by 128.
 fn idct(coefs: &[i32; 64], only_dc: bool, out: &mut [u8], stride: usize) {
@@ -440,9 +563,69 @@ fn idct(coefs: &[i32; 64], only_dc: bool, out: &mut [u8], stride: usize) {
     }
 }
 
+/// Coefficients per side to keep for full-resolution planes: the smallest k (1, 2, 4 or 8)
+/// whose k/8-scaled image still covers `target`. Images drawn smaller than they are decode
+/// with a k-point inverse DCT instead of the full one plus downscaling.
+pub(crate) fn luma_scale(width: usize, height: usize, target: (u32, u32)) -> usize {
+    [1usize, 2, 4, 8]
+        .into_iter()
+        .find(|&k| {
+            (width * k).div_ceil(8) >= target.0 as usize
+                && (height * k).div_ceil(8) >= target.1 as usize
+        })
+        .unwrap_or(8)
+}
+
+/// The scale of one component: subsampled chroma uses a larger one (as libjpeg does), so it
+/// comes out at the luma resolution with no upsampling.
+pub(crate) fn plane_scale(k: usize, hmax: usize, vmax: usize, c: &Component) -> usize {
+    let wanted = (k * hmax / c.h).min(k * vmax / c.v).min(8);
+    [8usize, 4, 2, 1]
+        .into_iter()
+        .find(|&p| p <= wanted)
+        .unwrap_or(1)
+}
+
+/// `C(u) cos((2x + 1) u pi / 2k) / 2` for each k: the k-point inverse DCT of a block's lowest
+/// k x k frequencies, which equals the 8-point one averaged over (8/k)^2 pixels.
+static COS_SCALED: std::sync::LazyLock<[Vec<f32>; 4]> = std::sync::LazyLock::new(|| {
+    [1usize, 2, 4, 8].map(|k| {
+        let mut t = vec![0f32; k * k];
+        for x in 0..k {
+            for u in 0..k {
+                let c = if u == 0 {
+                    std::f32::consts::FRAC_1_SQRT_2
+                } else {
+                    1.0
+                };
+                t[x * k + u] = c
+                    * (((2 * x + 1) * u) as f32 * std::f32::consts::PI / (2 * k) as f32).cos()
+                    / 2.0;
+            }
+        }
+        t
+    })
+});
+
+pub(crate) fn idct_scaled(coefs: &[f32], k: usize, out: &mut [u8], stride: usize) {
+    let table = &COS_SCALED[k.trailing_zeros() as usize];
+    let mut tmp = [0f32; 64];
+    for y in 0..k {
+        for x in 0..k {
+            tmp[y * k + x] = (0..k).map(|u| table[x * k + u] * coefs[y * k + u]).sum();
+        }
+    }
+    for x in 0..k {
+        for y in 0..k {
+            let v: f32 = (0..k).map(|v| table[y * k + v] * tmp[v * k + x]).sum();
+            out[y * stride + x] = (v + 128.0).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
 /// Entropy-coded data, most significant bit first, with 0xFF00 unstuffed. A marker ends the
 /// data: zeros are read past it until a restart moves over it.
-struct BitReader<'a> {
+pub(crate) struct BitReader<'a> {
     data: &'a [u8],
     pos: usize,
     buf: u64,
@@ -450,7 +633,7 @@ struct BitReader<'a> {
 }
 
 impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8]) -> BitReader<'a> {
+    pub(crate) fn new(data: &'a [u8]) -> BitReader<'a> {
         BitReader {
             data,
             pos: 0,
@@ -489,7 +672,7 @@ impl<'a> BitReader<'a> {
     }
 
     #[inline]
-    fn take(&mut self, n: u32) -> u32 {
+    pub(crate) fn take(&mut self, n: u32) -> u32 {
         if n == 0 {
             return 0;
         }
@@ -499,8 +682,13 @@ impl<'a> BitReader<'a> {
         v
     }
 
+    /// Bytes consumed so far: where the next marker begins once the scan has ended.
+    pub(crate) fn position(&self) -> usize {
+        self.pos
+    }
+
     /// Drop buffered bits and step over the restart marker.
-    fn restart(&mut self) {
+    pub(crate) fn restart(&mut self) {
         self.buf = 0;
         self.count = 0;
         while self.pos + 1 < self.data.len() {
@@ -515,7 +703,7 @@ impl<'a> BitReader<'a> {
 
 const FAST: u32 = 9;
 
-struct Huffman {
+pub(crate) struct Huffman {
     /// `value << 5 | length` for codes up to `FAST` bits; 0 means "take the slow path".
     fast: Vec<u16>,
     max_code: [i32; 17],
@@ -564,7 +752,7 @@ impl Huffman {
     }
 
     #[inline]
-    fn decode(&self, bits: &mut BitReader) -> Result<u8, Error> {
+    pub(crate) fn decode(&self, bits: &mut BitReader) -> Result<u8, Error> {
         let entry = self.fast[bits.peek(FAST) as usize];
         if entry != 0 {
             bits.take(u32::from(entry & 31));
@@ -677,21 +865,83 @@ mod tests {
     }
 
     #[test]
-    fn refuses_progressive_files_and_survives_damage() {
-        assert_eq!(
-            decode(include_bytes!("testdata/jprog.jpg"), (48, 40)),
-            Err(Error::Unsupported("progressive JPEG"))
+    fn decodes_progressive_files_like_libjpeg() {
+        compare(
+            include_bytes!("testdata/jprog.jpg"),
+            include_bytes!("testdata/jprog.ref.pnm"),
+            "progressive 4:2:0",
         );
-        let data = include_bytes!("testdata/j420.jpg");
-        for cut in [2, 10, 100, 300, 600] {
-            let _ = decode(&data[..cut], (48, 40));
-        }
+        compare(
+            include_bytes!("testdata/jprog444.jpg"),
+            include_bytes!("testdata/jprog444.ref.pnm"),
+            "progressive 4:4:4",
+        );
+        compare(
+            include_bytes!("testdata/jproggray.jpg"),
+            include_bytes!("testdata/jproggray.ref.pnm"),
+            "progressive gray",
+        );
+        compare(
+            include_bytes!("testdata/jprogrst.jpg"),
+            include_bytes!("testdata/jprogrst.ref.pnm"),
+            "progressive restarts",
+        );
+    }
+
+    #[test]
+    fn keeps_only_the_frequencies_a_smaller_target_needs() {
+        // 96x80 drawn at 48x40 keeps 4x4 coefficients, at 24x20 2x2: compared with libjpeg's
+        // scaled decoding (`djpeg -scale 1/2`, `1/4`).
+        let data = include_bytes!("testdata/jprog96.jpg");
+        compare(data, include_bytes!("testdata/jprog96.ref.pnm"), "full");
+        compare(
+            data,
+            include_bytes!("testdata/jprog96_half.ref.pnm"),
+            "half",
+        );
+        compare(
+            data,
+            include_bytes!("testdata/jprog96_quarter.ref.pnm"),
+            "quarter",
+        );
+    }
+
+    #[test]
+    fn baseline_files_drawn_smaller_use_the_scaled_transform_too() {
+        let data = include_bytes!("testdata/jbase96.jpg");
+        compare(
+            data,
+            include_bytes!("testdata/jbase96_half.ref.pnm"),
+            "baseline half",
+        );
+        compare(
+            data,
+            include_bytes!("testdata/jbase96_quarter.ref.pnm"),
+            "baseline quarter",
+        );
+    }
+
+    #[test]
+    fn shows_partial_progressive_files_and_survives_damage() {
+        let data = include_bytes!("testdata/jprog.jpg");
+        let partial = decode(&data[..data.len() * 2 / 3], (48, 40))
+            .expect("earlier scans still make an image");
+        assert_eq!((partial.width, partial.height), (48, 40));
         for i in 2..data.len() {
             let mut damaged = data.to_vec();
             damaged[i] ^= 0x33;
             let _ = decode(&damaged, (48, 40));
         }
-        let small = decode(data, (12, 10)).unwrap();
+        let baseline = include_bytes!("testdata/j420.jpg");
+        for cut in [2, 10, 100, 300, 600] {
+            let _ = decode(&baseline[..cut], (48, 40));
+        }
+        for i in 2..baseline.len() {
+            let mut damaged = baseline.to_vec();
+            damaged[i] ^= 0x33;
+            let _ = decode(&damaged, (48, 40));
+        }
+        let small = decode(baseline, (12, 10)).unwrap();
         assert_eq!((small.width, small.height), (12, 10));
     }
 }

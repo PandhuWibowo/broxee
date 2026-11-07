@@ -1,4 +1,9 @@
-//! The window: navigation, history, scrolling, links and the address field.
+//! The window: tabs and profiles, navigation, history, scrolling, links and the address field.
+//!
+//! Only the visible tab holds a built page (DOM, styles, layout). Every other tab sleeps as a
+//! snapshot of what it was built from, compressed as it arrived (`engine::Snapshot`), or as
+//! just its history once snapshots pass their budget. Selecting a tab rebuilds it from its
+//! snapshot without the network, at its old scroll position.
 //!
 //! Runs on the engine thread. Input arrives from the main thread over a channel; every event
 //! queued while the engine was busy is handled before the next frame, so a burst of scroll
@@ -7,14 +12,18 @@
 //! The browser draws through the `Screen` trait: the real window on macOS, an in-memory screen
 //! in tests. Tests drive it with synthetic events and local files, never the real desktop.
 
+use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
 use html::NodeId;
 use paint::{Painter, Target, Viewport};
 use platform::{Event, Key, KeyEvent};
 
-use crate::chrome::{self, Button, Chrome, FieldView, Frame, HeaderView, HEADER_HEIGHT};
-use crate::engine::{self, FontStore, Loaded, Settings};
+use crate::chrome::{
+    self, Button, Chrome, FieldView, Frame, HeaderView, Hue, SidebarItem, SidebarView, TabView,
+    HEADER_HEIGHT, SIDEBAR_WIDTH,
+};
+use crate::engine::{self, FontStore, Loaded, Settings, Snapshot};
 use crate::Options;
 
 /// Arrow keys scroll by this many points.
@@ -23,6 +32,14 @@ const LINE_STEP: f32 = 40.0;
 const PAGE_OVERLAP: f32 = 40.0;
 /// The glyph cache is dropped past this size, so long sessions cannot grow it without bound.
 const GLYPH_CACHE_LIMIT: usize = 8 << 20;
+/// All sleeping tabs' snapshots together stay under this; past it, the tabs used longest ago
+/// keep only their history and reload from the network when selected.
+const SNAPSHOT_BUDGET: usize = 8 << 20;
+/// Closed tabs that ⌘⇧T can reopen, per profile.
+const CLOSED_LIMIT: usize = 20;
+/// Session file limits, so a damaged file cannot make startup slow.
+const SESSION_TABS: usize = 500;
+const SESSION_ENTRIES: usize = 100;
 
 /// Where the browser draws.
 pub trait Screen {
@@ -39,6 +56,8 @@ pub trait Screen {
         height: usize,
         draw: &mut dyn FnMut(&mut [u8], usize),
     ) -> Result<(), String>;
+    /// Nothing has happened for a while: free what only drawing needs.
+    fn idle(&self) {}
 }
 
 #[cfg(target_os = "macos")]
@@ -59,6 +78,10 @@ impl Screen for platform::Window {
         platform::Window::set_title(self, title);
     }
 
+    fn idle(&self) {
+        self.release_spare();
+    }
+
     fn render(
         &self,
         width: usize,
@@ -72,14 +95,76 @@ impl Screen for platform::Window {
 #[cfg(target_os = "macos")]
 pub fn run(opts: Options) -> std::process::ExitCode {
     let (width, height) = (f64::from(opts.width), f64::from(opts.height));
+    let session = std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join("Library/Application Support/Broxee/session"));
     platform::run_app("Broxee", width, height, move |window, events| {
-        Browser::new(opts, window).run(&events);
+        Browser::new(opts, window, session).run(&events);
     })
 }
 
+#[derive(Clone)]
 struct Entry {
     url: net::Url,
     scroll: f32,
+}
+
+/// A tab. The visible one's page lives in `Browser::page`; the others sleep.
+#[derive(Default)]
+struct Tab {
+    history: Vec<Entry>,
+    index: usize,
+    title: String,
+    /// What a sleeping tab is rebuilt from. `None` for the visible tab, for a tab whose snapshot
+    /// went over budget, and for tabs restored from a session.
+    snapshot: Option<Snapshot>,
+    /// When the tab was last visible, for choosing which snapshots to drop first.
+    seen: u64,
+}
+
+impl Tab {
+    fn entry(&self) -> Option<&Entry> {
+        self.history.get(self.index)
+    }
+
+    fn title(&self) -> &str {
+        if !self.title.is_empty() {
+            &self.title
+        } else if self.history.is_empty() {
+            "New tab"
+        } else {
+            "Untitled"
+        }
+    }
+}
+
+/// A closed tab ⌘⇧T can bring back: its history, not its page.
+struct Closed {
+    history: Vec<Entry>,
+    index: usize,
+    title: String,
+    position: usize,
+}
+
+/// Work and personal browsing kept apart: each profile has its own tabs and history, and
+/// switching drops every open connection and TLS session (`net::forget_sessions`).
+struct Profile {
+    name: &'static str,
+    hue: Hue,
+    tabs: Vec<Tab>,
+    active: usize,
+    closed: Vec<Closed>,
+}
+
+impl Profile {
+    fn new(name: &'static str, hue: Hue) -> Profile {
+        Profile {
+            name,
+            hue,
+            tabs: vec![Tab::default()],
+            active: 0,
+            closed: Vec::new(),
+        }
+    }
 }
 
 struct Field {
@@ -141,10 +226,19 @@ struct Browser<S: Screen> {
     height: f32,
     scale: f32,
     dark: bool,
+    /// The visible tab's page and scroll position.
     page: Option<Loaded>,
     scroll: f32,
-    history: Vec<Entry>,
-    index: usize,
+    /// The page shown is the visible tab's current entry, as loaded (not an error or a message),
+    /// so it may be kept as the tab's snapshot.
+    page_is_entry: bool,
+    profiles: Vec<Profile>,
+    /// The visible profile.
+    profile: usize,
+    sidebar: bool,
+    clock: u64,
+    snapshot_budget: usize,
+    session: Option<PathBuf>,
     field: Option<Field>,
     /// Header button with keyboard focus, reached with Tab.
     focus: Option<Button>,
@@ -152,7 +246,7 @@ struct Browser<S: Screen> {
 }
 
 impl<S: Screen> Browser<S> {
-    fn new(opts: Options, window: S) -> Browser<S> {
+    fn new(opts: Options, window: S, session: Option<PathBuf>) -> Browser<S> {
         let (width, height) = window.size();
         let (scale, dark) = (window.scale() as f32, window.dark());
         Browser {
@@ -167,17 +261,48 @@ impl<S: Screen> Browser<S> {
             dark,
             page: None,
             scroll: 0.0,
-            history: Vec::new(),
-            index: 0,
+            page_is_entry: false,
+            profiles: vec![
+                Profile::new("Personal", Hue::Emerald),
+                Profile::new("Work", Hue::Amber),
+            ],
+            profile: 0,
+            sidebar: true,
+            clock: 0,
+            snapshot_budget: SNAPSHOT_BUDGET,
+            session,
             field: None,
             focus: None,
             loading: None,
         }
     }
 
+    fn tab(&self) -> &Tab {
+        let p = &self.profiles[self.profile];
+        &p.tabs[p.active]
+    }
+
+    fn tab_mut(&mut self) -> &mut Tab {
+        let p = &mut self.profiles[self.profile];
+        &mut p.tabs[p.active]
+    }
+
+    /// Left edge of the pane, in points.
+    fn pane_left(&self) -> f32 {
+        if self.sidebar {
+            SIDEBAR_WIDTH.min(self.width)
+        } else {
+            0.0
+        }
+    }
+
+    fn pane_width(&self) -> f32 {
+        (self.width - self.pane_left()).max(1.0)
+    }
+
     fn settings(&self) -> Settings {
         Settings {
-            width: self.width,
+            width: self.pane_width(),
             height: self.page_height(),
             dark: self.dark,
             fetch_css: self.opts.fetch_css,
@@ -190,26 +315,81 @@ impl<S: Screen> Browser<S> {
 
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn run(&mut self, events: &Receiver<Event>) {
+        /// How long without events before the window frees its spare frame.
+        const IDLE_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
         self.start();
-        while let Ok(event) = events.recv() {
+        let mut trimmed = false;
+        loop {
+            let event = match events.recv_timeout(IDLE_AFTER) {
+                Ok(event) => event,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if !trimmed {
+                        self.window.idle();
+                        trimmed = true;
+                    }
+                    continue;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            };
             let mut dirty = self.handle(event);
             for event in events.try_iter() {
                 dirty |= self.handle(event);
             }
             if dirty {
                 self.render();
+                trimmed = false;
             }
         }
     }
 
-    /// Show the first frame and open the page from the command line.
+    /// Show the first frame, bring back the last session, and open the page from the command
+    /// line (selecting its tab if the session already has it).
     fn start(&mut self) {
         // The header needs fonts; they load in a few milliseconds, before the first frame.
         self.fonts.ready();
         self.render();
-        let target = self.opts.target.clone();
+        if let Some(text) = self
+            .session
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+        {
+            if let Some((profiles, visible)) = parse_session(&text) {
+                for (profile, (tabs, active)) in self.profiles.iter_mut().zip(profiles) {
+                    if !tabs.is_empty() {
+                        profile.active = active.min(tabs.len() - 1);
+                        profile.tabs = tabs;
+                    }
+                }
+                self.profile = visible.min(self.profiles.len() - 1);
+            }
+        }
+        let target = self.opts.target.trim().to_string();
+        if target.is_empty() {
+            self.wake();
+            return;
+        }
         match engine::to_url(&target) {
-            Ok(url) => self.navigate(url, true),
+            Ok(url) => {
+                let p = &self.profiles[self.profile];
+                let open = p
+                    .tabs
+                    .iter()
+                    .position(|t| t.entry().is_some_and(|e| e.url == url));
+                match open {
+                    Some(i) => {
+                        self.profiles[self.profile].active = i;
+                        self.wake();
+                    }
+                    None => {
+                        if !self.tab().history.is_empty() {
+                            let p = &mut self.profiles[self.profile];
+                            p.tabs.push(Tab::default());
+                            p.active = p.tabs.len() - 1;
+                        }
+                        self.navigate(url, true);
+                    }
+                }
+            }
             Err(e) => self.show_message("Broxee couldn't open that", &e),
         }
     }
@@ -223,14 +403,15 @@ impl<S: Screen> Browser<S> {
                 height,
                 scale,
             } => {
+                let size = (width as f32, height as f32, scale as f32);
+                if size == (self.width, self.height, self.scale) {
+                    // macOS repeats notifications (focus, the same backing scale): nothing to do.
+                    return false;
+                }
                 self.width = width as f32;
                 self.height = height as f32;
                 self.scale = scale as f32;
-                let settings = self.settings();
-                if let Some(page) = self.page.as_mut() {
-                    engine::relayout(page, settings, &self.fonts);
-                }
-                self.clamp_scroll();
+                self.relayout();
                 true
             }
             Event::Click { x, y } => self.click(x as f32, y as f32),
@@ -243,6 +424,15 @@ impl<S: Screen> Browser<S> {
                 None => false,
             },
         }
+    }
+
+    /// Lay the page out again for a new pane size.
+    fn relayout(&mut self) {
+        let settings = self.settings();
+        if let Some(page) = self.page.as_mut() {
+            engine::relayout(page, settings, &self.fonts);
+        }
+        self.clamp_scroll();
     }
 
     fn max_scroll(&self) -> f32 {
@@ -266,9 +456,23 @@ impl<S: Screen> Browser<S> {
     }
 
     fn click(&mut self, x: f32, y: f32) -> bool {
+        let left = self.pane_left();
+        if x < left {
+            self.field = None;
+            self.focus = None;
+            let p = &self.profiles[self.profile];
+            return match chrome::sidebar_hit(x, y, p.tabs.len(), p.active) {
+                Some(SidebarItem::Profile) => self.switch_profile(),
+                Some(SidebarItem::Tab(i)) => self.select_tab(i),
+                Some(SidebarItem::CloseTab(_)) => self.close_tab(),
+                Some(SidebarItem::NewTab) => self.new_tab(),
+                None => false,
+            };
+        }
+        let x = x - left;
         if y < HEADER_HEIGHT {
             self.focus = None;
-            return match chrome::hit(x, self.width) {
+            return match chrome::hit(x, self.pane_width()) {
                 Some(Button::Back) => self.back(),
                 Some(Button::Forward) => self.forward(),
                 Some(Button::Reload) => self.reload(),
@@ -288,6 +492,21 @@ impl<S: Screen> Browser<S> {
     fn key(&mut self, k: KeyEvent) -> bool {
         if k.command {
             return match k.key {
+                Key::Char('t') if k.shift => self.reopen_tab(),
+                Key::Char('t') => self.new_tab(),
+                Key::Char('w') => self.close_tab(),
+                Key::Char('p') if k.shift => self.switch_profile(),
+                Key::Char('\\') => {
+                    self.sidebar = !self.sidebar;
+                    self.relayout();
+                    true
+                }
+                // ⌘9 is the last tab, as in other browsers.
+                Key::Char('9') => {
+                    let last = self.profiles[self.profile].tabs.len() - 1;
+                    self.select_tab(last)
+                }
+                Key::Char(c @ '1'..='8') => self.select_tab(c as usize - '1' as usize),
                 Key::Char('l') => self.focus_field(),
                 Key::Char('[') => self.back(),
                 Key::Char(']') => self.forward(),
@@ -379,10 +598,11 @@ impl<S: Screen> Browser<S> {
             self.focus
         };
         let start = current.and_then(|b| order.iter().position(|&o| o == b));
+        let tab = self.tab();
         let enabled = |b: Button| match b {
-            Button::Back => self.index > 0,
-            Button::Forward => self.index + 1 < self.history.len(),
-            Button::Reload => !self.history.is_empty(),
+            Button::Back => tab.index > 0,
+            Button::Forward => tab.index + 1 < tab.history.len(),
+            Button::Reload => !tab.history.is_empty(),
             Button::Address => true,
         };
         let n = order.len();
@@ -410,8 +630,8 @@ impl<S: Screen> Browser<S> {
     fn focus_field(&mut self) -> bool {
         self.focus = None;
         let text = self
-            .history
-            .get(self.index)
+            .tab()
+            .entry()
             .map(|e| e.url.to_string())
             .unwrap_or_default();
         self.field = Some(Field {
@@ -424,33 +644,40 @@ impl<S: Screen> Browser<S> {
 
     fn save_scroll(&mut self) {
         let scroll = self.scroll;
-        if let Some(entry) = self.history.get_mut(self.index) {
+        let tab = self.tab_mut();
+        let index = tab.index;
+        if let Some(entry) = tab.history.get_mut(index) {
             entry.scroll = scroll;
         }
     }
 
     fn back(&mut self) -> bool {
-        if self.index == 0 || self.history.is_empty() || self.loading.is_some() {
+        if self.tab().index == 0 || self.loading.is_some() {
             return false;
         }
         self.save_scroll();
-        self.index -= 1;
-        self.navigate(self.history[self.index].url.clone(), false);
+        let tab = self.tab_mut();
+        tab.index -= 1;
+        let url = tab.history[tab.index].url.clone();
+        self.navigate(url, false);
         true
     }
 
     fn forward(&mut self) -> bool {
-        if self.index + 1 >= self.history.len() || self.loading.is_some() {
+        let tab = self.tab();
+        if tab.index + 1 >= tab.history.len() || self.loading.is_some() {
             return false;
         }
         self.save_scroll();
-        self.index += 1;
-        self.navigate(self.history[self.index].url.clone(), false);
+        let tab = self.tab_mut();
+        tab.index += 1;
+        let url = tab.history[tab.index].url.clone();
+        self.navigate(url, false);
         true
     }
 
     fn reload(&mut self) -> bool {
-        let Some(entry) = self.history.get(self.index) else {
+        let Some(entry) = self.tab().entry() else {
             return false;
         };
         let url = entry.url.clone();
@@ -486,6 +713,7 @@ impl<S: Screen> Browser<S> {
             self.render_with(&fonts);
         });
         self.fonts = fonts;
+        let loaded = result.is_ok();
         let page = result.unwrap_or_else(|e| {
             engine::page_from_html(
                 url.clone(),
@@ -495,20 +723,197 @@ impl<S: Screen> Browser<S> {
             )
         });
 
+        let tab = self.tab_mut();
         let scroll = if push {
-            if !self.history.is_empty() {
-                self.history.truncate(self.index + 1);
+            if !tab.history.is_empty() {
+                tab.history.truncate(tab.index + 1);
             }
-            self.history.push(Entry {
+            tab.history.push(Entry {
                 url: page.url.clone(),
                 scroll: 0.0,
             });
-            self.index = self.history.len() - 1;
+            tab.index = tab.history.len() - 1;
             0.0
         } else {
-            self.history[self.index].scroll
+            tab.history[tab.index].scroll
         };
-        self.show(page, scroll);
+        self.tab_mut().title = self.show(page, scroll);
+        self.page_is_entry = loaded;
+        self.save_session();
+    }
+
+    /// Put the visible tab to sleep: keep what rebuilds its page, drop the page.
+    fn sleep(&mut self) {
+        self.save_scroll();
+        self.field = None;
+        self.focus = None;
+        let page = self.page.take();
+        let keep = std::mem::take(&mut self.page_is_entry);
+        self.clock += 1;
+        let clock = self.clock;
+        let tab = self.tab_mut();
+        tab.seen = clock;
+        if let Some(page) = page.filter(|_| keep) {
+            tab.snapshot = Some(engine::snapshot(page));
+        }
+        self.trim_snapshots();
+    }
+
+    /// Drop the snapshots of the tabs seen longest ago until the rest fit the budget.
+    fn trim_snapshots(&mut self) {
+        let mut sleeping: Vec<(u64, usize, usize, usize)> = Vec::new();
+        for (p, profile) in self.profiles.iter().enumerate() {
+            for (t, tab) in profile.tabs.iter().enumerate() {
+                if let Some(snapshot) = &tab.snapshot {
+                    sleeping.push((tab.seen, snapshot.bytes(), p, t));
+                }
+            }
+        }
+        let mut total: usize = sleeping.iter().map(|s| s.1).sum();
+        sleeping.sort_unstable_by_key(|s| s.0);
+        for (_, bytes, p, t) in sleeping {
+            if total <= self.snapshot_budget {
+                break;
+            }
+            self.profiles[p].tabs[t].snapshot = None;
+            total -= bytes;
+        }
+    }
+
+    /// Show the visible tab: from its snapshot, from the network, or as a new tab.
+    fn wake(&mut self) {
+        let settings = self.settings();
+        let tab = self.tab_mut();
+        let snapshot = tab.snapshot.take();
+        let entry = tab.entry().cloned();
+        let title = tab.title().to_string();
+        if let (Some(snapshot), Some(entry)) = (snapshot, &entry) {
+            if let Ok(page) = engine::restore(snapshot, settings, &self.fonts) {
+                self.tab_mut().title = self.show(page, entry.scroll);
+                self.page_is_entry = true;
+                self.save_session();
+                return;
+            }
+        }
+        match entry {
+            Some(entry) => self.navigate(entry.url, false),
+            None => {
+                // A new tab: an empty pane with the address field open.
+                self.page = None;
+                self.page_is_entry = false;
+                self.scroll = 0.0;
+                self.window.set_title(&title);
+                self.focus_field();
+                self.save_session();
+                self.render();
+            }
+        }
+    }
+
+    fn select_tab(&mut self, i: usize) -> bool {
+        let p = &self.profiles[self.profile];
+        if i >= p.tabs.len() || i == p.active || self.loading.is_some() {
+            return false;
+        }
+        self.sleep();
+        self.profiles[self.profile].active = i;
+        self.wake();
+        true
+    }
+
+    fn new_tab(&mut self) -> bool {
+        if self.loading.is_some() {
+            return false;
+        }
+        self.sleep();
+        let p = &mut self.profiles[self.profile];
+        p.tabs.push(Tab::default());
+        p.active = p.tabs.len() - 1;
+        self.wake();
+        true
+    }
+
+    /// Close the visible tab. The last tab of a profile is replaced by a new one.
+    fn close_tab(&mut self) -> bool {
+        if self.loading.is_some() {
+            return false;
+        }
+        self.save_scroll();
+        self.page = None;
+        self.page_is_entry = false;
+        self.field = None;
+        self.focus = None;
+        let p = &mut self.profiles[self.profile];
+        let tab = p.tabs.remove(p.active);
+        if !tab.history.is_empty() {
+            if p.closed.len() >= CLOSED_LIMIT {
+                p.closed.remove(0);
+            }
+            p.closed.push(Closed {
+                history: tab.history,
+                index: tab.index,
+                title: tab.title,
+                position: p.active,
+            });
+        }
+        if p.tabs.is_empty() {
+            p.tabs.push(Tab::default());
+        }
+        p.active = p.active.min(p.tabs.len() - 1);
+        self.wake();
+        true
+    }
+
+    fn reopen_tab(&mut self) -> bool {
+        if self.loading.is_some() || self.profiles[self.profile].closed.is_empty() {
+            return false;
+        }
+        self.sleep();
+        let p = &mut self.profiles[self.profile];
+        let closed = p.closed.pop().expect("checked above");
+        let at = closed.position.min(p.tabs.len());
+        p.tabs.insert(
+            at,
+            Tab {
+                history: closed.history,
+                index: closed.index,
+                title: closed.title,
+                ..Tab::default()
+            },
+        );
+        p.active = at;
+        self.wake();
+        true
+    }
+
+    fn switch_profile(&mut self) -> bool {
+        if self.loading.is_some() {
+            return false;
+        }
+        self.sleep();
+        // Nothing a server could use to link the two profiles carries over.
+        net::forget_sessions();
+        self.profile = (self.profile + 1) % self.profiles.len();
+        self.wake();
+        true
+    }
+
+    /// Write the tabs and their history (not their pages) so the next start brings them back.
+    fn save_session(&self) {
+        let Some(path) = &self.session else {
+            return;
+        };
+        let text = write_session(&self.profiles, self.profile);
+        let tmp = path.with_extension("tmp");
+        let written = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&tmp, text))
+            .and_then(|()| std::fs::rename(&tmp, path));
+        if let Err(e) = written {
+            self.window
+                .set_title(&format!("Broxee: couldn't save the session ({e})"));
+        }
     }
 
     /// A page Broxee writes itself, without a history entry.
@@ -519,15 +924,22 @@ impl<S: Screen> Browser<S> {
         self.show(page, 0.0);
     }
 
-    fn show(&mut self, page: Loaded, scroll: f32) {
+    /// Show `page` in the pane; returns its title.
+    fn show(&mut self, page: Loaded, scroll: f32) -> String {
         let title = page.dom.title().unwrap_or_else(|| host_of(&page.url));
         self.window.set_title(&title);
+        self.page_is_entry = false;
         self.page = Some(page);
         self.loading = None;
         self.scroll = scroll;
         self.clamp_scroll();
         self.painter.trim(GLYPH_CACHE_LIMIT);
+        // Loading freed a lot (the previous page, stylesheet text, parse scratch): hand it back
+        // to the system before the frame that needs a second surface.
+        #[cfg(target_os = "macos")]
+        platform::release_free_memory();
         self.render();
+        title
     }
 
     /// The link under a point in the page area (points, top of the page area at 0). The
@@ -579,15 +991,17 @@ impl<S: Screen> Browser<S> {
         let height_px = (self.height * scale).round().max(1.0) as usize;
         let header_rows = ((HEADER_HEIGHT * scale).round() as usize).min(height_px);
         let page_rows = height_px - header_rows;
+        let sidebar_px = ((self.pane_left() * scale).round() as usize).min(width_px - 1);
+        let pane_px = width_px - sidebar_px;
 
-        let host = self
-            .history
-            .get(self.index)
-            .map(|e| host_of(&e.url))
-            .unwrap_or_default();
+        let profile = &self.profiles[self.profile];
+        let tab = &profile.tabs[profile.active];
+        let host = tab.entry().map(|e| host_of(&e.url)).unwrap_or_default();
         let header = HeaderView {
-            can_back: self.index > 0 && self.loading.is_none(),
-            can_forward: self.index + 1 < self.history.len() && self.loading.is_none(),
+            profile: profile.name,
+            hue: profile.hue,
+            can_back: tab.index > 0 && self.loading.is_none(),
+            can_forward: tab.index + 1 < tab.history.len() && self.loading.is_none(),
             loading: self.loading,
             host: &host,
             field: self.field.as_ref().map(|f| FieldView {
@@ -597,9 +1011,24 @@ impl<S: Screen> Browser<S> {
             }),
             focused: self.focus,
         };
+        let tabs: Vec<TabView> = profile
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(i, t)| TabView {
+                title: t.title(),
+                asleep: i != profile.active,
+            })
+            .collect();
+        let sidebar = (sidebar_px > 0).then_some(SidebarView {
+            profile: profile.name,
+            hue: profile.hue,
+            tabs: &tabs,
+            active: profile.active,
+        });
         let view = self.page.as_ref().map(|p| engine::page_view(p, fonts));
         let viewport = Viewport {
-            width: self.width,
+            width: pane_px as f32 / scale,
             height: page_rows as f32 / scale,
             scale,
             scroll_y: self.scroll,
@@ -609,6 +1038,16 @@ impl<S: Screen> Browser<S> {
         let shown = self
             .window
             .render(width_px, height_px, &mut |pixels, stride| {
+                if let Some(sidebar) = &sidebar {
+                    let frame = Frame {
+                        pixels: &mut *pixels,
+                        stride,
+                        left: 0,
+                        width: sidebar_px,
+                        scale,
+                    };
+                    chrome.draw_sidebar(painter, frame, fonts.set(), fonts.metrics(), sidebar);
+                }
                 let (top, bottom) = pixels.split_at_mut(header_rows * stride);
                 match &view {
                     Some(view) if page_rows > 0 => {
@@ -619,15 +1058,17 @@ impl<S: Screen> Browser<S> {
                                 pixels: bottom,
                                 stride,
                                 bgra: true,
+                                left: sidebar_px,
                             },
                         );
                     }
-                    _ => chrome::fill(bottom, stride, width_px, blank),
+                    _ => chrome::fill(bottom, stride, sidebar_px, pane_px, blank),
                 }
                 let frame = Frame {
                     pixels: top,
                     stride,
-                    width: width_px,
+                    left: sidebar_px,
+                    width: pane_px,
                     scale,
                 };
                 chrome.draw(painter, frame, fonts.set(), fonts.metrics(), &header);
@@ -636,6 +1077,75 @@ impl<S: Screen> Browser<S> {
             self.window.set_title(&format!("Broxee: {e}"));
         }
     }
+}
+
+/// The session as text: one line per profile, tab and history entry, tab-separated. Pages
+/// are not saved; restored tabs reload when selected.
+fn write_session(profiles: &[Profile], visible: usize) -> String {
+    let clean = |s: &str| s.replace(['\t', '\n', '\r'], " ");
+    let mut out = format!("broxee-session 1\nvisible\t{visible}\n");
+    for profile in profiles {
+        out += &format!("profile\t{}\t{}\n", profile.active, profile.name);
+        for tab in &profile.tabs {
+            out += &format!("tab\t{}\t{}\n", tab.index, clean(&tab.title));
+            for entry in &tab.history {
+                out += &format!("entry\t{}\t{}\n", entry.scroll, entry.url);
+            }
+        }
+    }
+    out
+}
+
+type SessionProfile = (Vec<Tab>, usize);
+
+/// Read a session written by `write_session`; anything malformed is skipped, never trusted.
+fn parse_session(text: &str) -> Option<(Vec<SessionProfile>, usize)> {
+    let mut lines = text.lines();
+    if lines.next()? != "broxee-session 1" {
+        return None;
+    }
+    let mut visible = 0;
+    let mut profiles: Vec<SessionProfile> = Vec::new();
+    for line in lines {
+        let mut parts = line.splitn(3, '\t');
+        let (kind, a, b) = (parts.next()?, parts.next(), parts.next());
+        let number = a.and_then(|a| a.parse::<usize>().ok()).unwrap_or(0);
+        match kind {
+            "visible" => visible = number,
+            "profile" => profiles.push((Vec::new(), number)),
+            "tab" => {
+                if let Some((tabs, _)) = profiles.last_mut().filter(|p| p.0.len() < SESSION_TABS) {
+                    tabs.push(Tab {
+                        index: number,
+                        title: b.unwrap_or_default().to_string(),
+                        ..Tab::default()
+                    });
+                }
+            }
+            "entry" => {
+                let tab = profiles.last_mut().and_then(|p| p.0.last_mut());
+                let url = b.and_then(|u| net::Url::parse(u).ok());
+                let scroll = a
+                    .and_then(|a| a.parse::<f32>().ok())
+                    .filter(|s| s.is_finite());
+                if let (Some(tab), Some(url)) = (tab, url) {
+                    if tab.history.len() < SESSION_ENTRIES {
+                        tab.history.push(Entry {
+                            url,
+                            scroll: scroll.unwrap_or(0.0).max(0.0),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for (tabs, _) in &mut profiles {
+        for tab in tabs.iter_mut() {
+            tab.index = tab.index.min(tab.history.len().saturating_sub(1));
+        }
+    }
+    Some((profiles, visible))
 }
 
 /// The nearest `<a href>` at or above `node`, resolved against the page URL. Only links Broxee
@@ -735,7 +1245,8 @@ mod tests {
     use std::cell::RefCell;
     use std::path::{Path, PathBuf};
 
-    /// An in-memory screen: 400 x 300 points at 1x, rows padded to exercise the stride.
+    /// An in-memory screen: 640 x 300 points at 1x (a 400-point pane beside the sidebar), rows
+    /// padded to exercise the stride.
     #[derive(Default)]
     struct FakeScreen {
         title: RefCell<String>,
@@ -750,7 +1261,7 @@ mod tests {
         }
 
         fn size(&self) -> (f64, f64) {
-            (400.0, 300.0)
+            (640.0, 300.0)
         }
 
         fn dark(&self) -> bool {
@@ -805,6 +1316,10 @@ mod tests {
     }
 
     fn browser(target: &Path) -> Browser<FakeScreen> {
+        browser_with(target, None)
+    }
+
+    fn browser_with(target: &Path, session: Option<PathBuf>) -> Browser<FakeScreen> {
         let opts = Options {
             target: target.display().to_string(),
             tree: false,
@@ -814,12 +1329,12 @@ mod tests {
             paint: false,
             window: true,
             depth: 8,
-            width: 400.0,
+            width: 640.0,
             height: 300.0,
             scale: 1.0,
             fetch_css: false,
         };
-        let mut b = Browser::new(opts, FakeScreen::default());
+        let mut b = Browser::new(opts, FakeScreen::default(), session);
         b.start();
         b
     }
@@ -854,7 +1369,7 @@ mod tests {
             .find(|t| page.layout.text(t).contains(text))
             .expect("text on the page");
         let (x, y) = (
-            run.x + run.width / 2.0,
+            SIDEBAR_WIDTH + run.x + run.width / 2.0,
             run.baseline - 4.0 - b.scroll + HEADER_HEIGHT,
         );
         b.handle(Event::Click {
@@ -870,7 +1385,7 @@ mod tests {
         assert_eq!(title(&b), "Page A");
         assert!(click_text(&mut b, "Go to B"));
         assert_eq!(title(&b), "Page B");
-        assert_eq!((b.history.len(), b.index), (2, 1));
+        assert_eq!((b.tab().history.len(), b.tab().index), (2, 1));
         assert!(b.handle(command('[')));
         assert_eq!(title(&b), "Page A");
         assert!(b.handle(command(']')));
@@ -878,7 +1393,7 @@ mod tests {
         assert!(!b.handle(command(']')), "nothing forward of the last page");
         assert!(click_text(&mut b, "Back to A"));
         assert_eq!(
-            (b.history.len(), b.index),
+            (b.tab().history.len(), b.tab().index),
             (3, 2),
             "a new page after going back keeps the trail"
         );
@@ -979,7 +1494,7 @@ mod tests {
             .unwrap();
         let t = layout.texts[pinned];
         assert!(layout.text_is_fixed(pinned));
-        let (x, y) = (t.x + 2.0, t.baseline - 4.0 + HEADER_HEIGHT);
+        let (x, y) = (SIDEBAR_WIDTH + t.x + 2.0, t.baseline - 4.0 + HEADER_HEIGHT);
         assert!(b.handle(Event::Click {
             x: f64::from(x),
             y: f64::from(y)
@@ -994,7 +1509,7 @@ mod tests {
             .unwrap();
         let t = layout.texts[ghost];
         b.handle(Event::Click {
-            x: f64::from(t.x + 2.0),
+            x: f64::from(SIDEBAR_WIDTH + t.x + 2.0),
             y: f64::from(t.baseline - 4.0 + HEADER_HEIGHT),
         });
         assert_eq!(title(&b), "Fixed", "a hidden link does not navigate");
@@ -1036,26 +1551,211 @@ mod tests {
         let mut b = browser(&a);
         b.render();
         let theme = b.chrome.theme();
+        let bgra = |c: css::Color| [c.b, c.g, c.r, 255];
+        let edge = theme.profile(Hue::Emerald);
         assert_eq!(
-            b.window.pixel(200, 2),
-            [theme.surface.b, theme.surface.g, theme.surface.r, 255]
+            b.window.pixel(440, 0),
+            bgra(edge),
+            "profile edge over the pane"
         );
+        assert_eq!(b.window.pixel(100, 1), bgra(edge), "and over the switcher");
+        assert_eq!(b.window.pixel(440, 2), bgra(theme.surface));
+        assert_eq!(b.window.pixel(440, 35), bgra(theme.line), "bottom hairline");
         assert_eq!(
-            b.window.pixel(200, 35),
-            [theme.line.b, theme.line.g, theme.line.r, 255],
-            "bottom hairline"
+            b.window.pixel(239, 200),
+            bgra(theme.line),
+            "sidebar hairline"
         );
+        assert_eq!(b.window.pixel(4, 280), bgra(theme.canvas), "sidebar");
         assert_eq!(
-            b.window.pixel(399, 200),
+            b.window.pixel(639, 200),
             [255, 255, 255, 255],
             "page canvas below the header"
         );
         assert!(b.handle(Event::Resize {
-            width: 250.0,
+            width: 490.0,
             height: 300.0,
             scale: 1.0
         }));
         assert_eq!(b.page.as_ref().unwrap().layout.width, 250.0);
+        assert!(b.handle(command('\\')), "⌘\\ hides the sidebar");
+        assert_eq!(b.page.as_ref().unwrap().layout.width, 490.0);
+    }
+
+    fn command_shift(c: char) -> Event {
+        Event::Key(KeyEvent {
+            key: Key::Char(c),
+            command: true,
+            shift: true,
+        })
+    }
+
+    fn open(b: &mut Browser<FakeScreen>, path: &Path) {
+        b.handle(command('l'));
+        b.handle(Event::Paste(format!("file://{}", path.display())));
+        b.handle(key(Key::Enter));
+    }
+
+    fn tab_titles(b: &Browser<FakeScreen>) -> Vec<String> {
+        let p = &b.profiles[b.profile];
+        p.tabs.iter().map(|t| t.title().to_string()).collect()
+    }
+
+    #[test]
+    fn sleeping_tabs_wake_from_their_snapshot_without_the_network() {
+        let (a, bpath) = site("sleep");
+        let mut b = browser(&a);
+        b.handle(key(Key::PageDown));
+        let saved = b.scroll;
+        assert!(saved > 0.0);
+
+        assert!(b.handle(command('t')));
+        assert!(b.page.is_none(), "a new tab is empty");
+        assert_eq!(b.field.as_ref().map(|f| f.text.as_str()), Some(""));
+        assert_eq!(tab_titles(&b), ["Page A", "New tab"]);
+        open(&mut b, &bpath);
+        assert_eq!(title(&b), "Page B");
+        assert!(
+            b.profiles[0].tabs[0].snapshot.is_some(),
+            "A sleeps as a snapshot"
+        );
+
+        // With A's file gone, only the snapshot can bring it back.
+        std::fs::remove_file(&a).unwrap();
+        assert!(b.handle(command('1')));
+        assert_eq!(title(&b), "Page A");
+        assert_eq!(b.scroll, saved, "at the same scroll position");
+        assert!(b.profiles[0].tabs[1].snapshot.is_some());
+        assert!(
+            b.profiles[0].tabs[0].snapshot.is_none(),
+            "the visible tab is awake"
+        );
+        assert!(!b.handle(command('1')), "already selected");
+
+        // Clicking the second row in the sidebar selects it.
+        assert!(b.handle(Event::Click { x: 100.0, y: 93.0 }));
+        assert_eq!(title(&b), "Page B");
+        b.handle(command('1'));
+        assert!(b.handle(command('9')), "⌘9 is the last tab");
+        assert_eq!(b.profiles[0].active, 1);
+    }
+
+    #[test]
+    fn snapshots_past_the_budget_fall_back_to_the_network() {
+        let (a, bpath) = site("budget");
+        let mut b = browser(&a);
+        b.snapshot_budget = 0;
+        b.handle(command('t'));
+        open(&mut b, &bpath);
+        assert!(b.profiles[0].tabs[0].snapshot.is_none());
+        assert!(b.handle(command('1')));
+        assert_eq!(title(&b), "Page A", "reloaded from its URL");
+    }
+
+    #[test]
+    fn closes_and_reopens_tabs() {
+        let (a, bpath) = site("close");
+        let mut b = browser(&a);
+        b.handle(command('t'));
+        open(&mut b, &bpath);
+        assert!(b.handle(command('w')));
+        assert_eq!(tab_titles(&b), ["Page A"]);
+        assert_eq!(title(&b), "Page A");
+        assert!(b.handle(command_shift('t')));
+        assert_eq!(tab_titles(&b), ["Page A", "Page B"]);
+        assert_eq!((b.profiles[0].active, title(&b).as_str()), (1, "Page B"));
+        assert!(!b.handle(command_shift('t')), "nothing left to reopen");
+
+        // The close button on the active row.
+        assert!(b.handle(Event::Click { x: 220.0, y: 93.0 }));
+        assert!(b.handle(command('w')));
+        assert_eq!(
+            tab_titles(&b),
+            ["New tab"],
+            "the last tab becomes a new tab"
+        );
+        assert!(b.page.is_none());
+        assert!(b.handle(command_shift('t')));
+        assert_eq!(tab_titles(&b), ["Page A", "New tab"]);
+    }
+
+    #[test]
+    fn profiles_keep_their_own_tabs() {
+        let (a, bpath) = site("profiles");
+        let mut b = browser(&a);
+        assert!(b.handle(command_shift('p')));
+        assert_eq!(b.profiles[b.profile].name, "Work");
+        assert_eq!(tab_titles(&b), ["New tab"]);
+        assert_eq!(title(&b), "New tab");
+        b.render();
+        let theme = b.chrome.theme();
+        let amber = theme.profile(Hue::Amber);
+        assert_eq!(b.window.pixel(440, 0), [amber.b, amber.g, amber.r, 255]);
+        open(&mut b, &bpath);
+        assert_eq!(title(&b), "Page B");
+
+        assert!(b.handle(command_shift('p')));
+        assert_eq!(tab_titles(&b), ["Page A"]);
+        assert_eq!(title(&b), "Page A");
+        assert!(b.handle(Event::Click { x: 100.0, y: 10.0 }), "the switcher");
+        assert_eq!(title(&b), "Page B");
+    }
+
+    #[test]
+    fn restores_the_session_with_tabs_asleep() {
+        let (a, bpath) = site("session");
+        let path = a.with_file_name("session");
+        let _ = std::fs::remove_file(&path);
+        let mut b = browser_with(&a, Some(path.clone()));
+        b.handle(command('t'));
+        open(&mut b, &bpath);
+        b.handle(key(Key::Down));
+        b.handle(command_shift('p'));
+        b.handle(command_shift('p'));
+        drop(b);
+
+        let b = browser_with(Path::new(""), Some(path.clone()));
+        assert_eq!(tab_titles(&b), ["Page A", "Page B"]);
+        assert_eq!(b.profiles[0].active, 1);
+        assert_eq!(title(&b), "Page B", "only the visible tab loads");
+        assert!(b.profiles[0].tabs[0].snapshot.is_none());
+        assert_eq!(b.profiles[1].tabs.len(), 1);
+
+        // Opening an address the session already has selects its tab.
+        let b = browser_with(&a, Some(path));
+        assert_eq!(tab_titles(&b).len(), 2);
+        assert_eq!((b.profiles[0].active, title(&b).as_str()), (0, "Page A"));
+    }
+
+    #[test]
+    fn reads_damaged_sessions_safely() {
+        assert!(parse_session("").is_none());
+        assert!(parse_session("something else\nvisible\t1").is_none());
+        let (profiles, visible) = parse_session(
+            "broxee-session 1\nvisible\t7\nentry\t0\thttps://orphan.example/\n\
+             profile\t0\tPersonal\ntab\t9\tKept\nentry\tNaN\thttps://a.example/\n\
+             entry\t5\tnot a url\nbogus line\n",
+        )
+        .unwrap();
+        assert_eq!(visible, 7, "clamped by the caller");
+        let tab = &profiles[0].0[0];
+        assert_eq!(
+            (tab.title.as_str(), tab.index, tab.history.len()),
+            ("Kept", 0, 1)
+        );
+        assert_eq!(tab.history[0].scroll, 0.0);
+
+        let mut personal = Profile::new("Personal", Hue::Emerald);
+        personal.tabs[0].title = "A\ttab\nname".into();
+        personal.tabs[0].history.push(Entry {
+            url: net::Url::parse("https://a.example/x").unwrap(),
+            scroll: 12.5,
+        });
+        let text = write_session(&[personal], 0);
+        let (profiles, _) = parse_session(&text).unwrap();
+        let tab = &profiles[0].0[0];
+        assert_eq!(tab.title, "A tab name");
+        assert_eq!(tab.history[0].scroll, 12.5);
     }
 
     #[test]

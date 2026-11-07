@@ -2,11 +2,23 @@
 
 html, body, address, blockquote, center, dd, details, dialog, div, dl, dt, fieldset, figcaption,
 figure, footer, form, h1, h2, h3, h4, h5, h6, header, hgroup, hr, legend, main, menu, nav, ol, p,
-pre, section, summary, ul, article, aside, table, thead, tbody, tfoot, tr, caption, optgroup {
+pre, section, summary, ul, article, aside, optgroup {
   display: block;
 }
 li { display: list-item }
-td, th { display: inline-block }
+
+/* Tables, as in the HTML standard's rendering section. */
+table { display: table; border-spacing: 2px; border-collapse: separate; box-sizing: border-box }
+caption { display: table-caption; text-align: center }
+thead { display: table-header-group }
+tbody { display: table-row-group }
+tfoot { display: table-footer-group }
+tr { display: table-row }
+td, th { display: table-cell; padding: 1px }
+col { display: table-column }
+colgroup { display: table-column-group }
+thead, tbody, tfoot, table > tr { vertical-align: middle }
+tr, td, th { vertical-align: inherit }
 head, script, style, title, meta, link, template, base, area, datalist, param, rp, [hidden] {
   display: none;
 }
@@ -31,6 +43,7 @@ i, em, cite, var, dfn, address { font-style: italic }
 pre { white-space: pre }
 small { font-size: smaller }
 big { font-size: larger }
-center, th { text-align: center }
+th { text-align: center }
+center { text-align: -webkit-center }
 
 a { color: #0000ee; text-decoration: underline }
