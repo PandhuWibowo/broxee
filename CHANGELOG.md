@@ -192,3 +192,8 @@
   and sleeping tabs ("Asleep to save memory. Select to wake."), and hide on any other input. The window
   reports pointer moves and can write to the clipboard. A flaky 50 ms timing check in a test became a 2 s
   guard.
+- CSS parsing (#16): rules whose selector text names a class or id the page lacks are dropped before their
+  selectors are built. GitHub's 30 sheets (3.4 MB): 15.0 → 11.7 ms and 155,109 → 34,167 allocations, with
+  the same 820 rules kept; checked rule by rule against the full selector check on GitHub, Wikipedia, MDN
+  and Hacker News. `cargo run --release -p css --example parse_bench -- page.html sheets...` measures it
+  (`CHECK=1` runs the comparison). The old "about 125 ms" note was stale.

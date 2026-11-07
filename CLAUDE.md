@@ -139,6 +139,9 @@ casts), not taken from binding crates. Ask before proposing any dependency.
 - **Stylesheets are parsed against the document's vocabulary** (`css::Vocabulary`): rules needing a tag, id,
   class, attribute or exact attribute value (`[data-theme=dark]`) the DOM lacks are dropped. Correct only while the DOM cannot gain names. When scripts arrive, keep the
   source text and re-parse without a vocabulary (or add the new names and re-parse) before restyling.
+- **`Vocabulary::text_could_match` may only reject what `could_match` rejects.** It skips anything inside
+  parentheses, brackets or strings and any escaped name. After changing either, run
+  `CHECK=1 cargo run --release -p css --example parse_bench -- page.html sheets...` on real sites.
 - **Presentational hints** (`hints.rs`) apply between UA and author rules; elements with hints skip the
   matched-rule cache because the result depends on attributes.
 - **Unsupported selectors are dropped, never approximated.** A selector Broxee cannot evaluate must not match;
