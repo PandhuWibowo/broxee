@@ -1,0 +1,10 @@
+[package]
+name = "net"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# TLS is the one piece we do not write ourselves: hand-rolled crypto is unsafe.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+flate = { path = "../flate" }

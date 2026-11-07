@@ -1,0 +1,7 @@
+[package]
+name = "platform"
+version.workspace = true
+edition.workspace = true
+
+# No dependencies: the window layer talks to the OS through its C and Objective-C ABIs directly.
+[dependencies]

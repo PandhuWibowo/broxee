@@ -1,0 +1,100 @@
+# Changelog
+
+## Unreleased
+
+### Added
+- `net`: URL parsing and relative resolution, HTTP/1.1 over TCP with TLS (rustls), chunked bodies, redirects, `file://`.
+- `html`: tokenizer, entity decoding, tree builder with implied end tags and raw-text elements, arena DOM.
+- `shell`: `broxee <url-or-file> [--tree] [--depth N]`, printing timings and peak RAM.
+- `scripts/budget.sh`: fails the build when the binary or peak RAM reaches 60 MB.
+- Project files: `CLAUDE.md`, `AGENT.md`, `.claude/`, CI (fmt, clippy, tests, budget on Linux and macOS), `Makefile`.
+
+- `css`: stylesheet and `style=""` parsing with shorthand expansion, `@media` evaluated against the
+  viewport, selector matching (type, class, id, attribute, `:root`, descendant, child), cascade with
+  specificity, `!important`, inline styles and inheritance, and a user-agent stylesheet.
+- `shell`: loads `<style>` and `<link rel=stylesheet>` (up to 32), runs the cascade, `--styles` prints
+  computed styles, `--no-css-fetch` skips external sheets.
+- `net`: a GET whose connection is reset is retried once.
+- `css`: `min-width`, `max-width`, `min-height`, `max-height`; `vw`, `vh`, `vmin`, `vmax` units; rules whose
+  subject is only an attribute selector get their own index bucket.
+- `font`: TrueType/OpenType reader for advances and vertical metrics (cmap formats 4 and 12, `.ttc`).
+- `layout`: block layout (sizes, auto margins, min/max, percentages, sibling margin collapsing), inline layout
+  (line breaking, white-space modes, `<br>`, text-align, half-leading baselines), `<img>` from its size,
+  scrollable height including overflow.
+- `shell`: `--layout` prints every box and line, `--width` sets the viewport; text is measured with Arial or
+  DejaVu Sans when present.
+- `font`: glyph outlines from `glyf`/`loca`, including composite glyphs and their transforms.
+- `paint`: display list, signed-area anti-aliased rasterizer, glyph cache, compositing in parallel bands,
+  painting into caller-owned strided BGRA memory, PNG writer (CRC-32, Adler-32, stored deflate).
+- `platform`: macOS window through the Objective-C runtime, Quit menu, quit on last window close, engine thread
+  with `dispatch_async_f` hand-off, frames shown through `IOSurface` without copies.
+- `shell`: `--window`, `--png`, `--paint`, `--scale`, `--height`; stylesheets fetched and parsed in parallel
+  (bounded to 6, joined in document order); fonts load in parallel with the page.
+- `css`: `:link` and `:any-link`.
+- `html`: `ChunkVec`, a chunked list that grows without copying.
+- `docs/pipeline.md`: which stages are sequential, parallel, or main-thread only.
+
+- Browsing in the window: scrolling (trackpad, wheel, keys), following links, back/forward/reload with scroll
+  positions restored, an address field (⌘L, typing, paste, Enter/Esc), Tab focus through the header with focus
+  rings, error and message pages rendered by the engine, re-layout on resize, dark appearance from macOS.
+- `platform`: input events from a custom `NSView` (scroll, click, keys, paste), window delegate for resize and
+  display changes, dark appearance detection, two alternating `IOSurface`s per window.
+- `paint`: `overlay` for interface drawing (fills, text, masks, horizontal clip), glyph cache trimming.
+- `shell`: `engine.rs` (shared pipeline, fonts loaded once and shared), `browser.rs` behind a `Screen` trait so
+  scenario tests run on an in-memory screen, `chrome.rs` for the header.
+
+- `css`: `+` and `~` combinators, `:first-child`, `:last-child`, `:only-child`, `:nth-child()`,
+  `:nth-last-child()`, `:not()` with simple arguments, `:checked`, `:disabled`, `:enabled`, `:empty`, attribute
+  operators (`~=`, `|=`, `^=`, `$=`, `*=`, `i`). Style sharing turns off when a sibling-dependent rule exists.
+- `css`: `position`, `top`/`right`/`bottom`/`left`/`inset`, `visibility`, `overflow`, `opacity: 0`.
+- `css`: custom properties and `var()` with fallbacks, nesting and cycle detection, resolved lazily on the
+  declaring element.
+- `layout`: relative offsets, absolute and fixed boxes in their own paint layers (containing block, insets,
+  shrink-to-fit), overflow clip ranges.
+- `paint`: layers in order, fixed layers ignore scroll, nested clips per item, hidden content skipped.
+- `shell`: link hit testing follows layers, fixed boxes and visibility.
+- `css`: flex properties (`flex-direction`, `flex-wrap`, `flex-flow`, `justify-content`, `align-items`,
+  `align-self`, `flex`, `flex-grow`, `flex-shrink`, `flex-basis`, `gap`, `row-gap`, `column-gap`, `order`),
+  `inline-flex`, `box-sizing`.
+- `layout`: flex containers (`flex.rs`): one layout per item, sizes from memoized intrinsic widths, the 9.7
+  resolution loop, auto margins, justify and align, wrapping rows, columns. `inline-block`/`inline-flex` as atomic
+  inlines. `box-sizing: border-box`.
+- `css`: grid properties (`grid.rs`): track lists, `repeat()` with `auto-fill`/`auto-fit`, `minmax()`,
+  `fit-content()`, template areas, line placement and the `grid-template`, `grid-area`, `grid-row`, `grid-column`
+  shorthands. Templates and placements are interned in `StyleMap`; a style carries two ids.
+- `layout`: grid containers (`grid.rs`): placement by area, line and span, sparse auto-placement, track sizing with
+  content contributions, maximize, `fr` and auto stretch, alignment; every item laid out once.
+- `flate`: DEFLATE decoding (stored, fixed and dynamic Huffman blocks, 9-bit fast lookup), zlib and gzip
+  wrappers with checksum checks, an output cap. CRC-32 and Adler-32 moved here from the PNG writer.
+- `net`: keep-alive connection pool, `Accept-Encoding: gzip, deflate`, responses framed by length or chunks
+  and read straight into the body, 64 MB body cap, connect and write timeouts.
+- `image`: PNG decoder (every color type and bit depth, palettes, `tRNS`, Adam7) and baseline JPEG decoder
+  (Huffman with 9-bit lookup, float IDCT with a DC-only path, any subsampling, restart markers, Adobe RGB),
+  both scaling rows down as they decode; header probes for PNG, JPEG, GIF and WebP.
+- `flate`: streaming zlib output with a 32 KiB window, incremental CRC-32 and Adler-32.
+- `net`: `data:` URLs.
+- Images on pages: fetched with stylesheets, sized by layout as replaced elements, decoded in parallel when
+  visible at their drawn size, cached up to 8 MB of pixels (on-screen images are always kept).
+
+### Changed
+- The PNG writer streams rows into the file: a 1280x3000 render peaks at 48 MB instead of 69 MB.
+- GitHub's stylesheets load in 0.23 s instead of 0.72 s, Wikipedia's in 69 ms instead of 207 ms.
+- Fetched stylesheets are parsed in the buffer they arrived in, and comments are blanked in place, instead of two
+  copies per sheet. Flex and grid share one box-height helper.
+- Cascade 3x faster on the stress page (48 to 16 ms): computed styles are cached by (parent style, matched rules);
+  the shared hasher mixes 8 bytes per step instead of 1 (`Fnv` is now `FastHasher`); candidate rules are no
+  longer sorted twice.
+- Layout 18 to 12 ms on the stress page: children are walked in place and inline runs are sibling ranges, with no
+  allocation per box or inline element.
+- Fixed: absolutely positioned boxes used containing-block and static positions recorded before an ancestor was
+  shifted (`position: relative`, flex alignment). Both are now read from the ancestor's box when needed.
+- DOM memory halved: children are a linked list instead of a Vec per node, ids are u32, tag and
+  attribute names are interned, text is stored at exact size. Stress page peak RAM 55.8 MB to 27.0 MB.
+- DOM nodes shrank from 48 to 28 bytes: text, comments and attribute values live in shared buffers instead of
+  one allocation each, and `NodeKind` / `Element` are now views borrowed from the DOM. Stress page painted at
+  2x: 58.3 MB to 48.7 MB; parse 20 ms to 16 ms.
+- The `libc` crate is no longer used; `getrusage` is declared by hand.
+- `scripts/budget.sh` measures peak RAM with the page painted at 2x.
+- The raw HTML is freed right after parsing.
+- Tokenizer borrows from the source and allocates only for lowercased names or decoded entities.
+  Stress page parse 24 ms to 19 ms.

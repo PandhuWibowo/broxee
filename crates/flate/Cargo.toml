@@ -1,0 +1,7 @@
+[package]
+name = "flate"
+version.workspace = true
+edition.workspace = true
+
+# Written here: DEFLATE, zlib and gzip decoding for HTTP bodies and PNG images.
+[dependencies]

@@ -1,0 +1,36 @@
+/* Broxee user-agent stylesheet: the defaults every page starts from. */
+
+html, body, address, blockquote, center, dd, details, dialog, div, dl, dt, fieldset, figcaption,
+figure, footer, form, h1, h2, h3, h4, h5, h6, header, hgroup, hr, legend, main, menu, nav, ol, p,
+pre, section, summary, ul, article, aside, table, thead, tbody, tfoot, tr, caption, optgroup {
+  display: block;
+}
+li { display: list-item }
+td, th { display: inline-block }
+head, script, style, title, meta, link, template, base, area, datalist, param, rp, [hidden] {
+  display: none;
+}
+
+body { margin: 8px }
+
+h1 { font-size: 2em; margin: 0.67em 0; font-weight: bold }
+h2 { font-size: 1.5em; margin: 0.83em 0; font-weight: bold }
+h3 { font-size: 1.17em; margin: 1em 0; font-weight: bold }
+h4 { margin: 1.33em 0; font-weight: bold }
+h5 { font-size: 0.83em; margin: 1.67em 0; font-weight: bold }
+h6 { font-size: 0.67em; margin: 2.33em 0; font-weight: bold }
+
+p, dl, ul, ol, pre { margin: 1em 0 }
+blockquote, figure { margin: 1em 40px }
+ul, ol { padding-left: 40px }
+dd { margin-left: 40px }
+hr { margin: 0.5em 0; border: 1px solid #808080 }
+
+b, strong, th { font-weight: bold }
+i, em, cite, var, dfn, address { font-style: italic }
+pre { white-space: pre }
+small { font-size: smaller }
+big { font-size: larger }
+center, th { text-align: center }
+
+a { color: #0000ee; text-decoration: underline }

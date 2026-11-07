@@ -1,0 +1,9 @@
+[package]
+name = "layout"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+html = { path = "../html" }
+css = { path = "../css" }
+font = { path = "../font" }

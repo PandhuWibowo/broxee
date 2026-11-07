@@ -1,0 +1,8 @@
+[package]
+name = "image"
+version.workspace = true
+edition.workspace = true
+
+# Written here: PNG and baseline JPEG decoders that scale while decoding.
+[dependencies]
+flate = { path = "../flate" }
