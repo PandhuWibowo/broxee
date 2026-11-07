@@ -126,6 +126,8 @@ casts), not taken from binding crates. Ask before proposing any dependency.
 - **Positioned boxes cost nothing per fragment.** Paint order is `Layout::layers` (index ranges) and clipping is
   `Layout::clips` (nested ranges); a fragment's position in the lists decides both. Anything that reorders or
   inserts fragments after layout must keep those ranges valid. Fixed layers never add to the scroll height.
+- **`box_extents` / `text_extents` are computed at the end of `layout()`** (`Layout::index`). Anything that moves
+  fragments after that must recompute them, or painting skips what is on screen.
 - **Every box is laid out once.** Flex items and inline blocks are sized from intrinsic widths
   (`intrinsic_width`, memoized, no layout), laid out at their final size, then moved with `shift_range` or
   grown with `stretch`. Do not add a measure-by-layout pass: nested containers would multiply it.

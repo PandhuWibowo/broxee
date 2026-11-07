@@ -564,6 +564,10 @@ impl Painter {
                 None => NO_CLIP,
             };
 
+            // Only runs of fragments that reach into the view, in page coordinates.
+            let (top, bottom) = (scroll, scroll + height as f32 / s);
+            let boxes = Layout::in_view(&layout.box_extents, boxes, top, bottom);
+            let texts = Layout::in_view(&layout.text_extents, texts, top, bottom);
             for i in boxes {
                 let clip = to_clip(box_clips.at(i as u32));
                 let b = &layout.boxes[i];
@@ -1031,6 +1035,70 @@ mod tests {
         );
         for y in [0, 48, 96] {
             assert_eq!(pixel(&f, 36, y), [0x12, 0x34, 0x56], "row {y}");
+        }
+    }
+
+    #[test]
+    fn skipping_runs_out_of_view_draws_the_same_pixels() {
+        // A long page: rows with a border and text, a fixed bar, and an absolutely positioned
+        // box far down (in its own layer, painted after the long flow).
+        let rows: String = (0..2000)
+            .map(|i| format!("<div class=r><p>Row {i} text</p></div>"))
+            .collect();
+        let dom = html::parse(&format!("<div id=bar></div><div id=abs></div>{rows}"));
+        let author = parse_stylesheet(
+            "body { margin: 0 } .r { border-bottom: 1px solid #888; height: 20px } \
+             p { margin: 0; font-size: 12px } #bar { position: fixed; top: 0; height: 10px; \
+             width: 50px; background: #f00 } #abs { position: absolute; top: 15000px; \
+             left: 5px; width: 30px; height: 30px; background: #00f }",
+        );
+        let styles = cascade(
+            &dom,
+            &[
+                (Origin::UserAgent, user_agent_stylesheet()),
+                (Origin::Author, &author),
+            ],
+            &Media::default(),
+        );
+        let mut laid_out = layout::layout(
+            &dom,
+            &styles,
+            &Approximate,
+            &layout::no_images,
+            200.0,
+            100.0,
+        );
+        assert!(laid_out.boxes.len() > 2000 && laid_out.box_extents.len() > 5);
+        let paint = |layout: &Layout, scroll_y: f32| {
+            let page = Page {
+                dom: &dom,
+                styles: &styles,
+                layout,
+                metrics: &Approximate,
+                fonts: None,
+                images: None,
+            };
+            let view = Viewport {
+                width: 200.0,
+                height: 100.0,
+                scale: 2.0,
+                scroll_y,
+            };
+            Painter::new().paint(&page, view).0.pixels
+        };
+        // Views whose edge is 40 points into a run of boxes (borders every 21 points are drawn
+        // there), where a wrong extent would drop them. Text draws nothing without fonts here.
+        let mut scrolls = vec![0.0, 5000.0, 14_980.0, 39_900.0];
+        for &(top, bottom) in &laid_out.box_extents[1..5] {
+            scrolls.push(bottom - 40.0);
+            scrolls.push(top - 100.0 + 40.0);
+        }
+        let fast: Vec<Vec<u8>> = scrolls.iter().map(|&y| paint(&laid_out, y)).collect();
+        // Without the index: one run covering everything.
+        laid_out.box_extents = vec![(f32::MIN, f32::MAX); laid_out.box_extents.len()];
+        laid_out.text_extents = vec![(f32::MIN, f32::MAX); laid_out.text_extents.len()];
+        for (i, &y) in scrolls.iter().enumerate() {
+            assert!(fast[i] == paint(&laid_out, y), "same pixels at scroll {y}");
         }
     }
 

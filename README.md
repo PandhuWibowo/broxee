@@ -192,6 +192,7 @@ time something reads it (most theme variables never are). A `var()` value is sub
 | 2026-11-07 | Tabs that sleep to disk, profiles, session restore, sidebar | 2.0 MB | 49.3 MB peak painted at 2x | Window with four tabs: 60 to 61 MB peak (see below) |
 | 2026-11-07 | Space-efficient malloc on macOS (#1) | 2.0 MB | 49.3 MB peak painted at 2x | Window: GitHub 58 → 48 MB peak, four tabs 61 → 46 MB, twelve pages in a row 47 MB |
 | 2026-11-07 | Rules dropped from their selector text (#16) | 2.2 MB | 49.3 MB peak painted at 2x | GitHub's 30 sheets (3.4 MB): 15.0 → 11.7 ms, 155,109 → 34,167 allocations, same 820 rules |
+| 2026-11-08 | Display list skips runs of fragments out of view (#17) | 2.2 MB | 49.4 MB peak painted at 2x | Stress page: display list 0.65 → 0.01 ms a frame at any scroll; layout +0.8 ms once to index |
 
 Other pages after the layout milestone: GitHub home 22.7 MB peak (8,170 rules); Hacker News 11.5 MB.
 
@@ -289,8 +290,6 @@ Where data lives, and what compression does for it (measured 2026-11-07):
   id, so renaming moves nothing). Four colors exist (emerald, amber, rose, violet), so profiles past four
   share them; their names always tell them apart.
 - GIF, WebP and SVG are sized from their headers but not drawn yet. Failed images draw nothing.
-- Building the display list walks every fragment each frame (0.7 ms on the 140k-fragment stress page). An index
-  by vertical position would make scrolling cost independent of page length.
 - Glyphs are placed on whole device pixels, so spacing is slightly uneven at 1x; subpixel positioning later.
 - Painting will add a window framebuffer (about 16 MB at 2x for 1280x800). The stress page sits at 37 MB, so
   paint must stay within roughly 20 MB including glyph caches.

@@ -197,3 +197,8 @@
   the same 820 rules kept; checked rule by rule against the full selector check on GitHub, Wikipedia, MDN
   and Hacker News. `cargo run --release -p css --example parse_bench -- page.html sheets...` measures it
   (`CHECK=1` runs the comparison). The old "about 125 ms" note was stale.
+- Display list (#17): layout records the vertical extent of every run of 256 boxes and 256 text runs
+  (`Layout::box_extents`, `text_extents`, a few KB), and painting visits only runs that reach the view. On the
+  140,000-run stress page the display list takes 0.01 ms a frame instead of 0.65 ms, wherever the page is
+  scrolled; indexing adds about 0.8 ms to each layout. A test paints a long page with fixed and positioned
+  layers at scroll positions on run edges, with and without the index, and compares every pixel.
