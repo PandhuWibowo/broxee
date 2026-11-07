@@ -13,7 +13,9 @@
 //! in tests. Tests drive it with synthetic events and local files, never the real desktop.
 
 use std::path::PathBuf;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
+use std::sync::Arc;
+use std::time::Duration;
 
 use html::NodeId;
 use paint::{Painter, Target, Viewport};
@@ -36,6 +38,8 @@ const GLYPH_CACHE_LIMIT: usize = 8 << 20;
 /// Sleeping tabs' files together stay under this on disk; past it, the tabs used longest ago
 /// keep only their history and reload from the network when selected.
 const SNAPSHOT_BUDGET: u64 = 256 << 20;
+/// How often the engine thread looks at a running load's progress: once per frame at 60 Hz.
+const LOAD_POLL: Duration = Duration::from_millis(16);
 /// Closed tabs that ⌘⇧T can reopen, per profile.
 const CLOSED_LIMIT: usize = 20;
 /// Session file limits, so a damaged file cannot make startup slow.
@@ -141,6 +145,30 @@ impl Tab {
     }
 }
 
+/// A page loading on its own thread for the visible tab. Dropping it cancels the load: the
+/// loader's next progress report fails and it stops, freeing what it built.
+struct Load {
+    url: net::Url,
+    to: Destination,
+    settings: Settings,
+    messages: Receiver<LoadMessage>,
+}
+
+/// Where a finished load goes in the tab's history.
+#[derive(Clone, Copy)]
+enum Destination {
+    /// A new entry after the current one (forward entries are dropped).
+    Push,
+    /// This existing entry (back, forward, reload, waking), restoring its scroll position.
+    Entry(usize),
+}
+
+enum LoadMessage {
+    Progress(f32),
+    /// Boxed: a channel slot is as large as its largest message.
+    Done(Box<Result<Loaded, String>>),
+}
+
 /// A closed tab ⌘⇧T can bring back: its history, not its page.
 struct Closed {
     history: Vec<Entry>,
@@ -225,7 +253,8 @@ struct Browser<S: Screen> {
     window: S,
     painter: Painter,
     chrome: Chrome,
-    fonts: FontStore,
+    /// Shared with the loader thread.
+    fonts: Arc<FontStore>,
     width: f32,
     height: f32,
     scale: f32,
@@ -248,7 +277,9 @@ struct Browser<S: Screen> {
     field: Option<Field>,
     /// Header button with keyboard focus, reached with Tab.
     focus: Option<Button>,
+    /// Progress of `load`, for the header's loading line.
     loading: Option<f32>,
+    load: Option<Load>,
 }
 
 impl<S: Screen> Browser<S> {
@@ -265,7 +296,7 @@ impl<S: Screen> Browser<S> {
             window,
             painter: Painter::new(),
             chrome: Chrome::new(dark),
-            fonts: FontStore::start(),
+            fonts: Arc::new(FontStore::start()),
             width: width as f32,
             height: height as f32,
             scale,
@@ -286,6 +317,7 @@ impl<S: Screen> Browser<S> {
             field: None,
             focus: None,
             loading: None,
+            load: None,
         }
     }
 
@@ -328,28 +360,36 @@ impl<S: Screen> Browser<S> {
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn run(&mut self, events: &Receiver<Event>) {
         /// How long without events before the window frees its spare frame.
-        const IDLE_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+        const IDLE_AFTER: Duration = Duration::from_secs(1);
         self.start();
         let mut trimmed = false;
         loop {
-            let event = match events.recv_timeout(IDLE_AFTER) {
-                Ok(event) => event,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if !trimmed {
-                        self.window.idle();
-                        trimmed = true;
-                    }
-                    continue;
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            // While a page loads, wake every frame to show its progress; otherwise sleep until
+            // an event arrives.
+            let wait = if self.load.is_some() {
+                LOAD_POLL
+            } else {
+                IDLE_AFTER
             };
-            let mut dirty = self.handle(event);
-            for event in events.try_iter() {
-                dirty |= self.handle(event);
+            let mut dirty = false;
+            let mut quiet = false;
+            match events.recv_timeout(wait) {
+                Ok(event) => {
+                    dirty |= self.handle(event);
+                    for event in events.try_iter() {
+                        dirty |= self.handle(event);
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => quiet = true,
+                Err(RecvTimeoutError::Disconnected) => break,
             }
+            dirty |= self.poll_load();
             if dirty {
                 self.render();
                 trimmed = false;
+            } else if quiet && self.load.is_none() && !trimmed {
+                self.window.idle();
+                trimmed = true;
             }
         }
     }
@@ -383,8 +423,14 @@ impl<S: Screen> Browser<S> {
         if targets.is_empty() {
             self.wake();
         }
-        for target in targets {
-            self.open_target(&target);
+        let last = targets.len().saturating_sub(1);
+        for (i, target) in targets.iter().enumerate() {
+            self.open_target(target);
+            // Each page sleeps before the next one loads; only the last one loads in the
+            // background while the window answers input.
+            if i < last {
+                self.wait_for_load();
+            }
         }
     }
 
@@ -414,7 +460,7 @@ impl<S: Screen> Browser<S> {
                     p.tabs.push(Tab::default());
                     p.active = p.tabs.len() - 1;
                 }
-                self.navigate(url, true);
+                self.navigate(url, Destination::Push);
             }
         }
     }
@@ -500,7 +546,7 @@ impl<S: Screen> Browser<S> {
             return match chrome::hit(x, self.pane_width()) {
                 Some(Button::Back) => self.back(),
                 Some(Button::Forward) => self.forward(),
-                Some(Button::Reload) => self.reload(),
+                Some(Button::Reload) => self.reload_or_stop(),
                 Some(Button::Address) => self.focus_field(),
                 None => false,
             };
@@ -508,7 +554,7 @@ impl<S: Screen> Browser<S> {
         let was_editing = self.field.take().is_some() | self.focus.take().is_some();
         if let Some(url) = self.link_at(x, y - HEADER_HEIGHT) {
             self.save_scroll();
-            self.navigate(url, true);
+            self.navigate(url, Destination::Push);
             return true;
         }
         was_editing
@@ -581,7 +627,7 @@ impl<S: Screen> Browser<S> {
                     return match button {
                         Button::Back => self.back(),
                         Button::Forward => self.forward(),
-                        Button::Reload => self.reload(),
+                        Button::Reload => self.reload_or_stop(),
                         Button::Address => self.focus_field(),
                     };
                 }
@@ -594,6 +640,9 @@ impl<S: Screen> Browser<S> {
         }
         if k.key == Key::Tab {
             return self.move_focus(k.shift);
+        }
+        if k.key == Key::Escape {
+            return self.stop_load();
         }
         let page = self.page_height() - PAGE_OVERLAP;
         match k.key {
@@ -627,7 +676,7 @@ impl<S: Screen> Browser<S> {
         let enabled = |b: Button| match b {
             Button::Back => tab.index > 0,
             Button::Forward => tab.index + 1 < tab.history.len(),
-            Button::Reload => !tab.history.is_empty(),
+            Button::Reload => !tab.history.is_empty() || self.load.is_some(),
             Button::Address => true,
         };
         let n = order.len();
@@ -677,38 +726,46 @@ impl<S: Screen> Browser<S> {
     }
 
     fn back(&mut self) -> bool {
-        if self.tab().index == 0 || self.loading.is_some() {
+        let index = self.tab().index;
+        if index == 0 {
             return false;
         }
-        self.save_scroll();
-        let tab = self.tab_mut();
-        tab.index -= 1;
-        let url = tab.history[tab.index].url.clone();
-        self.navigate(url, false);
+        self.go_to_entry(index - 1);
         true
     }
 
     fn forward(&mut self) -> bool {
-        let tab = self.tab();
-        if tab.index + 1 >= tab.history.len() || self.loading.is_some() {
+        let index = self.tab().index;
+        if index + 1 >= self.tab().history.len() {
             return false;
         }
-        self.save_scroll();
-        let tab = self.tab_mut();
-        tab.index += 1;
-        let url = tab.history[tab.index].url.clone();
-        self.navigate(url, false);
+        self.go_to_entry(index + 1);
         true
     }
 
     fn reload(&mut self) -> bool {
-        let Some(entry) = self.tab().entry() else {
+        if self.tab().entry().is_none() {
             return false;
-        };
-        let url = entry.url.clone();
-        self.save_scroll();
-        self.navigate(url, false);
+        }
+        self.go_to_entry(self.tab().index);
         true
+    }
+
+    /// The reload button turns into a stop button while a page loads.
+    fn reload_or_stop(&mut self) -> bool {
+        if self.load.is_some() {
+            self.stop_load()
+        } else {
+            self.reload()
+        }
+    }
+
+    /// Load the tab's history entry `index`. The tab moves to it only when the page arrives,
+    /// so a stopped load leaves the tab where it was.
+    fn go_to_entry(&mut self, index: usize) {
+        self.save_scroll();
+        let url = self.tab().history[index].url.clone();
+        self.navigate(url, Destination::Entry(index));
     }
 
     /// What the user typed in the address field.
@@ -716,51 +773,141 @@ impl<S: Screen> Browser<S> {
         match parse_input(input) {
             Ok(url) => {
                 self.save_scroll();
-                self.navigate(url, true);
+                self.navigate(url, Destination::Push);
             }
             Err(message) => self.show_message("Broxee can't search yet", &message),
         }
     }
 
-    /// Load `url`. With `push`, it becomes a new history entry (dropping any forward entries);
-    /// without, it replaces the current one and its saved scroll position is restored.
-    fn navigate(&mut self, url: net::Url, push: bool) {
+    /// Start loading `url` on its own thread; `to` says where it goes in the history when it
+    /// arrives. The current page stays on screen and the window keeps answering input. A load
+    /// already running is cancelled: one page is built at a time.
+    fn navigate(&mut self, url: net::Url, to: Destination) {
+        self.stop_load();
         self.field = None;
         self.focus = None;
+        let settings = self.settings();
+        let (sender, messages) = mpsc::channel();
+        let fonts = Arc::clone(&self.fonts);
+        let target = url.clone();
+        let spawned = std::thread::Builder::new()
+            .name("load".into())
+            .spawn(move || {
+                // A failed send means the browser dropped the load: stop at the next stage.
+                let result = engine::load(&target, settings, &fonts, &mut |progress| {
+                    sender.send(LoadMessage::Progress(progress)).is_ok()
+                });
+                let _ = sender.send(LoadMessage::Done(Box::new(result)));
+            });
+        let load = Load {
+            url,
+            to,
+            settings,
+            messages,
+        };
+        if let Err(e) = spawned {
+            return self.finish_load(load, Err(e.to_string()));
+        }
+        self.load = Some(load);
         self.loading = Some(0.1);
         self.render();
+    }
 
-        let settings = self.settings();
-        // The fonts move out for the load so the progress callback can render with them too.
-        let fonts = std::mem::take(&mut self.fonts);
-        let result = engine::load(&url, settings, &fonts, &mut |progress| {
-            self.loading = Some(progress);
-            self.render_with(&fonts);
-        });
-        self.fonts = fonts;
+    /// Apply what the loader has sent since the last look; returns whether to repaint.
+    fn poll_load(&mut self) -> bool {
+        let mut dirty = false;
+        loop {
+            let Some(load) = &self.load else {
+                return dirty;
+            };
+            match load.messages.try_recv() {
+                Ok(LoadMessage::Progress(p)) => {
+                    self.loading = Some(p);
+                    dirty = true;
+                }
+                Ok(LoadMessage::Done(result)) => {
+                    let load = self.load.take().expect("checked above");
+                    self.finish_load(load, *result);
+                    // `show` painted the new page already.
+                    return false;
+                }
+                Err(TryRecvError::Empty) => return dirty,
+                Err(TryRecvError::Disconnected) => {
+                    let load = self.load.take().expect("checked above");
+                    self.finish_load(load, Err("the page stopped loading".into()));
+                    return false;
+                }
+            }
+        }
+    }
+
+    /// Block until the running load, if any, has finished and is shown.
+    fn wait_for_load(&mut self) {
+        while let Some(load) = &self.load {
+            let message = load.messages.recv();
+            let load = match message {
+                Ok(LoadMessage::Progress(p)) => {
+                    self.loading = Some(p);
+                    continue;
+                }
+                Ok(LoadMessage::Done(result)) => (self.load.take(), *result),
+                Err(_) => (self.load.take(), Err("the page stopped loading".into())),
+            };
+            if let (Some(l), result) = load {
+                self.finish_load(l, result);
+            }
+        }
+    }
+
+    /// Stop the running load, keeping the page that is on screen.
+    fn stop_load(&mut self) -> bool {
+        if self.load.take().is_none() {
+            return false;
+        }
+        self.loading = None;
+        true
+    }
+
+    /// Show a finished load (or its error page) and record it in the tab's history.
+    fn finish_load(&mut self, load: Load, result: Result<Loaded, String>) {
+        self.loading = None;
+        let url = load.url;
+        if matches!(&result, Err(e) if e == engine::CANCELLED) {
+            return;
+        }
         let loaded = result.is_ok();
-        let page = result.unwrap_or_else(|e| {
+        let mut page = result.unwrap_or_else(|e| {
             engine::page_from_html(
                 url.clone(),
                 &error_page(&url, &e, &self.chrome),
-                settings,
+                load.settings,
                 &self.fonts,
             )
         });
+        // The window may have changed size while the page loaded.
+        let settings = self.settings();
+        if settings != load.settings {
+            engine::relayout(&mut page, settings, &self.fonts);
+        }
 
         let tab = self.tab_mut();
-        let scroll = if push {
-            if !tab.history.is_empty() {
-                tab.history.truncate(tab.index + 1);
+        let scroll = match load.to {
+            Destination::Push => {
+                if !tab.history.is_empty() {
+                    tab.history.truncate(tab.index + 1);
+                }
+                tab.history.push(Entry {
+                    url: page.url.clone(),
+                    scroll: 0.0,
+                });
+                tab.index = tab.history.len() - 1;
+                0.0
             }
-            tab.history.push(Entry {
-                url: page.url.clone(),
-                scroll: 0.0,
-            });
-            tab.index = tab.history.len() - 1;
-            0.0
-        } else {
-            tab.history[tab.index].scroll
+            Destination::Entry(i) if i < tab.history.len() => {
+                tab.index = i;
+                tab.history[i].scroll
+            }
+            Destination::Entry(_) => 0.0,
         };
         self.tab_mut().title = self.show(page, scroll);
         self.page_is_entry = loaded;
@@ -769,6 +916,7 @@ impl<S: Screen> Browser<S> {
 
     /// Put the visible tab to sleep: keep what rebuilds its page, drop the page.
     fn sleep(&mut self) {
+        self.stop_load();
         self.save_scroll();
         self.field = None;
         self.focus = None;
@@ -836,7 +984,10 @@ impl<S: Screen> Browser<S> {
             }
         }
         match entry {
-            Some(entry) => self.navigate(entry.url, false),
+            Some(entry) => {
+                let index = self.tab().index;
+                self.navigate(entry.url, Destination::Entry(index));
+            }
             None => {
                 // A new tab: an empty pane with the address field open.
                 self.page = None;
@@ -852,7 +1003,7 @@ impl<S: Screen> Browser<S> {
 
     fn select_tab(&mut self, i: usize) -> bool {
         let p = &self.profiles[self.profile];
-        if i >= p.tabs.len() || i == p.active || self.loading.is_some() {
+        if i >= p.tabs.len() || i == p.active {
             return false;
         }
         self.sleep();
@@ -862,9 +1013,6 @@ impl<S: Screen> Browser<S> {
     }
 
     fn new_tab(&mut self) -> bool {
-        if self.loading.is_some() {
-            return false;
-        }
         self.sleep();
         let p = &mut self.profiles[self.profile];
         p.tabs.push(Tab::default());
@@ -875,9 +1023,7 @@ impl<S: Screen> Browser<S> {
 
     /// Close the visible tab. The last tab of a profile is replaced by a new one.
     fn close_tab(&mut self) -> bool {
-        if self.loading.is_some() {
-            return false;
-        }
+        self.stop_load();
         self.save_scroll();
         self.page = None;
         self.page_is_entry = false;
@@ -905,7 +1051,7 @@ impl<S: Screen> Browser<S> {
     }
 
     fn reopen_tab(&mut self) -> bool {
-        if self.loading.is_some() || self.profiles[self.profile].closed.is_empty() {
+        if self.profiles[self.profile].closed.is_empty() {
             return false;
         }
         self.sleep();
@@ -927,9 +1073,6 @@ impl<S: Screen> Browser<S> {
     }
 
     fn switch_profile(&mut self) -> bool {
-        if self.loading.is_some() {
-            return false;
-        }
         self.sleep();
         // Nothing a server could use to link the two profiles carries over.
         net::forget_sessions();
@@ -958,6 +1101,7 @@ impl<S: Screen> Browser<S> {
 
     /// A page Broxee writes itself, without a history entry.
     fn show_message(&mut self, title: &str, detail: &str) {
+        self.stop_load();
         let url = net::Url::parse("file:///").expect("a file URL always parses");
         let html = message_page(title, detail, None, &self.chrome);
         let page = engine::page_from_html(url, &html, self.settings(), &self.fonts);
@@ -1021,9 +1165,8 @@ impl<S: Screen> Browser<S> {
     }
 
     fn render(&mut self) {
-        let fonts = std::mem::take(&mut self.fonts);
+        let fonts = Arc::clone(&self.fonts);
         self.render_with(&fonts);
-        self.fonts = fonts;
     }
 
     fn render_with(&mut self, fonts: &FontStore) {
@@ -1041,8 +1184,8 @@ impl<S: Screen> Browser<S> {
         let header = HeaderView {
             profile: profile.name,
             hue: profile.hue,
-            can_back: tab.index > 0 && self.loading.is_none(),
-            can_forward: tab.index + 1 < tab.history.len() && self.loading.is_none(),
+            can_back: tab.index > 0,
+            can_forward: tab.index + 1 < tab.history.len(),
             loading: self.loading,
             host: &host,
             field: self.field.as_ref().map(|f| FieldView {
@@ -1380,7 +1523,16 @@ mod tests {
         };
         let mut b = Browser::new(opts, FakeScreen::default(), session, Some(store));
         b.start();
+        b.wait_for_load();
         b
+    }
+
+    /// Apply an event and wait for any page it started loading, as a person would before
+    /// looking at the result.
+    fn act(b: &mut Browser<FakeScreen>, event: Event) -> bool {
+        let dirty = b.handle(event);
+        b.wait_for_load();
+        dirty
     }
 
     fn key(key: Key) -> Event {
@@ -1416,10 +1568,13 @@ mod tests {
             SIDEBAR_WIDTH + run.x + run.width / 2.0,
             run.baseline - 4.0 - b.scroll + HEADER_HEIGHT,
         );
-        b.handle(Event::Click {
-            x: f64::from(x),
-            y: f64::from(y),
-        })
+        act(
+            b,
+            Event::Click {
+                x: f64::from(x),
+                y: f64::from(y),
+            },
+        )
     }
 
     #[test]
@@ -1430,11 +1585,14 @@ mod tests {
         assert!(click_text(&mut b, "Go to B"));
         assert_eq!(title(&b), "Page B");
         assert_eq!((b.tab().history.len(), b.tab().index), (2, 1));
-        assert!(b.handle(command('[')));
+        assert!(act(&mut b, command('[')));
         assert_eq!(title(&b), "Page A");
-        assert!(b.handle(command(']')));
+        assert!(act(&mut b, command(']')));
         assert_eq!(title(&b), "Page B");
-        assert!(!b.handle(command(']')), "nothing forward of the last page");
+        assert!(
+            !act(&mut b, command(']')),
+            "nothing forward of the last page"
+        );
         assert!(click_text(&mut b, "Back to A"));
         assert_eq!(
             (b.tab().history.len(), b.tab().index),
@@ -1447,27 +1605,27 @@ mod tests {
     fn scrolls_within_the_page_and_restores_position_on_back() {
         let (a, bpath) = site("scroll");
         let mut b = browser(&a);
-        assert!(b.handle(key(Key::PageDown)));
+        assert!(act(&mut b, key(Key::PageDown)));
         let saved = b.scroll;
         assert!(saved > 0.0);
-        assert!(b.handle(key(Key::End)));
+        assert!(act(&mut b, key(Key::End)));
         let bottom = b.scroll;
-        assert!(!b.handle(key(Key::Down)), "already at the bottom");
+        assert!(!act(&mut b, key(Key::Down)), "already at the bottom");
         assert!((bottom - b.max_scroll()).abs() < 0.01);
-        assert!(b.handle(Event::Scroll { dy: 10_000.0 }));
+        assert!(act(&mut b, Event::Scroll { dy: 10_000.0 }));
         assert_eq!(b.scroll, 0.0, "scrolling up past the top stops at 0");
-        b.handle(key(Key::PageDown));
+        act(&mut b, key(Key::PageDown));
 
         // Open B through the address field, then come back to A at the same position.
-        assert!(b.handle(command('l')));
+        assert!(act(&mut b, command('l')));
         assert!(b.field.as_ref().is_some_and(|f| f.all_selected));
         for c in format!("file://{}", bpath.display()).chars() {
-            b.handle(key(Key::Char(c)));
+            act(&mut b, key(Key::Char(c)));
         }
-        b.handle(key(Key::Enter));
+        act(&mut b, key(Key::Enter));
         assert_eq!(title(&b), "Page B");
         assert_eq!(b.scroll, 0.0);
-        b.handle(command('['));
+        act(&mut b, command('['));
         assert_eq!(title(&b), "Page A");
         assert_eq!(b.scroll, saved);
     }
@@ -1484,31 +1642,31 @@ mod tests {
             })
         };
         // Only one page: back and forward are disabled, so Tab lands on reload first.
-        assert!(b.handle(tab(false)));
+        assert!(act(&mut b, tab(false)));
         assert_eq!(b.focus, Some(Button::Reload));
-        assert!(b.handle(tab(false)));
+        assert!(act(&mut b, tab(false)));
         assert!(b.field.is_some(), "then the address field");
-        assert!(b.handle(tab(false)));
+        assert!(act(&mut b, tab(false)));
         assert_eq!(
             b.focus,
             Some(Button::Reload),
             "wraps past the disabled buttons"
         );
-        assert!(b.handle(tab(true)));
+        assert!(act(&mut b, tab(true)));
         assert!(b.field.is_some(), "Shift+Tab goes backwards");
 
         click_text(&mut b, "Go to B");
         assert_eq!(b.focus, None);
-        b.handle(tab(false));
+        act(&mut b, tab(false));
         assert_eq!(b.focus, Some(Button::Back));
         b.render();
-        assert!(b.handle(key(Key::Enter)));
+        assert!(act(&mut b, key(Key::Enter)));
         assert_eq!(
             title(&b),
             "Page A",
             "Enter on the focused back button goes back"
         );
-        assert!(b.handle(key(Key::Escape)) || b.focus.is_none());
+        assert!(act(&mut b, key(Key::Escape)) || b.focus.is_none());
     }
 
     #[test]
@@ -1529,7 +1687,7 @@ mod tests {
         .unwrap();
         std::fs::write(dir.join("target.html"), "<title>Target</title>").unwrap();
         let mut b = browser(&page);
-        b.handle(key(Key::PageDown));
+        act(&mut b, key(Key::PageDown));
         assert!(b.scroll > 100.0);
         // The pinned link is still at the top of the page area after scrolling.
         let layout = &b.page.as_ref().unwrap().layout;
@@ -1539,23 +1697,29 @@ mod tests {
         let t = layout.texts[pinned];
         assert!(layout.text_is_fixed(pinned));
         let (x, y) = (SIDEBAR_WIDTH + t.x + 2.0, t.baseline - 4.0 + HEADER_HEIGHT);
-        assert!(b.handle(Event::Click {
-            x: f64::from(x),
-            y: f64::from(y)
-        }));
+        assert!(act(
+            &mut b,
+            Event::Click {
+                x: f64::from(x),
+                y: f64::from(y)
+            }
+        ));
         assert_eq!(title(&b), "Target");
 
-        b.handle(command('['));
-        b.handle(key(Key::Home));
+        act(&mut b, command('['));
+        act(&mut b, key(Key::Home));
         let layout = &b.page.as_ref().unwrap().layout;
         let ghost = (0..layout.texts.len())
             .find(|&i| layout.text(&layout.texts[i]) == "Ghost")
             .unwrap();
         let t = layout.texts[ghost];
-        b.handle(Event::Click {
-            x: f64::from(SIDEBAR_WIDTH + t.x + 2.0),
-            y: f64::from(t.baseline - 4.0 + HEADER_HEIGHT),
-        });
+        act(
+            &mut b,
+            Event::Click {
+                x: f64::from(SIDEBAR_WIDTH + t.x + 2.0),
+                y: f64::from(t.baseline - 4.0 + HEADER_HEIGHT),
+            },
+        );
         assert_eq!(title(&b), "Fixed", "a hidden link does not navigate");
     }
 
@@ -1563,15 +1727,16 @@ mod tests {
     fn shows_error_and_message_pages() {
         let (a, _) = site("errors");
         let mut b = browser(&a);
-        b.handle(command('l'));
-        b.handle(Event::Paste(
-            "file:///no/such/broxee/page.html\nsecond line".into(),
-        ));
+        act(&mut b, command('l'));
+        act(
+            &mut b,
+            Event::Paste("file:///no/such/broxee/page.html\nsecond line".into()),
+        );
         assert_eq!(
             b.field.as_ref().map(|f| f.text.as_str()),
             Some("file:///no/such/broxee/page.html")
         );
-        b.handle(key(Key::Enter));
+        act(&mut b, key(Key::Enter));
         assert_eq!(title(&b), "Couldn't reach page.html");
         assert!(b
             .page
@@ -1581,11 +1746,11 @@ mod tests {
             .text_content(html::Dom::ROOT)
             .contains("Try again"));
 
-        b.handle(command('l'));
+        act(&mut b, command('l'));
         for c in "what is rust".chars() {
-            b.handle(key(Key::Char(c)));
+            act(&mut b, key(Key::Char(c)));
         }
-        b.handle(key(Key::Enter));
+        act(&mut b, key(Key::Enter));
         assert_eq!(title(&b), "Broxee can't search yet");
     }
 
@@ -1616,13 +1781,16 @@ mod tests {
             [255, 255, 255, 255],
             "page canvas below the header"
         );
-        assert!(b.handle(Event::Resize {
-            width: 490.0,
-            height: 300.0,
-            scale: 1.0
-        }));
+        assert!(act(
+            &mut b,
+            Event::Resize {
+                width: 490.0,
+                height: 300.0,
+                scale: 1.0
+            }
+        ));
         assert_eq!(b.page.as_ref().unwrap().layout.width, 250.0);
-        assert!(b.handle(command('\\')), "⌘\\ hides the sidebar");
+        assert!(act(&mut b, command('\\')), "⌘\\ hides the sidebar");
         assert_eq!(b.page.as_ref().unwrap().layout.width, 490.0);
     }
 
@@ -1635,9 +1803,9 @@ mod tests {
     }
 
     fn open(b: &mut Browser<FakeScreen>, path: &Path) {
-        b.handle(command('l'));
-        b.handle(Event::Paste(format!("file://{}", path.display())));
-        b.handle(key(Key::Enter));
+        act(b, command('l'));
+        act(b, Event::Paste(format!("file://{}", path.display())));
+        act(b, key(Key::Enter));
     }
 
     fn tab_titles(b: &Browser<FakeScreen>) -> Vec<String> {
@@ -1649,11 +1817,11 @@ mod tests {
     fn sleeping_tabs_wake_from_their_snapshot_without_the_network() {
         let (a, bpath) = site("sleep");
         let mut b = browser(&a);
-        b.handle(key(Key::PageDown));
+        act(&mut b, key(Key::PageDown));
         let saved = b.scroll;
         assert!(saved > 0.0);
 
-        assert!(b.handle(command('t')));
+        assert!(act(&mut b, command('t')));
         assert!(b.page.is_none(), "a new tab is empty");
         assert_eq!(b.field.as_ref().map(|f| f.text.as_str()), Some(""));
         assert_eq!(tab_titles(&b), ["Page A", "New tab"]);
@@ -1666,7 +1834,7 @@ mod tests {
 
         // With A's file gone, only the snapshot can bring it back.
         std::fs::remove_file(&a).unwrap();
-        assert!(b.handle(command('1')));
+        assert!(act(&mut b, command('1')));
         assert_eq!(title(&b), "Page A");
         assert_eq!(b.scroll, saved, "at the same scroll position");
         assert!(b.profiles[0].tabs[1].snapshot.is_some());
@@ -1674,13 +1842,13 @@ mod tests {
             b.profiles[0].tabs[0].snapshot.is_none(),
             "the visible tab is awake"
         );
-        assert!(!b.handle(command('1')), "already selected");
+        assert!(!act(&mut b, command('1')), "already selected");
 
         // Clicking the second row in the sidebar selects it.
-        assert!(b.handle(Event::Click { x: 100.0, y: 93.0 }));
+        assert!(act(&mut b, Event::Click { x: 100.0, y: 93.0 }));
         assert_eq!(title(&b), "Page B");
-        b.handle(command('1'));
-        assert!(b.handle(command('9')), "⌘9 is the last tab");
+        act(&mut b, command('1'));
+        assert!(act(&mut b, command('9')), "⌘9 is the last tab");
         assert_eq!(b.profiles[0].active, 1);
     }
 
@@ -1689,10 +1857,10 @@ mod tests {
         let (a, bpath) = site("budget");
         let mut b = browser(&a);
         b.snapshot_budget = 0;
-        b.handle(command('t'));
+        act(&mut b, command('t'));
         open(&mut b, &bpath);
         assert!(b.profiles[0].tabs[0].snapshot.is_none());
-        assert!(b.handle(command('1')));
+        assert!(act(&mut b, command('1')));
         assert_eq!(title(&b), "Page A", "reloaded from its URL");
     }
 
@@ -1700,26 +1868,26 @@ mod tests {
     fn closes_and_reopens_tabs() {
         let (a, bpath) = site("close");
         let mut b = browser(&a);
-        b.handle(command('t'));
+        act(&mut b, command('t'));
         open(&mut b, &bpath);
-        assert!(b.handle(command('w')));
+        assert!(act(&mut b, command('w')));
         assert_eq!(tab_titles(&b), ["Page A"]);
         assert_eq!(title(&b), "Page A");
-        assert!(b.handle(command_shift('t')));
+        assert!(act(&mut b, command_shift('t')));
         assert_eq!(tab_titles(&b), ["Page A", "Page B"]);
         assert_eq!((b.profiles[0].active, title(&b).as_str()), (1, "Page B"));
-        assert!(!b.handle(command_shift('t')), "nothing left to reopen");
+        assert!(!act(&mut b, command_shift('t')), "nothing left to reopen");
 
         // The close button on the active row.
-        assert!(b.handle(Event::Click { x: 220.0, y: 93.0 }));
-        assert!(b.handle(command('w')));
+        assert!(act(&mut b, Event::Click { x: 220.0, y: 93.0 }));
+        assert!(act(&mut b, command('w')));
         assert_eq!(
             tab_titles(&b),
             ["New tab"],
             "the last tab becomes a new tab"
         );
         assert!(b.page.is_none());
-        assert!(b.handle(command_shift('t')));
+        assert!(act(&mut b, command_shift('t')));
         assert_eq!(tab_titles(&b), ["Page A", "New tab"]);
     }
 
@@ -1727,7 +1895,7 @@ mod tests {
     fn profiles_keep_their_own_tabs() {
         let (a, bpath) = site("profiles");
         let mut b = browser(&a);
-        assert!(b.handle(command_shift('p')));
+        assert!(act(&mut b, command_shift('p')));
         assert_eq!(b.profiles[b.profile].name, "Work");
         assert_eq!(tab_titles(&b), ["New tab"]);
         assert_eq!(title(&b), "New tab");
@@ -1738,10 +1906,13 @@ mod tests {
         open(&mut b, &bpath);
         assert_eq!(title(&b), "Page B");
 
-        assert!(b.handle(command_shift('p')));
+        assert!(act(&mut b, command_shift('p')));
         assert_eq!(tab_titles(&b), ["Page A"]);
         assert_eq!(title(&b), "Page A");
-        assert!(b.handle(Event::Click { x: 100.0, y: 10.0 }), "the switcher");
+        assert!(
+            act(&mut b, Event::Click { x: 100.0, y: 10.0 }),
+            "the switcher"
+        );
         assert_eq!(title(&b), "Page B");
     }
 
@@ -1751,11 +1922,11 @@ mod tests {
         let path = a.with_file_name("session");
         let _ = std::fs::remove_file(&path);
         let mut b = browser_with(&a, Some(path.clone()));
-        b.handle(command('t'));
+        act(&mut b, command('t'));
         open(&mut b, &bpath);
-        b.handle(key(Key::Down));
-        b.handle(command_shift('p'));
-        b.handle(command_shift('p'));
+        act(&mut b, key(Key::Down));
+        act(&mut b, command_shift('p'));
+        act(&mut b, command_shift('p'));
         drop(b);
 
         let b = browser_with(Path::new(""), Some(path.clone()));
@@ -1829,7 +2000,7 @@ mod tests {
         );
         let mut b = browser(&red);
         b.opts.fetch_css = true;
-        b.handle(command('r'));
+        act(&mut b, command('r'));
         let at = (SIDEBAR_WIDTH as usize + 10, HEADER_HEIGHT as usize + 10);
         assert_eq!(b.window.pixel(at.0, at.1), [0, 0, 255, 255], "red, as BGRA");
         open(&mut b, &blue);
@@ -1838,6 +2009,111 @@ mod tests {
             [255, 0, 0, 255],
             "blue, not the cached red"
         );
+    }
+
+    /// A local HTTP server that holds each response until `release` sends a message or is
+    /// dropped: a slow site, without the network.
+    fn slow_server(title: &'static str) -> (String, mpsc::Sender<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release, wait) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request);
+                let _ = wait.recv();
+                let body = format!("<title>{title}</title><p>slow");
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (format!("http://{address}/"), release)
+    }
+
+    /// Start loading `url` from the address field without waiting for it.
+    fn start_loading(b: &mut Browser<FakeScreen>, url: &str) {
+        act(b, command('l'));
+        act(b, Event::Paste(url.to_string()));
+        b.handle(key(Key::Enter));
+        assert!(b.load.is_some() && b.loading.is_some(), "loading {url}");
+    }
+
+    #[test]
+    fn the_window_answers_while_a_page_loads() {
+        let (a, _) = site("async");
+        let (slow, release) = slow_server("Slow");
+        let mut b = browser(&a);
+
+        // A new tab while a page loads: answered at once, and the load is dropped.
+        start_loading(&mut b, &slow);
+        let started = std::time::Instant::now();
+        assert!(b.handle(command('t')));
+        assert!(started.elapsed() < Duration::from_millis(50));
+        assert!(b.load.is_none() && b.loading.is_none());
+        assert_eq!(tab_titles(&b), ["Page A", "New tab"]);
+        act(&mut b, command('w'));
+        assert_eq!(title(&b), "Page A");
+
+        // Esc stops a load and keeps the page and history as they were.
+        start_loading(&mut b, &slow);
+        assert!(b.handle(key(Key::Escape)));
+        assert!(b.load.is_none() && b.loading.is_none());
+        assert_eq!(title(&b), "Page A");
+        assert_eq!(b.tab().history.len(), 1);
+        assert!(!b.handle(key(Key::Escape)), "nothing left to stop");
+
+        // So does the reload button, which is a stop button while loading.
+        start_loading(&mut b, &slow);
+        assert!(b.handle(Event::Click {
+            x: f64::from(SIDEBAR_WIDTH + 80.0),
+            y: 18.0
+        }));
+        assert!(b.load.is_none());
+        assert_eq!(title(&b), "Page A");
+
+        // Following a link while a page loads replaces that load.
+        start_loading(&mut b, &slow);
+        assert!(click_text(&mut b, "Go to B"));
+        assert_eq!(title(&b), "Page B");
+        assert_eq!(b.tab().history.len(), 2);
+
+        // Going back while a page loads cancels it and goes back.
+        start_loading(&mut b, &slow);
+        assert!(act(&mut b, command('[')));
+        assert_eq!((title(&b).as_str(), b.tab().index), ("Page A", 0));
+
+        // Switching profile while loading answers at once too.
+        start_loading(&mut b, &slow);
+        assert!(b.handle(command_shift('p')));
+        assert!(b.load.is_none());
+        assert_eq!(b.profiles[b.profile].name, "Work");
+        drop(release);
+    }
+
+    #[test]
+    fn a_page_loading_in_the_background_arrives_in_its_tab() {
+        let (a, _) = site("arrive");
+        let (slow, release) = slow_server("Slow page");
+        let mut b = browser(&a);
+        start_loading(&mut b, &slow);
+        // Scrolling the current page still works meanwhile.
+        assert!(b.handle(key(Key::PageDown)));
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while b.load.is_some() && std::time::Instant::now() < deadline {
+            b.poll_load();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(title(&b), "Slow page");
+        assert_eq!(b.tab().history.len(), 2);
+        assert_eq!(b.scroll, 0.0, "a new page starts at the top");
+        assert!(b.loading.is_none());
     }
 
     #[test]

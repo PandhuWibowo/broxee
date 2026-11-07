@@ -242,7 +242,7 @@ impl Chrome {
         let width_pt = frame.width as f32 / s;
 
         let icon_px = px(ICON) as u32;
-        for shape in [Shape::Back, Shape::Forward, Shape::Reload] {
+        for shape in [Shape::Back, Shape::Forward, Shape::Reload, Shape::Close] {
             self.masks
                 .entry((shape, icon_px, icon_px))
                 .or_insert_with(|| icon(shape, s));
@@ -315,7 +315,15 @@ impl Chrome {
         let buttons = [
             (Shape::Back, view.can_back),
             (Shape::Forward, view.can_forward),
-            (Shape::Reload, view.loading.is_none()),
+            // While a page loads, reload becomes stop.
+            (
+                if view.loading.is_some() {
+                    Shape::Close
+                } else {
+                    Shape::Reload
+                },
+                true,
+            ),
         ];
         let focused_slot = match view.focused {
             Some(Button::Back) => Some(0),

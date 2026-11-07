@@ -91,6 +91,9 @@ casts), not taken from binding crates. Ask before proposing any dependency.
   sleep); skipping it shows another page's pixels.
 - **Switching profile calls `net::forget_sessions`.** Nothing that could link profiles (connections, TLS
   tickets, and cookies once they exist) may be shared between them.
+- **One page load at a time.** `Browser::navigate` stops the running load before starting another, and every
+  tab or profile change stops it too. A finished load always belongs to the visible tab, because nothing can
+  change the visible tab without stopping it first. Keep both true when adding background work.
 - **Session and tab files are data, never trusted**: every length and count is checked against what is left,
   and damage gives a reload, not a panic.
 

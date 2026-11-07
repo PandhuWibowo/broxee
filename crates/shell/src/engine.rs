@@ -34,7 +34,7 @@ const FONT_CANDIDATES: [(&str, &str); 3] = [
 ];
 
 /// What the page is laid out for.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Settings {
     pub width: f32,
     pub height: f32,
@@ -206,8 +206,9 @@ pub fn restore(
         settings,
         fonts,
         From::Snapshot(sources, images),
-        &mut |_| {},
-    );
+        &mut |_| true,
+    )
+    .expect("a load without a stop request finishes");
     page.sources.html = html;
     Ok(page)
 }
@@ -221,18 +222,24 @@ enum From {
     Nowhere,
 }
 
+/// The error `load` returns when its `progress` callback asked it to stop.
+pub const CANCELLED: &str = "cancelled";
+
 /// Fetch a page and build it. `progress` receives a fraction after each stage, for a
-/// loading indicator.
+/// loading indicator, and returns whether to go on: `false` stops the load at that point with
+/// `CANCELLED`, freeing what was built. A stage already running (a slow fetch) finishes first.
 pub fn load(
     url: &net::Url,
     settings: Settings,
     fonts: &FontStore,
-    progress: &mut dyn FnMut(f32),
+    progress: &mut dyn FnMut(f32) -> bool,
 ) -> Result<Loaded, String> {
     let started = Instant::now();
     let resp = net::fetch(url)?;
     let fetch_ms = millis(started);
-    progress(0.4);
+    if !progress(0.4) {
+        return Err(CANCELLED.into());
+    }
 
     let started = Instant::now();
     let dom = html::parse(&String::from_utf8_lossy(&resp.body));
@@ -249,7 +256,9 @@ pub fn load(
         drop(resp.body);
         resp.wire
     };
-    progress(0.5);
+    if !progress(0.5) {
+        return Err(CANCELLED.into());
+    }
 
     let from = if settings.fetch_css {
         From::Network
@@ -269,7 +278,8 @@ pub fn load(
         fonts,
         from,
         progress,
-    );
+    )
+    .ok_or(CANCELLED)?;
     page.sources.html = html;
     Ok(page)
 }
@@ -293,7 +303,8 @@ pub fn page_from_html(
         fetch_ms: 0.0,
         parse_ms: 0.0,
     };
-    let mut page = finish(origin, dom, settings, fonts, From::Nowhere, &mut |_| {});
+    let mut page = finish(origin, dom, settings, fonts, From::Nowhere, &mut |_| true)
+        .expect("a load without a stop request finishes");
     page.sources.html = net::Wire {
         encoding: net::Encoding::Identity,
         bytes: source.as_bytes().to_vec(),
@@ -315,16 +326,18 @@ fn finish(
     settings: Settings,
     fonts: &FontStore,
     from: From,
-    progress: &mut dyn FnMut(f32),
-) -> Loaded {
+    progress: &mut dyn FnMut(f32) -> bool,
+) -> Option<Loaded> {
     let (css, images, stylesheets) = load_subresources(&dom, &source.url, from);
-    progress(0.75);
+    if !progress(0.75) {
+        return None;
+    }
     // Join stage 1 before layout, the first stage that measures text.
     let fonts_wait_ms = fonts.ready();
     let (styles, cascade_ms, layout, layout_ms) =
         style_and_layout(&dom, &css, &images, settings, fonts);
     progress(0.95);
-    Loaded {
+    Some(Loaded {
         url: source.url,
         status: source.status,
         bytes: source.bytes,
@@ -342,7 +355,7 @@ fn finish(
         cascade_ms,
         fonts_wait_ms,
         layout_ms,
-    }
+    })
 }
 
 /// Cascade and lay out again, for a new viewport size or color scheme. `@media` rules can

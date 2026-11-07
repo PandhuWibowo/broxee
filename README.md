@@ -26,6 +26,7 @@ In the window:
 | Scroll | trackpad or wheel, ↑ ↓, Space / Shift+Space, Page Up / Page Down, Home / End |
 | Follow a link | click it |
 | Back / forward / reload | the header buttons, or ⌘[ / ⌘] / ⌘R |
+| Stop loading | Esc, or the × that replaces reload while a page loads |
 | New tab / close tab / reopen closed tab | ⌘T / ⌘W / ⌘⇧T, or "+ New tab" and the × on the active row |
 | Go to tab 1 to 8, the last tab | ⌘1 … ⌘8, ⌘9, or click the row |
 | Switch profile (Personal, Work) | ⌘⇧P, or click the profile name at the top of the sidebar |
@@ -36,6 +37,9 @@ In the window:
 
 Tabs and profiles:
 
+- Pages load on their own thread while the current page stays on screen: scrolling, links, tabs, profiles and
+  the address field keep working. Opening another page, switching tab or switching profile stops the load (one
+  page is built at a time, for memory); the tab stays on the page it showed.
 - Each profile has its own tabs, history and closed tabs. Switching profile closes every idle connection and
   forgets TLS sessions, so a server cannot link the two through a reused connection.
 - Only the visible tab is a live page. The others sleep: the HTML and stylesheets as they arrived (usually
@@ -248,7 +252,6 @@ Where data lives, and what compression does for it (measured 2026-11-07):
 - No table layout and no presentational attributes (`bgcolor`, `align`): Hacker News renders centred without its
   orange bar.
 - Tab reaches the header controls but not links inside the page yet; there is no visible focus for page links.
-- Reload cannot stop a load in progress (the load runs on the engine thread to completion).
 - No cookies, so nothing stays logged in yet. Profiles are separate in tabs, history and connections; cookie
   storage will be per profile when it exists.
 - Not built yet, so not shown: the ⌘K palette and the "Search or go to ⌘K" field in the sidebar, the ⋯ menu,

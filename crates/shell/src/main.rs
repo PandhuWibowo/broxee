@@ -161,7 +161,7 @@ fn run(opts: &Options) -> Result<(), String> {
         dark: false,
         fetch_css: opts.fetch_css,
     };
-    let page = engine::load(&url, settings, &fonts, &mut |_| {})?;
+    let page = engine::load(&url, settings, &fonts, &mut |_| true)?;
 
     if opts.layout {
         let mut out = String::new();

@@ -140,3 +140,7 @@
 - macOS: `broxee` restarts itself once with `MallocSpaceEfficient=1`, so malloc returns freed memory instead
   of keeping it dirty. Window peak: GitHub 58 → 48 MB, four tabs 61 → 46 MB, twelve heavy pages in a row
   47 MB; idle about 29 MB. Timings unchanged (#1).
+- Pages load on their own thread (#2): the window keeps scrolling, following links, switching tabs and
+  profiles and editing the address while a page loads. Esc or the stop button (× in place of reload) stops a
+  load; opening another page or changing tab stops it too. Back, forward and reload move the tab only once
+  the page arrives.
