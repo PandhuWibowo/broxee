@@ -164,3 +164,7 @@
   hop, third-party cookies blocked, public suffixes refused using the built-in Public Suffix List
   (`net::site`), persistent cookies saved per profile with mode 0600, session cookies kept in memory only,
   and "Clear this profile's cookies" in the palette. The session file is now written 0600 too.
+- Keyboard focus for links in the page (#20): Tab and Shift+Tab continue from the header into the page's
+  visible `<a href>` links in document order and wrap; the page scrolls to the focused link, a 2px `accent`
+  ring with a 2px gap marks it, Enter follows it, Esc leaves it. The focus is kept per tab and comes back
+  when a sleeping tab wakes. Fixed: Tab in the address field restarted the order from the first button.

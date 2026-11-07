@@ -33,7 +33,7 @@ In the window:
 | Switch profile (Personal, Work) | ⌘⇧P, or click the profile name at the top of the sidebar |
 | Show or hide the sidebar | ⌘\\ |
 | Address field | ⌘L or click the host; type or paste (⌘V), Enter to open, Esc to cancel |
-| Move between header controls | Tab / Shift+Tab, Enter or Space to activate |
+| Move between header controls and the page's links | Tab / Shift+Tab (a 2px ring marks the focused link; the page scrolls to it), Enter to activate or follow, Esc to leave |
 | Quit | ⌘Q or close the window |
 
 Tabs and profiles:
@@ -265,7 +265,6 @@ Where data lives, and what compression does for it (measured 2026-11-07):
 
 - No table layout and no presentational attributes (`bgcolor`, `align`): Hacker News renders centred without its
   orange bar.
-- Tab reaches the header controls but not links inside the page yet; there is no visible focus for page links.
 - The palette cannot search the web: with no search engine chosen, a query that matches nothing says
   "Broxee can't search the web yet." Bookmarks will join its results when they exist.
 - The UI font (Arial, until Figtree is bundled) has no ⌘ ⇧ ⌥ glyphs, so the chrome draws those three as

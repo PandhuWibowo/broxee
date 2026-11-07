@@ -130,6 +130,9 @@ struct Tab {
     snapshot: Option<Stored>,
     /// When the tab was last visible, for choosing which snapshots to drop first.
     seen: u64,
+    /// The link that had keyboard focus when the tab went to sleep; the page is rebuilt
+    /// identically from its snapshot, so the node id still names it.
+    focused_link: Option<NodeId>,
 }
 
 impl Tab {
@@ -170,6 +173,13 @@ enum LoadMessage {
     Progress(f32),
     /// Boxed: a channel slot is as large as its largest message.
     Done(Box<Result<Loaded, String>>),
+}
+
+/// A focused link and where it is drawn: one rectangle per line it spans, in page coordinates
+/// (`true` when the rectangle is in a fixed layer and does not scroll).
+struct LinkFocus {
+    node: NodeId,
+    rects: Vec<(layout::Rect, bool)>,
 }
 
 /// A closed tab ⌘⇧T can bring back: its history, not its page.
@@ -295,6 +305,8 @@ struct Browser<S: Screen> {
     palette: Option<Palette>,
     /// Header button with keyboard focus, reached with Tab.
     focus: Option<Button>,
+    /// A link in the page with keyboard focus, reached with Tab after the header.
+    link_focus: Option<LinkFocus>,
     /// Progress of `load`, for the header's loading line.
     loading: Option<f32>,
     load: Option<Load>,
@@ -343,6 +355,7 @@ impl<S: Screen> Browser<S> {
             field: None,
             palette: None,
             focus: None,
+            link_focus: None,
             loading: None,
             load: None,
         }
@@ -539,6 +552,10 @@ impl<S: Screen> Browser<S> {
             engine::relayout(page, settings, &self.fonts);
         }
         self.clamp_scroll();
+        // The focused link moved with the layout.
+        if let Some(node) = self.link_focus.take().map(|l| l.node) {
+            self.focus_link(node, false);
+        }
     }
 
     fn max_scroll(&self) -> f32 {
@@ -599,15 +616,9 @@ impl<S: Screen> Browser<S> {
             };
         }
         let was_editing = self.field.take().is_some() | self.focus.take().is_some();
+        let was_editing = was_editing | self.link_focus.take().is_some();
         if let Some(url) = self.link_at(x, y - HEADER_HEIGHT) {
-            self.save_scroll();
-            // A link from another site does not carry SameSite=Strict cookies.
-            let from = self
-                .page
-                .as_ref()
-                .map(|p| net::site(&p.url.host).to_string());
-            let same_site = from.is_none_or(|from| from == net::site(&url.host));
-            self.navigate_from(url, Destination::Push, same_site);
+            self.follow(url);
             return true;
         }
         was_editing
@@ -672,10 +683,8 @@ impl<S: Screen> Browser<S> {
                     self.open_input(&input);
                 }
                 Key::Escape => self.field = None,
-                Key::Tab => {
-                    self.field = None;
-                    return self.move_focus(k.shift);
-                }
+                // `move_focus` closes the field, after reading where focus was.
+                Key::Tab => return self.move_focus(k.shift),
                 _ => return false,
             }
             return true;
@@ -701,6 +710,25 @@ impl<S: Screen> Browser<S> {
         if k.key == Key::Tab {
             return self.move_focus(k.shift);
         }
+        if let Some(node) = self.link_focus.as_ref().map(|l| l.node) {
+            match k.key {
+                Key::Enter => {
+                    let url = self.page.as_ref().and_then(|p| link_for(p, node));
+                    return match url {
+                        Some(url) => {
+                            self.follow(url);
+                            true
+                        }
+                        None => false,
+                    };
+                }
+                Key::Escape => {
+                    self.link_focus = None;
+                    return true;
+                }
+                _ => {}
+            }
+        }
         if k.key == Key::Escape {
             return self.stop_load();
         }
@@ -717,21 +745,14 @@ impl<S: Screen> Browser<S> {
         }
     }
 
-    /// Tab order through the header: back, forward, reload, address field. Disabled buttons
-    /// are skipped; the order wraps around.
+    /// Tab order: back, forward, reload, the address field, then the page's links in document
+    /// order. Disabled buttons and links that are not shown are skipped; the order wraps.
     fn move_focus(&mut self, backwards: bool) -> bool {
-        let order = [
-            Button::Back,
-            Button::Forward,
-            Button::Reload,
-            Button::Address,
-        ];
-        let current = if self.field.is_some() {
-            Some(Button::Address)
-        } else {
-            self.focus
-        };
-        let start = current.and_then(|b| order.iter().position(|&o| o == b));
+        #[derive(Clone, Copy, PartialEq)]
+        enum Stop {
+            Header(Button),
+            Link(NodeId),
+        }
         let tab = self.tab();
         let enabled = |b: Button| match b {
             Button::Back => tab.index > 0,
@@ -739,26 +760,85 @@ impl<S: Screen> Browser<S> {
             Button::Reload => !tab.history.is_empty() || self.load.is_some(),
             Button::Address => true,
         };
+        let mut order: Vec<Stop> = [
+            Button::Back,
+            Button::Forward,
+            Button::Reload,
+            Button::Address,
+        ]
+        .into_iter()
+        .filter(|&b| enabled(b))
+        .map(Stop::Header)
+        .collect();
+        if let Some(page) = &self.page {
+            order.extend(focusable_links(page).into_iter().map(Stop::Link));
+        }
+        let current = if self.field.is_some() {
+            Some(Stop::Header(Button::Address))
+        } else if let Some(link) = &self.link_focus {
+            Some(Stop::Link(link.node))
+        } else {
+            self.focus.map(Stop::Header)
+        };
         let n = order.len();
-        for step in 1..=n {
-            let i = match (start, backwards) {
-                (Some(s), false) => (s + step) % n,
-                (Some(s), true) => (s + n - step) % n,
-                (None, false) => step - 1,
-                (None, true) => n - step,
-            };
-            if enabled(order[i]) {
-                self.field = None;
-                self.focus = None;
-                if order[i] == Button::Address {
-                    self.focus_field();
-                } else {
-                    self.focus = Some(order[i]);
+        let next = match (
+            current.and_then(|c| order.iter().position(|&o| o == c)),
+            backwards,
+        ) {
+            (Some(i), false) => (i + 1) % n,
+            (Some(i), true) => (i + n - 1) % n,
+            (None, false) => 0,
+            (None, true) => n - 1,
+        };
+        self.field = None;
+        self.focus = None;
+        self.link_focus = None;
+        match order[next] {
+            Stop::Header(Button::Address) => {
+                self.focus_field();
+            }
+            Stop::Header(button) => self.focus = Some(button),
+            Stop::Link(node) => self.focus_link(node, true),
+        }
+        true
+    }
+
+    /// Give `node` (a link) keyboard focus; with `reveal`, scroll it into view.
+    fn focus_link(&mut self, node: NodeId, reveal: bool) {
+        let Some(page) = &self.page else {
+            return;
+        };
+        let rects = link_rects(page, node, self.fonts.metrics());
+        if rects.is_empty() {
+            return;
+        }
+        if reveal {
+            const MARGIN: f32 = 40.0;
+            let view = self.page_height();
+            let scrolling = rects.iter().filter(|(_, fixed)| !fixed).map(|(r, _)| r);
+            let top = scrolling.clone().map(|r| r.y).fold(f32::MAX, f32::min);
+            let bottom = scrolling.map(|r| r.y + r.height).fold(f32::MIN, f32::max);
+            if top < f32::MAX {
+                if top < self.scroll + MARGIN {
+                    self.scroll_to(top - MARGIN);
+                } else if bottom > self.scroll + view - MARGIN {
+                    self.scroll_to((bottom - view + MARGIN).min(top - MARGIN));
                 }
-                return true;
             }
         }
-        false
+        self.link_focus = Some(LinkFocus { node, rects });
+    }
+
+    /// Follow a link the person chose, by click or with Enter.
+    fn follow(&mut self, url: net::Url) {
+        self.save_scroll();
+        // A link from another site does not carry SameSite=Strict cookies.
+        let from = self
+            .page
+            .as_ref()
+            .map(|p| net::site(&p.url.host).to_string());
+        let same_site = from.is_none_or(|from| from == net::site(&url.host));
+        self.navigate_from(url, Destination::Push, same_site);
     }
 
     /// Run a command, from its shortcut or the palette.
@@ -1200,6 +1280,8 @@ impl<S: Screen> Browser<S> {
         self.save_scroll();
         self.field = None;
         self.focus = None;
+        let focused_link = self.link_focus.take().map(|l| l.node);
+        self.tab_mut().focused_link = focused_link;
         let page = self.page.take();
         self.painter.forget_images();
         let keep = std::mem::take(&mut self.page_is_entry);
@@ -1259,6 +1341,10 @@ impl<S: Screen> Browser<S> {
             if let Ok(page) = engine::restore(snapshot, settings, &self.fonts) {
                 let title = self.show(page, entry.scroll);
                 self.set_tab_title(title);
+                if let Some(node) = self.tab_mut().focused_link.take() {
+                    self.focus_link(node, false);
+                    self.render();
+                }
                 self.page_is_entry = true;
                 self.save_session();
                 return;
@@ -1428,6 +1514,7 @@ impl<S: Screen> Browser<S> {
         self.window.set_title(&title);
         self.page_is_entry = false;
         self.page = Some(page);
+        self.link_focus = None;
         self.loading = None;
         self.scroll = scroll;
         self.clamp_scroll();
@@ -1554,6 +1641,16 @@ impl<S: Screen> Browser<S> {
                 .as_deref()
                 .map(|line| (line, "Broxee can't search the web yet.")),
         });
+        // The focused link's rectangles in page-area points.
+        let ring: Vec<(f32, f32, f32, f32)> = self.link_focus.as_ref().map_or(Vec::new(), |l| {
+            l.rects
+                .iter()
+                .map(|(r, fixed)| {
+                    let y = if *fixed { r.y } else { r.y - self.scroll };
+                    (r.x, y, r.width, r.height)
+                })
+                .collect()
+        });
         let view = self.page.as_ref().map(|p| engine::page_view(p, fonts));
         let viewport = Viewport {
             width: pane_px as f32 / scale,
@@ -1591,6 +1688,16 @@ impl<S: Screen> Browser<S> {
                         );
                     }
                     _ => chrome::fill(bottom, stride, sidebar_px, pane_px, blank),
+                }
+                if !ring.is_empty() && page_rows > 0 {
+                    let frame = Frame {
+                        pixels: &mut *bottom,
+                        stride,
+                        left: sidebar_px,
+                        width: pane_px,
+                        scale,
+                    };
+                    chrome.draw_focus_ring(painter, frame, &ring);
                 }
                 let frame = Frame {
                     pixels: top,
@@ -1748,6 +1855,78 @@ fn link_for(page: &Loaded, node: NodeId) -> Option<net::Url> {
         current = page.dom.parent(id);
     }
     None
+}
+
+/// The links Tab can reach, in document order: `<a href>` elements that are visible and have
+/// something laid out.
+fn focusable_links(page: &Loaded) -> Vec<NodeId> {
+    let (dom, layout) = (&page.dom, &page.layout);
+    let mut shown = vec![false; dom.len()];
+    for t in &layout.texts {
+        shown[t.node as usize] = true;
+    }
+    for b in &layout.boxes {
+        shown[b.node as usize] = true;
+    }
+    dom.descendants(html::Dom::ROOT)
+        .filter(|&id| {
+            dom.tag_name(id) == Some("a")
+                && dom.attr(id, "href").is_some()
+                && {
+                    let style = page.styles.style(id);
+                    style.visible && !style.transparent
+                }
+                && dom.descendants(id).any(|d| shown[d as usize])
+        })
+        .collect()
+}
+
+/// Where link `node` is drawn: its boxes and text runs, with runs on one line joined.
+fn link_rects(
+    page: &Loaded,
+    node: NodeId,
+    metrics: &dyn font::TextMetrics,
+) -> Vec<(layout::Rect, bool)> {
+    let layout = &page.layout;
+    let inside: std::collections::HashSet<NodeId> = page.dom.descendants(node).collect();
+    let mut rects: Vec<(layout::Rect, bool)> = Vec::new();
+    for (i, b) in layout.boxes.iter().enumerate() {
+        if inside.contains(&b.node) {
+            rects.push((b.rect, layout.box_is_fixed(i)));
+        }
+    }
+    for (i, t) in layout.texts.iter().enumerate() {
+        if !inside.contains(&t.node) {
+            continue;
+        }
+        let style = page.styles.style(t.node);
+        if !style.visible {
+            continue;
+        }
+        let size = style.font_size.to_f32();
+        let top = t.baseline - metrics.ascent_em() * size;
+        let rect = layout::Rect {
+            x: t.x,
+            y: top,
+            width: t.width,
+            height: t.baseline + metrics.descent_em() * size - top,
+        };
+        let fixed = layout.text_is_fixed(i);
+        // Join with the previous run when it is on the same line and close by.
+        match rects.last_mut() {
+            Some((last, last_fixed))
+                if *last_fixed == fixed
+                    && (last.y - rect.y).abs() < 0.5
+                    && (last.height - rect.height).abs() < 0.5
+                    && rect.x >= last.x
+                    && rect.x <= last.x + last.width + size =>
+            {
+                last.width = rect.x + rect.width - last.x;
+            }
+            _ => rects.push((rect, fixed)),
+        }
+    }
+    rects
 }
 
 /// Typed text to a URL: full URLs as they are, `example.com` as https.
@@ -2044,11 +2223,7 @@ mod tests {
         assert!(act(&mut b, tab(false)));
         assert!(b.field.is_some(), "then the address field");
         assert!(act(&mut b, tab(false)));
-        assert_eq!(
-            b.focus,
-            Some(Button::Reload),
-            "wraps past the disabled buttons"
-        );
+        assert!(b.link_focus.is_some(), "then the page's first link");
         assert!(act(&mut b, tab(true)));
         assert!(b.field.is_some(), "Shift+Tab goes backwards");
 
@@ -2064,6 +2239,82 @@ mod tests {
             "Enter on the focused back button goes back"
         );
         assert!(act(&mut b, key(Key::Escape)) || b.focus.is_none());
+    }
+
+    #[test]
+    fn tab_reaches_page_links_scrolls_to_them_and_enter_follows() {
+        let dir = std::env::temp_dir().join(format!("broxee-focus-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let page = dir.join("links.html");
+        std::fs::write(
+            &page,
+            format!(
+                "<title>Links</title><style>body {{ margin: 0 }} p {{ margin: 0; line-height: 20px }} \
+                 .gone {{ display: none }} #ghost {{ visibility: hidden }}</style>\
+                 <p><a href=one.html>First</a> <a class=gone href=x.html>Gone</a> \
+                 <a id=ghost href=y.html>Ghost</a> <a name=anchor>No href</a></p>{}\
+                 <p><a href=two.html>Far down</a></p>",
+                "<p>line</p>".repeat(60)
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("one.html"), "<title>One</title>").unwrap();
+        std::fs::write(dir.join("two.html"), "<title>Two</title>").unwrap();
+        let mut b = browser(&page);
+        let tab = |shift| {
+            Event::Key(KeyEvent {
+                key: Key::Tab,
+                command: false,
+                shift,
+            })
+        };
+        let focused = |b: &Browser<FakeScreen>| {
+            let node = b.link_focus.as_ref()?.node;
+            let page = b.page.as_ref()?;
+            Some(page.dom.text_content(node))
+        };
+        act(&mut b, tab(false)); // reload
+        act(&mut b, tab(false)); // address field
+        act(&mut b, tab(false));
+        assert_eq!(focused(&b).as_deref(), Some("First"));
+        assert_eq!(b.scroll, 0.0);
+
+        // The focus ring: 2px of accent, 2px outside the link's text.
+        b.render();
+        let rect = b.link_focus.as_ref().unwrap().rects[0].0;
+        let accent = b.chrome.theme().accent;
+        let ring_x = (SIDEBAR_WIDTH + rect.x + rect.width) as usize + 3;
+        let ring_y = (HEADER_HEIGHT + rect.y + rect.height / 2.0) as usize;
+        assert_eq!(
+            b.window.pixel(ring_x, ring_y),
+            [accent.b, accent.g, accent.r, 255]
+        );
+
+        // Hidden links and anchors without href are skipped; the next one is scrolled to.
+        act(&mut b, tab(false));
+        assert_eq!(focused(&b).as_deref(), Some("Far down"));
+        assert!(b.scroll > 0.0, "scrolled into view");
+        let far = b.link_focus.as_ref().unwrap().rects[0].0;
+        assert!(far.y >= b.scroll && far.y + far.height <= b.scroll + b.page_height());
+
+        // Wrapping goes back to the header; Shift+Tab comes back.
+        act(&mut b, tab(false));
+        assert!(b.link_focus.is_none() && b.focus.is_some());
+        act(&mut b, tab(true));
+        assert_eq!(focused(&b).as_deref(), Some("Far down"));
+
+        // The focus comes back with a sleeping tab; Enter follows the link.
+        act(&mut b, command('t'));
+        act(&mut b, key(Key::Escape));
+        act(&mut b, command('1'));
+        assert_eq!(
+            focused(&b).as_deref(),
+            Some("Far down"),
+            "restored on waking"
+        );
+        assert!(act(&mut b, key(Key::Enter)));
+        assert_eq!(title(&b), "Two");
+        assert!(b.link_focus.is_none(), "a new page starts without focus");
     }
 
     #[test]

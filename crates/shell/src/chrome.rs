@@ -989,6 +989,53 @@ impl Chrome {
         );
     }
 
+    /// The keyboard focus ring around a page element: 2px `accent`, 2px outside each of its
+    /// rectangles (DESIGN.md, section 13). Rectangles are in points from the page area's
+    /// top-left corner; `frame` holds the page area's rows.
+    pub fn draw_focus_ring(
+        &self,
+        painter: &mut Painter,
+        frame: Frame,
+        rects: &[(f32, f32, f32, f32)],
+    ) {
+        let s = frame.scale;
+        let px = |v: f32| (v * s).round() as i32;
+        let (gap, ring) = (px(2.0), px(2.0).max(1));
+        let mut ops = Vec::new();
+        for &(x, y, w, h) in rects {
+            let (x0, y0) = (px(x) - gap - ring, px(y) - gap - ring);
+            let (x1, y1) = (px(x + w) + gap + ring, px(y + h) + gap + ring);
+            for (a, b, c, d) in [
+                (x0, y0, x1, y0 + ring),
+                (x0, y1 - ring, x1, y1),
+                (x0, y0, x0 + ring, y1),
+                (x1 - ring, y0, x1, y1),
+            ] {
+                ops.push(Op::Fill {
+                    x0: a,
+                    y0: b,
+                    x1: c,
+                    y1: d,
+                    color: self.theme.accent,
+                });
+            }
+        }
+        let (stride, left, width) = (frame.stride, frame.left, frame.width);
+        painter.overlay(
+            Target {
+                pixels: frame.pixels,
+                stride,
+                bgra: true,
+                left,
+            },
+            width,
+            (0, width as i32),
+            None,
+            &font::Approximate,
+            &ops,
+        );
+    }
+
     /// Free the palette's shapes once it closes (its shadow alone is about 1 MB at 2x).
     pub fn forget_palette(&mut self) {
         self.masks
