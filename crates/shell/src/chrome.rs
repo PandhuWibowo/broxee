@@ -595,9 +595,10 @@ impl Chrome {
 pub fn fill(pixels: &mut [u8], stride: usize, left: usize, width: usize, color: Color) {
     for row in pixels.chunks_mut(stride) {
         let end = ((left + width) * 4).min(row.len());
-        for px in row[(left * 4).min(end)..end].chunks_exact_mut(4) {
-            px.copy_from_slice(&[color.b, color.g, color.r, 255]);
-        }
+        row[(left * 4).min(end)..end]
+            .as_chunks_mut::<4>()
+            .0
+            .fill([color.b, color.g, color.r, 255]);
     }
 }
 

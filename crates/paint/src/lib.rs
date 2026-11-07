@@ -741,9 +741,10 @@ fn composite_band(
     let canvas = order(band.canvas);
     if band.fill_canvas {
         for row in rows.chunks_mut(band.stride) {
-            for px in row[band.left * 4..(band.left + band.width) * 4].chunks_exact_mut(4) {
-                px.copy_from_slice(&[canvas.r, canvas.g, canvas.b, 255]);
-            }
+            row[band.left * 4..(band.left + band.width) * 4]
+                .as_chunks_mut::<4>()
+                .0
+                .fill([canvas.r, canvas.g, canvas.b, 255]);
         }
     }
     let (lo, hi) = (band.clip.0.max(0), band.clip.1.min(band.width as i32));
