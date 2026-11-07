@@ -37,6 +37,8 @@ pub struct KeyEvent {
     pub key: Key,
     pub command: bool,
     pub shift: bool,
+    /// The Option (Alt) key: ⌘⌥B opens the bookmarks panel.
+    pub option: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

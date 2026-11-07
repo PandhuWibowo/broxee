@@ -12,13 +12,16 @@ pub enum Command {
     ToggleSidebar,
     FocusAddress,
     ClearCookies,
+    BookmarkPage,
+    ShowBookmarks,
+    RemoveBookmark,
     Back,
     Forward,
     Reload,
 }
 
 impl Command {
-    pub const ALL: [Command; 10] = [
+    pub const ALL: [Command; 13] = [
         Command::NewTab,
         Command::CloseTab,
         Command::ReopenTab,
@@ -26,6 +29,9 @@ impl Command {
         Command::ToggleSidebar,
         Command::FocusAddress,
         Command::ClearCookies,
+        Command::BookmarkPage,
+        Command::ShowBookmarks,
+        Command::RemoveBookmark,
         Command::Back,
         Command::Forward,
         Command::Reload,
@@ -40,6 +46,9 @@ impl Command {
             Command::ToggleSidebar => "Show or hide the sidebar",
             Command::FocusAddress => "Edit the address",
             Command::ClearCookies => "Clear this profile's cookies",
+            Command::BookmarkPage => "Bookmark this page",
+            Command::ShowBookmarks => "Show or hide bookmarks",
+            Command::RemoveBookmark => "Remove this page's bookmark",
             Command::Back => "Back",
             Command::Forward => "Forward",
             Command::Reload => "Reload",
@@ -56,7 +65,9 @@ impl Command {
             Command::SwitchProfile => "⌘⇧P",
             Command::ToggleSidebar => "⌘\\",
             Command::FocusAddress => "⌘L",
-            Command::ClearCookies => return None,
+            Command::ClearCookies | Command::RemoveBookmark => return None,
+            Command::BookmarkPage => "⌘D",
+            Command::ShowBookmarks => "⌘⌥B",
             Command::Back => "⌘[",
             Command::Forward => "⌘]",
             Command::Reload => "⌘R",

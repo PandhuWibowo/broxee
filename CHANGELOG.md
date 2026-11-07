@@ -168,3 +168,8 @@
   visible `<a href>` links in document order and wrap; the page scrolls to the focused link, a 2px `accent`
   ring with a 2px gap marks it, Enter follows it, Esc leaves it. The focus is kept per tab and comes back
   when a sleeping tab wakes. Fixed: Tab in the address field restarted the order from the first button.
+- Bookmarks per profile (#8): ⌘D saves the page with a name and folder (the last folder preselected) or edits
+  its bookmark; ⌘⌥B shows them by folder in place of the tab list, with keyboard and mouse; every bookmark
+  is a palette result; "Remove this page's bookmark" is a palette command; saved per profile (0600) and
+  read defensively. The sidebar is now a list of rows (labels, items, an empty state) with long titles
+  ending in "…". Key events carry the Option modifier.

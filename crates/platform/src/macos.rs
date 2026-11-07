@@ -442,6 +442,7 @@ extern "C" fn mouse_down(this: Id, _sel: Sel, event: Id) {
 extern "C" fn key_down(_this: Id, _sel: Sel, event: Id) {
     const COMMAND: u64 = 1 << 20;
     const SHIFT: u64 = 1 << 17;
+    const OPTION: u64 = 1 << 19;
     // SAFETY: `event` is the NSEvent passed to keyDown:.
     let (code, flags) = unsafe {
         (
@@ -451,6 +452,7 @@ extern "C" fn key_down(_this: Id, _sel: Sel, event: Id) {
     };
     let command = flags & COMMAND != 0;
     let shift = flags & SHIFT != 0;
+    let option = flags & OPTION != 0;
     let key = match code {
         36 | 76 => Some(Key::Enter),
         53 => Some(Key::Escape),
@@ -471,6 +473,7 @@ extern "C" fn key_down(_this: Id, _sel: Sel, event: Id) {
             key,
             command,
             shift,
+            option,
         }));
         return;
     }
@@ -496,6 +499,7 @@ extern "C" fn key_down(_this: Id, _sel: Sel, event: Id) {
             key: Key::Char(ch),
             command,
             shift,
+            option,
         }));
     }
 }

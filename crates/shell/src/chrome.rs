@@ -123,13 +123,17 @@ pub enum SidebarItem {
     Profile,
     /// "Search or go to ⌘K".
     Search,
-    Tab(usize),
-    CloseTab(usize),
-    NewTab,
+    /// A row of the list (a tab, a bookmark).
+    Row(usize),
+    /// The close button of a row.
+    CloseRow(usize),
+    /// The line after the list ("+ New tab").
+    Footer,
 }
 
-/// What is at (x, y) in the sidebar, in points, with `tabs` rows and the active one at `active`.
-pub fn sidebar_hit(x: f32, y: f32, tabs: usize, active: usize) -> Option<SidebarItem> {
+/// What is at (x, y) in the sidebar, in points, for a list of `rows` and, with `footer`, a
+/// line after it.
+pub fn sidebar_hit(x: f32, y: f32, rows: &[ListRow], footer: bool) -> Option<SidebarItem> {
     if !(0.0..SIDEBAR_WIDTH).contains(&x) || y < 0.0 {
         return None;
     }
@@ -146,31 +150,44 @@ pub fn sidebar_hit(x: f32, y: f32, tabs: usize, active: usize) -> Option<Sidebar
         return None;
     }
     let row = ((y - TABS_TOP) / TAB_ROW) as usize;
-    if row < tabs {
-        let on_close = x >= SIDEBAR_WIDTH - ROW_INSET - CLOSE_SIZE;
-        Some(if row == active && on_close {
-            SidebarItem::CloseTab(row)
-        } else {
-            SidebarItem::Tab(row)
-        })
-    } else if row == tabs {
-        Some(SidebarItem::NewTab)
-    } else {
-        None
+    match rows.get(row) {
+        Some(ListRow::Label(_)) => None,
+        Some(ListRow::Item { closable, .. }) => {
+            let on_close = x >= SIDEBAR_WIDTH - ROW_INSET - CLOSE_SIZE;
+            Some(if *closable && on_close {
+                SidebarItem::CloseRow(row)
+            } else {
+                SidebarItem::Row(row)
+            })
+        }
+        None if footer && row == rows.len() => Some(SidebarItem::Footer),
+        None => None,
     }
 }
 
-pub struct TabView<'a> {
-    pub title: &'a str,
-    /// Asleep to save memory: the title is drawn in `muted`.
-    pub asleep: bool,
+/// A row of the sidebar's list.
+pub enum ListRow<'a> {
+    /// A section label, 12px semibold in `muted` (DESIGN.md, section 4): a bookmark folder.
+    Label(&'a str),
+    Item {
+        title: &'a str,
+        /// Drawn in `muted`: a sleeping tab.
+        muted: bool,
+        /// With a close button at its right end.
+        closable: bool,
+    },
 }
 
 pub struct SidebarView<'a> {
     pub profile: &'a str,
     pub hue: Hue,
-    pub tabs: &'a [TabView<'a>],
-    pub active: usize,
+    pub rows: &'a [ListRow<'a>],
+    /// The highlighted row: the active tab, or the bookmark chosen with the keyboard.
+    pub selected: Option<usize>,
+    /// The line after the list, if any ("+ New tab").
+    pub footer: Option<&'a str>,
+    /// Shown when the list is empty: a line, and a quieter one that may hold ⌘ keys.
+    pub empty: Option<(&'a str, &'a str)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -207,6 +224,44 @@ fn palette_rect(pane_width: f32, rows: usize) -> (f32, f32, f32, f32) {
     let x = ((pane_width - w) / 2.0).max(0.0);
     let h = PALETTE_INPUT + 1.0 + 2.0 * PALETTE_PAD + PALETTE_ROW * rows.max(1) as f32;
     (x, PALETTE_TOP, w, h)
+}
+
+/// A dialog: where the palette sits, `DIALOG_WIDTH` wide at most.
+const DIALOG_WIDTH: f32 = 420.0;
+const DIALOG_PAD: f32 = 16.0;
+/// From the dialog's top to its first field's label.
+const DIALOG_HEAD: f32 = 48.0;
+/// One labelled field: label, box and the gap after it.
+const DIALOG_ROW: f32 = 62.0;
+const DIALOG_FIELD: f32 = 32.0;
+
+fn dialog_rect(pane_width: f32, fields: usize) -> (f32, f32, f32, f32) {
+    let w = DIALOG_WIDTH.min(pane_width - 32.0).max(160.0);
+    let x = ((pane_width - w) / 2.0).max(0.0);
+    let h = DIALOG_HEAD + DIALOG_ROW * fields as f32 + 20.0;
+    (x, PALETTE_TOP, w, h)
+}
+
+/// What is at (x, y) over a dialog with `fields` fields: `Some(Some(i))` on field `i`,
+/// `Some(None)` elsewhere on the dialog, `None` outside it.
+pub fn dialog_hit(x: f32, y: f32, pane_width: f32, fields: usize) -> Option<Option<usize>> {
+    let (dx, dy, w, h) = dialog_rect(pane_width, fields);
+    if !(dx..dx + w).contains(&x) || !(dy..dy + h).contains(&y) {
+        return None;
+    }
+    let field = (0..fields).find(|&i| {
+        let top = dy + DIALOG_HEAD + DIALOG_ROW * i as f32 + 18.0;
+        (top..top + DIALOG_FIELD).contains(&y)
+    });
+    Some(field)
+}
+
+pub struct DialogView<'a> {
+    pub heading: &'a str,
+    /// Label, text and the caret's byte offset, per field.
+    pub fields: &'a [(&'a str, &'a str, usize)],
+    pub active: usize,
+    pub help: &'a str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -679,46 +734,95 @@ impl Chrome {
         );
         let row_top = |i: usize| TABS_TOP + TAB_ROW * i as f32;
         let masks = &self.masks;
-        for (i, tab) in view.tabs.iter().enumerate() {
-            let active = i == view.active;
-            if active {
-                ops.push(Op::Mask {
-                    x: px(ROW_INSET),
-                    y: px(row_top(i) + 1.0),
-                    mask: &masks[&(Shape::Rounded, row_w, row_h)],
-                    color: t.selected,
-                });
-                ops.push(Op::Mask {
-                    x: px(SIDEBAR_WIDTH - ROW_INSET - CLOSE_SIZE + (CLOSE_SIZE - ICON) / 2.0),
-                    y: px(row_top(i) + (TAB_ROW - ICON) / 2.0),
-                    mask: &masks[&(Shape::Close, icon_px, icon_px)],
-                    color: t.text_2,
-                });
+        // Titles end with "…" before the close button or the edge.
+        let fitted: Vec<Cow<str>> = view
+            .rows
+            .iter()
+            .map(|row| match row {
+                ListRow::Label(text) => Cow::Borrowed(*text),
+                ListRow::Item {
+                    title, closable, ..
+                } => {
+                    let right = if *closable { CLOSE_SIZE } else { 8.0 };
+                    let room = (SIDEBAR_WIDTH - ROW_INSET - right - ROW_TEXT) * s;
+                    fit(title, room, 13.0 * s, metrics)
+                }
+            })
+            .collect();
+        for (i, (row, text)) in view.rows.iter().zip(&fitted).enumerate() {
+            let selected = view.selected == Some(i);
+            match row {
+                ListRow::Label(_) => text_ops.push(Op::Text {
+                    x: ROW_TEXT * s,
+                    baseline: px(row_top(i) + 20.0) as f32,
+                    text,
+                    size: 12.0 * s,
+                    bold: true,
+                    color: t.muted,
+                }),
+                ListRow::Item {
+                    muted, closable, ..
+                } => {
+                    if selected {
+                        ops.push(Op::Mask {
+                            x: px(ROW_INSET),
+                            y: px(row_top(i) + 1.0),
+                            mask: &masks[&(Shape::Rounded, row_w, row_h)],
+                            color: t.selected,
+                        });
+                    }
+                    if *closable {
+                        ops.push(Op::Mask {
+                            x: px(
+                                SIDEBAR_WIDTH - ROW_INSET - CLOSE_SIZE + (CLOSE_SIZE - ICON) / 2.0
+                            ),
+                            y: px(row_top(i) + (TAB_ROW - ICON) / 2.0),
+                            mask: &masks[&(Shape::Close, icon_px, icon_px)],
+                            color: t.text_2,
+                        });
+                    }
+                    // `muted` never sits on `selected` (DESIGN.md, section 3).
+                    let color = if *muted && !selected { t.muted } else { t.text };
+                    text_ops.push(Op::Text {
+                        x: ROW_TEXT * s,
+                        baseline: px(row_top(i) + 19.5) as f32,
+                        text,
+                        size: 13.0 * s,
+                        bold: false,
+                        color,
+                    });
+                }
             }
-            // `muted` never sits on `selected` (DESIGN.md, section 3): a selected tab is awake.
-            let color = if tab.asleep && !active {
-                t.muted
-            } else {
-                t.text
-            };
+        }
+        if let (true, Some((line, second))) = (view.rows.is_empty(), view.empty) {
             text_ops.push(Op::Text {
                 x: ROW_TEXT * s,
-                baseline: px(row_top(i) + 19.5) as f32,
-                text: tab.title,
+                baseline: px(row_top(0) + 19.5) as f32,
+                text: line,
                 size: 13.0 * s,
                 bold: false,
-                color,
+                color: t.text_2,
+            });
+            push_keys(
+                &mut ops,
+                masks,
+                second,
+                (ROW_TEXT * s, px(row_top(0) + 37.5) as f32),
+                (s, 12.0),
+                t.text_2,
+                metrics,
+            );
+        }
+        if let Some(footer) = view.footer {
+            text_ops.push(Op::Text {
+                x: ROW_TEXT * s,
+                baseline: px(row_top(view.rows.len()) + 19.5) as f32,
+                text: footer,
+                size: 13.0 * s,
+                bold: false,
+                color: t.text_2,
             });
         }
-        let new_row = view.tabs.len();
-        text_ops.push(Op::Text {
-            x: ROW_TEXT * s,
-            baseline: px(row_top(new_row) + 19.5) as f32,
-            text: "+ New tab",
-            size: 13.0 * s,
-            bold: false,
-            color: t.text_2,
-        });
         let (stride, left) = (frame.stride, frame.left);
         painter.overlay(
             Target {
@@ -733,8 +837,8 @@ impl Chrome {
             metrics,
             &ops,
         );
-        // Titles stop short of the close button.
-        let text_clip = (px(ROW_INSET), px(SIDEBAR_WIDTH - ROW_INSET - CLOSE_SIZE));
+        // Titles were fitted to their room; this only keeps text inside the sidebar.
+        let text_clip = (px(ROW_INSET), px(SIDEBAR_WIDTH - ROW_INSET));
         painter.overlay(
             Target {
                 pixels: frame.pixels,
@@ -780,21 +884,7 @@ impl Chrome {
         let blur = px(SHADOW_BLUR) as u32;
         let key_px = px(KEY_ICON) as u32;
 
-        // Palette masks depend on the number of rows: keep only the current size's.
-        let shadow_key = (Shape::Shadow, panel.0, panel.1);
-        self.masks.retain(|k, _| match k.0 {
-            Shape::Shadow => *k == shadow_key,
-            Shape::Panel => (k.1, k.2) == panel || (k.1, k.2) == inner,
-            _ => true,
-        });
-        self.masks
-            .entry(shadow_key)
-            .or_insert_with(|| shadow(panel.0, panel.1, 10.0 * s, blur));
-        for (size, radius) in [(panel, 10.0), (inner, 9.0)] {
-            self.masks
-                .entry((Shape::Panel, size.0, size.1))
-                .or_insert_with(|| rounded_rect(size.0, size.1, radius * s));
-        }
+        let shadow_key = self.panel_masks(panel, inner, blur, s);
         self.masks
             .entry((Shape::Rounded, row.0, row.1))
             .or_insert_with(|| rounded_rect(row.0, row.1, 6.0 * s));
@@ -1033,6 +1123,191 @@ impl Chrome {
             None,
             &font::Approximate,
             &ops,
+        );
+    }
+
+    /// The shapes of a floating panel (palette, dialog): its shadow, hairline and body. Only the
+    /// current size is kept, since a panel's height changes with its contents.
+    fn panel_masks(
+        &mut self,
+        panel: (u32, u32),
+        inner: (u32, u32),
+        blur: u32,
+        s: f32,
+    ) -> (Shape, u32, u32) {
+        let shadow_key = (Shape::Shadow, panel.0, panel.1);
+        self.masks.retain(|k, _| match k.0 {
+            Shape::Shadow => *k == shadow_key,
+            Shape::Panel => (k.1, k.2) == panel || (k.1, k.2) == inner,
+            _ => true,
+        });
+        self.masks
+            .entry(shadow_key)
+            .or_insert_with(|| shadow(panel.0, panel.1, 10.0 * s, blur));
+        for (size, radius) in [(panel, 10.0), (inner, 9.0)] {
+            self.masks
+                .entry((Shape::Panel, size.0, size.1))
+                .or_insert_with(|| rounded_rect(size.0, size.1, radius * s));
+        }
+        shadow_key
+    }
+
+    /// Draw a small dialog over the pane, where the palette sits: a heading, labelled text
+    /// fields (the active one with a focus ring and caret) and a line of help.
+    pub fn draw_dialog(
+        &mut self,
+        painter: &mut Painter,
+        frame: Frame,
+        fonts: Option<&FontSet>,
+        metrics: &dyn TextMetrics,
+        view: &DialogView,
+    ) {
+        let t = self.theme;
+        let s = frame.scale;
+        let px = |v: f32| (v * s).round() as i32;
+        let pane_w = frame.width as f32 / s;
+        let (x, y, w, h) = dialog_rect(pane_w, view.fields.len());
+        let hair = px(1.0).max(1);
+        let panel = (px(w) as u32, px(h) as u32);
+        let inner = (panel.0 - 2 * hair as u32, panel.1 - 2 * hair as u32);
+        let blur = px(SHADOW_BLUR) as u32;
+        let shadow_key = self.panel_masks(panel, inner, blur, s);
+        let field = (px(w - 2.0 * DIALOG_PAD) as u32, px(DIALOG_FIELD) as u32);
+        let ring = px(2.0);
+        for (size, radius) in [
+            (field, 6.0),
+            ((field.0 - 2 * hair as u32, field.1 - 2 * hair as u32), 5.0),
+            ((field.0 - 2 * ring as u32, field.1 - 2 * ring as u32), 4.0),
+        ] {
+            self.masks
+                .entry((Shape::Rounded, size.0, size.1))
+                .or_insert_with(|| rounded_rect(size.0, size.1, radius * s));
+        }
+        let masks = &self.masks;
+        let mut shapes = vec![
+            Op::Mask {
+                x: px(x) - blur as i32,
+                y: px(y + SHADOW_DROP) - blur as i32,
+                mask: &masks[&shadow_key],
+                color: Color::rgb(0, 0, 0),
+            },
+            Op::Mask {
+                x: px(x),
+                y: px(y),
+                mask: &masks[&(Shape::Panel, panel.0, panel.1)],
+                color: t.line,
+            },
+            Op::Mask {
+                x: px(x) + hair,
+                y: px(y) + hair,
+                mask: &masks[&(Shape::Panel, inner.0, inner.1)],
+                color: t.surface,
+            },
+        ];
+        let mut text = vec![Op::Text {
+            x: px(x + DIALOG_PAD) as f32,
+            baseline: px(y + 30.0) as f32,
+            text: view.heading,
+            size: 14.0 * s,
+            bold: true,
+            color: t.text,
+        }];
+        let size = 13.0 * s;
+        let left = px(x + DIALOG_PAD + 10.0) as f32;
+        let right = px(x + w - DIALOG_PAD - 10.0) as f32;
+        for (i, (label, value, cursor)) in view.fields.iter().enumerate() {
+            let top = y + DIALOG_HEAD + DIALOG_ROW * i as f32;
+            text.push(Op::Text {
+                x: px(x + DIALOG_PAD) as f32,
+                baseline: px(top + 12.0) as f32,
+                text: label,
+                size: 12.0 * s,
+                bold: false,
+                color: t.text_2,
+            });
+            let box_y = top + 18.0;
+            let active = i == view.active;
+            // The active field: a 2px accent ring; the others: a hairline.
+            let (edge, edge_px) = if active {
+                (t.accent, ring)
+            } else {
+                (t.line, hair)
+            };
+            shapes.push(Op::Mask {
+                x: px(x + DIALOG_PAD),
+                y: px(box_y),
+                mask: &masks[&(Shape::Rounded, field.0, field.1)],
+                color: edge,
+            });
+            shapes.push(Op::Mask {
+                x: px(x + DIALOG_PAD) + edge_px,
+                y: px(box_y) + edge_px,
+                mask: &masks[&(
+                    Shape::Rounded,
+                    field.0 - 2 * edge_px as u32,
+                    field.1 - 2 * edge_px as u32,
+                )],
+                color: t.canvas,
+            });
+            let caret = metrics.width(&value[..*cursor], size, false);
+            let shift = if active {
+                (left + caret - right).max(0.0)
+            } else {
+                0.0
+            };
+            text.push(Op::Text {
+                x: left - shift,
+                baseline: px(box_y + 20.5) as f32,
+                text: value,
+                size,
+                bold: false,
+                color: t.text,
+            });
+            if active {
+                let cx = (left - shift + caret).round() as i32;
+                text.push(Op::Fill {
+                    x0: cx,
+                    y0: px(box_y + 7.0),
+                    x1: cx + hair,
+                    y1: px(box_y + DIALOG_FIELD - 7.0),
+                    color: t.accent,
+                });
+            }
+        }
+        text.push(Op::Text {
+            x: px(x + DIALOG_PAD) as f32,
+            baseline: px(y + h - DIALOG_PAD) as f32,
+            text: view.help,
+            size: 12.0 * s,
+            bold: false,
+            color: t.text_2,
+        });
+        let (stride, frame_left, width) = (frame.stride, frame.left, frame.width);
+        painter.overlay(
+            Target {
+                pixels: &mut *frame.pixels,
+                stride,
+                bgra: true,
+                left: frame_left,
+            },
+            width,
+            (0, width as i32),
+            fonts,
+            metrics,
+            &shapes,
+        );
+        painter.overlay(
+            Target {
+                pixels: frame.pixels,
+                stride,
+                bgra: true,
+                left: frame_left,
+            },
+            width,
+            (px(x + DIALOG_PAD), px(x + w - DIALOG_PAD)),
+            fonts,
+            metrics,
+            &text,
         );
     }
 
@@ -1343,21 +1618,49 @@ mod tests {
 
     #[test]
     fn hit_tests_the_sidebar() {
-        let hit = |x, y| sidebar_hit(x, y, 3, 1);
+        let item = |title| ListRow::Item {
+            title,
+            muted: false,
+            closable: false,
+        };
+        let rows = [
+            item("a"),
+            ListRow::Item {
+                title: "b",
+                muted: false,
+                closable: true,
+            },
+            ListRow::Label("Folder"),
+            item("c"),
+        ];
+        let hit = |x, y| sidebar_hit(x, y, &rows, true);
         assert_eq!(hit(100.0, 10.0), Some(SidebarItem::Profile));
         assert_eq!(hit(100.0, 50.0), Some(SidebarItem::Search));
-        assert_eq!(hit(100.0, 78.0), None, "gap above the tabs");
-        assert_eq!(hit(100.0, 90.0), Some(SidebarItem::Tab(0)));
+        assert_eq!(hit(100.0, 78.0), None, "gap above the list");
+        assert_eq!(hit(100.0, 90.0), Some(SidebarItem::Row(0)));
         assert_eq!(
             hit(220.0, 90.0),
-            Some(SidebarItem::Tab(0)),
-            "only the active row has a close button"
+            Some(SidebarItem::Row(0)),
+            "no close button"
         );
-        assert_eq!(hit(220.0, 120.0), Some(SidebarItem::CloseTab(1)));
-        assert_eq!(hit(100.0, 150.0), Some(SidebarItem::Tab(2)));
-        assert_eq!(hit(100.0, 180.0), Some(SidebarItem::NewTab));
-        assert_eq!(hit(100.0, 215.0), None);
+        assert_eq!(hit(220.0, 120.0), Some(SidebarItem::CloseRow(1)));
+        assert_eq!(hit(100.0, 150.0), None, "a label is not a row to open");
+        assert_eq!(hit(100.0, 180.0), Some(SidebarItem::Row(3)));
+        assert_eq!(hit(100.0, 210.0), Some(SidebarItem::Footer));
+        assert_eq!(sidebar_hit(100.0, 210.0, &rows, false), None, "no footer");
+        assert_eq!(hit(100.0, 245.0), None);
         assert_eq!(hit(250.0, 90.0), None, "the pane");
+    }
+
+    #[test]
+    fn hit_tests_dialogs() {
+        // A 400-point pane: the dialog is 368 wide from x = 16, top 48; field 0's box starts at
+        // 48 + 48 + 18 = 114, field 1's at 176.
+        assert_eq!(dialog_hit(10.0, 120.0, 400.0, 2), None);
+        assert_eq!(dialog_hit(100.0, 60.0, 400.0, 2), Some(None));
+        assert_eq!(dialog_hit(100.0, 120.0, 400.0, 2), Some(Some(0)));
+        assert_eq!(dialog_hit(100.0, 180.0, 400.0, 2), Some(Some(1)));
+        assert_eq!(dialog_hit(100.0, 400.0, 400.0, 2), None);
     }
 
     #[test]

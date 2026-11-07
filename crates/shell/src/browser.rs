@@ -22,8 +22,8 @@ use paint::{Painter, Target, Viewport};
 use platform::{Event, Key, KeyEvent};
 
 use crate::chrome::{
-    self, Button, Chrome, FieldView, Frame, HeaderView, HintView, Hue, PaletteHit, PaletteRow,
-    PaletteView, SidebarItem, SidebarView, TabView, HEADER_HEIGHT, SIDEBAR_WIDTH,
+    self, Button, Chrome, DialogView, FieldView, Frame, HeaderView, HintView, Hue, ListRow,
+    PaletteHit, PaletteRow, PaletteView, SidebarItem, SidebarView, HEADER_HEIGHT, SIDEBAR_WIDTH,
 };
 use crate::engine::{self, FontStore, Loaded, Settings};
 use crate::hibernate::{Stored, TabStore};
@@ -39,6 +39,10 @@ const GLYPH_CACHE_LIMIT: usize = 8 << 20;
 /// Sleeping tabs' files together stay under this on disk; past it, the tabs used longest ago
 /// keep only their history and reload from the network when selected.
 const SNAPSHOT_BUDGET: u64 = 256 << 20;
+/// The folder of a first bookmark.
+const DEFAULT_FOLDER: &str = "Bookmarks";
+/// A bookmarks file past this many is cut there when read.
+const BOOKMARK_LIMIT: usize = 10_000;
 /// How often the engine thread looks at a running load's progress: once per frame at 60 Hz.
 const LOAD_POLL: Duration = Duration::from_millis(16);
 /// Closed tabs that ⌘⇧T can reopen, per profile.
@@ -182,6 +186,39 @@ struct LinkFocus {
     rects: Vec<(layout::Rect, bool)>,
 }
 
+/// A saved page.
+#[derive(Clone, Debug, PartialEq)]
+struct Bookmark {
+    title: String,
+    url: net::Url,
+    folder: String,
+}
+
+/// ⌘D's dialog: the page's name and folder.
+struct BookmarkDialog {
+    url: net::Url,
+    /// Name, then folder.
+    fields: [Field; 2],
+    active: usize,
+    /// Editing this bookmark rather than adding one.
+    existing: Option<usize>,
+}
+
+/// What the sidebar lists.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SidebarList {
+    Tabs,
+    Bookmarks,
+}
+
+/// What a sidebar row stands for.
+#[derive(Clone, Copy)]
+enum RowTarget {
+    Tab(usize),
+    Bookmark(usize),
+    Folder,
+}
+
 /// A closed tab ⌘⇧T can bring back: its history, not its page.
 struct Closed {
     history: Vec<Entry>,
@@ -200,6 +237,9 @@ struct Profile {
     closed: Vec<Closed>,
     /// This profile's cookies: logins in one profile never reach the other.
     cookies: Arc<net::Cookies>,
+    bookmarks: Vec<Bookmark>,
+    /// Preselected in ⌘D's dialog (DESIGN.md, section 7).
+    last_folder: String,
 }
 
 impl Profile {
@@ -211,6 +251,8 @@ impl Profile {
             active: 0,
             closed: Vec::new(),
             cookies: Arc::new(net::Cookies::new()),
+            bookmarks: Vec::new(),
+            last_folder: DEFAULT_FOLDER.into(),
         }
     }
 }
@@ -303,6 +345,10 @@ struct Browser<S: Screen> {
     store: Option<TabStore>,
     field: Option<Field>,
     palette: Option<Palette>,
+    dialog: Option<BookmarkDialog>,
+    list: SidebarList,
+    /// The bookmark row chosen with ↑ ↓ while the bookmarks panel is open.
+    bookmark_row: Option<usize>,
     /// Header button with keyboard focus, reached with Tab.
     focus: Option<Button>,
     /// A link in the page with keyboard focus, reached with Tab after the header.
@@ -326,10 +372,19 @@ impl<S: Screen> Browser<S> {
             Profile::new("Work", Hue::Amber),
         ];
         for profile in &mut profiles {
-            let saved = cookie_file(session.as_deref(), profile.name)
-                .and_then(|path| std::fs::read_to_string(path).ok());
-            if let Some(text) = saved {
+            let read = |file| {
+                profile_file(session.as_deref(), profile.name, file)
+                    .and_then(|path| std::fs::read_to_string(path).ok())
+            };
+            if let Some(text) = read("cookies") {
                 profile.cookies = Arc::new(net::Cookies::load(&text));
+            }
+            if let Some(text) = read("bookmarks") {
+                let (bookmarks, last) = parse_bookmarks(&text);
+                profile.bookmarks = bookmarks;
+                if let Some(last) = last {
+                    profile.last_folder = last;
+                }
             }
         }
         Browser {
@@ -354,6 +409,9 @@ impl<S: Screen> Browser<S> {
             store,
             field: None,
             palette: None,
+            dialog: None,
+            list: SidebarList::Tabs,
+            bookmark_row: None,
             focus: None,
             link_focus: None,
             loading: None,
@@ -580,6 +638,25 @@ impl<S: Screen> Browser<S> {
 
     fn click(&mut self, x: f32, y: f32) -> bool {
         let left = self.pane_left();
+        let pane_width = self.pane_width();
+        if let Some(d) = &mut self.dialog {
+            if x >= left {
+                return match chrome::dialog_hit(x - left, y, pane_width, d.fields.len()) {
+                    Some(Some(field)) => {
+                        d.active = field;
+                        true
+                    }
+                    Some(None) => false,
+                    None => {
+                        self.dialog = None;
+                        self.chrome.forget_palette();
+                        true
+                    }
+                };
+            }
+            self.dialog = None;
+            self.chrome.forget_palette();
+        }
         if let Some(p) = &self.palette {
             if x >= left {
                 let rows = (p.items.len() - p.first).min(chrome::palette_capacity(self.height));
@@ -594,14 +671,25 @@ impl<S: Screen> Browser<S> {
         if x < left {
             self.field = None;
             self.focus = None;
-            let p = &self.profiles[self.profile];
-            return match chrome::sidebar_hit(x, y, p.tabs.len(), p.active) {
-                Some(SidebarItem::Profile) => self.switch_profile(),
-                Some(SidebarItem::Search) => self.open_palette(),
-                Some(SidebarItem::Tab(i)) => self.select_tab(i),
-                Some(SidebarItem::CloseTab(_)) => self.close_tab(),
-                Some(SidebarItem::NewTab) => self.new_tab(),
-                None => false,
+            let hit = {
+                let list = self.sidebar_rows();
+                chrome::sidebar_hit(x, y, &list.rows, list.footer.is_some()).map(
+                    |item| match item {
+                        SidebarItem::Row(r) | SidebarItem::CloseRow(r) => {
+                            (item, Some(list.targets[r]))
+                        }
+                        _ => (item, None),
+                    },
+                )
+            };
+            return match hit {
+                Some((SidebarItem::Profile, _)) => self.switch_profile(),
+                Some((SidebarItem::Search, _)) => self.open_palette(),
+                Some((SidebarItem::CloseRow(_), _)) => self.close_tab(),
+                Some((SidebarItem::Footer, _)) => self.new_tab(),
+                Some((_, Some(RowTarget::Tab(i)))) => self.select_tab(i),
+                Some((_, Some(RowTarget::Bookmark(i)))) => self.open_bookmark(i),
+                _ => false,
             };
         }
         let x = x - left;
@@ -625,6 +713,17 @@ impl<S: Screen> Browser<S> {
     }
 
     fn key(&mut self, k: KeyEvent) -> bool {
+        if self.dialog.is_some() {
+            if !k.command {
+                return self.dialog_key(k);
+            }
+            // ⌘D closes it; any other shortcut closes it and runs.
+            self.dialog = None;
+            self.chrome.forget_palette();
+            if k.key == Key::Char('d') {
+                return true;
+            }
+        }
         if self.palette.is_some() {
             if !k.command {
                 return self.palette_key(k);
@@ -638,6 +737,8 @@ impl<S: Screen> Browser<S> {
         if k.command {
             return match k.key {
                 Key::Char('k') => self.open_palette(),
+                Key::Char('b') if k.option => self.run_command(Command::ShowBookmarks),
+                Key::Char('d') => self.run_command(Command::BookmarkPage),
                 Key::Char('t') if k.shift => self.run_command(Command::ReopenTab),
                 Key::Char('t') => self.run_command(Command::NewTab),
                 Key::Char('w') => self.run_command(Command::CloseTab),
@@ -709,6 +810,12 @@ impl<S: Screen> Browser<S> {
         }
         if k.key == Key::Tab {
             return self.move_focus(k.shift);
+        }
+        if self.list == SidebarList::Bookmarks && self.focus.is_none() && self.link_focus.is_none()
+        {
+            if let Some(done) = self.bookmarks_key(k.key) {
+                return done;
+            }
         }
         if let Some(node) = self.link_focus.as_ref().map(|l| l.node) {
             match k.key {
@@ -854,6 +961,30 @@ impl<S: Screen> Browser<S> {
                 true
             }
             Command::FocusAddress => self.focus_field(),
+            Command::BookmarkPage => self.open_bookmark_dialog(),
+            Command::ShowBookmarks => {
+                self.list = match self.list {
+                    SidebarList::Tabs => SidebarList::Bookmarks,
+                    SidebarList::Bookmarks => SidebarList::Tabs,
+                };
+                self.bookmark_row = None;
+                if !self.sidebar {
+                    self.sidebar = true;
+                    self.relayout();
+                }
+                true
+            }
+            Command::RemoveBookmark => {
+                let url = self.tab().entry().map(|e| e.url.clone());
+                let p = &mut self.profiles[self.profile];
+                let before = p.bookmarks.len();
+                p.bookmarks.retain(|b| Some(&b.url) != url.as_ref());
+                let removed = p.bookmarks.len() != before;
+                if removed {
+                    self.save_bookmarks();
+                }
+                removed
+            }
             Command::ClearCookies => {
                 let cookies = &self.profiles[self.profile].cookies;
                 cookies.clear();
@@ -879,6 +1010,165 @@ impl<S: Screen> Browser<S> {
         });
         self.refresh_palette();
         true
+    }
+
+    /// ⌘D: name and file the visible page; a page already saved opens its bookmark.
+    fn open_bookmark_dialog(&mut self) -> bool {
+        let Some(entry) = self.tab().entry() else {
+            return false;
+        };
+        let url = entry.url.clone();
+        let title = self.tab().title().to_string();
+        let p = &self.profiles[self.profile];
+        let existing = p.bookmarks.iter().position(|b| b.url == url);
+        let (name, folder) = match existing {
+            Some(i) => (p.bookmarks[i].title.clone(), p.bookmarks[i].folder.clone()),
+            None => (title, p.last_folder.clone()),
+        };
+        let field = |text: String, selected| Field {
+            cursor: text.len(),
+            text,
+            all_selected: selected,
+        };
+        self.close_palette();
+        self.field = None;
+        self.focus = None;
+        self.dialog = Some(BookmarkDialog {
+            url,
+            fields: [field(name, true), field(folder, false)],
+            active: 0,
+            existing,
+        });
+        true
+    }
+
+    fn dialog_key(&mut self, k: KeyEvent) -> bool {
+        let Some(d) = self.dialog.as_mut() else {
+            return false;
+        };
+        let field = &mut d.fields[d.active];
+        match k.key {
+            Key::Char(c) => field.insert(c.encode_utf8(&mut [0; 4])),
+            Key::Backspace => field.backspace(),
+            Key::Left => field.left(),
+            Key::Right => field.right(),
+            Key::Home => {
+                field.all_selected = false;
+                field.cursor = 0;
+            }
+            Key::End => {
+                field.all_selected = false;
+                field.cursor = field.text.len();
+            }
+            Key::Tab | Key::Up | Key::Down => {
+                field.all_selected = false;
+                d.active = 1 - d.active;
+                // Typing replaces the field just reached, as in macOS dialogs.
+                d.fields[d.active].all_selected = true;
+            }
+            Key::Escape => {
+                self.dialog = None;
+                self.chrome.forget_palette();
+            }
+            Key::Enter => return self.save_bookmark_dialog(),
+            _ => return false,
+        }
+        true
+    }
+
+    fn save_bookmark_dialog(&mut self) -> bool {
+        let Some(d) = self.dialog.take() else {
+            return false;
+        };
+        self.chrome.forget_palette();
+        let clean = |s: &str| s.trim().replace(['\t', '\n', '\r'], " ");
+        let title = match clean(&d.fields[0].text) {
+            t if t.is_empty() => d.url.to_string(),
+            t => t,
+        };
+        let folder = match clean(&d.fields[1].text) {
+            f if f.is_empty() => DEFAULT_FOLDER.to_string(),
+            f => f,
+        };
+        let p = &mut self.profiles[self.profile];
+        let bookmark = Bookmark {
+            title,
+            url: d.url,
+            folder: folder.clone(),
+        };
+        match d.existing.filter(|&i| i < p.bookmarks.len()) {
+            Some(i) => p.bookmarks[i] = bookmark,
+            None => p.bookmarks.push(bookmark),
+        }
+        p.last_folder = folder;
+        self.save_bookmarks();
+        true
+    }
+
+    fn open_bookmark(&mut self, index: usize) -> bool {
+        let Some(url) = self.profiles[self.profile]
+            .bookmarks
+            .get(index)
+            .map(|b| b.url.clone())
+        else {
+            return false;
+        };
+        self.save_scroll();
+        self.navigate(url, Destination::Push);
+        true
+    }
+
+    /// ↑ ↓ Enter Esc while the bookmarks panel is open; `None` for keys it leaves alone.
+    fn bookmarks_key(&mut self, key: Key) -> Option<bool> {
+        let targets = self.sidebar_rows().targets;
+        let items: Vec<usize> = (0..targets.len())
+            .filter(|&r| matches!(targets[r], RowTarget::Bookmark(_)))
+            .collect();
+        let at = self
+            .bookmark_row
+            .and_then(|r| items.iter().position(|&i| i == r));
+        match key {
+            Key::Down | Key::Up if !items.is_empty() => {
+                let next = match (at, key == Key::Down) {
+                    (None, true) => 0,
+                    (None, false) => items.len() - 1,
+                    (Some(i), true) => (i + 1).min(items.len() - 1),
+                    (Some(i), false) => i.saturating_sub(1),
+                };
+                self.bookmark_row = Some(items[next]);
+                Some(true)
+            }
+            Key::Enter => {
+                let row = self.bookmark_row?;
+                match targets.get(row) {
+                    Some(&RowTarget::Bookmark(i)) => Some(self.open_bookmark(i)),
+                    _ => None,
+                }
+            }
+            Key::Escape => {
+                self.list = SidebarList::Tabs;
+                self.bookmark_row = None;
+                Some(true)
+            }
+            _ => None,
+        }
+    }
+
+    fn sidebar_rows(&self) -> SidebarRows<'_> {
+        sidebar_rows(&self.profiles[self.profile], self.list, self.bookmark_row)
+    }
+
+    /// Write the visible profile's bookmarks, readable by this user only.
+    fn save_bookmarks(&self) {
+        let profile = &self.profiles[self.profile];
+        let Some(path) = profile_file(self.session.as_deref(), profile.name, "bookmarks") else {
+            return;
+        };
+        let text = write_bookmarks(&profile.bookmarks, &profile.last_folder);
+        if let Err(e) = write_private(&path, text.as_bytes()) {
+            self.window
+                .set_title(&format!("Broxee: couldn't save bookmarks ({e})"));
+        }
     }
 
     fn close_palette(&mut self) -> bool {
@@ -936,6 +1226,15 @@ impl<S: Screen> Browser<S> {
                     action: Action::Tab { profile: p, index },
                 });
             }
+        }
+        let profile = &self.profiles[self.profile];
+        for b in &profile.bookmarks {
+            items.push(palette::Item {
+                title: b.title.clone(),
+                detail: b.url.to_string(),
+                hint: Hint::Label(format!("Bookmark · {}", b.folder)),
+                action: Action::Visit(b.url.clone()),
+            });
         }
         const HISTORY_LIMIT: usize = 200;
         let profile = &self.profiles[self.profile];
@@ -1477,7 +1776,7 @@ impl<S: Screen> Browser<S> {
         if !profile.cookies.take_changed() {
             return;
         }
-        let Some(path) = cookie_file(self.session.as_deref(), profile.name) else {
+        let Some(path) = profile_file(self.session.as_deref(), profile.name, "cookies") else {
             return;
         };
         if let Err(e) = write_private(&path, profile.cookies.save().as_bytes()) {
@@ -1596,20 +1895,31 @@ impl<S: Screen> Browser<S> {
             }),
             focused: self.focus,
         };
-        let tabs: Vec<TabView> = profile
-            .tabs
-            .iter()
-            .enumerate()
-            .map(|(i, t)| TabView {
-                title: t.title(),
-                asleep: i != profile.active,
-            })
-            .collect();
+        let list = sidebar_rows(profile, self.list, self.bookmark_row);
         let sidebar = (sidebar_px > 0).then_some(SidebarView {
             profile: profile.name,
             hue: profile.hue,
-            tabs: &tabs,
-            active: profile.active,
+            rows: &list.rows,
+            selected: list.selected,
+            footer: list.footer,
+            empty: list.empty,
+        });
+        let dialog_fields: Vec<(&str, &str, usize)> =
+            self.dialog.as_ref().map_or(Vec::new(), |d| {
+                vec![
+                    ("Name", d.fields[0].text.as_str(), d.fields[0].cursor),
+                    ("Folder", d.fields[1].text.as_str(), d.fields[1].cursor),
+                ]
+            });
+        let dialog_view = self.dialog.as_ref().map(|d| DialogView {
+            heading: if d.existing.is_some() {
+                "Edit bookmark"
+            } else {
+                "Bookmark this page"
+            },
+            fields: &dialog_fields,
+            active: d.active,
+            help: "Enter to save · Tab for the other field · Esc to cancel",
         });
         let palette_rows: Vec<PaletteRow> = self.palette.as_ref().map_or(Vec::new(), |p| {
             p.items
@@ -1707,6 +2017,16 @@ impl<S: Screen> Browser<S> {
                     scale,
                 };
                 chrome.draw(painter, frame, fonts.set(), fonts.metrics(), &header);
+                if let Some(dialog) = &dialog_view {
+                    let frame = Frame {
+                        pixels: &mut *pixels,
+                        stride,
+                        left: sidebar_px,
+                        width: pane_px,
+                        scale,
+                    };
+                    chrome.draw_dialog(painter, frame, fonts.set(), fonts.metrics(), dialog);
+                }
                 if let Some(palette) = &palette_view {
                     let frame = Frame {
                         pixels: &mut *pixels,
@@ -1724,15 +2044,119 @@ impl<S: Screen> Browser<S> {
     }
 }
 
-/// Where a profile's cookies are kept: beside the session file, one folder per profile.
-fn cookie_file(session: Option<&std::path::Path>, profile: &str) -> Option<PathBuf> {
-    Some(
-        session?
-            .parent()?
-            .join("profiles")
-            .join(profile)
-            .join("cookies"),
-    )
+/// The sidebar's rows for the current list, what each stands for, and its footer and
+/// empty-state text.
+fn sidebar_rows(
+    profile: &Profile,
+    list: SidebarList,
+    bookmark_row: Option<usize>,
+) -> SidebarRows<'_> {
+    match list {
+        SidebarList::Tabs => SidebarRows {
+            rows: profile
+                .tabs
+                .iter()
+                .enumerate()
+                .map(|(i, t)| ListRow::Item {
+                    title: t.title(),
+                    muted: i != profile.active,
+                    closable: i == profile.active,
+                })
+                .collect(),
+            targets: (0..profile.tabs.len()).map(RowTarget::Tab).collect(),
+            selected: Some(profile.active),
+            footer: Some("+ New tab"),
+            empty: None,
+        },
+        SidebarList::Bookmarks => {
+            // Folders in name order; bookmarks in the order they were saved.
+            let mut folders: Vec<&str> = profile
+                .bookmarks
+                .iter()
+                .map(|b| b.folder.as_str())
+                .collect();
+            folders.sort_by_key(|f| f.to_lowercase());
+            folders.dedup();
+            let mut rows = Vec::new();
+            let mut targets = Vec::new();
+            for folder in folders {
+                rows.push(ListRow::Label(folder));
+                targets.push(RowTarget::Folder);
+                for (i, b) in profile.bookmarks.iter().enumerate() {
+                    if b.folder == folder {
+                        rows.push(ListRow::Item {
+                            title: &b.title,
+                            muted: false,
+                            closable: false,
+                        });
+                        targets.push(RowTarget::Bookmark(i));
+                    }
+                }
+            }
+            SidebarRows {
+                rows,
+                targets,
+                selected: bookmark_row,
+                footer: None,
+                empty: Some(("No bookmarks yet.", "Press ⌘D on any page to save it.")),
+            }
+        }
+    }
+}
+
+/// The sidebar's list as rows, ready to draw or hit-test.
+struct SidebarRows<'a> {
+    rows: Vec<ListRow<'a>>,
+    targets: Vec<RowTarget>,
+    selected: Option<usize>,
+    footer: Option<&'static str>,
+    empty: Option<(&'static str, &'static str)>,
+}
+
+/// Where a profile keeps `file` (its cookies, its bookmarks): beside the session file, one
+/// folder per profile.
+fn profile_file(session: Option<&std::path::Path>, profile: &str, file: &str) -> Option<PathBuf> {
+    Some(session?.parent()?.join("profiles").join(profile).join(file))
+}
+
+/// Bookmarks as text: the last folder used, then one bookmark per line (folder, URL, title).
+fn write_bookmarks(bookmarks: &[Bookmark], last_folder: &str) -> String {
+    let mut out = format!("broxee-bookmarks 1\nlast\t{last_folder}\n");
+    for b in bookmarks {
+        out += &format!("mark\t{}\t{}\t{}\n", b.folder, b.url, b.title);
+    }
+    out
+}
+
+/// Read `write_bookmarks` text; lines that do not parse are skipped.
+fn parse_bookmarks(text: &str) -> (Vec<Bookmark>, Option<String>) {
+    let mut lines = text.lines();
+    if lines.next() != Some("broxee-bookmarks 1") {
+        return (Vec::new(), None);
+    }
+    let (mut bookmarks, mut last) = (Vec::new(), None);
+    for line in lines {
+        let fields: Vec<&str> = line.splitn(4, '\t').collect();
+        match fields.as_slice() {
+            ["last", folder] if !folder.trim().is_empty() => last = Some(folder.to_string()),
+            ["mark", folder, url, title] if bookmarks.len() < BOOKMARK_LIMIT => {
+                if let Ok(url) = net::Url::parse(url) {
+                    let folder = if folder.trim().is_empty() {
+                        DEFAULT_FOLDER
+                    } else {
+                        folder
+                    };
+                    bookmarks.push(Bookmark {
+                        title: title.to_string(),
+                        url,
+                        folder: folder.to_string(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    (bookmarks, last)
 }
 
 /// Write `data` to `path` through a temporary file and a rename, readable by this user only.
@@ -2116,6 +2540,7 @@ mod tests {
             key,
             command: false,
             shift: false,
+            option: false,
         })
     }
 
@@ -2124,6 +2549,7 @@ mod tests {
             key: Key::Char(c),
             command: true,
             shift: false,
+            option: false,
         })
     }
 
@@ -2215,6 +2641,7 @@ mod tests {
                 key: Key::Tab,
                 command: false,
                 shift,
+                option: false,
             })
         };
         // Only one page: back and forward are disabled, so Tab lands on reload first.
@@ -2266,6 +2693,7 @@ mod tests {
                 key: Key::Tab,
                 command: false,
                 shift,
+                option: false,
             })
         };
         let focused = |b: &Browser<FakeScreen>| {
@@ -2447,6 +2875,7 @@ mod tests {
             key: Key::Char(c),
             command: true,
             shift: true,
+            option: false,
         })
     }
 
@@ -3023,6 +3452,147 @@ mod tests {
         act(&mut b, key(Key::Enter));
         assert!(b.profiles[b.profile].cookies.is_empty());
         assert!(!b.profiles[1 - b.profile].cookies.is_empty());
+    }
+
+    fn command_option(c: char) -> Event {
+        Event::Key(KeyEvent {
+            key: Key::Char(c),
+            command: true,
+            shift: false,
+            option: true,
+        })
+    }
+
+    #[test]
+    fn bookmarks_are_saved_in_folders_found_and_opened() {
+        let (a, _) = site("bookmarks");
+        let session = a.with_file_name("bookmark-session");
+        let _ = std::fs::remove_dir_all(a.with_file_name("profiles"));
+        let mut b = browser_with(&a, Some(session.clone()));
+
+        // ⌘D on page A: its title, the default folder; Enter saves.
+        assert!(act(&mut b, command('d')));
+        let d = b.dialog.as_ref().unwrap();
+        assert_eq!(
+            (d.fields[0].text.as_str(), d.fields[1].text.as_str()),
+            ("Page A", "Bookmarks")
+        );
+        b.render();
+        act(&mut b, key(Key::Enter));
+        assert!(b.dialog.is_none());
+
+        // Page B, renamed, in a new folder: typing replaces the field Tab reaches.
+        click_text(&mut b, "Go to B");
+        act(&mut b, command('d'));
+        type_text(&mut b, "Second page");
+        act(&mut b, key(Key::Tab));
+        type_text(&mut b, "Reading");
+        act(&mut b, key(Key::Enter));
+        let p = &b.profiles[0];
+        assert_eq!(p.bookmarks.len(), 2);
+        assert_eq!(
+            (
+                p.bookmarks[1].title.as_str(),
+                p.bookmarks[1].folder.as_str()
+            ),
+            ("Second page", "Reading")
+        );
+        assert_eq!(p.last_folder, "Reading");
+
+        // ⌘D on a saved page edits it; Esc leaves it as it was.
+        act(&mut b, command('d'));
+        assert_eq!(b.dialog.as_ref().unwrap().existing, Some(1));
+        type_text(&mut b, "x");
+        act(&mut b, key(Key::Escape));
+        assert_eq!(b.profiles[0].bookmarks[1].title, "Second page");
+
+        // ⌘⌥B: folders in name order, as labels; ↓ Enter opens a bookmark.
+        assert!(act(&mut b, command_option('b')));
+        let list = b.sidebar_rows();
+        let rows: Vec<String> = list
+            .rows
+            .iter()
+            .map(|r| match r {
+                ListRow::Label(l) => format!("[{l}]"),
+                ListRow::Item { title, .. } => title.to_string(),
+            })
+            .collect();
+        assert_eq!(rows, ["[Bookmarks]", "Page A", "[Reading]", "Second page"]);
+        b.render();
+        act(&mut b, key(Key::Down));
+        assert_eq!(b.bookmark_row, Some(1));
+        act(&mut b, key(Key::Enter));
+        assert_eq!(title(&b), "Page A");
+        // A click on a row opens it too (rows start at 82, 30 points each).
+        assert!(act(
+            &mut b,
+            Event::Click {
+                x: 100.0,
+                y: 82.0 + 30.0 * 3.0 + 15.0
+            }
+        ));
+        assert_eq!(title(&b), "Page B");
+        act(&mut b, key(Key::Escape));
+        assert_eq!(b.list, SidebarList::Tabs);
+
+        // The palette finds bookmarks, with their folder.
+        act(&mut b, command('k'));
+        type_text(&mut b, "second");
+        let p = b.palette.as_ref().unwrap();
+        assert_eq!(p.items[0].hint, Hint::Label("Bookmark · Reading".into()));
+        act(&mut b, key(Key::Escape));
+
+        // Work has none, and says how to add one.
+        act(&mut b, command_shift('p'));
+        act(&mut b, key(Key::Escape));
+        act(&mut b, command_option('b'));
+        assert!(b.sidebar_rows().rows.is_empty() && b.sidebar_rows().empty.is_some());
+        b.render();
+        act(&mut b, command_option('b'));
+        act(&mut b, command_shift('p'));
+
+        // Saved per profile, private, and back after a restart; removing works too.
+        let file = a
+            .with_file_name("profiles")
+            .join("Personal")
+            .join("bookmarks");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        drop(b);
+        let mut b = browser_with(Path::new(""), Some(session));
+        assert_eq!(b.profiles[0].bookmarks.len(), 2);
+        assert_eq!(b.profiles[0].last_folder, "Reading");
+        if b.profiles[b.profile].name != "Personal" {
+            act(&mut b, command_shift('p'));
+        }
+        act(&mut b, command('k'));
+        type_text(&mut b, "remove this");
+        act(&mut b, key(Key::Enter));
+        assert_eq!(b.profiles[0].bookmarks.len(), 1);
+    }
+
+    #[test]
+    fn reads_damaged_bookmark_files_safely() {
+        assert_eq!(parse_bookmarks(""), (Vec::new(), None));
+        let (marks, last) = parse_bookmarks(
+            "broxee-bookmarks 1\nlast\tWork stuff\nmark\t\thttps://a.example/\tA\n\
+             mark\tF\tnot a url\tB\nmark\tshort\nnonsense\nmark\tF\thttps://c.example/\tC\twith tab\n",
+        );
+        assert_eq!(last.as_deref(), Some("Work stuff"));
+        assert_eq!(marks.len(), 2);
+        assert_eq!(
+            marks[0].folder, DEFAULT_FOLDER,
+            "an empty folder becomes the default"
+        );
+        assert_eq!(marks[1].title, "C\twith tab");
+        let text = write_bookmarks(&marks, "F");
+        assert_eq!(parse_bookmarks(&text).0, marks);
     }
 
     #[test]

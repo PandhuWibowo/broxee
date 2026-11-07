@@ -32,6 +32,8 @@ In the window:
 | Go to tab 1 to 8, the last tab | ⌘1 … ⌘8, ⌘9, or click the row |
 | Switch profile (Personal, Work) | ⌘⇧P, or click the profile name at the top of the sidebar |
 | Show or hide the sidebar | ⌘\\ |
+| Bookmark this page (or edit its bookmark) | ⌘D: name and folder, the last folder preselected; Tab between them, Enter saves, Esc cancels |
+| Bookmarks panel, in place of the tab list | ⌘⌥B: folders in name order; ↑ ↓ and Enter or a click opens, Esc goes back to tabs. Every bookmark is a ⌘K result too |
 | Address field | ⌘L or click the host; type or paste (⌘V), Enter to open, Esc to cancel |
 | Move between header controls and the page's links | Tab / Shift+Tab (a 2px ring marks the focused link; the page scrolls to it), Enter to activate or follow, Esc to leave |
 | Quit | ⌘Q or close the window |
@@ -269,7 +271,9 @@ Where data lives, and what compression does for it (measured 2026-11-07):
   "Broxee can't search the web yet." Bookmarks will join its results when they exist.
 - The UI font (Arial, until Figtree is bundled) has no ⌘ ⇧ ⌥ glyphs, so the chrome draws those three as
   icons; page text that uses them shows nothing for them.
-- Not built yet, so not shown: the ⋯ menu, split view, bookmarks, tab groups and pinned tabs, dragging tabs, a resizable sidebar. The sidebar does not
+- Bookmarks cannot be imported from other browsers yet, and folders are flat (no folders inside folders).
+  They are saved per profile in `profiles/<profile>/bookmarks` (0600).
+- Not built yet, so not shown: the ⋯ menu, split view, tab groups and pinned tabs, dragging tabs, a resizable sidebar. The sidebar does not
   scroll; tabs past the window's height are still reachable with ⌘1 … ⌘9 and ⌘W.
 - Sleeping-tab rows show no tooltip ("Asleep to save memory. Select to wake.") because the window has no
   tooltips yet; the muted title is the only sign.
