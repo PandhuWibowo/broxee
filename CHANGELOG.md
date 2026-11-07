@@ -3,6 +3,10 @@
 ## Unreleased
 
 ### Added
+- Release workflow: pushing a `v*` tag builds macOS (arm64, x86_64) and Linux (x86_64) binaries, runs the tests
+  and the 60 MB budget, and publishes a GitHub release with checksums.
+- README: screenshots rendered by Broxee and a Download section.
+
 - `net`: URL parsing and relative resolution, HTTP/1.1 over TCP with TLS (rustls), chunked bodies, redirects, `file://`.
 - `html`: tokenizer, entity decoding, tree builder with implied end tags and raw-text elements, arena DOM.
 - `shell`: `broxee <url-or-file> [--tree] [--depth N]`, printing timings and peak RAM.

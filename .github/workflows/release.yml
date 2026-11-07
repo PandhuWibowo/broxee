@@ -1,0 +1,93 @@
+name: Release
+
+# Push a tag such as v0.1.0 to build the binaries and publish a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            name: macos-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            name: macos-x86_64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            name: linux-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Tests
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: cargo test
+      - name: 60 MB budget
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: ./scripts/budget.sh
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          dir="broxee-$TAG-${{ matrix.name }}"
+          mkdir "$dir"
+          cp "target/${{ matrix.target }}/release/broxee" README.md "$dir/"
+          tar -czf "$dir.tar.gz" "$dir"
+          shasum -a 256 "$dir.tar.gz" > "$dir.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4.6.2
+        with:
+          name: ${{ matrix.name }}
+          path: broxee-*.tar.gz*
+
+  release:
+    name: Publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Broxee $TAG" \
+            --prerelease \
+            --notes "Early preview build of Broxee, a browser with its own engine written in Rust.
+
+          - **macOS** (arm64, x86_64): \`broxee <url> --window\` opens the browser window.
+          - **Linux** (x86_64): CLI only for now (\`--png\`, \`--tree\`, \`--styles\`, \`--layout\`); no window yet.
+
+          The binaries are not signed. On macOS, after extracting run:
+          \`xattr -d com.apple.quarantine broxee\`
+
+          Each archive has a \`.sha256\` checksum next to it."
