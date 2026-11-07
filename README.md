@@ -15,6 +15,19 @@ cargo run --release -- https://en.wikipedia.org/wiki/Web_browser --png docs/scre
 cargo run --release -- https://news.ycombinator.com --png docs/screenshots/hacker-news.png --width 1280 --height 800 --scale 1
 ```
 
+## Download
+
+Prebuilt binaries are on the [Releases](https://github.com/kikiraihan/broxee/releases) page: macOS (arm64,
+x86_64) and Linux (x86_64, CLI only for now). They are not signed; on macOS run
+`xattr -d com.apple.quarantine broxee` after extracting, then `./broxee https://example.com --window`.
+
+A release is built by `.github/workflows/release.yml` when a `v*` tag is pushed:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
 ## Run
 
 ```bash
