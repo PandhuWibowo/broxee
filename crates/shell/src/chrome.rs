@@ -15,7 +15,14 @@ const BUTTON_START: f32 = 8.0;
 const BUTTON_WIDTH: f32 = 28.0;
 const ICON: f32 = 16.0;
 const FIELD_LEFT: f32 = 100.0;
-const FIELD_RIGHT_GAP: f32 = 8.0;
+/// The ⋯ button sits this far from the header's right edge.
+const MORE_RIGHT: f32 = 8.0;
+/// The host label and the address field stop before the ⋯ button.
+const FIELD_RIGHT_GAP: f32 = MORE_RIGHT + BUTTON_WIDTH + 4.0;
+/// The ⋯ menu.
+const MENU_WIDTH: f32 = 230.0;
+const MENU_ROW: f32 = 30.0;
+const MENU_PAD: f32 = 6.0;
 const FIELD_TOP: f32 = 5.0;
 const FIELD_HEIGHT: f32 = 26.0;
 const FIELD_PADDING: f32 = 10.0;
@@ -260,6 +267,8 @@ pub enum Button {
     Forward,
     Reload,
     Address,
+    /// ⋯: the pane's menu.
+    More,
 }
 
 /// Which header control is at `x` (points), for a header `width` points wide.
@@ -270,6 +279,9 @@ pub fn hit(x: f32, width: f32) -> Option<Button> {
         0 => Some(Button::Back),
         1 => Some(Button::Forward),
         2 => Some(Button::Reload),
+        _ if (width - MORE_RIGHT - BUTTON_WIDTH..width - MORE_RIGHT).contains(&x) => {
+            Some(Button::More)
+        }
         _ if x >= FIELD_LEFT && x <= width - FIELD_RIGHT_GAP => Some(Button::Address),
         _ => None,
     }
@@ -288,6 +300,35 @@ fn palette_rect(pane_width: f32, rows: usize) -> (f32, f32, f32, f32) {
     let x = ((pane_width - w) / 2.0).max(0.0);
     let h = PALETTE_INPUT + 1.0 + 2.0 * PALETTE_PAD + PALETTE_ROW * rows.max(1) as f32;
     (x, PALETTE_TOP, w, h)
+}
+
+/// The ⋯ menu: under the header, its right edge on the ⋯ button's. x, y, w, h in points from
+/// the pane's left edge and the window's top.
+fn menu_rect(pane_width: f32, items: usize) -> (f32, f32, f32, f32) {
+    let w = MENU_WIDTH.min(pane_width - 16.0).max(120.0);
+    let x = (pane_width - MORE_RIGHT - w).max(0.0);
+    (
+        x,
+        HEADER_HEIGHT - 2.0,
+        w,
+        2.0 * MENU_PAD + MENU_ROW * items as f32,
+    )
+}
+
+/// What is at (x, y) over the ⋯ menu: `Some(Some(i))` on item `i`, `Some(None)` elsewhere on
+/// it, `None` outside it. x from the pane's left edge.
+pub fn menu_hit(x: f32, y: f32, pane_width: f32, items: usize) -> Option<Option<usize>> {
+    let (mx, my, w, h) = menu_rect(pane_width, items);
+    if !(mx..mx + w).contains(&x) || !(my..my + h).contains(&y) {
+        return None;
+    }
+    let row = ((y - my - MENU_PAD) / MENU_ROW).floor();
+    Some((row >= 0.0 && (row as usize) < items).then_some(row as usize))
+}
+
+pub struct MenuView<'a> {
+    pub items: &'a [&'a str],
+    pub selected: Option<usize>,
 }
 
 /// A dialog: where the palette sits, `DIALOG_WIDTH` wide at most.
@@ -402,6 +443,7 @@ enum Shape {
     Forward,
     Reload,
     Close,
+    More,
     /// Modifier keys, `KEY_ICON` points.
     Command,
     Shift,
@@ -458,7 +500,13 @@ impl Chrome {
         let width_pt = frame.width as f32 / s;
 
         let icon_px = px(ICON) as u32;
-        for shape in [Shape::Back, Shape::Forward, Shape::Reload, Shape::Close] {
+        for shape in [
+            Shape::Back,
+            Shape::Forward,
+            Shape::Reload,
+            Shape::Close,
+            Shape::More,
+        ] {
             self.masks
                 .entry((shape, icon_px, icon_px))
                 .or_insert_with(|| icon(shape, s));
@@ -541,17 +589,20 @@ impl Chrome {
                 true,
             ),
         ];
-        let focused_slot = match view.focused {
-            Some(Button::Back) => Some(0),
-            Some(Button::Forward) => Some(1),
-            Some(Button::Reload) => Some(2),
+        // Left edge of each button's 28-point slot.
+        let more_x = width_pt - MORE_RIGHT - BUTTON_WIDTH;
+        let focused_x = match view.focused {
+            Some(Button::Back) => Some(BUTTON_START),
+            Some(Button::Forward) => Some(BUTTON_START + BUTTON_WIDTH),
+            Some(Button::Reload) => Some(BUTTON_START + 2.0 * BUTTON_WIDTH),
+            Some(Button::More) => Some(more_x),
             _ => None,
         };
-        if let Some(slot) = focused_slot {
+        if let Some(slot_x) = focused_x {
             // Focus ring: a 2px accent ring around the 24px button area (DESIGN.md, section 13).
             let ring = px(2.0);
             let (bx, by) = (
-                px(BUTTON_START + BUTTON_WIDTH * slot as f32 + 2.0),
+                px(slot_x + 2.0),
                 px((HEADER_HEIGHT - BUTTON_WIDTH + 4.0) / 2.0),
             );
             let inner = button_px - 2 * ring as u32;
@@ -577,6 +628,12 @@ impl Chrome {
                 color: if enabled { t.text_2 } else { t.muted },
             });
         }
+        ops.push(Op::Mask {
+            x: px(more_x + (BUTTON_WIDTH - ICON) / 2.0),
+            y: px((HEADER_HEIGHT - ICON) / 2.0),
+            mask: &self.masks[&(Shape::More, icon_px, icon_px)],
+            color: t.text_2,
+        });
 
         let mut text_ops = Vec::new();
         let mut text_clip = (px(FIELD_LEFT + 4.0), px(width_pt - FIELD_RIGHT_GAP));
@@ -1383,6 +1440,178 @@ impl Chrome {
         );
     }
 
+    /// Draw the ⋯ menu under its button at the pane's right edge. `frame` is every row of the
+    /// window, from the pane's left edge.
+    pub fn draw_menu(
+        &mut self,
+        painter: &mut Painter,
+        frame: Frame,
+        fonts: Option<&FontSet>,
+        metrics: &dyn TextMetrics,
+        view: &MenuView,
+    ) {
+        let t = self.theme;
+        let s = frame.scale;
+        let px = |v: f32| (v * s).round() as i32;
+        let (x, y, w, h) = menu_rect(frame.width as f32 / s, view.items.len());
+        let hair = px(1.0).max(1);
+        let panel = (px(w) as u32, px(h) as u32);
+        let inner = (panel.0 - 2 * hair as u32, panel.1 - 2 * hair as u32);
+        let blur = px(SHADOW_BLUR) as u32;
+        let shadow_key = self.panel_masks(panel, inner, blur, s);
+        let row = (px(w - 2.0 * MENU_PAD) as u32, px(MENU_ROW - 2.0) as u32);
+        self.masks
+            .entry((Shape::Rounded, row.0, row.1))
+            .or_insert_with(|| rounded_rect(row.0, row.1, 6.0 * s));
+        let masks = &self.masks;
+        let mut shapes = vec![
+            Op::Mask {
+                x: px(x) - blur as i32,
+                y: px(y + SHADOW_DROP) - blur as i32,
+                mask: &masks[&shadow_key],
+                color: Color::rgb(0, 0, 0),
+            },
+            Op::Mask {
+                x: px(x),
+                y: px(y),
+                mask: &masks[&(Shape::Panel, panel.0, panel.1)],
+                color: t.line,
+            },
+            Op::Mask {
+                x: px(x) + hair,
+                y: px(y) + hair,
+                mask: &masks[&(Shape::Panel, inner.0, inner.1)],
+                color: t.surface,
+            },
+        ];
+        if let Some(i) = view.selected.filter(|&i| i < view.items.len()) {
+            shapes.push(Op::Mask {
+                x: px(x + MENU_PAD),
+                y: px(y + MENU_PAD + MENU_ROW * i as f32 + 1.0),
+                mask: &masks[&(Shape::Rounded, row.0, row.1)],
+                color: t.selected,
+            });
+        }
+        let room = (w - 2.0 * MENU_PAD - 20.0) * s;
+        let fitted: Vec<Cow<str>> = view
+            .items
+            .iter()
+            .map(|item| fit(item, room, 13.0 * s, metrics))
+            .collect();
+        let text: Vec<Op> = fitted
+            .iter()
+            .enumerate()
+            .map(|(i, item)| Op::Text {
+                x: px(x + MENU_PAD + 10.0) as f32,
+                baseline: px(y + MENU_PAD + MENU_ROW * i as f32 + 19.5) as f32,
+                text: item,
+                size: 13.0 * s,
+                bold: false,
+                color: t.text,
+            })
+            .collect();
+        let (stride, left, width) = (frame.stride, frame.left, frame.width);
+        for (ops, clip) in [
+            (&shapes[..], (0, width as i32)),
+            (&text[..], (px(x), px(x + w))),
+        ] {
+            painter.overlay(
+                Target {
+                    pixels: &mut *frame.pixels,
+                    stride,
+                    bgra: true,
+                    left,
+                },
+                width,
+                clip,
+                fonts,
+                metrics,
+                ops,
+            );
+        }
+    }
+
+    /// A tooltip near (x, y) in window points: a small labelled panel kept inside the window.
+    /// `frame` is the whole window. ⌘ ⇧ ⌥ in the text are drawn as icons.
+    pub fn draw_tooltip(
+        &mut self,
+        painter: &mut Painter,
+        frame: Frame,
+        fonts: Option<&FontSet>,
+        metrics: &dyn TextMetrics,
+        (x, y): (f32, f32),
+        text: &str,
+    ) {
+        let t = self.theme;
+        let s = frame.scale;
+        let px = |v: f32| (v * s).round() as i32;
+        let window = (
+            frame.width as f32 / s,
+            (frame.pixels.len() / frame.stride) as f32 / s,
+        );
+        let key_px = px(KEY_ICON) as u32;
+        for shape in [Shape::Command, Shape::Shift, Shape::Option] {
+            self.masks
+                .entry((shape, key_px, key_px))
+                .or_insert_with(|| key_icon(shape, s));
+        }
+        let w = keys_width(text, s, 12.0, metrics) / s + 16.0;
+        let h = 24.0;
+        // Below and right of the pointer, or above / left of it near the window's edges.
+        let tx = (x + 12.0).min(window.0 - w - 4.0).max(4.0);
+        let ty = if y + 20.0 + h < window.1 {
+            y + 20.0
+        } else {
+            (y - h - 8.0).max(4.0)
+        };
+        let hair = px(1.0).max(1);
+        let size = (px(w) as u32, px(h) as u32);
+        let inner = (size.0 - 2 * hair as u32, size.1 - 2 * hair as u32);
+        for (sz, radius) in [(size, 6.0), (inner, 5.0)] {
+            self.masks
+                .entry((Shape::Rounded, sz.0, sz.1))
+                .or_insert_with(|| rounded_rect(sz.0, sz.1, radius * s));
+        }
+        let masks = &self.masks;
+        let mut ops = vec![
+            Op::Mask {
+                x: px(tx),
+                y: px(ty),
+                mask: &masks[&(Shape::Rounded, size.0, size.1)],
+                color: t.line,
+            },
+            Op::Mask {
+                x: px(tx) + hair,
+                y: px(ty) + hair,
+                mask: &masks[&(Shape::Rounded, inner.0, inner.1)],
+                color: t.surface,
+            },
+        ];
+        push_keys(
+            &mut ops,
+            masks,
+            text,
+            (px(tx + 8.0) as f32, px(ty + 16.5) as f32),
+            (s, 12.0),
+            t.text,
+            metrics,
+        );
+        let (stride, left, width) = (frame.stride, frame.left, frame.width);
+        painter.overlay(
+            Target {
+                pixels: frame.pixels,
+                stride,
+                bgra: true,
+                left,
+            },
+            width,
+            (0, width as i32),
+            fonts,
+            metrics,
+            &ops,
+        );
+    }
+
     /// Free the palette's shapes once it closes (its shadow alone is about 1 MB at 2x).
     pub fn forget_palette(&mut self) {
         self.masks
@@ -1606,6 +1835,11 @@ fn icon(shape: Shape, scale: f32) -> GlyphBitmap {
             };
             vec![arc, vec![head(0.8), (ex, ey), head(-0.8)]]
         }
+        // Three dots: zero-length strokes with square caps.
+        Shape::More => [3.5, 8.0, 12.5]
+            .iter()
+            .map(|&x| vec![(x, 8.0), (x + 0.01, 8.0)])
+            .collect(),
         Shape::Close => vec![
             vec![(4.5, 4.5), (11.5, 11.5)],
             vec![(11.5, 4.5), (4.5, 11.5)],
@@ -1695,7 +1929,14 @@ mod tests {
         assert_eq!(hit(80.0, 800.0), Some(Button::Reload));
         assert_eq!(hit(95.0, 800.0), None, "gap between reload and the field");
         assert_eq!(hit(400.0, 800.0), Some(Button::Address));
+        assert_eq!(hit(770.0, 800.0), Some(Button::More));
+        assert_eq!(hit(762.0, 800.0), None, "gap before ⋯");
         assert_eq!(hit(797.0, 800.0), None);
+        // The menu: 230 wide from x = 562 (right edge 8 from the pane's), rows from 34 + 6.
+        assert_eq!(menu_hit(700.0, 50.0, 800.0, 3), Some(Some(0)));
+        assert_eq!(menu_hit(700.0, 105.0, 800.0, 3), Some(Some(2)));
+        assert_eq!(menu_hit(700.0, 37.0, 800.0, 3), Some(None), "its padding");
+        assert_eq!(menu_hit(500.0, 50.0, 800.0, 3), None);
     }
 
     #[test]
@@ -1841,7 +2082,13 @@ mod tests {
 
     #[test]
     fn icons_and_field_shapes_have_ink() {
-        for shape in [Shape::Back, Shape::Forward, Shape::Reload, Shape::Close] {
+        for shape in [
+            Shape::Back,
+            Shape::Forward,
+            Shape::Reload,
+            Shape::Close,
+            Shape::More,
+        ] {
             let mask = icon(shape, 2.0);
             assert_eq!((mask.width, mask.height), (32, 32));
             assert!(mask.coverage.iter().any(|&c| c > 200), "icon is drawn");

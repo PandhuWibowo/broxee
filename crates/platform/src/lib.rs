@@ -34,6 +34,11 @@ pub enum Event {
         x: f64,
         y: f64,
     },
+    /// The pointer moved with no button down (for tooltips).
+    Hover {
+        x: f64,
+        y: f64,
+    },
     Key(KeyEvent),
     /// Text from the clipboard, read on the main thread when the user pressed Cmd+V.
     Paste(String),

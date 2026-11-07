@@ -186,3 +186,9 @@
   (letters, digits, `-`, `_`), so a damaged session cannot point outside `profiles/`. Two new colors, rose
   and violet, checked to 4.5:1 on `canvas` in both themes and recorded in DESIGN.md. The palette lists
   "Switch to …" for every other profile.
+- ⋯ menu and tooltips (#10): the header's ⋯ button (also a Tab stop) opens a menu to copy the address, open the
+  page in a new tab of another profile, bookmark it, reload or close the tab, by mouse or keyboard; tooltips
+  appear after 0.6 s on the header's buttons (with their shortcuts), the profile switcher, the close button
+  and sleeping tabs ("Asleep to save memory. Select to wake."), and hide on any other input. The window
+  reports pointer moves and can write to the clipboard. A flaky 50 ms timing check in a test became a 2 s
+  guard.

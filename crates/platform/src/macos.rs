@@ -251,6 +251,13 @@ impl Window {
         };
     }
 
+    /// Put `text` on the clipboard, as plain text.
+    pub fn copy_text(&self, text: &str) {
+        let boxed = Box::new(text.to_string());
+        // SAFETY: the main queue outlives the process; the context is reclaimed by `copy_on_main`.
+        unsafe { dispatch_async_f(&_dispatch_main_q, Box::into_raw(boxed).cast(), copy_on_main) };
+    }
+
     /// Paint a frame of `width` x `height` device pixels and show it. `draw` receives surface
     /// memory (BGRA, rows of `stride` bytes) and must fill every pixel.
     pub fn render(
@@ -405,6 +412,20 @@ extern "C" fn title_on_main(context: *mut c_void) {
     }
 }
 
+extern "C" fn copy_on_main(context: *mut c_void) {
+    // SAFETY: `context` came from Box::into_raw in copy_text and is used exactly once.
+    let text = unsafe { Box::from_raw(context.cast::<String>()) };
+    // SAFETY: main thread. -[NSPasteboard clearContents] returns NSInteger;
+    // -setString:forType: takes two objects and returns BOOL.
+    unsafe {
+        let board = send!(Id; class(c"NSPasteboard"), c"generalPasteboard");
+        send!(i64; board, c"clearContents");
+        let s = ns_string(&text);
+        send!(bool; board, c"setString:forType:", s => Id, NSPasteboardTypeString => Id);
+        send!((); s, c"release");
+    }
+}
+
 // ---- Methods of the custom view and delegates (called by AppKit on the main thread) ----
 
 extern "C" fn returns_yes(_this: Id, _sel: Sel) -> bool {
@@ -453,6 +474,11 @@ extern "C" fn mouse_dragged(this: Id, _sel: Sel, event: Id) {
 extern "C" fn mouse_up(this: Id, _sel: Sel, event: Id) {
     let (x, y) = location(this, event);
     emit(Event::Release { x, y });
+}
+
+extern "C" fn mouse_moved(this: Id, _sel: Sel, event: Id) {
+    let (x, y) = location(this, event);
+    emit(Event::Hover { x, y });
 }
 
 extern "C" fn key_down(_this: Id, _sel: Sel, event: Id) {
@@ -642,6 +668,7 @@ pub fn run_app(
                 (c"mouseDown:", mouse_down as *const c_void, c"v@:@"),
                 (c"mouseDragged:", mouse_dragged as *const c_void, c"v@:@"),
                 (c"mouseUp:", mouse_up as *const c_void, c"v@:@"),
+                (c"mouseMoved:", mouse_moved as *const c_void, c"v@:@"),
                 (c"keyDown:", key_down as *const c_void, c"v@:@"),
             ],
         );
@@ -684,6 +711,8 @@ pub fn run_app(
 
         send!((); window, c"makeKeyAndOrderFront:", std::ptr::null_mut::<c_void>() => Id);
         send!(bool; window, c"makeFirstResponder:", view => Id);
+        // Pointer moves without a button reach the view (tooltips).
+        send!((); window, c"setAcceptsMouseMovedEvents:", true => bool);
         send!((); app, c"activateIgnoringOtherApps:", true => bool);
 
         // The size the window really got, so the first frames already match it.

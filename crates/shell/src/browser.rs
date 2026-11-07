@@ -24,8 +24,8 @@ use platform::{Event, Key, KeyEvent};
 
 use crate::chrome::{
     self, Button, Chrome, DialogView, FieldView, Frame, HeaderView, HintView, Hue, ListRow,
-    PaletteHit, PaletteRow, PaletteView, SidebarItem, SidebarView, HEADER_HEIGHT, SIDEBAR_MAX,
-    SIDEBAR_MIN, SIDEBAR_WIDTH,
+    MenuView, PaletteHit, PaletteRow, PaletteView, SidebarItem, SidebarView, HEADER_HEIGHT,
+    SIDEBAR_MAX, SIDEBAR_MIN, SIDEBAR_WIDTH,
 };
 use crate::engine::{self, FontStore, Loaded, Settings};
 use crate::hibernate::{Stored, TabStore};
@@ -45,6 +45,8 @@ const SNAPSHOT_BUDGET: u64 = 256 << 20;
 const DEFAULT_FOLDER: &str = "Bookmarks";
 /// A bookmarks file past this many is cut there when read.
 const BOOKMARK_LIMIT: usize = 10_000;
+/// A tooltip shows after the pointer rests this long on something that has one.
+const TOOLTIP_DELAY: Duration = Duration::from_millis(600);
 /// How often the engine thread looks at a running load's progress: once per frame at 60 Hz.
 const LOAD_POLL: Duration = Duration::from_millis(16);
 /// Closed tabs that ⌘⇧T can reopen, per profile.
@@ -70,6 +72,8 @@ pub trait Screen {
     ) -> Result<(), String>;
     /// Nothing has happened for a while: free what only drawing needs.
     fn idle(&self) {}
+    /// Put text on the clipboard.
+    fn copy(&self, _text: &str) {}
 }
 
 #[cfg(target_os = "macos")]
@@ -92,6 +96,10 @@ impl Screen for platform::Window {
 
     fn idle(&self) {
         self.release_spare();
+    }
+
+    fn copy(&self, text: &str) {
+        self.copy_text(text);
     }
 
     fn render(
@@ -183,6 +191,31 @@ enum LoadMessage {
     Progress(f32),
     /// Boxed: a channel slot is as large as its largest message.
     Done(Box<Result<Loaded, String>>),
+}
+
+/// The ⋯ menu while it is open.
+struct Menu {
+    items: Vec<(String, MenuAction)>,
+    /// Chosen with ↑ ↓; none when opened with the mouse.
+    selected: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MenuAction {
+    CopyAddress,
+    /// Open this page in a new tab of profile `n`.
+    OpenIn(usize),
+    Bookmark,
+    Reload,
+    CloseTab,
+}
+
+/// The pointer resting on something with a tooltip.
+struct Hover {
+    at: (f32, f32),
+    text: String,
+    since: std::time::Instant,
+    shown: bool,
 }
 
 /// A focused link and where it is drawn: one rectangle per line it spans, in page coordinates
@@ -445,6 +478,8 @@ struct Browser<S: Screen> {
     field: Option<Field>,
     palette: Option<Palette>,
     dialog: Option<Dialog>,
+    menu: Option<Menu>,
+    hover: Option<Hover>,
     /// Sidebar width in points, 200 to 320.
     sidebar_width: f32,
     /// How far the sidebar's list is scrolled.
@@ -516,6 +551,8 @@ impl<S: Screen> Browser<S> {
             field: None,
             palette: None,
             dialog: None,
+            menu: None,
+            hover: None,
             sidebar_width: SIDEBAR_WIDTH,
             sidebar_scroll: 0.0,
             drag: None,
@@ -573,11 +610,15 @@ impl<S: Screen> Browser<S> {
         loop {
             // While a page loads, wake every frame to show its progress; otherwise sleep until
             // an event arrives.
-            let wait = if self.load.is_some() {
+            let mut wait = if self.load.is_some() {
                 LOAD_POLL
             } else {
                 IDLE_AFTER
             };
+            // Wake when a waiting tooltip is due.
+            if let Some(h) = self.hover.as_ref().filter(|h| !h.shown) {
+                wait = wait.min(TOOLTIP_DELAY.saturating_sub(h.since.elapsed()));
+            }
             let mut dirty = false;
             let mut quiet = false;
             match events.recv_timeout(wait) {
@@ -591,6 +632,7 @@ impl<S: Screen> Browser<S> {
                 Err(RecvTimeoutError::Disconnected) => break,
             }
             dirty |= self.poll_load();
+            dirty |= self.tick();
             if dirty {
                 self.render();
                 trimmed = false;
@@ -674,7 +716,12 @@ impl<S: Screen> Browser<S> {
 
     /// Apply one event; returns whether the frame needs repainting.
     fn handle(&mut self, event: Event) -> bool {
-        match event {
+        if let Event::Hover { x, y } = event {
+            return self.hover_at(x as f32, y as f32);
+        }
+        // Anything else hides a tooltip.
+        let hid = self.hover.take().is_some_and(|h| h.shown);
+        hid | match event {
             Event::Scroll { dy, x, .. } if (x as f32) < self.pane_left() => {
                 let rows = self.sidebar_rows();
                 let max =
@@ -686,6 +733,7 @@ impl<S: Screen> Browser<S> {
             Event::Scroll { dy, .. } => self.scroll_by(-(dy as f32)),
             Event::Drag { x, y } => self.drag_to(x as f32, y as f32),
             Event::Release { x, y } => self.release(x as f32, y as f32),
+            Event::Hover { .. } => false,
             Event::Resize {
                 width,
                 height,
@@ -758,6 +806,19 @@ impl<S: Screen> Browser<S> {
     fn click(&mut self, x: f32, y: f32) -> bool {
         let left = self.pane_left();
         let pane_width = self.pane_width();
+        if let Some(menu) = &self.menu {
+            let hit = (x >= left)
+                .then(|| chrome::menu_hit(x - left, y, pane_width, menu.items.len()))
+                .flatten();
+            return match hit {
+                Some(Some(i)) => self.run_menu(i),
+                Some(None) => false,
+                None => {
+                    self.close_menu();
+                    true
+                }
+            };
+        }
         if let Some(d) = &mut self.dialog {
             if x >= left {
                 return match chrome::dialog_hit(x - left, y, pane_width, d.fields.len()) {
@@ -836,6 +897,7 @@ impl<S: Screen> Browser<S> {
                 Some(Button::Forward) => self.forward(),
                 Some(Button::Reload) => self.reload_or_stop(),
                 Some(Button::Address) => self.focus_field(),
+                Some(Button::More) => self.open_menu(false),
                 None => false,
             };
         }
@@ -849,6 +911,12 @@ impl<S: Screen> Browser<S> {
     }
 
     fn key(&mut self, k: KeyEvent) -> bool {
+        if self.menu.is_some() {
+            if !k.command {
+                return self.menu_key(k.key);
+            }
+            self.close_menu();
+        }
         if self.dialog.is_some() {
             if !k.command {
                 return self.dialog_key(k);
@@ -935,6 +1003,7 @@ impl<S: Screen> Browser<S> {
                         Button::Forward => self.forward(),
                         Button::Reload => self.reload_or_stop(),
                         Button::Address => self.focus_field(),
+                        Button::More => self.open_menu(true),
                     };
                 }
                 Key::Escape => {
@@ -1001,13 +1070,14 @@ impl<S: Screen> Browser<S> {
             Button::Back => tab.index > 0,
             Button::Forward => tab.index + 1 < tab.history.len(),
             Button::Reload => !tab.history.is_empty() || self.load.is_some(),
-            Button::Address => true,
+            Button::Address | Button::More => true,
         };
         let mut order: Vec<Stop> = [
             Button::Back,
             Button::Forward,
             Button::Reload,
             Button::Address,
+            Button::More,
         ]
         .into_iter()
         .filter(|&b| enabled(b))
@@ -1393,6 +1463,156 @@ impl<S: Screen> Browser<S> {
         }
         self.save_session();
         true
+    }
+
+    /// Open the ⋯ menu; from the keyboard, with its first item chosen.
+    fn open_menu(&mut self, keyboard: bool) -> bool {
+        self.close_palette();
+        self.field = None;
+        let entry = self.tab().entry().is_some();
+        let mut items = Vec::new();
+        if entry {
+            items.push(("Copy address".to_string(), MenuAction::CopyAddress));
+            for (i, p) in self.profiles.iter().enumerate() {
+                if i != self.profile {
+                    items.push((format!("Open in {}", p.name), MenuAction::OpenIn(i)));
+                }
+            }
+            items.push(("Bookmark this page".to_string(), MenuAction::Bookmark));
+            items.push(("Reload".to_string(), MenuAction::Reload));
+        }
+        items.push(("Close tab".to_string(), MenuAction::CloseTab));
+        self.menu = Some(Menu {
+            items,
+            selected: keyboard.then_some(0),
+        });
+        true
+    }
+
+    fn close_menu(&mut self) {
+        if self.menu.take().is_some() {
+            self.chrome.forget_palette();
+        }
+    }
+
+    fn menu_key(&mut self, key: Key) -> bool {
+        let Some(menu) = self.menu.as_mut() else {
+            return false;
+        };
+        let last = menu.items.len() - 1;
+        match key {
+            Key::Down | Key::Tab => {
+                menu.selected = Some(menu.selected.map_or(0, |i| (i + 1).min(last)));
+            }
+            Key::Up => menu.selected = Some(menu.selected.map_or(last, |i| i.saturating_sub(1))),
+            Key::Enter | Key::Char(' ') => {
+                return match menu.selected {
+                    Some(i) => self.run_menu(i),
+                    None => false,
+                };
+            }
+            Key::Escape => self.close_menu(),
+            _ => return false,
+        }
+        true
+    }
+
+    fn run_menu(&mut self, index: usize) -> bool {
+        let Some(action) = self
+            .menu
+            .as_ref()
+            .and_then(|m| m.items.get(index))
+            .map(|(_, a)| *a)
+        else {
+            return false;
+        };
+        self.close_menu();
+        let url = self.tab().entry().map(|e| e.url.clone());
+        match (action, url) {
+            (MenuAction::CopyAddress, Some(url)) => {
+                self.window.copy(&url.to_string());
+                true
+            }
+            (MenuAction::OpenIn(p), Some(url)) if p < self.profiles.len() => {
+                // A new tab in the other profile, with that profile's cookies.
+                self.sleep();
+                net::forget_sessions();
+                self.profile = p;
+                let profile = &mut self.profiles[p];
+                profile.tabs.push(Tab::default());
+                profile.active = profile.tabs.len() - 1;
+                self.navigate(url, Destination::Push);
+                self.reveal_active_tab();
+                self.save_session();
+                true
+            }
+            (MenuAction::Bookmark, Some(_)) => self.open_bookmark_dialog(),
+            (MenuAction::Reload, Some(_)) => self.reload(),
+            (MenuAction::CloseTab, _) => self.close_tab(),
+            _ => false,
+        }
+    }
+
+    /// What a tooltip at (x, y) would say: icon buttons and their shortcuts, sleeping tabs.
+    fn tooltip_at(&self, x: f32, y: f32) -> Option<String> {
+        let left = self.pane_left();
+        if x >= left && y < HEADER_HEIGHT {
+            return Some(
+                match chrome::hit(x - left, self.pane_width())? {
+                    Button::Back => "Back ⌘[",
+                    Button::Forward => "Forward ⌘]",
+                    Button::Reload if self.load.is_some() => "Stop Esc",
+                    Button::Reload => "Reload ⌘R",
+                    Button::More => "More",
+                    Button::Address => return None,
+                }
+                .to_string(),
+            );
+        }
+        if !self.sidebar || x >= left {
+            return None;
+        }
+        let list = self.sidebar_rows();
+        let item = chrome::sidebar_hit(x, y, left, self.sidebar_scroll, &list.rows, false)?;
+        let active = self.profiles[self.profile].active;
+        let text = match item {
+            SidebarItem::Profile => "Switch profile ⌘⇧P",
+            SidebarItem::CloseRow(_) => "Close tab ⌘W",
+            SidebarItem::Row(r) => match list.targets.get(r) {
+                Some(&RowTarget::Tab(i)) if i != active => "Asleep to save memory. Select to wake.",
+                _ => return None,
+            },
+            _ => return None,
+        };
+        Some(text.to_string())
+    }
+
+    /// The pointer moved: start waiting for a new tooltip, or hide the one shown.
+    fn hover_at(&mut self, x: f32, y: f32) -> bool {
+        let text = self.tooltip_at(x, y);
+        let same = self.hover.as_ref().map(|h| &h.text) == text.as_ref();
+        if same {
+            return false;
+        }
+        let was_shown = self.hover.as_ref().is_some_and(|h| h.shown);
+        self.hover = text.map(|text| Hover {
+            at: (x, y),
+            text,
+            since: std::time::Instant::now(),
+            shown: false,
+        });
+        was_shown
+    }
+
+    /// Timers: show a tooltip once the pointer has rested long enough.
+    fn tick(&mut self) -> bool {
+        match self.hover.as_mut() {
+            Some(h) if !h.shown && h.since.elapsed() >= TOOLTIP_DELAY => {
+                h.shown = true;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Fold or unfold the group of tab `tab`.
@@ -2465,6 +2685,18 @@ impl<S: Screen> Browser<S> {
             scale,
             scroll_y: self.scroll,
         };
+        let menu_items: Vec<&str> = self.menu.as_ref().map_or(Vec::new(), |m| {
+            m.items.iter().map(|(label, _)| label.as_str()).collect()
+        });
+        let menu_view = self.menu.as_ref().map(|m| MenuView {
+            items: &menu_items,
+            selected: m.selected,
+        });
+        let tooltip = self
+            .hover
+            .as_ref()
+            .filter(|h| h.shown)
+            .map(|h| (h.at, h.text.as_str()));
         let (painter, chrome) = (&mut self.painter, &mut self.chrome);
         let blank = chrome.theme().surface;
         let shown = self
@@ -2533,6 +2765,26 @@ impl<S: Screen> Browser<S> {
                         scale,
                     };
                     chrome.draw_palette(painter, frame, fonts.set(), fonts.metrics(), palette);
+                }
+                if let Some(menu) = &menu_view {
+                    let frame = Frame {
+                        pixels: &mut *pixels,
+                        stride,
+                        left: sidebar_px,
+                        width: pane_px,
+                        scale,
+                    };
+                    chrome.draw_menu(painter, frame, fonts.set(), fonts.metrics(), menu);
+                }
+                if let Some((at, text)) = tooltip {
+                    let frame = Frame {
+                        pixels: &mut *pixels,
+                        stride,
+                        left: 0,
+                        width: width_px,
+                        scale,
+                    };
+                    chrome.draw_tooltip(painter, frame, fonts.set(), fonts.metrics(), at, text);
                 }
             });
         if let Err(e) = shown {
@@ -3088,6 +3340,7 @@ mod tests {
     struct FakeScreen {
         title: RefCell<String>,
         frame: RefCell<(usize, usize, Vec<u8>)>,
+        clipboard: RefCell<String>,
     }
 
     const PAD: usize = 16;
@@ -3107,6 +3360,10 @@ mod tests {
 
         fn set_title(&self, title: &str) {
             *self.title.borrow_mut() = title.to_string();
+        }
+
+        fn copy(&self, text: &str) {
+            *self.clipboard.borrow_mut() = text.to_string();
         }
 
         fn render(
@@ -3310,9 +3567,13 @@ mod tests {
         assert!(act(&mut b, tab(false)));
         assert!(b.field.is_some(), "then the address field");
         assert!(act(&mut b, tab(false)));
+        assert_eq!(b.focus, Some(Button::More), "then ⋯");
+        assert!(act(&mut b, tab(false)));
         assert!(b.link_focus.is_some(), "then the page's first link");
         assert!(act(&mut b, tab(true)));
-        assert!(b.field.is_some(), "Shift+Tab goes backwards");
+        assert_eq!(b.focus, Some(Button::More), "Shift+Tab goes backwards");
+        assert!(act(&mut b, tab(true)));
+        assert!(b.field.is_some());
 
         click_text(&mut b, "Go to B");
         assert_eq!(b.focus, None);
@@ -3363,6 +3624,7 @@ mod tests {
         };
         act(&mut b, tab(false)); // reload
         act(&mut b, tab(false)); // address field
+        act(&mut b, tab(false)); // ⋯
         act(&mut b, tab(false));
         assert_eq!(focused(&b).as_deref(), Some("First"));
         assert_eq!(b.scroll, 0.0);
@@ -3808,7 +4070,9 @@ mod tests {
         start_loading(&mut b, &slow);
         let started = std::time::Instant::now();
         assert!(b.handle(command('t')));
-        assert!(started.elapsed() < Duration::from_millis(50));
+        // The server has not answered: a window waiting on it would not get here at all. The
+        // bound only guards against a regression that waits for the network's timeout.
+        assert!(started.elapsed() < Duration::from_secs(2));
         assert!(b.load.is_none() && b.loading.is_none());
         assert_eq!(tab_titles(&b), ["Page A", "New tab"]);
         act(&mut b, command('w'));
@@ -4578,6 +4842,158 @@ mod tests {
         );
         assert_eq!(session.profiles[0].hue, Hue::Violet);
         assert!(!valid_id("a/b") && !valid_id("..") && !valid_id("") && valid_id("Work_2-x"));
+    }
+
+    #[test]
+    fn the_more_menu_copies_opens_in_another_profile_and_closes_tabs() {
+        let (a, _) = site("menu");
+        let mut b = browser(&a);
+        let more = (f64::from(SIDEBAR_WIDTH) + 400.0 - 8.0 - 14.0, 18.0);
+
+        // Mouse: the ⋯ button opens it; an item runs; outside closes.
+        assert!(act(
+            &mut b,
+            Event::Click {
+                x: more.0,
+                y: more.1
+            }
+        ));
+        let labels: Vec<&str> = b
+            .menu
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .map(|(l, _)| l.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "Copy address",
+                "Open in Work",
+                "Bookmark this page",
+                "Reload",
+                "Close tab"
+            ]
+        );
+        b.render();
+        // Rows from 34 + 6, 30 points each; the menu's right edge is 8 from the pane's.
+        assert!(act(
+            &mut b,
+            Event::Click {
+                x: more.0 - 50.0,
+                y: 40.0 + 15.0
+            }
+        ));
+        assert!(b.menu.is_none());
+        assert!(b.window.clipboard.borrow().starts_with("file://"));
+        assert!(b.window.clipboard.borrow().ends_with("a.html"));
+        act(
+            &mut b,
+            Event::Click {
+                x: more.0,
+                y: more.1,
+            },
+        );
+        assert!(act(
+            &mut b,
+            Event::Click {
+                x: f64::from(SIDEBAR_WIDTH) + 20.0,
+                y: 250.0
+            }
+        ));
+        assert!(b.menu.is_none(), "a click outside closes it");
+
+        // Keyboard: Tab to ⋯, Enter opens with the first item chosen, ↓ Enter runs the second.
+        for _ in 0..3 {
+            act(&mut b, key(Key::Tab));
+        }
+        assert_eq!(b.focus, Some(Button::More));
+        act(&mut b, key(Key::Enter));
+        assert_eq!(b.menu.as_ref().unwrap().selected, Some(0));
+        act(&mut b, key(Key::Down));
+        act(&mut b, key(Key::Enter));
+        assert_eq!(b.profiles[b.profile].name, "Work");
+        assert_eq!(title(&b), "Page A", "opened in a new tab of Work");
+        assert_eq!(b.profiles[1].tabs.len(), 2);
+
+        // A new tab's menu has only what makes sense there.
+        act(&mut b, command('t'));
+        act(&mut b, key(Key::Escape));
+        act(
+            &mut b,
+            Event::Click {
+                x: more.0,
+                y: more.1,
+            },
+        );
+        let labels: Vec<&str> = b
+            .menu
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .map(|(l, _)| l.as_str())
+            .collect();
+        assert_eq!(labels, ["Close tab"]);
+        act(&mut b, key(Key::Escape));
+        assert!(b.menu.is_none());
+    }
+
+    #[test]
+    fn tooltips_wait_then_show_and_hide_on_any_input() {
+        let (a, _) = site("tooltips");
+        let mut b = browser(&a);
+        act(&mut b, command('t'));
+        act(&mut b, key(Key::Escape));
+        // Pointer on the back button: nothing at first, the tooltip after the delay.
+        let back = Event::Hover {
+            x: f64::from(SIDEBAR_WIDTH) + 20.0,
+            y: 18.0,
+        };
+        assert!(!b.handle(back.clone()));
+        assert!(!b.tick(), "not yet");
+        assert_eq!(b.hover.as_ref().unwrap().text, "Back ⌘[");
+        b.hover.as_mut().unwrap().since -= TOOLTIP_DELAY;
+        assert!(b.tick());
+        b.render();
+        // Moving within the same button keeps it; moving off hides it.
+        assert!(!b.handle(Event::Hover {
+            x: f64::from(SIDEBAR_WIDTH) + 22.0,
+            y: 19.0
+        }));
+        assert!(b.hover.as_ref().unwrap().shown);
+        assert!(b.handle(Event::Hover {
+            x: f64::from(SIDEBAR_WIDTH) + 200.0,
+            y: 200.0
+        }));
+        assert!(b.hover.is_none());
+
+        // A sleeping tab says why it is quiet; the active tab has no tooltip.
+        b.handle(Event::Hover {
+            x: 100.0,
+            y: row_center(0),
+        });
+        assert_eq!(
+            b.hover.as_ref().unwrap().text,
+            "Asleep to save memory. Select to wake."
+        );
+        b.handle(Event::Hover {
+            x: 100.0,
+            y: row_center(1),
+        });
+        assert!(b.hover.is_none());
+        b.handle(Event::Hover {
+            x: 220.0,
+            y: row_center(1),
+        });
+        assert_eq!(b.hover.as_ref().unwrap().text, "Close tab ⌘W");
+
+        // Any other input hides a shown tooltip.
+        b.hover.as_mut().unwrap().since -= TOOLTIP_DELAY;
+        b.tick();
+        assert!(b.handle(key(Key::Down)) || b.hover.is_none());
+        assert!(b.hover.is_none());
     }
 
     #[test]

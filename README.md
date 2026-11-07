@@ -28,6 +28,8 @@ In the window:
 | Follow a link | click it |
 | Back / forward / reload | the header buttons, or ⌘[ / ⌘] / ⌘R |
 | Stop loading | Esc, or the × that replaces reload while a page loads |
+| Page menu: copy the address, open in another profile, bookmark, reload, close | ⋯ at the right of the header, or Tab to it and Enter; ↑ ↓ Enter, Esc |
+| Tooltips | rest the pointer on a button or a sleeping tab for 0.6 s |
 | New tab (opens the palette) / close tab / reopen closed tab | ⌘T / ⌘W / ⌘⇧T, or "+ New tab" and the × on the active row |
 | Go to tab 1 to 8, the last tab | ⌘1 … ⌘8, ⌘9, or click the row (in the order shown: pinned, groups, the rest) |
 | Pin a tab, move it to a group, fold a group | palette: "Pin or unpin this tab", "Move this tab to a group" (an empty name takes it out), "Fold or unfold this tab's group"; or click a group's label to fold it |
@@ -279,9 +281,9 @@ Where data lives, and what compression does for it (measured 2026-11-07):
   They are saved per profile in `profiles/<profile>/bookmarks` (0600).
 - Sidebar rows have no keyboard focus of their own: tabs are reached with ⌘1 … ⌘9 and the palette, which
   also runs every sidebar action. Dragging needs the mouse.
-- Not built yet, so not shown: the ⋯ menu, split view.
-- Sleeping-tab rows show no tooltip ("Asleep to save memory. Select to wake.") because the window has no
-  tooltips yet; the muted title is the only sign.
+- Not built yet, so not shown: split view.
+- A tooltip can stay on screen when the pointer leaves the window over it, until the next input: the
+  window does not track the pointer leaving yet.
 - Profiles start as Personal and Work; up to 12, each with its own folder in `profiles/` (named by a fixed
   id, so renaming moves nothing). Four colors exist (emerald, amber, rose, violet), so profiles past four
   share them; their names always tell them apart.
