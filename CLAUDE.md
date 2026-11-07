@@ -43,8 +43,10 @@ crates/
   paint/   display list, glyph rasterizer + cache, image cache + parallel decode, band compositing,
            streaming PNG writer
   platform/ macOS window via the Objective-C runtime, IOSurface frames (empty module on other OSes)
-  shell/   the `broxee` binary: main.rs (CLI), engine.rs (page pipeline, FontStore), browser.rs (history,
-           navigation, input, Screen trait), chrome.rs (header from DESIGN.md), pool.rs (fetch pool)
+  shell/   the `broxee` binary: main.rs (CLI), engine.rs (page pipeline, FontStore, snapshot/restore),
+           browser.rs (profiles, tabs, history, navigation, input, session file, Screen trait),
+           hibernate.rs (sleeping tabs on disk), chrome.rs (sidebar and header from DESIGN.md),
+           pool.rs (fetch pool)
 scripts/
   budget.sh  60 MB check: binary size + peak RAM on a generated 2.6 MB page with a <style> block
 ```
@@ -72,6 +74,19 @@ casts), not taken from binding crates. Ask before proposing any dependency.
   surfaces per window; the spare one is released when idle (`Window::release_spare`).
 - **Window memory is measured with `footprint <pid>` on a real window** (idle and `phys_footprint_peak`), not
   only with the CLI: frame surfaces (16 MB each at Retina) and AppKit are on top of the page.
+
+### Tab invariants
+
+- **Only the visible tab is a live page** (`Browser::page`). Every other tab is a file in `TabStore` or just
+  its history. Never keep a second `Loaded` around: a heavy page is 10 to 20 MB live.
+- **A snapshot holds only what the page was built from**, as it arrived (`net::Wire`): rebuilding must give the
+  same DOM, so `NodeId`s in the stored `ImageStore` stay valid. Do not store anything derived (styles, layout).
+- **Image ids in the painter are per page.** `Painter::forget_images` runs whenever the page changes (show,
+  sleep); skipping it shows another page's pixels.
+- **Switching profile calls `net::forget_sessions`.** Nothing that could link profiles (connections, TLS
+  tickets, and cookies once they exist) may be shared between them.
+- **Session and tab files are data, never trusted**: every length and count is checked against what is left,
+  and damage gives a reload, not a panic.
 
 ### Testing the browser
 

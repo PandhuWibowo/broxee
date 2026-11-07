@@ -441,7 +441,6 @@ impl Painter {
         composite_band(target.pixels, band, 0, &items, &self.glyphs, &self.images);
     }
 
-    /// Drop the glyph cache when it grows past `max_bytes`, so browsing many pages cannot grow it forever.
     /// Decode the images this frame draws that are not cached yet, in parallel, then evict
     /// images no longer drawn while the cache is over budget. Returns how many were decoded.
     fn decode_images(&mut self, pictures: Vec<(ImageKey, &[u8])>) -> usize {
@@ -505,11 +504,18 @@ impl Painter {
         decoded
     }
 
+    /// Drop the glyph cache when it grows past `max_bytes`, so browsing many pages cannot grow it forever.
     pub fn trim(&mut self, max_bytes: usize) {
         let bytes: usize = self.glyphs.values().map(|g| g.coverage.len()).sum();
         if bytes > max_bytes {
             self.glyphs.clear();
         }
+    }
+
+    /// Forget every decoded image. Call it when the page changes: image ids are only unique
+    /// within one page, so another page's image 0 at the same size must not reuse the pixels.
+    pub fn forget_images(&mut self) {
+        self.images = HashMap::default();
     }
 
     fn build<'p>(

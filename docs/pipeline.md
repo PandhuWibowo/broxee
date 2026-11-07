@@ -47,6 +47,8 @@ thread) and, later, the JavaScript event loop (single-threaded, as in every brow
 | The engine handles every queued event, then paints once (30 scroll events cost one frame) | coalesced, sequential | engine |
 | Navigation runs stages 2 to 9; after each stage the header's loading line is repainted | sequential | engine |
 | Frames are painted straight into one of two `IOSurface`s; the one on screen is never written | double-buffered | engine, then main |
+| Switching tab: the visible page is reduced to its sources, written to disk, then dropped; the selected tab is read back and rebuilt with stages 2 to 9 (no fetches) | sequential | engine |
+| The session file is rewritten (temporary file, then rename) after each tab or navigation change | sequential, a few KB | engine |
 
 If the window server still holds the spare surface, the engine waits up to 50 ms for it rather than
 allocating a third 16 MB buffer; past that it reuses it and accepts one possibly torn frame.

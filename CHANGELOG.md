@@ -91,6 +91,18 @@
   transforms), verified byte for byte against the reference encoder and live GitHub, Cloudflare and MDN streams.
   `net` asks for `br` first.
 
+- Tabs and profiles: a 240-point sidebar with the profile switcher, the tab list and "+ New tab"; the
+  profile's 2px edge over the sidebar and the pane; the pane header names the profile ("github.com · Work").
+  ⌘T, ⌘W, ⌘⇧T, ⌘1 … ⌘9, ⌘⇧P, ⌘\\. Personal (emerald) and Work (amber) keep their own tabs, history and
+  closed tabs.
+- Sleeping tabs (`hibernate.rs`): only the visible tab is a live page; the others are written to a private file
+  as the sources they arrived as (`net::Response::wire`, `engine::Sources`) plus their compressed images, and
+  rebuilt from it without the network (`engine::snapshot`, `engine::restore`).
+- Session restore: tabs and history are saved after each change and come back asleep on start.
+  `broxee --window` without an address restores the session; several addresses open one tab each.
+- `net::forget_sessions`: switching profile closes idle connections and drops TLS session tickets.
+- `paint::Target::left`: painting into a pane that starts right of the sidebar.
+
 ### Changed
 - gzip decoding twice as fast (237 → 478 MB/s): CRC-32 with ARMv8 instructions or slicing-by-8, output allocated
   from the gzip size trailer, 8-byte match copies, 8-byte bit refills.
@@ -122,3 +134,6 @@
 - The raw HTML is freed right after parsing.
 - Tokenizer borrows from the source and allocates only for lowercased names or decoded entities.
   Stress page parse 24 ms to 19 ms.
+- Fixed: a new page could show the previous page's image. The painter cached decoded images by their index
+  within the page, so another page's image 0 drawn at the same size reused the old pixels; the cache is now
+  cleared when the page changes, which also frees the old page's pixels.

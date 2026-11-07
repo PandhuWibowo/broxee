@@ -6,6 +6,8 @@ Broxee is a web browser with its own engine, written in Rust. Hard budget: **und
 
 ```bash
 cargo run --release -- https://example.com --window    # open it in a window (macOS)
+cargo run --release -- --window                        # bring back the last session
+cargo run --release -- a.com b.org --window            # one tab per address
 cargo run --release -- https://example.com --png out.png --scale 2   # render to an image
 cargo run --release -- https://example.com --tree      # fetch, parse, print the DOM tree
 cargo run --release -- https://example.com --styles    # the tree with computed styles
@@ -24,9 +26,27 @@ In the window:
 | Scroll | trackpad or wheel, ↑ ↓, Space / Shift+Space, Page Up / Page Down, Home / End |
 | Follow a link | click it |
 | Back / forward / reload | the header buttons, or ⌘[ / ⌘] / ⌘R |
+| New tab / close tab / reopen closed tab | ⌘T / ⌘W / ⌘⇧T, or "+ New tab" and the × on the active row |
+| Go to tab 1 to 8, the last tab | ⌘1 … ⌘8, ⌘9, or click the row |
+| Switch profile (Personal, Work) | ⌘⇧P, or click the profile name at the top of the sidebar |
+| Show or hide the sidebar | ⌘\\ |
 | Address field | ⌘L or click the host; type or paste (⌘V), Enter to open, Esc to cancel |
 | Move between header controls | Tab / Shift+Tab, Enter or Space to activate |
 | Quit | ⌘Q or close the window |
+
+Tabs and profiles:
+
+- Each profile has its own tabs, history and closed tabs. Switching profile closes every idle connection and
+  forgets TLS sessions, so a server cannot link the two through a reused connection.
+- Only the visible tab is a live page. The others sleep: the HTML and stylesheets as they arrived (usually
+  Brotli or gzip) and the compressed images go to a private file in `~/Library/Caches/Broxee/tabs` (folder
+  0700, files 0600). Selecting the tab rebuilds it from that file, without the network, at its old scroll
+  position: 5 ms for MDN's home page, about 45 ms for GitHub. Sleeping tabs use no page memory, however many
+  there are. The files total at most 256 MB; past that the tabs seen longest ago keep only their history and
+  reload when selected. The folder is removed on exit, or at the next start when the browser was killed.
+- The session (profiles, tabs, history, scroll positions; no page contents) is written to
+  `~/Library/Application Support/Broxee/session` after each change. On start every tab comes back asleep and
+  only the visible one loads.
 
 ## Written from scratch
 
@@ -116,7 +136,8 @@ time something reads it (most theme variables never are). A `var()` value is sub
 5. ✅ Painting to a window: the first visible page
 6. ✅ Scrolling, links, back/forward, address bar
 7. JavaScript (Boa) + a subset of the DOM API
-8. Then the product features: profiles, tab organisation, session restore, split view, bookmarks
+8. Product features: ✅ profiles, ✅ tabs that sleep to disk, ✅ session restore; next the ⌘K palette, split
+   view, bookmarks, tab groups
 
 ## Budget log
 
@@ -140,6 +161,7 @@ time something reads it (most theme variables never are). A `var()` value is sub
 | 2026-11-07 | Inline boxes; attribute-aware rule pruning; window fitted to screen, spare surface released when idle | 1.8 MB | 49.2 MB peak painted at 2x | window: GitHub 43 MB idle / 58 MB peak (was 74 MB peak) |
 | 2026-11-07 | Progressive JPEG; scaled inverse DCT for every JPEG drawn smaller | 1.8 MB | 49.1 MB peak painted at 2x | 12 MP photo at 400 px: 15 to 18 MB peak, decode 21 to 32 ms |
 | 2026-11-07 | Brotli; faster gzip (hardware CRC, exact output allocation, chunked copies) | 1.9 MB | 49.2 MB peak painted at 2x | gzip 237 → 478 MB/s; Brotli 400 to 690 MB/s |
+| 2026-11-07 | Tabs that sleep to disk, profiles, session restore, sidebar | 2.0 MB | 49.3 MB peak painted at 2x | Window with four tabs: 60 to 61 MB peak (see below) |
 
 Other pages after the layout milestone: GitHub home 22.7 MB peak (8,170 rules); Hacker News 11.5 MB.
 
@@ -155,6 +177,8 @@ Window mode on a Retina display, measured with `footprint` (what Activity Monito
 | example.com | 33 MB | 48 MB | baseline: AppKit, fonts, one 16 MB frame surface |
 | GitHub | 43 MB | 58 MB | |
 | Wikipedia "Cat" | 40 MB | 55 MB | |
+| Tabs: Wikipedia, MDN, example.com asleep, GitHub visible | 45 MB | 61 MB | 2026-11-07, sidebar shown |
+| Tabs: GitHub, MDN, example.com asleep, Wikipedia visible | 45 MB | 60 MB | |
 
 Two fixes got there. The window asked for 1280 points; macOS shrank it to fit the screen after the first frames,
 which rebuilt every surface while the old one was still on screen (74 MB peak on GitHub). The window is now
@@ -162,6 +186,13 @@ fitted before it is shown. And the spare surface of the double buffer is release
 events (16 MB at Retina size); the next frame recreates it. Peaks happen while drawing, when both surfaces
 exist. Releasing freed allocator pages (`malloc_zone_pressure_relief`) after loading changed nothing measurable:
 what remains is live data and fragmentation.
+
+Tabs: the sleeping tabs are not what moves the peak. Kept in memory, the three sleeping tabs above added about
+1 MB. On disk they add nothing, yet the peak stayed at 60 to 61 MB. The cost comes from having built a heavy page
+before: after GitHub, then example.com, the window idles at 45 MB instead of 33 MB. `heap` counts 6.8 MB of
+live allocations in that state, while `MALLOC_SMALL` holds 19 to 25 MB: freed memory that macOS malloc keeps
+dirty because live objects are scattered through its regions. Any long session that opens a heavy page
+pays this, with or without tabs. See Known issues.
 
 Earlier: Hacker News 48 MB with double buffering,
 of which 31 MB are the two 2560x1600 Retina frames. A third buffer appeared during loading (63 MB) until the
@@ -200,7 +231,7 @@ Where data lives, and what compression does for it (measured 2026-11-07):
 | CPU | gzip 6.5 → 3.3 ms for Wikipedia's 1.5 MB page (237 → 478 MB/s) | Profiling showed the CRC check and match copies, not decoding, dominated: CRC-32 now uses ARMv8 instructions (slicing-by-8 elsewhere), output is allocated once from gzip's size trailer, and short matches copy in 8-byte chunks. |
 | Memory: images | Keep compressed files; decode only what is on screen, at its drawn size | Re-decoding from the file is the cheapest compressed form: 1 to 30 ms even for a 12 MP photo. A compressed pixel cache would add code and save little. |
 | Memory: page | Not compressed while open | Layout and paint read text and styles constantly; compressing them would cost every frame. |
-| Memory: tabs (next) | Hibernate a background tab to its compressed sources (the bytes as received) | A page that is 15 to 20 MB live is 0.2 to 0.5 MB compressed; restoring needs no network. |
+| Memory: tabs | A sleeping tab is its sources as received plus compressed images, in a file on disk | GitHub 2.5 MB (92 KB of gzip HTML, 712 KB of CSS, 1.75 MB of images), Wikipedia "Cat" 1.2 MB, MDN 57 KB. Waking takes 5 to 45 ms without the network. In RAM, even a few of them would fill the headroom under 60 MB. |
 | Disk: binary | Keep `opt-level = 3` | `"s"` saves 0.31 MB (1.95 → 1.64) but layout is 55% slower and cascade 25%; `"z"` is 3x slower. |
 | Disk: caches (later) | Store responses in the encoding they arrived in | No re-compression work, and already the smallest form. |
 
@@ -212,9 +243,17 @@ Where data lives, and what compression does for it (measured 2026-11-07):
   orange bar.
 - Tab reaches the header controls but not links inside the page yet; there is no visible focus for page links.
 - Reload cannot stop a load in progress (the load runs on the engine thread to completion).
-- No cookies, so nothing stays logged in; profiles (DESIGN.md) wait for cookie storage.
-- The header omits the profile name, profile edge and the ⋯ menu from DESIGN.md until profiles and menu
-  actions exist, rather than showing controls that do nothing.
+- **Window peak at the limit after heavy pages.** GitHub alone peaks at 58 MB; a session that has built
+  GitHub and then other pages peaks at 60 to 61 MB, because of allocator fragmentation (see the window table).
+  Tracked in #1.
+- No cookies, so nothing stays logged in yet. Profiles are separate in tabs, history and connections; cookie
+  storage will be per profile when it exists.
+- Not built yet, so not shown: the ⌘K palette and the "Search or go to ⌘K" field in the sidebar, the ⋯ menu,
+  split view, bookmarks, tab groups and pinned tabs, dragging tabs, a resizable sidebar. The sidebar does not
+  scroll; tabs past the window's height are still reachable with ⌘1 … ⌘9 and ⌘W.
+- Sleeping-tab rows show no tooltip ("Asleep to save memory. Select to wake.") because the window has no
+  tooltips yet; the muted title is the only sign.
+- Profiles are fixed (Personal, Work) and cannot be renamed or added.
 - GIF, WebP and SVG are sized from their headers but not drawn yet. Failed images draw nothing.
 - Building the display list walks every fragment each frame (0.7 ms on the 140k-fragment stress page). An index
   by vertical position would make scrolling cost independent of page length.

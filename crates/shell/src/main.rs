@@ -1,4 +1,6 @@
 mod engine;
+#[cfg(any(target_os = "macos", test))]
+mod hibernate;
 mod images;
 mod pool;
 
@@ -17,12 +19,14 @@ use paint::{Painter, Viewport};
 use engine::{FontStore, Settings};
 
 const USAGE: &str =
-    "usage: broxee [<url-or-file>] [--window | --png FILE | --paint] [--tree | --styles | --layout] \
+    "usage: broxee [<url-or-file>...] [--window | --png FILE | --paint] [--tree | --styles | --layout] \
                      [--depth N] [--width PX] [--height PX] [--scale N] [--no-css-fetch]";
 
 #[derive(Clone)]
 struct Options {
     target: String,
+    /// More addresses for the window, each opened in its own tab after `target`.
+    more: Vec<String>,
     tree: bool,
     styles: bool,
     layout: bool,
@@ -37,9 +41,10 @@ struct Options {
 }
 
 fn main() -> ExitCode {
-    let mut target = None;
+    let mut targets: Vec<String> = Vec::new();
     let mut opts = Options {
         target: String::new(),
+        more: Vec::new(),
         tree: false,
         styles: false,
         layout: false,
@@ -77,7 +82,7 @@ fn main() -> ExitCode {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;
             }
-            _ if target.is_none() => target = Some(arg),
+            _ if !arg.starts_with("--") => targets.push(arg),
             _ => {
                 eprintln!("unexpected argument: {arg}\n{USAGE}");
                 return ExitCode::from(2);
@@ -85,11 +90,18 @@ fn main() -> ExitCode {
         }
     }
     if opts.window {
-        // Without an address the window brings back the last session.
-        opts.target = target.unwrap_or_default();
+        // Without an address the window brings back the last session; with several, each
+        // gets a tab and the last one is shown.
+        let mut targets = targets.into_iter();
+        opts.target = targets.next().unwrap_or_default();
+        opts.more = targets.collect();
         return run_window(opts);
     }
-    let Some(target) = target else {
+    if targets.len() > 1 {
+        eprintln!("unexpected argument: {}\n{USAGE}", targets[1]);
+        return ExitCode::from(2);
+    }
+    let Some(target) = targets.pop() else {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };

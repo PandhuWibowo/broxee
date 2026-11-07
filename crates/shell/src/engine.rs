@@ -150,29 +150,12 @@ pub struct Sources {
     pub stylesheets: Vec<(String, net::Wire)>,
 }
 
-impl Sources {
-    pub fn bytes(&self) -> usize {
-        self.html.bytes.len()
-            + self
-                .stylesheets
-                .iter()
-                .map(|(url, w)| url.len() + w.bytes.len())
-                .sum::<usize>()
-    }
-}
-
 /// A page put to sleep: its sources and compressed images, and nothing built from them.
 pub struct Snapshot {
     pub url: net::Url,
     pub status: u16,
     pub sources: Sources,
     pub images: ImageStore,
-}
-
-impl Snapshot {
-    pub fn bytes(&self) -> usize {
-        self.sources.bytes() + self.images.bytes()
-    }
 }
 
 /// Drop everything built from a page (DOM, styles, layout), keeping what rebuilds it.
@@ -643,40 +626,6 @@ mod tests {
             1,
             "inline styles come from the HTML"
         );
-    }
-
-    #[test]
-    #[ignore = "measures live sites"]
-    fn measure_snapshots() {
-        for site in [
-            "https://github.com/",
-            "https://en.wikipedia.org/wiki/Cat",
-            "https://example.com/",
-            "https://developer.mozilla.org/en-US/",
-        ] {
-            let fonts = FontStore::start();
-            let settings = Settings {
-                width: 1200.0,
-                height: 800.0,
-                dark: false,
-                fetch_css: true,
-            };
-            let url = net::Url::parse(site).unwrap();
-            let page = load(&url, settings, &fonts, &mut |_| {}).unwrap();
-            let html_raw = page.bytes;
-            let css: usize = page
-                .sources
-                .stylesheets
-                .iter()
-                .map(|(_, w)| w.bytes.len())
-                .sum();
-            let started = Instant::now();
-            let snap = snapshot(page);
-            let (src, img) = (snap.sources.bytes(), snap.images.bytes());
-            let restored = restore(snap, settings, &fonts).unwrap();
-            println!("{site}: html {} raw -> {} kept ({:?}), css kept {css}, images {img}, snapshot {} KB, wake {:.1} ms",
-                html_raw, restored.sources.html.bytes.len(), restored.sources.html.encoding, (src + img) / 1024, millis(started));
-        }
     }
 
     fn page(src: &str) -> Loaded {

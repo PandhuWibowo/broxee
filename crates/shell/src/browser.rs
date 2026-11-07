@@ -1,9 +1,9 @@
 //! The window: tabs and profiles, navigation, history, scrolling, links and the address field.
 //!
-//! Only the visible tab holds a built page (DOM, styles, layout). Every other tab sleeps as a
-//! snapshot of what it was built from, compressed as it arrived (`engine::Snapshot`), or as
-//! just its history once snapshots pass their budget. Selecting a tab rebuilds it from its
-//! snapshot without the network, at its old scroll position.
+//! Only the visible tab holds a built page (DOM, styles, layout). Every other tab sleeps: what
+//! its page was built from, compressed as it arrived, goes to a private file on disk
+//! (`hibernate`), or the tab keeps just its history once those files pass their budget.
+//! Selecting a tab rebuilds it from its file without the network, at its old scroll position.
 //!
 //! Runs on the engine thread. Input arrives from the main thread over a channel; every event
 //! queued while the engine was busy is handled before the next frame, so a burst of scroll
@@ -23,7 +23,8 @@ use crate::chrome::{
     self, Button, Chrome, FieldView, Frame, HeaderView, Hue, SidebarItem, SidebarView, TabView,
     HEADER_HEIGHT, SIDEBAR_WIDTH,
 };
-use crate::engine::{self, FontStore, Loaded, Settings, Snapshot};
+use crate::engine::{self, FontStore, Loaded, Settings};
+use crate::hibernate::{Stored, TabStore};
 use crate::Options;
 
 /// Arrow keys scroll by this many points.
@@ -32,9 +33,9 @@ const LINE_STEP: f32 = 40.0;
 const PAGE_OVERLAP: f32 = 40.0;
 /// The glyph cache is dropped past this size, so long sessions cannot grow it without bound.
 const GLYPH_CACHE_LIMIT: usize = 8 << 20;
-/// All sleeping tabs' snapshots together stay under this; past it, the tabs used longest ago
+/// Sleeping tabs' files together stay under this on disk; past it, the tabs used longest ago
 /// keep only their history and reload from the network when selected.
-const SNAPSHOT_BUDGET: usize = 8 << 20;
+const SNAPSHOT_BUDGET: u64 = 256 << 20;
 /// Closed tabs that ⌘⇧T can reopen, per profile.
 const CLOSED_LIMIT: usize = 20;
 /// Session file limits, so a damaged file cannot make startup slow.
@@ -95,10 +96,13 @@ impl Screen for platform::Window {
 #[cfg(target_os = "macos")]
 pub fn run(opts: Options) -> std::process::ExitCode {
     let (width, height) = (f64::from(opts.width), f64::from(opts.height));
-    let session = std::env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join("Library/Application Support/Broxee/session"));
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let session = home
+        .as_ref()
+        .map(|home| home.join("Library/Application Support/Broxee/session"));
+    let store = home.and_then(|home| TabStore::open(&home.join("Library/Caches/Broxee/tabs")).ok());
     platform::run_app("Broxee", width, height, move |window, events| {
-        Browser::new(opts, window, session).run(&events);
+        Browser::new(opts, window, session, store).run(&events);
     })
 }
 
@@ -114,9 +118,9 @@ struct Tab {
     history: Vec<Entry>,
     index: usize,
     title: String,
-    /// What a sleeping tab is rebuilt from. `None` for the visible tab, for a tab whose snapshot
-    /// went over budget, and for tabs restored from a session.
-    snapshot: Option<Snapshot>,
+    /// The file a sleeping tab is rebuilt from. `None` for the visible tab, for a tab whose
+    /// file went over budget, and for tabs restored from a session.
+    snapshot: Option<Stored>,
     /// When the tab was last visible, for choosing which snapshots to drop first.
     seen: u64,
 }
@@ -237,8 +241,10 @@ struct Browser<S: Screen> {
     profile: usize,
     sidebar: bool,
     clock: u64,
-    snapshot_budget: usize,
+    snapshot_budget: u64,
     session: Option<PathBuf>,
+    /// Where sleeping tabs go; without it they keep only their history.
+    store: Option<TabStore>,
     field: Option<Field>,
     /// Header button with keyboard focus, reached with Tab.
     focus: Option<Button>,
@@ -246,7 +252,12 @@ struct Browser<S: Screen> {
 }
 
 impl<S: Screen> Browser<S> {
-    fn new(opts: Options, window: S, session: Option<PathBuf>) -> Browser<S> {
+    fn new(
+        opts: Options,
+        window: S,
+        session: Option<PathBuf>,
+        store: Option<TabStore>,
+    ) -> Browser<S> {
         let (width, height) = window.size();
         let (scale, dark) = (window.scale() as f32, window.dark());
         Browser {
@@ -271,6 +282,7 @@ impl<S: Screen> Browser<S> {
             clock: 0,
             snapshot_budget: SNAPSHOT_BUDGET,
             session,
+            store,
             field: None,
             focus: None,
             loading: None,
@@ -363,34 +375,47 @@ impl<S: Screen> Browser<S> {
                 self.profile = visible.min(self.profiles.len() - 1);
             }
         }
-        let target = self.opts.target.trim().to_string();
-        if target.is_empty() {
+        let targets: Vec<String> = std::iter::once(&self.opts.target)
+            .chain(&self.opts.more)
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if targets.is_empty() {
             self.wake();
-            return;
         }
-        match engine::to_url(&target) {
-            Ok(url) => {
-                let p = &self.profiles[self.profile];
-                let open = p
-                    .tabs
-                    .iter()
-                    .position(|t| t.entry().is_some_and(|e| e.url == url));
-                match open {
-                    Some(i) => {
-                        self.profiles[self.profile].active = i;
-                        self.wake();
-                    }
-                    None => {
-                        if !self.tab().history.is_empty() {
-                            let p = &mut self.profiles[self.profile];
-                            p.tabs.push(Tab::default());
-                            p.active = p.tabs.len() - 1;
-                        }
-                        self.navigate(url, true);
-                    }
-                }
+        for target in targets {
+            self.open_target(&target);
+        }
+    }
+
+    /// An address from the command line: select its tab if one already shows it, otherwise
+    /// open it in a new tab (or in the first, empty one).
+    fn open_target(&mut self, target: &str) {
+        let url = match engine::to_url(target) {
+            Ok(url) => url,
+            Err(e) => return self.show_message("Broxee couldn't open that", &e),
+        };
+        let p = &self.profiles[self.profile];
+        let open = p
+            .tabs
+            .iter()
+            .position(|t| t.entry().is_some_and(|e| e.url == url));
+        if self.page.is_some() {
+            self.sleep();
+        }
+        let p = &mut self.profiles[self.profile];
+        match open {
+            Some(i) => {
+                p.active = i;
+                self.wake();
             }
-            Err(e) => self.show_message("Broxee couldn't open that", &e),
+            None => {
+                if !p.tabs[p.active].history.is_empty() {
+                    p.tabs.push(Tab::default());
+                    p.active = p.tabs.len() - 1;
+                }
+                self.navigate(url, true);
+            }
         }
     }
 
@@ -748,35 +773,46 @@ impl<S: Screen> Browser<S> {
         self.field = None;
         self.focus = None;
         let page = self.page.take();
+        self.painter.forget_images();
         let keep = std::mem::take(&mut self.page_is_entry);
         self.clock += 1;
         let clock = self.clock;
+        // The page's DOM, styles and layout are freed first; then the sources are written and
+        // freed too. A tab that cannot be written keeps its history and reloads when selected.
+        let snapshot = page.filter(|_| keep).map(engine::snapshot);
+        let stored = match (snapshot, self.store.as_mut()) {
+            (Some(snapshot), Some(store)) => store.put(&snapshot).ok(),
+            _ => None,
+        };
         let tab = self.tab_mut();
         tab.seen = clock;
-        if let Some(page) = page.filter(|_| keep) {
-            tab.snapshot = Some(engine::snapshot(page));
-        }
+        tab.snapshot = stored;
         self.trim_snapshots();
     }
 
-    /// Drop the snapshots of the tabs seen longest ago until the rest fit the budget.
+    /// Fit the sleeping tabs' files in their budget, removing those seen longest ago first.
     fn trim_snapshots(&mut self) {
-        let mut sleeping: Vec<(u64, usize, usize, usize)> = Vec::new();
+        let mut sleeping: Vec<(u64, usize, usize)> = Vec::new();
+        let mut total = 0;
         for (p, profile) in self.profiles.iter().enumerate() {
             for (t, tab) in profile.tabs.iter().enumerate() {
-                if let Some(snapshot) = &tab.snapshot {
-                    sleeping.push((tab.seen, snapshot.bytes(), p, t));
+                if let Some(stored) = &tab.snapshot {
+                    sleeping.push((tab.seen, p, t));
+                    total += stored.bytes;
                 }
             }
         }
-        let mut total: usize = sleeping.iter().map(|s| s.1).sum();
         sleeping.sort_unstable_by_key(|s| s.0);
-        for (_, bytes, p, t) in sleeping {
+        for (_, p, t) in sleeping {
             if total <= self.snapshot_budget {
                 break;
             }
-            self.profiles[p].tabs[t].snapshot = None;
-            total -= bytes;
+            if let Some(stored) = self.profiles[p].tabs[t].snapshot.take() {
+                total -= stored.bytes;
+                if let Some(store) = &self.store {
+                    store.remove(stored);
+                }
+            }
         }
     }
 
@@ -784,9 +820,13 @@ impl<S: Screen> Browser<S> {
     fn wake(&mut self) {
         let settings = self.settings();
         let tab = self.tab_mut();
-        let snapshot = tab.snapshot.take();
+        let stored = tab.snapshot.take();
         let entry = tab.entry().cloned();
         let title = tab.title().to_string();
+        let snapshot = match (stored, &self.store) {
+            (Some(stored), Some(store)) => store.take(stored).ok(),
+            _ => None,
+        };
         if let (Some(snapshot), Some(entry)) = (snapshot, &entry) {
             if let Ok(page) = engine::restore(snapshot, settings, &self.fonts) {
                 self.tab_mut().title = self.show(page, entry.scroll);
@@ -934,6 +974,7 @@ impl<S: Screen> Browser<S> {
         self.scroll = scroll;
         self.clamp_scroll();
         self.painter.trim(GLYPH_CACHE_LIMIT);
+        self.painter.forget_images();
         // Loading freed a lot (the previous page, stylesheet text, parse scratch): hand it back
         // to the system before the frame that needs a second surface.
         #[cfg(target_os = "macos")]
@@ -1320,8 +1361,11 @@ mod tests {
     }
 
     fn browser_with(target: &Path, session: Option<PathBuf>) -> Browser<FakeScreen> {
+        let root = std::env::temp_dir().join(format!("broxee-tabs-{}", std::process::id()));
+        let store = TabStore::open(&root).expect("a folder for sleeping tabs");
         let opts = Options {
             target: target.display().to_string(),
+            more: Vec::new(),
             tree: false,
             styles: false,
             layout: false,
@@ -1334,7 +1378,7 @@ mod tests {
             scale: 1.0,
             fetch_css: false,
         };
-        let mut b = Browser::new(opts, FakeScreen::default(), session);
+        let mut b = Browser::new(opts, FakeScreen::default(), session, Some(store));
         b.start();
         b
     }
@@ -1756,6 +1800,44 @@ mod tests {
         let tab = &profiles[0].0[0];
         assert_eq!(tab.title, "A tab name");
         assert_eq!(tab.history[0].scroll, 12.5);
+    }
+
+    #[test]
+    fn a_new_page_never_reuses_the_last_pages_images() {
+        let dir = std::env::temp_dir().join(format!("broxee-images-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Two pages, each with one 20x20 image at the same size: both are image 0.
+        let page = |name: &str, rgb: [u8; 3]| {
+            let pixels: Vec<u8> = (0..400)
+                .flat_map(|_| [rgb[0], rgb[1], rgb[2], 255])
+                .collect();
+            let png: String = paint::png::encode(20, 20, &pixels)
+                .iter()
+                .map(|b| format!("%{b:02X}"))
+                .collect();
+            let path = dir.join(name);
+            std::fs::write(
+                &path,
+                format!("<style>body {{ margin: 0 }}</style><img src=\"data:image/png,{png}\">"),
+            )
+            .unwrap();
+            path
+        };
+        let (red, blue) = (
+            page("red.html", [255, 0, 0]),
+            page("blue.html", [0, 0, 255]),
+        );
+        let mut b = browser(&red);
+        b.opts.fetch_css = true;
+        b.handle(command('r'));
+        let at = (SIDEBAR_WIDTH as usize + 10, HEADER_HEIGHT as usize + 10);
+        assert_eq!(b.window.pixel(at.0, at.1), [0, 0, 255, 255], "red, as BGRA");
+        open(&mut b, &blue);
+        assert_eq!(
+            b.window.pixel(at.0, at.1),
+            [255, 0, 0, 255],
+            "blue, not the cached red"
+        );
     }
 
     #[test]
