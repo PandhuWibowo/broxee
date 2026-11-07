@@ -188,6 +188,8 @@ struct Profile {
     tabs: Vec<Tab>,
     active: usize,
     closed: Vec<Closed>,
+    /// This profile's cookies: logins in one profile never reach the other.
+    cookies: Arc<net::Cookies>,
 }
 
 impl Profile {
@@ -198,6 +200,7 @@ impl Profile {
             tabs: vec![Tab::default()],
             active: 0,
             closed: Vec::new(),
+            cookies: Arc::new(net::Cookies::new()),
         }
     }
 }
@@ -306,6 +309,17 @@ impl<S: Screen> Browser<S> {
     ) -> Browser<S> {
         let (width, height) = window.size();
         let (scale, dark) = (window.scale() as f32, window.dark());
+        let mut profiles = vec![
+            Profile::new("Personal", Hue::Emerald),
+            Profile::new("Work", Hue::Amber),
+        ];
+        for profile in &mut profiles {
+            let saved = cookie_file(session.as_deref(), profile.name)
+                .and_then(|path| std::fs::read_to_string(path).ok());
+            if let Some(text) = saved {
+                profile.cookies = Arc::new(net::Cookies::load(&text));
+            }
+        }
         Browser {
             opts,
             window,
@@ -319,10 +333,7 @@ impl<S: Screen> Browser<S> {
             page: None,
             scroll: 0.0,
             page_is_entry: false,
-            profiles: vec![
-                Profile::new("Personal", Hue::Emerald),
-                Profile::new("Work", Hue::Amber),
-            ],
+            profiles,
             profile: 0,
             sidebar: true,
             clock: 0,
@@ -590,7 +601,13 @@ impl<S: Screen> Browser<S> {
         let was_editing = self.field.take().is_some() | self.focus.take().is_some();
         if let Some(url) = self.link_at(x, y - HEADER_HEIGHT) {
             self.save_scroll();
-            self.navigate(url, Destination::Push);
+            // A link from another site does not carry SameSite=Strict cookies.
+            let from = self
+                .page
+                .as_ref()
+                .map(|p| net::site(&p.url.host).to_string());
+            let same_site = from.is_none_or(|from| from == net::site(&url.host));
+            self.navigate_from(url, Destination::Push, same_site);
             return true;
         }
         was_editing
@@ -757,6 +774,14 @@ impl<S: Screen> Browser<S> {
                 true
             }
             Command::FocusAddress => self.focus_field(),
+            Command::ClearCookies => {
+                let cookies = &self.profiles[self.profile].cookies;
+                cookies.clear();
+                self.save_cookies();
+                // Connections may still be tied to the old cookies on the server's side.
+                net::forget_sessions();
+                true
+            }
             Command::Back => self.back(),
             Command::Forward => self.forward(),
             Command::Reload => self.reload(),
@@ -865,7 +890,9 @@ impl<S: Screen> Browser<S> {
             items.push(palette::Item {
                 title: command.label().into(),
                 detail: "Command".into(),
-                hint: Hint::Keys(command.keys()),
+                hint: command
+                    .keys()
+                    .map_or(Hint::Label(String::new()), Hint::Keys),
                 action: Action::Run(command),
             });
         }
@@ -1022,18 +1049,29 @@ impl<S: Screen> Browser<S> {
     /// arrives. The current page stays on screen and the window keeps answering input. A load
     /// already running is cancelled: one page is built at a time.
     fn navigate(&mut self, url: net::Url, to: Destination) {
+        // Typed, from the palette, back, forward, reload: started by the person.
+        self.navigate_from(url, to, true);
+    }
+
+    /// `navigate`, saying whether the navigation started on the same site as `url`.
+    fn navigate_from(&mut self, url: net::Url, to: Destination, same_site_initiator: bool) {
         self.stop_load();
         self.field = None;
         self.focus = None;
         let settings = self.settings();
         let (sender, messages) = mpsc::channel();
         let fonts = Arc::clone(&self.fonts);
+        let cookies = Arc::clone(&self.profiles[self.profile].cookies);
         let target = url.clone();
         let spawned = std::thread::Builder::new()
             .name("load".into())
             .spawn(move || {
+                let jar = engine::Jar {
+                    cookies: &cookies,
+                    same_site_initiator,
+                };
                 // A failed send means the browser dropped the load: stop at the next stage.
-                let result = engine::load(&target, settings, &fonts, &mut |progress| {
+                let result = engine::load(&target, settings, &fonts, Some(jar), &mut |progress| {
                     sender.send(LoadMessage::Progress(progress)).is_ok()
                 });
                 let _ = sender.send(LoadMessage::Done(Box::new(result)));
@@ -1110,6 +1148,7 @@ impl<S: Screen> Browser<S> {
     /// Show a finished load (or its error page) and record it in the tab's history.
     fn finish_load(&mut self, load: Load, result: Result<Loaded, String>) {
         self.loading = None;
+        self.save_cookies();
         let url = load.url;
         if matches!(&result, Err(e) if e == engine::CANCELLED) {
             return;
@@ -1345,19 +1384,30 @@ impl<S: Screen> Browser<S> {
         tab.title = title;
     }
 
+    /// Write the visible profile's persistent cookies if they changed (atomically, readable by
+    /// this user only). Session cookies are never written.
+    fn save_cookies(&self) {
+        let profile = &self.profiles[self.profile];
+        if !profile.cookies.take_changed() {
+            return;
+        }
+        let Some(path) = cookie_file(self.session.as_deref(), profile.name) else {
+            return;
+        };
+        if let Err(e) = write_private(&path, profile.cookies.save().as_bytes()) {
+            self.window
+                .set_title(&format!("Broxee: couldn't save cookies ({e})"));
+        }
+    }
+
     /// Write the tabs and their history (not their pages) so the next start brings them back.
     fn save_session(&self) {
         let Some(path) = &self.session else {
             return;
         };
         let text = write_session(&self.profiles, self.profile);
-        let tmp = path.with_extension("tmp");
-        let written = path
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| std::fs::write(&tmp, text))
-            .and_then(|()| std::fs::rename(&tmp, path));
-        if let Err(e) = written {
+        // History is private: the file is this user's only, like the cookies.
+        if let Err(e) = write_private(path, text.as_bytes()) {
             self.window
                 .set_title(&format!("Broxee: couldn't save the session ({e})"));
         }
@@ -1565,6 +1615,36 @@ impl<S: Screen> Browser<S> {
             self.window.set_title(&format!("Broxee: {e}"));
         }
     }
+}
+
+/// Where a profile's cookies are kept: beside the session file, one folder per profile.
+fn cookie_file(session: Option<&std::path::Path>, profile: &str) -> Option<PathBuf> {
+    Some(
+        session?
+            .parent()?
+            .join("profiles")
+            .join(profile)
+            .join("cookies"),
+    )
+}
+
+/// Write `data` to `path` through a temporary file and a rename, readable by this user only.
+fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(dir) = path.parent() {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(dir)?;
+    }
+    let tmp = path.with_extension("tmp");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(&tmp)?.write_all(data)?;
+    std::fs::rename(&tmp, path)
 }
 
 /// The session as text: one line per profile, tab and history entry, tab-separated. Pages
@@ -2589,6 +2669,109 @@ mod tests {
             }
         ));
         assert!(b.palette.is_none());
+    }
+
+    /// A local HTTP server that sets `id=<n>` (persistent) and `s=1` (session) on its first
+    /// visit from a jar without them, and titles each page with the Cookie header it received.
+    fn cookie_server() -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for (n, stream) in listener.incoming().enumerate() {
+                let Ok(mut stream) = stream else { break };
+                let mut request = [0u8; 4096];
+                let len = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..len]).into_owned();
+                let cookie = request
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Cookie: "))
+                    .unwrap_or("none")
+                    .to_string();
+                let set = if cookie.contains("id=") {
+                    String::new()
+                } else {
+                    format!("Set-Cookie: id={n}; Max-Age=3600\r\nSet-Cookie: s=1\r\n")
+                };
+                let body = format!("<title>{cookie}</title>");
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\n{set}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        format!("http://{address}/")
+    }
+
+    fn visit(b: &mut Browser<FakeScreen>, url: &str) {
+        act(b, command('l'));
+        act(b, Event::Paste(url.to_string()));
+        act(b, key(Key::Enter));
+    }
+
+    #[test]
+    fn cookies_stay_in_their_profile_and_survive_a_restart() {
+        let (a, _) = site("cookies");
+        let server = cookie_server();
+        let session = a.with_file_name("cookie-session");
+        let _ = std::fs::remove_dir_all(a.with_file_name("profiles"));
+        let mut b = browser_with(&a, Some(session.clone()));
+
+        visit(&mut b, &server);
+        assert_eq!(title(&b), "none", "first visit: nothing to send");
+        act(&mut b, command('r'));
+        let personal = title(&b);
+        assert!(
+            personal.starts_with("id=") && personal.ends_with("; s=1"),
+            "{personal}"
+        );
+
+        // Work has its own jar.
+        act(&mut b, command_shift('p'));
+        act(&mut b, key(Key::Escape));
+        visit(&mut b, &server);
+        assert_eq!(title(&b), "none", "Personal's cookies do not reach Work");
+        act(&mut b, command('r'));
+        let work = title(&b);
+        assert!(
+            work.starts_with("id=") && work != personal,
+            "{work} vs {personal}"
+        );
+
+        // Saved per profile, private to this user; session cookies are not saved.
+        let file = a
+            .with_file_name("profiles")
+            .join("Personal")
+            .join("cookies");
+        let saved = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            saved.contains("id\t") && !saved.contains("s\t1\t"),
+            "{saved}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        drop(b);
+
+        // After a restart the persistent cookie comes back; the session one does not.
+        let mut b = browser_with(Path::new(""), Some(session.clone()));
+        act(&mut b, command_shift('p'));
+        if b.profiles[b.profile].name != "Personal" {
+            act(&mut b, command_shift('p'));
+        }
+        visit(&mut b, &server);
+        assert_eq!(title(&b), personal.trim_end_matches("; s=1"));
+
+        // Clearing works from the palette, for this profile only.
+        act(&mut b, command('k'));
+        type_text(&mut b, "clear this");
+        act(&mut b, key(Key::Enter));
+        assert!(b.profiles[b.profile].cookies.is_empty());
+        assert!(!b.profiles[1 - b.profile].cookies.is_empty());
     }
 
     #[test]

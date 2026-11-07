@@ -159,3 +159,8 @@
   Enter, Esc, ⌘K to close) and mouse; it fits the window's height and scrolls its results. A new tab opens
   with the palette, and the sidebar has the "Search or go to ⌘K" field. Radius 10, a hairline and one soft
   shadow; ⌘ ⇧ ⌥ drawn as icons; long titles end with "…".
+- Cookies, one jar per profile (#6): RFC 6265bis parsing and matching (cookie dates, `Domain`, `Path`,
+  `Expires`, `Max-Age`, `Secure`, `HttpOnly`, `SameSite`, name prefixes), sent and stored on every redirect
+  hop, third-party cookies blocked, public suffixes refused using the built-in Public Suffix List
+  (`net::site`), persistent cookies saved per profile with mode 0600, session cookies kept in memory only,
+  and "Clear this profile's cookies" in the palette. The session file is now written 0600 too.

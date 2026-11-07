@@ -213,9 +213,19 @@ pub fn restore(
     Ok(page)
 }
 
+/// A profile's cookie jar, for a load. `same_site_initiator`: the person started this
+/// navigation (typed, palette, back, reload) or a link on the same site did, so
+/// `SameSite=Strict` cookies go with it.
+#[derive(Clone, Copy)]
+pub struct Jar<'a> {
+    pub cookies: &'a net::Cookies,
+    pub same_site_initiator: bool,
+}
+
 /// Where a page's subresources come from.
-enum From {
-    Network,
+enum From<'a> {
+    /// Fetched, with the profile's cookies for subresources of the page's own site.
+    Network(Option<&'a net::Cookies>),
     /// A sleeping page waking: stylesheets from their stored bytes, images as they were.
     Snapshot(Sources, ImageStore),
     /// Pages Broxee writes itself.
@@ -232,10 +242,12 @@ pub fn load(
     url: &net::Url,
     settings: Settings,
     fonts: &FontStore,
+    jar: Option<Jar>,
     progress: &mut dyn FnMut(f32) -> bool,
 ) -> Result<Loaded, String> {
     let started = Instant::now();
-    let resp = net::fetch(url)?;
+    let context = net::Context::top_level(jar.is_none_or(|j| j.same_site_initiator));
+    let resp = net::fetch_in(url, jar.map(|j| (j.cookies, &context)))?;
     let fetch_ms = millis(started);
     if !progress(0.4) {
         return Err(CANCELLED.into());
@@ -261,7 +273,7 @@ pub fn load(
     }
 
     let from = if settings.fetch_css {
-        From::Network
+        From::Network(jar.map(|j| j.cookies))
     } else {
         From::Nowhere
     };
@@ -456,6 +468,13 @@ fn load_subresources(
     from: From,
 ) -> (LoadedCss, ImageStore, Vec<(String, net::Wire)>) {
     let external = !matches!(from, From::Nowhere);
+    let cookies = match from {
+        From::Network(cookies) => cookies,
+        _ => None,
+    };
+    // Subresources send and store cookies only for the page's own site.
+    let context = net::Context::subresource(base);
+    let jar = cookies.map(|c| (c, &context));
     let mut jobs = Vec::new();
     for id in dom.descendants(Dom::ROOT) {
         if jobs.len() >= MAX_STYLESHEETS {
@@ -487,10 +506,10 @@ fn load_subresources(
     let stored = stored_sheets.as_deref();
     let started = Instant::now();
     let results = pool::map_ordered(jobs, FETCH_WORKERS, |job| match job {
-        Job::Css(source) => Done::Css(load_css(source, &vocabulary, stored)),
+        Job::Css(source) => Done::Css(load_css(source, &vocabulary, stored, jar)),
         Job::Image(images::Source::Inline(bytes)) => Done::Image(Some(bytes)),
         Job::Image(images::Source::Url(url)) => Done::Image(
-            net::fetch(&url)
+            net::fetch_in(&url, jar)
                 .ok()
                 .filter(|r| r.status == 200)
                 .map(|r| r.body),
@@ -532,6 +551,7 @@ fn load_css(
     source: CssSource,
     vocabulary: &css::Vocabulary,
     stored: Option<&[(String, net::Wire)]>,
+    jar: Option<(&net::Cookies, &net::Context)>,
 ) -> CssResult {
     let failed = CssResult {
         sheet: None,
@@ -553,7 +573,7 @@ fn load_css(
                         Err(_) => return failed,
                     }
                 }
-                None => match net::fetch(&url) {
+                None => match net::fetch_in(&url, jar) {
                     Ok(mut resp) if resp.status == 200 => {
                         let wire = if resp.wire.bytes.is_empty() {
                             net::Wire {
@@ -636,7 +656,7 @@ mod tests {
             dark: false,
             fetch_css: false,
         };
-        let page = load(&url, settings, &FontStore::default(), &mut |_| true).unwrap();
+        let page = load(&url, settings, &FontStore::default(), None, &mut |_| true).unwrap();
         assert_eq!(page.dom.title().as_deref(), Some("Spaced"));
         assert!(to_url("https://a.com https://b.com").is_err());
     }

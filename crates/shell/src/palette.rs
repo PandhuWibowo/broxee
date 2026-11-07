@@ -11,19 +11,21 @@ pub enum Command {
     SwitchProfile,
     ToggleSidebar,
     FocusAddress,
+    ClearCookies,
     Back,
     Forward,
     Reload,
 }
 
 impl Command {
-    pub const ALL: [Command; 9] = [
+    pub const ALL: [Command; 10] = [
         Command::NewTab,
         Command::CloseTab,
         Command::ReopenTab,
         Command::SwitchProfile,
         Command::ToggleSidebar,
         Command::FocusAddress,
+        Command::ClearCookies,
         Command::Back,
         Command::Forward,
         Command::Reload,
@@ -37,25 +39,28 @@ impl Command {
             Command::SwitchProfile => "Switch profile",
             Command::ToggleSidebar => "Show or hide the sidebar",
             Command::FocusAddress => "Edit the address",
+            Command::ClearCookies => "Clear this profile's cookies",
             Command::Back => "Back",
             Command::Forward => "Forward",
             Command::Reload => "Reload",
         }
     }
 
-    /// The shortcut, with ⌘ ⇧ ⌥ as the modifier symbols the palette draws as icons.
-    pub fn keys(self) -> &'static str {
-        match self {
+    /// The shortcut, with ⌘ ⇧ ⌥ as the modifier symbols the palette draws as icons. Rare
+    /// commands that are easy to run by mistake have none.
+    pub fn keys(self) -> Option<&'static str> {
+        Some(match self {
             Command::NewTab => "⌘T",
             Command::CloseTab => "⌘W",
             Command::ReopenTab => "⌘⇧T",
             Command::SwitchProfile => "⌘⇧P",
             Command::ToggleSidebar => "⌘\\",
             Command::FocusAddress => "⌘L",
+            Command::ClearCookies => return None,
             Command::Back => "⌘[",
             Command::Forward => "⌘]",
             Command::Reload => "⌘R",
-        }
+        })
     }
 }
 
@@ -186,10 +191,10 @@ mod tests {
     }
 
     #[test]
-    fn every_command_has_a_label_and_a_shortcut() {
+    fn every_command_has_a_label_and_most_have_a_shortcut() {
         for c in Command::ALL {
             assert!(!c.label().is_empty());
-            assert!(c.keys().starts_with('⌘'));
+            assert!(c.keys().is_none_or(|k| k.starts_with('⌘')));
         }
     }
 }

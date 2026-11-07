@@ -41,8 +41,17 @@ Tabs and profiles:
 - Pages load on their own thread while the current page stays on screen: scrolling, links, tabs, profiles and
   the address field keep working. Opening another page, switching tab or switching profile stops the load (one
   page is built at a time, for memory); the tab stays on the page it showed.
-- Each profile has its own tabs, history and closed tabs. Switching profile closes every idle connection and
-  forgets TLS sessions, so a server cannot link the two through a reused connection.
+- Each profile has its own tabs, history, closed tabs and **cookies**, so a login in Work never reaches
+  Personal. Switching profile closes every idle connection and forgets TLS sessions, so a server cannot link
+  the two through a reused connection either.
+- Cookies follow RFC 6265bis: `Domain`, `Path`, `Expires`, `Max-Age`, `Secure`, `HttpOnly`, `SameSite`
+  (Lax by default; Strict cookies stay behind on links from other sites; None needs Secure) and the
+  `__Secure-` / `__Host-` prefixes. **Third-party cookies are blocked**: a subresource from another site
+  neither sends nor sets them. A site cannot set a cookie for a public suffix (`co.uk`, `github.io`): the
+  Public Suffix List is built in (below). Persistent cookies are saved per profile in
+  `~/Library/Application Support/Broxee/profiles/<profile>/cookies` (0600, written atomically); session cookies
+  never touch the disk. "Clear this profile's cookies" is in the palette. Limits: 4 KB per cookie, 60 per
+  site, 3,000 per profile.
 - Only the visible tab is a live page. The others sleep: the HTML and stylesheets as they arrived (usually
   Brotli or gzip) and the compressed images go to a private file in `~/Library/Caches/Broxee/tabs` (folder
   0700, files 0600). Selecting the tab rebuilds it from that file, without the network, at its old scroll
@@ -61,6 +70,12 @@ at risk. That is the only dependency; `libc` appears in the build only as a depe
 
 The window layer calls AppKit through the Objective-C runtime (`objc_msgSend`) and shows frames through
 `IOSurface`; process memory is read with a hand-declared `getrusage`.
+
+Data taken from elsewhere, as data: the Brotli dictionary and tables (RFC 7932, CRC-checked in tests) and the
+**Public Suffix List** (publicsuffix.org, Mozilla Public License 2.0), stored as
+`crates/net/src/public_suffix_list.gz`: its 10,406 rules, punycode for internationalised labels, 46 KB in the
+binary and about 150 KB in memory once a cookie first needs it. `scripts/update-public-suffixes.sh`
+refreshes it.
 
 ## Crates
 
@@ -251,8 +266,6 @@ Where data lives, and what compression does for it (measured 2026-11-07):
 - No table layout and no presentational attributes (`bgcolor`, `align`): Hacker News renders centred without its
   orange bar.
 - Tab reaches the header controls but not links inside the page yet; there is no visible focus for page links.
-- No cookies, so nothing stays logged in yet. Profiles are separate in tabs, history and connections; cookie
-  storage will be per profile when it exists.
 - The palette cannot search the web: with no search engine chosen, a query that matches nothing says
   "Broxee can't search the web yet." Bookmarks will join its results when they exist.
 - The UI font (Arial, until Figtree is bundled) has no ⌘ ⇧ ⌥ glyphs, so the chrome draws those three as

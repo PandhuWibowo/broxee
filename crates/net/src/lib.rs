@@ -4,6 +4,12 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod cookies;
+mod psl;
+
+pub use cookies::{Context, Cookie, Cookies, SameSite};
+pub use psl::site;
+
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
@@ -358,15 +364,28 @@ const IO_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_IDLE: usize = 8;
 const IDLE_FOR: Duration = Duration::from_secs(30);
 
-/// GET a URL, following redirects. A request that fails on a reused or reset connection is
-/// retried once on a fresh one.
+/// GET a URL without cookies, following redirects.
 pub fn fetch(url: &Url) -> Result<Response, String> {
+    fetch_in(url, None)
+}
+
+/// GET a URL, following redirects, sending and storing cookies of a profile's jar when given.
+/// A request that fails on a reused or reset connection is retried once on a fresh one.
+pub fn fetch_in(url: &Url, cookies: Option<(&Cookies, &Context)>) -> Result<Response, String> {
     let mut url = url.clone();
     for _ in 0..MAX_REDIRECTS {
-        let resp = match fetch_once(&url) {
-            Err(FetchError::Retryable(_)) => fetch_once(&url)?,
+        let header = cookies.and_then(|(jar, context)| jar.header(&url, context));
+        let resp = match fetch_once(&url, header.as_deref()) {
+            Err(FetchError::Retryable(_)) => fetch_once(&url, header.as_deref())?,
             other => other?,
         };
+        if let Some((jar, context)) = cookies {
+            for (name, value) in &resp.headers {
+                if name.eq_ignore_ascii_case("set-cookie") {
+                    jar.store(&url, value, context);
+                }
+            }
+        }
         if (300..400).contains(&resp.status) {
             if let Some(location) = resp.header("location") {
                 url = url.join(location)?;
@@ -378,7 +397,7 @@ pub fn fetch(url: &Url) -> Result<Response, String> {
     Err(format!("too many redirects ending at {url}"))
 }
 
-fn fetch_once(url: &Url) -> Result<Response, FetchError> {
+fn fetch_once(url: &Url, cookie: Option<&str>) -> Result<Response, FetchError> {
     if url.scheme == "file" {
         let path = url.decoded_path();
         let body = std::fs::read(&path).map_err(|e| format!("{path}: {e}"))?;
@@ -395,7 +414,7 @@ fn fetch_once(url: &Url) -> Result<Response, FetchError> {
         Some(conn) => (conn, true),
         None => (Conn::open(url)?, false),
     };
-    match request(&mut conn, url) {
+    match request(&mut conn, url, cookie) {
         Ok((resp, reusable)) => {
             if reusable {
                 put_idle(key, conn);
@@ -405,7 +424,7 @@ fn fetch_once(url: &Url) -> Result<Response, FetchError> {
         // A pooled connection the server already closed: not the server's answer.
         Err(FetchError::Retryable(_)) if reused => {
             let mut conn = Conn::open(url)?;
-            let (resp, reusable) = request(&mut conn, url)?;
+            let (resp, reusable) = request(&mut conn, url, cookie)?;
             if reusable {
                 put_idle(key, conn);
             }
@@ -415,16 +434,22 @@ fn fetch_once(url: &Url) -> Result<Response, FetchError> {
     }
 }
 
-fn request(conn: &mut Conn, url: &Url) -> Result<(Response, bool), FetchError> {
+fn request(
+    conn: &mut Conn,
+    url: &Url,
+    cookie: Option<&str>,
+) -> Result<(Response, bool), FetchError> {
     let host_header = if Some(url.port) == default_port(&url.scheme) {
         url.host.clone()
     } else {
         format!("{}:{}", url.host, url.port)
     };
+    // Cookie values never hold CR or LF: the jar refuses them when storing.
+    let cookie = cookie.map_or(String::new(), |c| format!("Cookie: {c}\r\n"));
     let request = format!(
         "GET {} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: {USER_AGENT}\r\n\
          Accept: text/html,*/*;q=0.8\r\nAccept-Encoding: br, gzip, deflate\r\n\
-         Connection: keep-alive\r\n\r\n",
+         {cookie}Connection: keep-alive\r\n\r\n",
         url.path
     );
     conn.stream

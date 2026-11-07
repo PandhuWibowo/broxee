@@ -29,7 +29,7 @@ crates/
   flate/   DEFLATE, zlib, gzip and Brotli decoding (brotli.rs; RFC 7932 dictionary and tables as
            data, CRC-checked in tests), CRC-32, Adler-32
   net/     URL parse + join, HTTP/1.1 over TCP, TLS (rustls), keep-alive pool, chunked bodies, gzip,
-           redirects, file://
+           redirects, file://, cookies.rs (per-profile jars), psl.rs (Public Suffix List, as data)
   html/    tokenizer.rs (byte-oriented, raw-text elements), entities.rs, lib.rs (tree builder + arena DOM,
            fast hasher shared with css, layout and paint)
   css/     parser.rs (rules, declarations, shorthands, @media), media.rs (query evaluation), grid.rs,
@@ -95,6 +95,9 @@ casts), not taken from binding crates. Ask before proposing any dependency.
 - **One page load at a time.** `Browser::navigate` stops the running load before starting another, and every
   tab or profile change stops it too. A finished load always belongs to the visible tab, because nothing can
   change the visible tab without stopping it first. Keep both true when adding background work.
+- **Cookies belong to a profile.** Every fetch for a page passes that profile's jar (`engine::Jar`);
+  subresources use `net::Context::subresource`, which blocks other sites' cookies. Never log or print cookie
+  values, never write session cookies to disk, and keep cookie and session files 0600 (`write_private`).
 - **Session and tab files are data, never trusted**: every length and count is checked against what is left,
   and damage gives a reload, not a panic.
 
