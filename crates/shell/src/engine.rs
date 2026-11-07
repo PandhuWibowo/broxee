@@ -594,11 +594,24 @@ fn is_stylesheet_link(dom: &Dom, id: NodeId) -> bool {
 
 /// A URL from the command line: an absolute URL or a local file path.
 pub fn to_url(target: &str) -> Result<net::Url, String> {
+    several_addresses(target)?;
     if target.contains("://") {
         return net::Url::parse(target);
     }
     let path = std::fs::canonicalize(target).map_err(|e| format!("{target}: {e}"))?;
     net::Url::parse(&format!("file://{}", path.display()))
+}
+
+/// Text with a space and a second `scheme://` is several addresses pasted together, not one
+/// URL with a space in its path (which the URL standard would accept).
+pub fn several_addresses(text: &str) -> Result<(), String> {
+    let text = text.trim();
+    if text.contains(char::is_whitespace) && text.matches("://").count() > 1 {
+        return Err(format!(
+            "That is more than one address. Open them one at a time: {text}"
+        ));
+    }
+    Ok(())
 }
 
 pub fn millis(since: Instant) -> f64 {
@@ -608,6 +621,25 @@ pub fn millis(since: Instant) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opens_files_with_spaces_in_their_names() {
+        let dir = std::env::temp_dir().join(format!("broxee space {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("my page.html");
+        std::fs::write(&file, "<title>Spaced</title>").unwrap();
+        let url = to_url(&file.display().to_string()).unwrap();
+        assert!(!url.to_string().contains(' '), "{url}");
+        let settings = Settings {
+            width: 400.0,
+            height: 300.0,
+            dark: false,
+            fetch_css: false,
+        };
+        let page = load(&url, settings, &FontStore::default(), &mut |_| true).unwrap();
+        assert_eq!(page.dom.title().as_deref(), Some("Spaced"));
+        assert!(to_url("https://a.com https://b.com").is_err());
+    }
 
     #[test]
     fn a_snapshot_rebuilds_the_same_page() {

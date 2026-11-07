@@ -144,3 +144,9 @@
   profiles and editing the address while a page loads. Esc or the stop button (× in place of reload) stops a
   load; opening another page or changing tab stops it too. Back, forward and reload move the tab only once
   the page arrives.
+- URLs follow the URL standard for whitespace (#3): leading and trailing spaces and controls are dropped, tabs
+  and newlines removed, and spaces, unsafe characters and non-ASCII in paths and queries percent-encoded; a
+  host with a space or another forbidden character is an error, an empty port means the default, and
+  `user:pass@` is dropped (never sent). Several addresses pasted as one, on the command line or in the
+  address field, are refused with a clear message. `file://` paths are decoded before reading, so files with
+  spaces in their names open.

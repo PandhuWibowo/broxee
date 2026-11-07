@@ -1358,6 +1358,7 @@ fn link_for(page: &Loaded, node: NodeId) -> Option<net::Url> {
 /// Typed text to a URL: full URLs as they are, `example.com` as https.
 fn parse_input(input: &str) -> Result<net::Url, String> {
     let input = input.trim();
+    engine::several_addresses(input)?;
     if input.contains("://") {
         return net::Url::parse(input);
     }
@@ -1372,7 +1373,8 @@ fn parse_input(input: &str) -> Result<net::Url, String> {
 
 fn host_of(url: &net::Url) -> String {
     if url.host.is_empty() {
-        url.path.rsplit('/').next().unwrap_or_default().to_string()
+        let path = url.decoded_path();
+        path.rsplit('/').next().unwrap_or_default().to_string()
     } else {
         url.host.clone()
     }
@@ -2153,6 +2155,11 @@ mod tests {
         );
         assert_eq!(parse_input("localhost:8080").unwrap().port, 8080);
         assert!(parse_input("what is rust").is_err());
+        assert!(parse_input("https://a.com/x https://b.com/").is_err());
+        assert_eq!(
+            parse_input("https://a.com/my page").unwrap().to_string(),
+            "https://a.com/my%20page"
+        );
         assert!(parse_input("").is_err());
     }
 
