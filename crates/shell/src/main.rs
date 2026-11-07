@@ -8,6 +8,8 @@ mod pool;
 mod browser;
 #[cfg(any(target_os = "macos", test))]
 mod chrome;
+#[cfg(any(target_os = "macos", test))]
+mod palette;
 
 use std::process::ExitCode;
 

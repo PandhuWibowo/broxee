@@ -23,11 +23,12 @@ In the window:
 
 | Action | Keys or mouse |
 |---|---|
+| Palette: open tabs (every profile), this profile's history, commands, a typed address | ⌘K or "Search or go to" in the sidebar; type to filter, ↑ ↓ or Tab, Enter, Esc |
 | Scroll | trackpad or wheel, ↑ ↓, Space / Shift+Space, Page Up / Page Down, Home / End |
 | Follow a link | click it |
 | Back / forward / reload | the header buttons, or ⌘[ / ⌘] / ⌘R |
 | Stop loading | Esc, or the × that replaces reload while a page loads |
-| New tab / close tab / reopen closed tab | ⌘T / ⌘W / ⌘⇧T, or "+ New tab" and the × on the active row |
+| New tab (opens the palette) / close tab / reopen closed tab | ⌘T / ⌘W / ⌘⇧T, or "+ New tab" and the × on the active row |
 | Go to tab 1 to 8, the last tab | ⌘1 … ⌘8, ⌘9, or click the row |
 | Switch profile (Personal, Work) | ⌘⇧P, or click the profile name at the top of the sidebar |
 | Show or hide the sidebar | ⌘\\ |
@@ -140,8 +141,8 @@ time something reads it (most theme variables never are). A `var()` value is sub
 5. ✅ Painting to a window: the first visible page
 6. ✅ Scrolling, links, back/forward, address bar
 7. JavaScript (Boa) + a subset of the DOM API
-8. Product features: ✅ profiles, ✅ tabs that sleep to disk, ✅ session restore; next the ⌘K palette, split
-   view, bookmarks, tab groups
+8. Product features: ✅ profiles, ✅ tabs that sleep to disk, ✅ session restore, ✅ ⌘K palette; next cookies,
+   split view, bookmarks, tab groups
 
 ## Budget log
 
@@ -252,8 +253,11 @@ Where data lives, and what compression does for it (measured 2026-11-07):
 - Tab reaches the header controls but not links inside the page yet; there is no visible focus for page links.
 - No cookies, so nothing stays logged in yet. Profiles are separate in tabs, history and connections; cookie
   storage will be per profile when it exists.
-- Not built yet, so not shown: the ⌘K palette and the "Search or go to ⌘K" field in the sidebar, the ⋯ menu,
-  split view, bookmarks, tab groups and pinned tabs, dragging tabs, a resizable sidebar. The sidebar does not
+- The palette cannot search the web: with no search engine chosen, a query that matches nothing says
+  "Broxee can't search the web yet." Bookmarks will join its results when they exist.
+- The UI font (Arial, until Figtree is bundled) has no ⌘ ⇧ ⌥ glyphs, so the chrome draws those three as
+  icons; page text that uses them shows nothing for them.
+- Not built yet, so not shown: the ⋯ menu, split view, bookmarks, tab groups and pinned tabs, dragging tabs, a resizable sidebar. The sidebar does not
   scroll; tabs past the window's height are still reachable with ⌘1 … ⌘9 and ⌘W.
 - Sleeping-tab rows show no tooltip ("Asleep to save memory. Select to wake.") because the window has no
   tooltips yet; the muted title is the only sign.

@@ -45,7 +45,8 @@ crates/
   platform/ macOS window via the Objective-C runtime, IOSurface frames (empty module on other OSes)
   shell/   the `broxee` binary: main.rs (CLI), engine.rs (page pipeline, FontStore, snapshot/restore),
            browser.rs (profiles, tabs, history, navigation, input, session file, Screen trait),
-           hibernate.rs (sleeping tabs on disk), chrome.rs (sidebar and header from DESIGN.md),
+           hibernate.rs (sleeping tabs on disk), palette.rs (⌘K results and ranking),
+           chrome.rs (sidebar, header and palette drawing from DESIGN.md),
            pool.rs (fetch pool)
 scripts/
   budget.sh  60 MB check: binary size + peak RAM on a generated 2.6 MB page with a <style> block

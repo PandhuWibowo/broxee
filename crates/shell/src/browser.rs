@@ -22,11 +22,12 @@ use paint::{Painter, Target, Viewport};
 use platform::{Event, Key, KeyEvent};
 
 use crate::chrome::{
-    self, Button, Chrome, FieldView, Frame, HeaderView, Hue, SidebarItem, SidebarView, TabView,
-    HEADER_HEIGHT, SIDEBAR_WIDTH,
+    self, Button, Chrome, FieldView, Frame, HeaderView, HintView, Hue, PaletteHit, PaletteRow,
+    PaletteView, SidebarItem, SidebarView, TabView, HEADER_HEIGHT, SIDEBAR_WIDTH,
 };
 use crate::engine::{self, FontStore, Loaded, Settings};
 use crate::hibernate::{Stored, TabStore};
+use crate::palette::{self, Action, Command, Hint};
 use crate::Options;
 
 /// Arrow keys scroll by this many points.
@@ -114,6 +115,8 @@ pub fn run(opts: Options) -> std::process::ExitCode {
 struct Entry {
     url: net::Url,
     scroll: f32,
+    /// The page's title when it was last shown, for the palette's history results.
+    title: String,
 }
 
 /// A tab. The visible one's page lives in `Browser::page`; the others sleep.
@@ -199,6 +202,17 @@ impl Profile {
     }
 }
 
+/// The ⌘K palette while it is open.
+struct Palette {
+    query: Field,
+    /// What matches the query, best first.
+    items: Vec<palette::Item>,
+    selected: usize,
+    /// The first visible result: the list scrolls to keep `selected` in view.
+    first: usize,
+}
+
+#[derive(Default)]
 struct Field {
     text: String,
     /// Byte offset of the caret, always on a char boundary.
@@ -275,6 +289,7 @@ struct Browser<S: Screen> {
     /// Where sleeping tabs go; without it they keep only their history.
     store: Option<TabStore>,
     field: Option<Field>,
+    palette: Option<Palette>,
     /// Header button with keyboard focus, reached with Tab.
     focus: Option<Button>,
     /// Progress of `load`, for the header's loading line.
@@ -315,6 +330,7 @@ impl<S: Screen> Browser<S> {
             session,
             store,
             field: None,
+            palette: None,
             focus: None,
             loading: None,
             load: None,
@@ -487,13 +503,21 @@ impl<S: Screen> Browser<S> {
             }
             Event::Click { x, y } => self.click(x as f32, y as f32),
             Event::Key(key) => self.key(key),
-            Event::Paste(text) => match self.field.as_mut() {
-                Some(field) => {
-                    field.insert(text.trim().lines().next().unwrap_or_default());
-                    true
+            Event::Paste(text) => {
+                let line = text.trim().lines().next().unwrap_or_default();
+                if let Some(palette) = self.palette.as_mut() {
+                    palette.query.insert(line);
+                    self.refresh_palette();
+                    return true;
                 }
-                None => false,
-            },
+                match self.field.as_mut() {
+                    Some(field) => {
+                        field.insert(line);
+                        true
+                    }
+                    None => false,
+                }
+            }
         }
     }
 
@@ -528,12 +552,24 @@ impl<S: Screen> Browser<S> {
 
     fn click(&mut self, x: f32, y: f32) -> bool {
         let left = self.pane_left();
+        if let Some(p) = &self.palette {
+            if x >= left {
+                let rows = (p.items.len() - p.first).min(chrome::palette_capacity(self.height));
+                return match chrome::palette_hit(x - left, y, self.pane_width(), rows) {
+                    PaletteHit::Row(i) => self.activate(p.first + i),
+                    PaletteHit::Inside => false,
+                    PaletteHit::Outside => self.close_palette(),
+                };
+            }
+            self.close_palette();
+        }
         if x < left {
             self.field = None;
             self.focus = None;
             let p = &self.profiles[self.profile];
             return match chrome::sidebar_hit(x, y, p.tabs.len(), p.active) {
                 Some(SidebarItem::Profile) => self.switch_profile(),
+                Some(SidebarItem::Search) => self.open_palette(),
                 Some(SidebarItem::Tab(i)) => self.select_tab(i),
                 Some(SidebarItem::CloseTab(_)) => self.close_tab(),
                 Some(SidebarItem::NewTab) => self.new_tab(),
@@ -561,27 +597,34 @@ impl<S: Screen> Browser<S> {
     }
 
     fn key(&mut self, k: KeyEvent) -> bool {
+        if self.palette.is_some() {
+            if !k.command {
+                return self.palette_key(k);
+            }
+            // ⌘K closes it; any other shortcut closes it and runs.
+            self.close_palette();
+            if k.key == Key::Char('k') {
+                return true;
+            }
+        }
         if k.command {
             return match k.key {
-                Key::Char('t') if k.shift => self.reopen_tab(),
-                Key::Char('t') => self.new_tab(),
-                Key::Char('w') => self.close_tab(),
-                Key::Char('p') if k.shift => self.switch_profile(),
-                Key::Char('\\') => {
-                    self.sidebar = !self.sidebar;
-                    self.relayout();
-                    true
-                }
+                Key::Char('k') => self.open_palette(),
+                Key::Char('t') if k.shift => self.run_command(Command::ReopenTab),
+                Key::Char('t') => self.run_command(Command::NewTab),
+                Key::Char('w') => self.run_command(Command::CloseTab),
+                Key::Char('p') if k.shift => self.run_command(Command::SwitchProfile),
+                Key::Char('\\') => self.run_command(Command::ToggleSidebar),
                 // ⌘9 is the last tab, as in other browsers.
                 Key::Char('9') => {
                     let last = self.profiles[self.profile].tabs.len() - 1;
                     self.select_tab(last)
                 }
                 Key::Char(c @ '1'..='8') => self.select_tab(c as usize - '1' as usize),
-                Key::Char('l') => self.focus_field(),
-                Key::Char('[') => self.back(),
-                Key::Char(']') => self.forward(),
-                Key::Char('r') => self.reload(),
+                Key::Char('l') => self.run_command(Command::FocusAddress),
+                Key::Char('[') => self.run_command(Command::Back),
+                Key::Char(']') => self.run_command(Command::Forward),
+                Key::Char('r') => self.run_command(Command::Reload),
                 Key::Char('a') => match self.field.as_mut() {
                     Some(field) => {
                         field.all_selected = true;
@@ -701,7 +744,203 @@ impl<S: Screen> Browser<S> {
         false
     }
 
+    /// Run a command, from its shortcut or the palette.
+    fn run_command(&mut self, command: Command) -> bool {
+        match command {
+            Command::NewTab => self.new_tab(),
+            Command::CloseTab => self.close_tab(),
+            Command::ReopenTab => self.reopen_tab(),
+            Command::SwitchProfile => self.switch_profile(),
+            Command::ToggleSidebar => {
+                self.sidebar = !self.sidebar;
+                self.relayout();
+                true
+            }
+            Command::FocusAddress => self.focus_field(),
+            Command::Back => self.back(),
+            Command::Forward => self.forward(),
+            Command::Reload => self.reload(),
+        }
+    }
+
+    fn open_palette(&mut self) -> bool {
+        self.field = None;
+        self.focus = None;
+        self.palette = Some(Palette {
+            query: Field::default(),
+            items: Vec::new(),
+            selected: 0,
+            first: 0,
+        });
+        self.refresh_palette();
+        true
+    }
+
+    fn close_palette(&mut self) -> bool {
+        if self.palette.take().is_none() {
+            return false;
+        }
+        self.chrome.forget_palette();
+        true
+    }
+
+    /// Match the query again: a typed address first, then ranked tabs, history and commands.
+    fn refresh_palette(&mut self) {
+        let Some(query) = self.palette.as_ref().map(|p| p.query.text.clone()) else {
+            return;
+        };
+        let mut items = Vec::new();
+        if let Ok(url) = parse_input(&query) {
+            items.push(palette::Item {
+                title: format!("Open {}", url),
+                detail: "Address".into(),
+                hint: Hint::Label(String::new()),
+                action: Action::Open(url),
+            });
+        }
+        items.extend(palette::rank(&query, self.palette_candidates()));
+        if let Some(p) = self.palette.as_mut() {
+            p.items = items;
+            p.selected = 0;
+            p.first = 0;
+        }
+    }
+
+    /// Everything the palette can find, in the order shown for an empty query: open tabs (this
+    /// profile's first, most recent first), this profile's history, then commands. History stays
+    /// within the profile; tabs of the other profiles are listed with their profile's name.
+    fn palette_candidates(&self) -> Vec<palette::Item> {
+        let mut items = Vec::new();
+        let others = (0..self.profiles.len()).filter(|&p| p != self.profile);
+        for p in std::iter::once(self.profile).chain(others) {
+            let profile = &self.profiles[p];
+            let mut tabs: Vec<(usize, &Tab)> = profile
+                .tabs
+                .iter()
+                .enumerate()
+                .filter(|&(i, t)| {
+                    !(p == self.profile && i == profile.active) && t.entry().is_some()
+                })
+                .collect();
+            tabs.sort_by_key(|&(_, t)| std::cmp::Reverse(t.seen));
+            for (index, tab) in tabs {
+                items.push(palette::Item {
+                    title: tab.title().to_string(),
+                    detail: tab.entry().map(|e| e.url.to_string()).unwrap_or_default(),
+                    hint: Hint::Label(format!("Tab · {}", profile.name)),
+                    action: Action::Tab { profile: p, index },
+                });
+            }
+        }
+        const HISTORY_LIMIT: usize = 200;
+        let profile = &self.profiles[self.profile];
+        let mut tabs: Vec<&Tab> = profile.tabs.iter().collect();
+        // The visible tab is the most recent.
+        tabs.sort_by_key(|t| std::cmp::Reverse(t.seen));
+        tabs.sort_by_key(|t| !std::ptr::eq(*t, &profile.tabs[profile.active]));
+        let mut seen = std::collections::HashSet::new();
+        'history: for tab in tabs {
+            for entry in tab.history.iter().rev() {
+                if seen.len() >= HISTORY_LIMIT {
+                    break 'history;
+                }
+                let url = entry.url.to_string();
+                if !seen.insert(url.clone()) {
+                    continue;
+                }
+                let title = if entry.title.is_empty() {
+                    host_of(&entry.url)
+                } else {
+                    entry.title.clone()
+                };
+                items.push(palette::Item {
+                    title,
+                    detail: url,
+                    hint: Hint::Label("History".into()),
+                    action: Action::Visit(entry.url.clone()),
+                });
+            }
+        }
+        for command in Command::ALL {
+            items.push(palette::Item {
+                title: command.label().into(),
+                detail: "Command".into(),
+                hint: Hint::Keys(command.keys()),
+                action: Action::Run(command),
+            });
+        }
+        items
+    }
+
+    /// A key while the palette is open: edit the query, move through results, open one.
+    fn palette_key(&mut self, k: KeyEvent) -> bool {
+        let rows = chrome::palette_capacity(self.height);
+        let Some(p) = self.palette.as_mut() else {
+            return false;
+        };
+        let step = |p: &mut Palette, delta: isize| {
+            if p.items.is_empty() {
+                return;
+            }
+            let last = p.items.len() as isize - 1;
+            p.selected = (p.selected as isize + delta).clamp(0, last) as usize;
+            if p.selected < p.first {
+                p.first = p.selected;
+            } else if p.selected >= p.first + rows {
+                p.first = p.selected + 1 - rows;
+            }
+        };
+        match k.key {
+            Key::Char(c) => {
+                p.query.insert(c.encode_utf8(&mut [0; 4]));
+                self.refresh_palette();
+            }
+            Key::Backspace => {
+                p.query.backspace();
+                self.refresh_palette();
+            }
+            Key::Left => p.query.left(),
+            Key::Right => p.query.right(),
+            Key::Home => p.query.cursor = 0,
+            Key::End => p.query.cursor = p.query.text.len(),
+            Key::Down => step(p, 1),
+            Key::Up => step(p, -1),
+            Key::Tab => step(p, if k.shift { -1 } else { 1 }),
+            Key::PageDown => step(p, rows as isize),
+            Key::PageUp => step(p, -(rows as isize)),
+            Key::Enter => {
+                let selected = p.selected;
+                return self.activate(selected);
+            }
+            Key::Escape => return self.close_palette(),
+        }
+        true
+    }
+
+    /// Open the palette's result `index`.
+    fn activate(&mut self, index: usize) -> bool {
+        let Some(action) = self
+            .palette
+            .as_ref()
+            .and_then(|p| p.items.get(index))
+            .map(|item| item.action.clone())
+        else {
+            return false;
+        };
+        self.close_palette();
+        match action {
+            Action::Open(url) | Action::Visit(url) => {
+                self.save_scroll();
+                self.navigate(url, Destination::Push);
+                true
+            }
+            Action::Tab { profile, index } => self.show_tab(profile, index),
+            Action::Run(command) => self.run_command(command),
+        }
+    }
+
     fn focus_field(&mut self) -> bool {
+        self.close_palette();
         self.focus = None;
         let text = self
             .tab()
@@ -899,6 +1138,7 @@ impl<S: Screen> Browser<S> {
                 tab.history.push(Entry {
                     url: page.url.clone(),
                     scroll: 0.0,
+                    title: String::new(),
                 });
                 tab.index = tab.history.len() - 1;
                 0.0
@@ -909,7 +1149,8 @@ impl<S: Screen> Browser<S> {
             }
             Destination::Entry(_) => 0.0,
         };
-        self.tab_mut().title = self.show(page, scroll);
+        let title = self.show(page, scroll);
+        self.set_tab_title(title);
         self.page_is_entry = loaded;
         self.save_session();
     }
@@ -977,7 +1218,8 @@ impl<S: Screen> Browser<S> {
         };
         if let (Some(snapshot), Some(entry)) = (snapshot, &entry) {
             if let Ok(page) = engine::restore(snapshot, settings, &self.fonts) {
-                self.tab_mut().title = self.show(page, entry.scroll);
+                let title = self.show(page, entry.scroll);
+                self.set_tab_title(title);
                 self.page_is_entry = true;
                 self.save_session();
                 return;
@@ -989,12 +1231,12 @@ impl<S: Screen> Browser<S> {
                 self.navigate(entry.url, Destination::Entry(index));
             }
             None => {
-                // A new tab: an empty pane with the address field open.
+                // A new tab: the palette over an empty pane (DESIGN.md, section 7).
                 self.page = None;
                 self.page_is_entry = false;
                 self.scroll = 0.0;
                 self.window.set_title(&title);
-                self.focus_field();
+                self.open_palette();
                 self.save_session();
                 self.render();
             }
@@ -1073,12 +1315,34 @@ impl<S: Screen> Browser<S> {
     }
 
     fn switch_profile(&mut self) -> bool {
+        let next = (self.profile + 1) % self.profiles.len();
+        let active = self.profiles[next].active;
+        self.show_tab(next, active)
+    }
+
+    /// Show tab `index` of `profile`, switching profile if needed.
+    fn show_tab(&mut self, profile: usize, index: usize) -> bool {
+        if profile == self.profile {
+            return self.select_tab(index);
+        }
         self.sleep();
         // Nothing a server could use to link the two profiles carries over.
         net::forget_sessions();
-        self.profile = (self.profile + 1) % self.profiles.len();
+        self.profile = profile;
+        let p = &mut self.profiles[profile];
+        p.active = index.min(p.tabs.len() - 1);
         self.wake();
         true
+    }
+
+    /// The visible tab's title, and its current history entry's.
+    fn set_tab_title(&mut self, title: String) {
+        let tab = self.tab_mut();
+        let index = tab.index;
+        if let Some(entry) = tab.history.get_mut(index) {
+            entry.title.clone_from(&title);
+        }
+        tab.title = title;
     }
 
     /// Write the tabs and their history (not their pages) so the next start brings them back.
@@ -1210,6 +1474,36 @@ impl<S: Screen> Browser<S> {
             tabs: &tabs,
             active: profile.active,
         });
+        let palette_rows: Vec<PaletteRow> = self.palette.as_ref().map_or(Vec::new(), |p| {
+            p.items
+                .iter()
+                .skip(p.first)
+                .take(chrome::palette_capacity(self.height))
+                .map(|item| PaletteRow {
+                    title: &item.title,
+                    detail: &item.detail,
+                    hint: match &item.hint {
+                        Hint::Label(label) => HintView::Label(label),
+                        Hint::Keys(keys) => HintView::Keys(keys),
+                    },
+                })
+                .collect()
+        });
+        let nothing = self
+            .palette
+            .as_ref()
+            .filter(|p| p.items.is_empty())
+            .map(|p| format!("Nothing matches \"{}\".", p.query.text.trim()));
+        let palette_view = self.palette.as_ref().map(|p| PaletteView {
+            query: &p.query.text,
+            cursor: p.query.cursor,
+            rows: &palette_rows,
+            selected: (!p.items.is_empty()).then(|| p.selected - p.first),
+            // Honest until a search engine is chosen (DESIGN.md asks for web search).
+            empty: nothing
+                .as_deref()
+                .map(|line| (line, "Broxee can't search the web yet.")),
+        });
         let view = self.page.as_ref().map(|p| engine::page_view(p, fonts));
         let viewport = Viewport {
             width: pane_px as f32 / scale,
@@ -1256,6 +1550,16 @@ impl<S: Screen> Browser<S> {
                     scale,
                 };
                 chrome.draw(painter, frame, fonts.set(), fonts.metrics(), &header);
+                if let Some(palette) = &palette_view {
+                    let frame = Frame {
+                        pixels: &mut *pixels,
+                        stride,
+                        left: sidebar_px,
+                        width: pane_px,
+                        scale,
+                    };
+                    chrome.draw_palette(painter, frame, fonts.set(), fonts.metrics(), palette);
+                }
             });
         if let Err(e) = shown {
             self.window.set_title(&format!("Broxee: {e}"));
@@ -1273,7 +1577,12 @@ fn write_session(profiles: &[Profile], visible: usize) -> String {
         for tab in &profile.tabs {
             out += &format!("tab\t{}\t{}\n", tab.index, clean(&tab.title));
             for entry in &tab.history {
-                out += &format!("entry\t{}\t{}\n", entry.scroll, entry.url);
+                out += &format!(
+                    "entry\t{}\t{}\t{}\n",
+                    entry.scroll,
+                    entry.url,
+                    clean(&entry.title)
+                );
             }
         }
     }
@@ -1308,7 +1617,12 @@ fn parse_session(text: &str) -> Option<(Vec<SessionProfile>, usize)> {
             }
             "entry" => {
                 let tab = profiles.last_mut().and_then(|p| p.0.last_mut());
-                let url = b.and_then(|u| net::Url::parse(u).ok());
+                // "url" or, since titles are kept, "url<tab>title".
+                let (url, title) = match b.map(|b| b.split_once('\t')) {
+                    Some(Some((url, title))) => (Some(url), title),
+                    _ => (b, ""),
+                };
+                let url = url.and_then(|u| net::Url::parse(u).ok());
                 let scroll = a
                     .and_then(|a| a.parse::<f32>().ok())
                     .filter(|s| s.is_finite());
@@ -1317,6 +1631,7 @@ fn parse_session(text: &str) -> Option<(Vec<SessionProfile>, usize)> {
                         tab.history.push(Entry {
                             url,
                             scroll: scroll.unwrap_or(0.0).max(0.0),
+                            title: title.to_string(),
                         });
                     }
                 }
@@ -1825,7 +2140,7 @@ mod tests {
 
         assert!(act(&mut b, command('t')));
         assert!(b.page.is_none(), "a new tab is empty");
-        assert_eq!(b.field.as_ref().map(|f| f.text.as_str()), Some(""));
+        assert!(b.palette.is_some(), "with the palette open");
         assert_eq!(tab_titles(&b), ["Page A", "New tab"]);
         open(&mut b, &bpath);
         assert_eq!(title(&b), "Page B");
@@ -1847,7 +2162,7 @@ mod tests {
         assert!(!act(&mut b, command('1')), "already selected");
 
         // Clicking the second row in the sidebar selects it.
-        assert!(act(&mut b, Event::Click { x: 100.0, y: 93.0 }));
+        assert!(act(&mut b, Event::Click { x: 100.0, y: 127.0 }));
         assert_eq!(title(&b), "Page B");
         act(&mut b, command('1'));
         assert!(act(&mut b, command('9')), "⌘9 is the last tab");
@@ -1881,7 +2196,7 @@ mod tests {
         assert!(!act(&mut b, command_shift('t')), "nothing left to reopen");
 
         // The close button on the active row.
-        assert!(act(&mut b, Event::Click { x: 220.0, y: 93.0 }));
+        assert!(act(&mut b, Event::Click { x: 220.0, y: 127.0 }));
         assert!(act(&mut b, command('w')));
         assert_eq!(
             tab_titles(&b),
@@ -1967,12 +2282,14 @@ mod tests {
         personal.tabs[0].history.push(Entry {
             url: net::Url::parse("https://a.example/x").unwrap(),
             scroll: 12.5,
+            title: "Page\tX".into(),
         });
         let text = write_session(&[personal], 0);
         let (profiles, _) = parse_session(&text).unwrap();
         let tab = &profiles[0].0[0];
         assert_eq!(tab.title, "A tab name");
         assert_eq!(tab.history[0].scroll, 12.5);
+        assert_eq!(tab.history[0].title, "Page X");
     }
 
     #[test]
@@ -2116,6 +2433,162 @@ mod tests {
         assert_eq!(b.tab().history.len(), 2);
         assert_eq!(b.scroll, 0.0, "a new page starts at the top");
         assert!(b.loading.is_none());
+    }
+
+    fn type_text(b: &mut Browser<FakeScreen>, text: &str) {
+        for c in text.chars() {
+            act(b, key(Key::Char(c)));
+        }
+    }
+
+    fn results(b: &Browser<FakeScreen>) -> Vec<String> {
+        let p = b.palette.as_ref().expect("the palette is open");
+        p.items.iter().map(|i| i.title.clone()).collect()
+    }
+
+    #[test]
+    fn the_palette_finds_tabs_in_every_profile_history_and_commands() {
+        let (a, bpath) = site("palette");
+        let mut b = browser(&a);
+        // Work profile: one tab showing B. Personal: A, with B in its history.
+        act(&mut b, command_shift('p'));
+        act(&mut b, key(Key::Escape));
+        open(&mut b, &bpath);
+        act(&mut b, command_shift('p'));
+        assert_eq!(title(&b), "Page A");
+        assert!(click_text(&mut b, "Go to B"));
+        act(&mut b, command('['));
+
+        assert!(act(&mut b, command('k')));
+        let all = results(&b);
+        assert_eq!(
+            all[0], "Page B",
+            "the other profile's tab first: Personal has no other tab"
+        );
+        assert!(
+            all.contains(&"Reopen closed tab".to_string()),
+            "commands are listed"
+        );
+        let p = b.palette.as_ref().unwrap();
+        assert_eq!(p.items[0].hint, Hint::Label("Tab · Work".into()));
+        assert!(p
+            .items
+            .iter()
+            .any(|i| i.hint == Hint::Label("History".into())));
+
+        // Typing narrows; Enter on another profile's tab switches to it.
+        type_text(&mut b, "page b");
+        assert_eq!(results(&b)[0], "Page B");
+        assert!(act(&mut b, key(Key::Enter)));
+        assert!(b.palette.is_none());
+        assert_eq!(b.profiles[b.profile].name, "Work");
+        assert_eq!(title(&b), "Page B");
+
+        // Commands run from the palette, with their shortcut shown.
+        act(&mut b, command('k'));
+        type_text(&mut b, "switch prof");
+        let p = b.palette.as_ref().unwrap();
+        assert_eq!(p.items[0].hint, Hint::Keys("⌘⇧P"));
+        act(&mut b, key(Key::Enter));
+        assert_eq!(b.profiles[b.profile].name, "Personal");
+
+        // History stays within the profile: Work's history is not offered here.
+        act(&mut b, command('k'));
+        let history: Vec<_> = b
+            .palette
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .filter(|i| i.hint == Hint::Label("History".into()))
+            .map(|i| i.title.clone())
+            .collect();
+        assert_eq!(history, ["Page B", "Page A"], "most recent first");
+        assert!(act(&mut b, key(Key::Escape)));
+        assert!(b.palette.is_none());
+    }
+
+    #[test]
+    fn the_palette_opens_typed_addresses_and_says_when_nothing_matches() {
+        let (a, bpath) = site("palette-open");
+        let mut b = browser(&a);
+        act(&mut b, command('k'));
+        type_text(&mut b, "zzqx");
+        assert!(results(&b).is_empty());
+        b.render();
+        assert!(!act(&mut b, key(Key::Enter)), "nothing to open");
+        assert!(b.palette.is_some());
+
+        for _ in 0..4 {
+            act(&mut b, key(Key::Backspace));
+        }
+        act(&mut b, Event::Paste(format!("file://{}", bpath.display())));
+        assert!(results(&b)[0].starts_with("Open file://"));
+        act(&mut b, key(Key::Enter));
+        assert_eq!(title(&b), "Page B");
+        assert_eq!(b.tab().history.len(), 2);
+
+        // A new tab opens with the palette; Esc leaves an empty tab.
+        act(&mut b, command('t'));
+        assert!(b.palette.is_some());
+        act(&mut b, key(Key::Escape));
+        assert!(b.palette.is_none() && b.page.is_none());
+        // ⌘K toggles; another shortcut closes it and runs.
+        act(&mut b, command('k'));
+        assert!(act(&mut b, command('k')));
+        assert!(b.palette.is_none());
+        act(&mut b, command('k'));
+        act(&mut b, command('l'));
+        assert!(b.palette.is_none() && b.field.is_some());
+    }
+
+    #[test]
+    fn the_palette_is_drawn_and_answers_the_mouse() {
+        let (a, _) = site("palette-mouse");
+        let mut b = browser(&a);
+        // The sidebar's search field opens it.
+        assert!(act(&mut b, Event::Click { x: 100.0, y: 58.0 }));
+        assert!(b.palette.is_some());
+        b.render();
+        let theme = b.chrome.theme();
+        // Pane 400 points wide, window 300 tall: 368 wide from x = 16, top 48, four rows fit
+        // (bottom at 48 + 57 + 176 = 281).
+        assert_eq!(chrome::palette_capacity(300.0), 4);
+        let (left, top) = (SIDEBAR_WIDTH as usize + 16, 48);
+        assert_eq!(
+            b.window.pixel(left + 100, top + 30),
+            [theme.surface.b, theme.surface.g, theme.surface.r, 255],
+            "the input row"
+        );
+        let shadow = b.window.pixel(left + 100, 287);
+        assert!(
+            shadow[0] < 255 && shadow[0] > 200,
+            "a soft shadow under it: {shadow:?}"
+        );
+
+        // Results are rows; clicking the second runs it.
+        type_text(&mut b, "tab");
+        let second = results(&b)[1].clone();
+        assert!(act(&mut b, key(Key::Down)));
+        let y = 48.0 + 44.0 + 1.0 + 6.0 + 44.0 + 20.0;
+        let x = f64::from(SIDEBAR_WIDTH + 100.0);
+        assert_eq!(second, "Close tab");
+        assert!(act(&mut b, Event::Click { x, y }));
+        assert_eq!(tab_titles(&b), ["New tab"], "Close tab ran");
+        assert!(
+            b.palette.is_some(),
+            "the new tab that replaced it opens the palette"
+        );
+
+        // A click outside closes it without doing anything else.
+        assert!(act(
+            &mut b,
+            Event::Click {
+                x: f64::from(SIDEBAR_WIDTH + 5.0),
+                y: 280.0
+            }
+        ));
+        assert!(b.palette.is_none());
     }
 
     #[test]

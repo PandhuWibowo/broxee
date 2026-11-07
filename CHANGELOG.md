@@ -153,3 +153,9 @@
 - `net`: a test for the one-time retry of a GET whose connection closes before any response (#4). The
   occasional reset from example.com could not be reproduced: 100 fresh connections and connections reused
   after 2 to 28 seconds idle all answered.
+- ⌘K palette (#5): open tabs in every profile (labelled with the profile), this profile's history (most recent
+  first, with page titles now kept per history entry), every command with its shortcut, and a typed address.
+  Fuzzy matching ranks substrings, word starts and letters found apart. Keyboard (↑ ↓, Tab, Page Up/Down,
+  Enter, Esc, ⌘K to close) and mouse; it fits the window's height and scrolls its results. A new tab opens
+  with the palette, and the sidebar has the "Search or go to ⌘K" field. Radius 10, a hairline and one soft
+  shadow; ⌘ ⇧ ⌥ drawn as icons; long titles end with "…".
