@@ -15,7 +15,7 @@ use font::{FontSet, TextMetrics};
 use html::{Dom, FastBuildHasher, NodeId};
 use layout::{Layout, Rect};
 
-pub use raster::{rasterize_glyph, GlyphBitmap, Rasterizer};
+pub use raster::{rasterize_glyph, rasterize_glyph_at, GlyphBitmap, Rasterizer};
 
 /// RGBA8 pixels, row by row from the top, fully opaque.
 pub struct Frame {
@@ -125,6 +125,16 @@ struct GlyphKey {
     glyph: u32,
     /// Device pixel size in quarter pixels.
     size: u32,
+    /// Where the glyph starts within its pixel, in quarters (0 to 3).
+    phase: u8,
+}
+
+/// A pen position in device pixels as the pixel to draw at and the quarter-pixel phase to
+/// rasterize with: glyphs keep the spacing their advances give instead of snapping to whole
+/// pixels, with at most four bitmaps per glyph and size.
+fn place(x: f32) -> (i32, u8) {
+    let quarters = (x * 4.0).round() as i32;
+    (quarters.div_euclid(4), quarters.rem_euclid(4) as u8)
 }
 
 /// x0, y0, x1, y1 in frame pixels; drawing outside is discarded.
@@ -313,9 +323,12 @@ impl Painter {
                 continue;
             }
             let bitmap = match page.fonts {
-                Some(fonts) => {
-                    rasterize_glyph(fonts.face(key.bold), key.glyph, key.size as f32 / 4.0)
-                }
+                Some(fonts) => rasterize_glyph_at(
+                    fonts.face(key.bold),
+                    key.glyph,
+                    key.size as f32 / 4.0,
+                    f32::from(key.phase) / 4.0,
+                ),
                 None => GlyphBitmap::default(),
             };
             stats.glyphs_rasterized += 1;
@@ -408,16 +421,19 @@ impl Painter {
                     let mut pen = x;
                     for ch in text.chars() {
                         if !ch.is_whitespace() {
+                            let (at, phase) = place(pen);
                             let key = GlyphKey {
                                 bold,
                                 glyph: fonts.face(bold).glyph(ch),
                                 size: size_key,
+                                phase,
                             };
                             self.glyphs.entry(key).or_insert_with(|| {
-                                rasterize_glyph(fonts.face(bold), key.glyph, size)
+                                let shift = f32::from(phase) / 4.0;
+                                rasterize_glyph_at(fonts.face(bold), key.glyph, size, shift)
                             });
                             items.push(Item::Glyph {
-                                x: pen.round() as i32,
+                                x: at,
                                 y: baseline.round() as i32,
                                 key,
                                 color,
@@ -657,14 +673,16 @@ impl Painter {
                 for ch in layout.text(t).chars() {
                     if !ch.is_whitespace() {
                         if let Some(fonts) = page.fonts {
+                            let (at, phase) = place(pen * s);
                             let key = GlyphKey {
                                 bold,
                                 glyph: fonts.face(bold).glyph(ch),
                                 size: size_key,
+                                phase,
                             };
                             wanted.push(key);
                             items.push(Item::Glyph {
-                                x: (pen * s).round() as i32,
+                                x: at,
                                 y: device_baseline,
                                 key,
                                 color,
@@ -1036,6 +1054,16 @@ mod tests {
         for y in [0, 48, 96] {
             assert_eq!(pixel(&f, 36, y), [0x12, 0x34, 0x56], "row {y}");
         }
+    }
+
+    #[test]
+    fn places_glyphs_on_quarter_pixels() {
+        assert_eq!(place(10.0), (10, 0));
+        assert_eq!(place(10.3), (10, 1));
+        assert_eq!(place(10.5), (10, 2));
+        assert_eq!(place(10.74), (10, 3));
+        assert_eq!(place(10.9), (11, 0), "rounds to the nearest quarter");
+        assert_eq!(place(-0.3), (-1, 3), "left of the edge too");
     }
 
     #[test]

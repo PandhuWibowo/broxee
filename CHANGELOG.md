@@ -202,3 +202,7 @@
   140,000-run stress page the display list takes 0.01 ms a frame instead of 0.65 ms, wherever the page is
   scrolled; indexing adds about 0.8 ms to each layout. A test paints a long page with fixed and positioned
   layers at scroll positions on run edges, with and without the index, and compares every pixel.
+- Subpixel glyph positioning (#18): glyphs are placed on quarter pixels; the whole pixel positions them and
+  the quarter (0 to 3) is part of the glyph cache key, rasterized with that offset (`rasterize_glyph_at`).
+  Ten "i" at 13px and 1x were 4, 3, 4, 3 … px apart (standard deviation 0.50 px) and are now 3.5 ± 0.15 px,
+  as the font's advances say. GitHub's glyph cache grows from 46 to 88 KB; the 8 MB cap is unchanged.
