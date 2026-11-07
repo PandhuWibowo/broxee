@@ -2,6 +2,19 @@
 
 Broxee is a web browser with its own engine, written in Rust. Hard budget: **under 60 MB** for the app on disk and for RAM on simple pages.
 
+## Screenshots
+
+Rendered by Broxee itself with `--png` at 1280x800 (fonts: DejaVu Sans on Linux), no other browser involved.
+
+| Wikipedia (15.7 MB peak RAM) | Hacker News (14.0 MB peak RAM) |
+|---|---|
+| ![Wikipedia "Web browser" article rendered by Broxee](docs/screenshots/wikipedia.png) | ![Hacker News front page rendered by Broxee](docs/screenshots/hacker-news.png) |
+
+```bash
+cargo run --release -- https://en.wikipedia.org/wiki/Web_browser --png docs/screenshots/wikipedia.png --width 1280 --height 800 --scale 1
+cargo run --release -- https://news.ycombinator.com --png docs/screenshots/hacker-news.png --width 1280 --height 800 --scale 1
+```
+
 ## Run
 
 ```bash
