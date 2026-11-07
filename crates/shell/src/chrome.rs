@@ -62,6 +62,27 @@ const KEY_ICON: f32 = 12.0;
 pub enum Hue {
     Emerald,
     Amber,
+    Rose,
+    Violet,
+}
+
+impl Hue {
+    /// Every profile color, in the order new profiles take them.
+    pub const ALL: [Hue; 4] = [Hue::Emerald, Hue::Amber, Hue::Rose, Hue::Violet];
+
+    /// The name saved in the session file.
+    pub fn key(self) -> &'static str {
+        match self {
+            Hue::Emerald => "emerald",
+            Hue::Amber => "amber",
+            Hue::Rose => "rose",
+            Hue::Violet => "violet",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Hue> {
+        Hue::ALL.into_iter().find(|h| h.key() == key.trim())
+    }
 }
 
 /// Color tokens from DESIGN.md, section 3. Every text pair was checked for WCAG AA there.
@@ -117,6 +138,11 @@ impl Theme {
             (Hue::Emerald, true) => hex(0x34d399),
             (Hue::Amber, false) => hex(0xb45309),
             (Hue::Amber, true) => hex(0xfbbf24),
+            // Checked to 4.5:1 on `canvas`: rose 5.67 / 7.23, violet 6.41 / 7.15.
+            (Hue::Rose, false) => hex(0xbe123c),
+            (Hue::Rose, true) => hex(0xfb7185),
+            (Hue::Violet, false) => hex(0x6d28d9),
+            (Hue::Violet, true) => hex(0xa78bfa),
         }
     }
 }

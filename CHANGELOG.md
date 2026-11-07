@@ -180,3 +180,9 @@
   320 points, laying the page out once when released; pins, groups, folds and the width are saved in the
   session. Labels and titles end with "…" when long. The window reports drags, releases and where a scroll
   happened.
+- Profiles can be added, renamed, recolored and removed (#11), from the palette: new profiles take the least
+  used color; removing asks for the profile's exact name and deletes its folder (tabs, history, cookies,
+  bookmarks); the last profile cannot go; up to 12. Each profile keeps a fixed folder id, validated when read
+  (letters, digits, `-`, `_`), so a damaged session cannot point outside `profiles/`. Two new colors, rose
+  and violet, checked to 4.5:1 on `canvas` in both themes and recorded in DESIGN.md. The palette lists
+  "Switch to …" for every other profile.

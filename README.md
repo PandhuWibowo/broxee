@@ -33,7 +33,8 @@ In the window:
 | Pin a tab, move it to a group, fold a group | palette: "Pin or unpin this tab", "Move this tab to a group" (an empty name takes it out), "Fold or unfold this tab's group"; or click a group's label to fold it |
 | Reorder tabs | drag a row; dropped under a label, it joins that section |
 | Scroll the sidebar, resize it | the wheel over it; drag its right edge (200 to 320 points) |
-| Switch profile (Personal, Work) | ⌘⇧P, or click the profile name at the top of the sidebar |
+| Switch profile | ⌘⇧P (cycles), a click on the profile name at the top of the sidebar, or "Switch to …" in the palette |
+| Add, rename, recolor or remove a profile | palette: "New profile", "Rename this profile", "Change this profile's color", "Remove this profile" (asks for its name; its tabs, history, cookies and bookmarks are deleted) |
 | Show or hide the sidebar | ⌘\\ |
 | Bookmark this page (or edit its bookmark) | ⌘D: name and folder, the last folder preselected; Tab between them, Enter saves, Esc cancels |
 | Bookmarks panel, in place of the tab list | ⌘⌥B: folders in name order; ↑ ↓ and Enter or a click opens, Esc goes back to tabs. Every bookmark is a ⌘K result too |
@@ -281,7 +282,9 @@ Where data lives, and what compression does for it (measured 2026-11-07):
 - Not built yet, so not shown: the ⋯ menu, split view.
 - Sleeping-tab rows show no tooltip ("Asleep to save memory. Select to wake.") because the window has no
   tooltips yet; the muted title is the only sign.
-- Profiles are fixed (Personal, Work) and cannot be renamed or added.
+- Profiles start as Personal and Work; up to 12, each with its own folder in `profiles/` (named by a fixed
+  id, so renaming moves nothing). Four colors exist (emerald, amber, rose, violet), so profiles past four
+  share them; their names always tell them apart.
 - GIF, WebP and SVG are sized from their headers but not drawn yet. Failed images draw nothing.
 - Building the display list walks every fragment each frame (0.7 ms on the 140k-fragment stress page). An index
   by vertical position would make scrolling cost independent of page length.

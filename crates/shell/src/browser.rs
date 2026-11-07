@@ -205,6 +205,8 @@ struct Dialog {
     kind: DialogKind,
     fields: Vec<Field>,
     active: usize,
+    /// Why Enter did not go through, shown in place of the help line.
+    error: Option<String>,
 }
 
 enum DialogKind {
@@ -215,6 +217,10 @@ enum DialogKind {
     },
     /// Move the visible tab to a group; an empty name takes it out of its group.
     Group,
+    NewProfile,
+    RenameProfile,
+    /// Remove the visible profile once its name is typed.
+    RemoveProfile,
 }
 
 /// A press in the sidebar that may become a drag.
@@ -265,7 +271,10 @@ struct Closed {
 /// Work and personal browsing kept apart: each profile has its own tabs and history, and
 /// switching drops every open connection and TLS session (`net::forget_sessions`).
 struct Profile {
-    name: &'static str,
+    /// Shown everywhere the profile is named; the person can change it.
+    name: String,
+    /// The profile's folder under `profiles/`; fixed, so renaming moves nothing.
+    id: String,
     hue: Hue,
     tabs: Vec<Tab>,
     active: usize,
@@ -280,6 +289,24 @@ struct Profile {
 }
 
 impl Profile {
+    /// Read this profile's cookies and bookmarks from its folder.
+    fn load_files(&mut self, session: Option<&std::path::Path>) {
+        let read = |file| {
+            profile_file(session, &self.id, file)
+                .and_then(|path| std::fs::read_to_string(path).ok())
+        };
+        if let Some(text) = read("cookies") {
+            self.cookies = Arc::new(net::Cookies::load(&text));
+        }
+        if let Some(text) = read("bookmarks") {
+            let (bookmarks, last) = parse_bookmarks(&text);
+            self.bookmarks = bookmarks;
+            if let Some(last) = last {
+                self.last_folder = last;
+            }
+        }
+    }
+
     /// Keep tabs in the order the sidebar shows them: pinned tabs, then each group (in the
     /// order groups first appear), then the rest. The sort is stable and the active tab stays
     /// active, so `⌘1` … `⌘9` follow what is on screen.
@@ -311,9 +338,10 @@ impl Profile {
 }
 
 impl Profile {
-    fn new(name: &'static str, hue: Hue) -> Profile {
+    fn new(id: &str, name: &str, hue: Hue) -> Profile {
         Profile {
-            name,
+            name: name.to_string(),
+            id: id.to_string(),
             hue,
             tabs: vec![Tab::default()],
             active: 0,
@@ -410,6 +438,8 @@ struct Browser<S: Screen> {
     clock: u64,
     snapshot_budget: u64,
     session: Option<PathBuf>,
+    /// The session read at startup, applied by `start`.
+    restored: Option<Session>,
     /// Where sleeping tabs go; without it they keep only their history.
     store: Option<TabStore>,
     field: Option<Field>,
@@ -441,25 +471,26 @@ impl<S: Screen> Browser<S> {
     ) -> Browser<S> {
         let (width, height) = window.size();
         let (scale, dark) = (window.scale() as f32, window.dark());
-        let mut profiles = vec![
-            Profile::new("Personal", Hue::Emerald),
-            Profile::new("Work", Hue::Amber),
-        ];
+        // The profiles of the last session, or Personal and Work; their files are read now,
+        // their tabs in `start`.
+        let restored = session
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|text| parse_session(&text))
+            .filter(|s| !s.profiles.is_empty());
+        let mut profiles: Vec<Profile> = match &restored {
+            Some(session) => session
+                .profiles
+                .iter()
+                .map(|p| Profile::new(&p.id, &p.name, p.hue))
+                .collect(),
+            None => vec![
+                Profile::new("Personal", "Personal", Hue::Emerald),
+                Profile::new("Work", "Work", Hue::Amber),
+            ],
+        };
         for profile in &mut profiles {
-            let read = |file| {
-                profile_file(session.as_deref(), profile.name, file)
-                    .and_then(|path| std::fs::read_to_string(path).ok())
-            };
-            if let Some(text) = read("cookies") {
-                profile.cookies = Arc::new(net::Cookies::load(&text));
-            }
-            if let Some(text) = read("bookmarks") {
-                let (bookmarks, last) = parse_bookmarks(&text);
-                profile.bookmarks = bookmarks;
-                if let Some(last) = last {
-                    profile.last_folder = last;
-                }
-            }
+            profile.load_files(session.as_deref());
         }
         Browser {
             opts,
@@ -479,6 +510,7 @@ impl<S: Screen> Browser<S> {
             sidebar: true,
             clock: 0,
             snapshot_budget: SNAPSHOT_BUDGET,
+            restored,
             session,
             store,
             field: None,
@@ -575,25 +607,19 @@ impl<S: Screen> Browser<S> {
         // The header needs fonts; they load in a few milliseconds, before the first frame.
         self.fonts.ready();
         self.render();
-        if let Some(text) = self
-            .session
-            .as_ref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-        {
-            if let Some(session) = parse_session(&text) {
-                for (profile, saved) in self.profiles.iter_mut().zip(session.profiles) {
-                    if !saved.tabs.is_empty() {
-                        profile.active = saved.active.min(saved.tabs.len() - 1);
-                        profile.tabs = saved.tabs;
-                        profile.folded = saved.folded;
-                        profile.normalize();
-                    }
+        if let Some(session) = self.restored.take() {
+            for (profile, saved) in self.profiles.iter_mut().zip(session.profiles) {
+                if !saved.tabs.is_empty() {
+                    profile.active = saved.active.min(saved.tabs.len() - 1);
+                    profile.tabs = saved.tabs;
+                    profile.folded = saved.folded;
+                    profile.normalize();
                 }
-                self.profile = session.visible.min(self.profiles.len() - 1);
-                if let Some((width, shown)) = session.sidebar {
-                    self.sidebar_width = width;
-                    self.sidebar = shown;
-                }
+            }
+            self.profile = session.visible.min(self.profiles.len() - 1);
+            if let Some((width, shown)) = session.sidebar {
+                self.sidebar_width = width;
+                self.sidebar = shown;
             }
         }
         let targets: Vec<String> = std::iter::once(&self.opts.target)
@@ -1116,6 +1142,26 @@ impl<S: Screen> Browser<S> {
                     false => false,
                 }
             }
+            Command::NewProfile => {
+                self.open_dialog(DialogKind::NewProfile, vec![String::new()]);
+                true
+            }
+            Command::RenameProfile => {
+                let name = self.profiles[self.profile].name.clone();
+                self.open_dialog(DialogKind::RenameProfile, vec![name]);
+                true
+            }
+            Command::RecolorProfile => {
+                let p = &mut self.profiles[self.profile];
+                let at = Hue::ALL.iter().position(|&h| h == p.hue).unwrap_or(0);
+                p.hue = Hue::ALL[(at + 1) % Hue::ALL.len()];
+                self.save_session();
+                true
+            }
+            Command::RemoveProfile => {
+                self.open_dialog(DialogKind::RemoveProfile, vec![String::new()]);
+                true
+            }
             Command::ClearCookies => {
                 let cookies = &self.profiles[self.profile].cookies;
                 cookies.clear();
@@ -1178,6 +1224,7 @@ impl<S: Screen> Browser<S> {
             kind,
             fields,
             active: 0,
+            error: None,
         });
     }
 
@@ -1224,6 +1271,9 @@ impl<S: Screen> Browser<S> {
         let clean = |s: &str| s.trim().replace(['\t', '\n', '\r'], " ");
         let (url, existing) = match d.kind {
             DialogKind::Bookmark { url, existing } => (url, existing),
+            DialogKind::NewProfile | DialogKind::RenameProfile | DialogKind::RemoveProfile => {
+                return self.finish_profile_dialog(d);
+            }
             DialogKind::Group => {
                 let name = clean(&d.fields[0].text);
                 let p = &mut self.profiles[self.profile];
@@ -1256,6 +1306,92 @@ impl<S: Screen> Browser<S> {
         }
         p.last_folder = folder;
         self.save_bookmarks();
+        true
+    }
+
+    /// Enter in a profile dialog. A name that cannot be used keeps the dialog open and says why.
+    fn finish_profile_dialog(&mut self, mut d: Dialog) -> bool {
+        let name: String = d.fields[0]
+            .text
+            .trim()
+            .replace(['\t', '\n', '\r'], " ")
+            .chars()
+            .take(MAX_NAME)
+            .collect();
+        let taken = |except: Option<usize>| {
+            self.profiles
+                .iter()
+                .enumerate()
+                .any(|(i, p)| Some(i) != except && p.name.eq_ignore_ascii_case(&name))
+        };
+        let error = match d.kind {
+            DialogKind::RemoveProfile if self.profiles.len() == 1 => {
+                Some("Broxee needs at least one profile.".to_string())
+            }
+            DialogKind::RemoveProfile if name != self.profiles[self.profile].name => Some(format!(
+                "Type {} exactly to remove it.",
+                self.profiles[self.profile].name
+            )),
+            DialogKind::RemoveProfile => None,
+            _ if name.is_empty() => Some("A profile needs a name.".to_string()),
+            DialogKind::RenameProfile if taken(Some(self.profile)) => {
+                Some(format!("There is already a profile called {name}."))
+            }
+            DialogKind::NewProfile if taken(None) => {
+                Some(format!("There is already a profile called {name}."))
+            }
+            DialogKind::NewProfile if self.profiles.len() >= MAX_PROFILES => {
+                Some(format!("Broxee keeps at most {MAX_PROFILES} profiles."))
+            }
+            _ => None,
+        };
+        if let Some(error) = error {
+            d.error = Some(error);
+            self.dialog = Some(d);
+            return true;
+        }
+        match d.kind {
+            DialogKind::RenameProfile => {
+                self.profiles[self.profile].name = name;
+            }
+            DialogKind::NewProfile => {
+                // The first color no profile uses yet, or the least used.
+                let used = |h: Hue| self.profiles.iter().filter(|p| p.hue == h).count();
+                let hue = Hue::ALL
+                    .iter()
+                    .copied()
+                    .min_by_key(|&h| used(h))
+                    .unwrap_or(Hue::Emerald);
+                let mut n = self.profiles.len() + 1;
+                let id = loop {
+                    let id = format!("profile-{n}");
+                    if !self.profiles.iter().any(|p| p.id.eq_ignore_ascii_case(&id)) {
+                        break id;
+                    }
+                    n += 1;
+                };
+                let mut profile = Profile::new(&id, &name, hue);
+                profile.load_files(self.session.as_deref());
+                self.profiles.push(profile);
+                let last = self.profiles.len() - 1;
+                self.show_tab(last, 0);
+            }
+            DialogKind::RemoveProfile => {
+                self.stop_load();
+                self.page = None;
+                self.page_is_entry = false;
+                let gone = self.profiles.remove(self.profile);
+                // Its tabs, history, cookies and bookmarks go with it.
+                if let Some(dir) = profile_file(self.session.as_deref(), &gone.id, "") {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+                net::forget_sessions();
+                self.profile = self.profile.min(self.profiles.len() - 1);
+                self.wake();
+            }
+            _ => {}
+        }
+        self.save_session();
         true
     }
 
@@ -1461,7 +1597,7 @@ impl<S: Screen> Browser<S> {
     /// Write the visible profile's bookmarks, readable by this user only.
     fn save_bookmarks(&self) {
         let profile = &self.profiles[self.profile];
-        let Some(path) = profile_file(self.session.as_deref(), profile.name, "bookmarks") else {
+        let Some(path) = profile_file(self.session.as_deref(), &profile.id, "bookmarks") else {
             return;
         };
         let text = write_bookmarks(&profile.bookmarks, &profile.last_folder);
@@ -1524,6 +1660,16 @@ impl<S: Screen> Browser<S> {
                     detail: tab.entry().map(|e| e.url.to_string()).unwrap_or_default(),
                     hint: Hint::Label(format!("Tab · {}", profile.name)),
                     action: Action::Tab { profile: p, index },
+                });
+            }
+        }
+        for (i, p) in self.profiles.iter().enumerate() {
+            if i != self.profile {
+                items.push(palette::Item {
+                    title: format!("Switch to {}", p.name),
+                    detail: "Profile".into(),
+                    hint: Hint::Label(String::new()),
+                    action: Action::Profile(i),
                 });
             }
         }
@@ -1641,6 +1787,11 @@ impl<S: Screen> Browser<S> {
                 true
             }
             Action::Tab { profile, index } => self.show_tab(profile, index),
+            Action::Profile(i) if i < self.profiles.len() => {
+                let active = self.profiles[i].active;
+                self.show_tab(i, active)
+            }
+            Action::Profile(_) => false,
             Action::Run(command) => self.run_command(command),
         }
     }
@@ -2078,7 +2229,7 @@ impl<S: Screen> Browser<S> {
         if !profile.cookies.take_changed() {
             return;
         }
-        let Some(path) = profile_file(self.session.as_deref(), profile.name, "cookies") else {
+        let Some(path) = profile_file(self.session.as_deref(), &profile.id, "cookies") else {
             return;
         };
         if let Err(e) = write_private(&path, profile.cookies.save().as_bytes()) {
@@ -2188,7 +2339,7 @@ impl<S: Screen> Browser<S> {
         let tab = &profile.tabs[profile.active];
         let host = tab.entry().map(|e| host_of(&e.url)).unwrap_or_default();
         let header = HeaderView {
-            profile: profile.name,
+            profile: &profile.name,
             hue: profile.hue,
             can_back: tab.index > 0,
             can_forward: tab.index + 1 < tab.history.len(),
@@ -2207,7 +2358,7 @@ impl<S: Screen> Browser<S> {
             _ => None,
         };
         let sidebar = (sidebar_px > 0).then_some(SidebarView {
-            profile: profile.name,
+            profile: &profile.name,
             hue: profile.hue,
             rows: &list.rows,
             selected: list.selected,
@@ -2216,32 +2367,48 @@ impl<S: Screen> Browser<S> {
             drop_at,
             empty: list.empty,
         });
-        let (labels, heading, help): (&[&str], &str, &str) =
+        let remove_label = format!("Type {} to remove it", self.profiles[self.profile].name);
+        let (labels, heading, help): (Vec<&str>, &str, &str) =
             match self.dialog.as_ref().map(|d| &d.kind) {
                 Some(DialogKind::Bookmark {
                     existing: Some(_), ..
                 }) => (
-                    &["Name", "Folder"],
+                    vec!["Name", "Folder"],
                     "Edit bookmark",
                     "Enter to save · Tab for the other field · Esc to cancel",
                 ),
                 Some(DialogKind::Bookmark { .. }) => (
-                    &["Name", "Folder"],
+                    vec!["Name", "Folder"],
                     "Bookmark this page",
                     "Enter to save · Tab for the other field · Esc to cancel",
                 ),
                 Some(DialogKind::Group) => (
-                    &["Group"],
+                    vec!["Group"],
                     "Move this tab to a group",
                     "Enter to move · an empty name takes it out · Esc to cancel",
                 ),
-                None => (&[], "", ""),
+                Some(DialogKind::NewProfile) => (
+                    vec!["Name"],
+                    "New profile",
+                    "Its own tabs, history, cookies and bookmarks · Enter to create",
+                ),
+                Some(DialogKind::RenameProfile) => (
+                    vec!["Name"],
+                    "Rename profile",
+                    "Enter to rename · Esc to cancel",
+                ),
+                Some(DialogKind::RemoveProfile) => (
+                    vec![remove_label.as_str()],
+                    "Remove profile",
+                    "Its tabs, history, cookies and bookmarks are deleted · Esc to cancel",
+                ),
+                None => (Vec::new(), "", ""),
             };
         let dialog_fields: Vec<(&str, &str, usize)> =
             self.dialog.as_ref().map_or(Vec::new(), |d| {
                 d.fields
                     .iter()
-                    .zip(labels)
+                    .zip(&labels)
                     .map(|(f, label)| (*label, f.text.as_str(), f.cursor))
                     .collect()
             });
@@ -2249,7 +2416,7 @@ impl<S: Screen> Browser<S> {
             heading,
             fields: &dialog_fields,
             active: d.active,
-            help,
+            help: d.error.as_deref().unwrap_or(help),
         });
         let palette_rows: Vec<PaletteRow> = self.palette.as_ref().map_or(Vec::new(), |p| {
             p.items
@@ -2482,6 +2649,19 @@ fn sidebar_rows(
     }
 }
 
+/// Profiles at most, and characters in a profile's name.
+const MAX_PROFILES: usize = 12;
+const MAX_NAME: usize = 32;
+
+/// A profile folder name: letters, digits, `-` and `_` only, so it cannot leave `profiles/`.
+fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 /// The sidebar's list as rows, ready to draw or hit-test.
 struct SidebarRows<'a> {
     rows: Vec<ListRow<'a>>,
@@ -2566,7 +2746,13 @@ fn write_session(profiles: &[Profile], visible: usize, sidebar: (f32, bool)) -> 
         u8::from(sidebar.1)
     );
     for profile in profiles {
-        out += &format!("profile\t{}\t{}\n", profile.active, profile.name);
+        out += &format!(
+            "profile\t{}\t{}\t{}\t{}\n",
+            profile.active,
+            clean(&profile.name),
+            profile.id,
+            profile.hue.key()
+        );
         for group in &profile.folded {
             out += &format!("folded\t{}\n", clean(group));
         }
@@ -2591,9 +2777,11 @@ fn write_session(profiles: &[Profile], visible: usize, sidebar: (f32, bool)) -> 
     out
 }
 
-/// A profile as saved: its tabs, the active one and its folded groups.
-#[derive(Default)]
+/// A profile as saved: who it is, its tabs, the active one and its folded groups.
 struct SavedProfile {
+    name: String,
+    id: String,
+    hue: Hue,
     tabs: Vec<Tab>,
     active: usize,
     folded: Vec<String>,
@@ -2630,10 +2818,36 @@ fn parse_session(text: &str) -> Option<Session> {
                     sidebar = Some((width.clamp(SIDEBAR_MIN, SIDEBAR_MAX), b != Some("0")));
                 }
             }
-            "profile" => profiles.push(SavedProfile {
-                active: number,
-                ..SavedProfile::default()
-            }),
+            "profile" => {
+                // "name" in older sessions; "name<tab>id<tab>hue" since profiles can change.
+                let mut fields = b.unwrap_or_default().split('\t');
+                let name = fields.next().unwrap_or_default().trim();
+                let id = fields.next().unwrap_or(name);
+                let hue = fields.next().and_then(Hue::from_key);
+                // The id names a folder: anything that is not a plain name is not trusted.
+                if valid_id(id) && !name.is_empty() && profiles.len() < MAX_PROFILES {
+                    let n = profiles.len();
+                    profiles.push(SavedProfile {
+                        name: name.chars().take(MAX_NAME).collect(),
+                        id: id.to_string(),
+                        // Older sessions: Personal emerald, Work amber, as before.
+                        hue: hue.unwrap_or(Hue::ALL[n % Hue::ALL.len()]),
+                        tabs: Vec::new(),
+                        active: number,
+                        folded: Vec::new(),
+                    });
+                } else {
+                    // Keep later lines from landing in the previous profile.
+                    profiles.push(SavedProfile {
+                        name: String::new(),
+                        id: String::new(),
+                        hue: Hue::Emerald,
+                        tabs: Vec::new(),
+                        active: 0,
+                        folded: Vec::new(),
+                    });
+                }
+            }
             "folded" => {
                 if let (Some(p), Some(name)) = (profiles.last_mut(), name) {
                     p.folded.push(name);
@@ -2682,6 +2896,9 @@ fn parse_session(text: &str) -> Option<Session> {
             _ => {}
         }
     }
+    profiles.retain(|p| !p.id.is_empty());
+    let mut seen = std::collections::HashSet::new();
+    profiles.retain(|p| seen.insert(p.id.to_lowercase()));
     for p in &mut profiles {
         for tab in p.tabs.iter_mut() {
             tab.index = tab.index.min(tab.history.len().saturating_sub(1));
@@ -3481,7 +3698,7 @@ mod tests {
         );
         assert_eq!(tab.history[0].scroll, 0.0);
 
-        let mut personal = Profile::new("Personal", Hue::Emerald);
+        let mut personal = Profile::new("Personal", "Personal", Hue::Emerald);
         personal.tabs[0].title = "A\ttab\nname".into();
         personal.tabs[0].history.push(Entry {
             url: net::Url::parse("https://a.example/x").unwrap(),
@@ -4235,6 +4452,132 @@ mod tests {
         let y = row_center(first_visible) - f64::from(b.sidebar_scroll);
         assert!(act(&mut b, Event::Click { x: 100.0, y }));
         assert_eq!(b.profiles[0].active, first_visible);
+    }
+
+    #[test]
+    fn profiles_can_be_added_renamed_recoloured_and_removed() {
+        let (a, bpath) = site("manage-profiles");
+        let session = a.with_file_name("manage-session");
+        let _ = std::fs::remove_file(&session);
+        let _ = std::fs::remove_dir_all(a.with_file_name("profiles"));
+        let mut b = browser_with(&a, Some(session.clone()));
+
+        // A new profile: named in a dialog, given the first unused color, shown at once.
+        run_palette(&mut b, "new profile");
+        type_text(&mut b, "work");
+        act(&mut b, key(Key::Enter));
+        let error = b.dialog.as_ref().and_then(|d| d.error.clone());
+        assert_eq!(
+            error.as_deref(),
+            Some("There is already a profile called work.")
+        );
+        for _ in 0..4 {
+            act(&mut b, key(Key::Backspace));
+        }
+        type_text(&mut b, "Side project");
+        act(&mut b, key(Key::Enter));
+        assert!(b.dialog.is_none());
+        let names: Vec<&str> = b.profiles.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["Personal", "Work", "Side project"]);
+        assert_eq!(b.profile, 2);
+        assert_eq!(
+            (b.profiles[2].hue, b.profiles[2].id.as_str()),
+            (Hue::Rose, "profile-3")
+        );
+        act(&mut b, key(Key::Escape));
+        open(&mut b, &bpath);
+        b.render();
+        let rose = b.chrome.theme().profile(Hue::Rose);
+        assert_eq!(
+            b.window.pixel(440, 0),
+            [rose.b, rose.g, rose.r, 255],
+            "its edge"
+        );
+
+        // Rename and recolor; the folder stays.
+        run_palette(&mut b, "rename this");
+        type_text(&mut b, "Projects");
+        act(&mut b, key(Key::Enter));
+        run_palette(&mut b, "change this profile");
+        assert_eq!(
+            (b.profiles[2].name.as_str(), b.profiles[2].hue),
+            ("Projects", Hue::Violet)
+        );
+        assert_eq!(b.profiles[2].id, "profile-3");
+
+        // ⌘⇧P cycles through all three; the palette switches by name.
+        act(&mut b, command_shift('p'));
+        assert_eq!(b.profile, 0);
+        act(&mut b, key(Key::Escape));
+        run_palette(&mut b, "switch to projects");
+        assert_eq!(b.profile, 2);
+        assert_eq!(title(&b), "Page B");
+        drop(b);
+
+        // Back after a restart, with names, colors and tabs.
+        let mut b = browser_with(Path::new(""), Some(session.clone()));
+        let names: Vec<&str> = b.profiles.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["Personal", "Work", "Projects"]);
+        assert_eq!(b.profiles[2].hue, Hue::Violet);
+        assert_eq!((b.profile, title(&b).as_str()), (2, "Page B"));
+
+        // Removing asks for the name, then deletes the profile's folder.
+        b.profiles[2].cookies.store(
+            &net::Url::parse("https://a.example/").unwrap(),
+            "k=1; Max-Age=60",
+            &net::Context::top_level(true),
+        );
+        b.save_cookies();
+        let folder = a.with_file_name("profiles").join("profile-3");
+        assert!(folder.exists());
+        run_palette(&mut b, "remove this profile");
+        type_text(&mut b, "projects");
+        act(&mut b, key(Key::Enter));
+        assert!(
+            b.dialog.as_ref().is_some_and(|d| d.error.is_some()),
+            "exact name only"
+        );
+        for _ in 0..8 {
+            act(&mut b, key(Key::Backspace));
+        }
+        type_text(&mut b, "Projects");
+        act(&mut b, key(Key::Enter));
+        assert_eq!(b.profiles.len(), 2);
+        assert!(!folder.exists(), "its cookies went with it");
+        assert_eq!(b.profile, 1);
+
+        // The last profile cannot go. (Work's new tab opened the palette: close it first.)
+        act(&mut b, key(Key::Escape));
+        run_palette(&mut b, "remove this profile");
+        type_text(&mut b, "Work");
+        act(&mut b, key(Key::Enter));
+        run_palette(&mut b, "remove this profile");
+        type_text(&mut b, "Personal");
+        act(&mut b, key(Key::Enter));
+        let error = b.dialog.as_ref().and_then(|d| d.error.clone());
+        assert_eq!(error.as_deref(), Some("Broxee needs at least one profile."));
+    }
+
+    #[test]
+    fn session_profile_folders_are_never_trusted() {
+        let session = parse_session(
+            "broxee-session 1\nprofile\t0\tEvil\t../../etc\trose\ntab\t0\tStolen\n\
+             profile\t0\tFine\tprofile-2\tviolet\nprofile\t0\tTwin\tPROFILE-2\tamber\n\
+             profile\t0\tOld\n",
+        )
+        .unwrap();
+        let ids: Vec<&str> = session.profiles.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["profile-2", "Old"],
+            "unsafe and duplicate folders dropped"
+        );
+        assert!(
+            session.profiles[0].tabs.is_empty(),
+            "the bad profile's tab did not move over"
+        );
+        assert_eq!(session.profiles[0].hue, Hue::Violet);
+        assert!(!valid_id("a/b") && !valid_id("..") && !valid_id("") && valid_id("Work_2-x"));
     }
 
     #[test]

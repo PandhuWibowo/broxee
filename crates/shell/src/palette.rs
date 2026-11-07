@@ -18,13 +18,17 @@ pub enum Command {
     TogglePin,
     MoveToGroup,
     FoldGroup,
+    NewProfile,
+    RenameProfile,
+    RecolorProfile,
+    RemoveProfile,
     Back,
     Forward,
     Reload,
 }
 
 impl Command {
-    pub const ALL: [Command; 16] = [
+    pub const ALL: [Command; 20] = [
         Command::NewTab,
         Command::CloseTab,
         Command::ReopenTab,
@@ -38,6 +42,10 @@ impl Command {
         Command::TogglePin,
         Command::MoveToGroup,
         Command::FoldGroup,
+        Command::NewProfile,
+        Command::RenameProfile,
+        Command::RecolorProfile,
+        Command::RemoveProfile,
         Command::Back,
         Command::Forward,
         Command::Reload,
@@ -58,6 +66,10 @@ impl Command {
             Command::TogglePin => "Pin or unpin this tab",
             Command::MoveToGroup => "Move this tab to a group",
             Command::FoldGroup => "Fold or unfold this tab's group",
+            Command::NewProfile => "New profile",
+            Command::RenameProfile => "Rename this profile",
+            Command::RecolorProfile => "Change this profile's color",
+            Command::RemoveProfile => "Remove this profile",
             Command::Back => "Back",
             Command::Forward => "Forward",
             Command::Reload => "Reload",
@@ -78,7 +90,11 @@ impl Command {
             | Command::RemoveBookmark
             | Command::TogglePin
             | Command::MoveToGroup
-            | Command::FoldGroup => return None,
+            | Command::FoldGroup
+            | Command::NewProfile
+            | Command::RenameProfile
+            | Command::RecolorProfile
+            | Command::RemoveProfile => return None,
             Command::BookmarkPage => "⌘D",
             Command::ShowBookmarks => "⌘⌥B",
             Command::Back => "⌘[",
@@ -100,6 +116,8 @@ pub enum Action {
     /// Open a page from the history in the current tab.
     Visit(net::Url),
     Run(Command),
+    /// Switch to profile `n`.
+    Profile(usize),
 }
 
 /// What is shown at the right end of a result.

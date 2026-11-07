@@ -100,8 +100,12 @@ Profiles are the reason Broxee exists, so their color is a real state marker, no
 |---|---|---|---|
 | Emerald (default for **Personal**) | `#047857` | `#34d399` | 4.95 / 9.1 |
 | Amber (default for **Work**) **(agent)** | `#b45309` | `#fbbf24` | 4.53 / 10.4 |
+| Rose **(agent)** | `#be123c` | `#fb7185` | 5.67 / 7.23 |
+| Violet **(agent)** | `#6d28d9` | `#a78bfa` | 6.41 / 7.15 |
 
-More hues can be added for extra profiles, each checked to 4.5:1 on `canvas` in both themes before it ships.
+More hues can be added for extra profiles, each checked to 4.5:1 on `canvas` in both themes before it ships. New
+profiles take the hue fewest profiles use. Sky is left out on purpose (it is the `accent`), and greys too:
+next to `text-2` and `muted` they would not read as a profile color.
 Amber in light mode is at the limit (4.53): never lighten it.
 
 ## 4. Typography
