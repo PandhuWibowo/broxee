@@ -247,8 +247,6 @@ Where data lives, and what compression does for it (measured 2026-11-07):
 
 ## Known issues
 
-- `example.com` occasionally resets the first connection (seen three times, never on a retry). `net::fetch` now
-  retries a reset GET once, as browsers do. Cause not found.
 - No table layout and no presentational attributes (`bgcolor`, `align`): Hacker News renders centred without its
   orange bar.
 - Tab reaches the header controls but not links inside the page yet; there is no visible focus for page links.

@@ -150,3 +150,6 @@
   `user:pass@` is dropped (never sent). Several addresses pasted as one, on the command line or in the
   address field, are refused with a clear message. `file://` paths are decoded before reading, so files with
   spaces in their names open.
+- `net`: a test for the one-time retry of a GET whose connection closes before any response (#4). The
+  occasional reset from example.com could not be reproduced: 100 fresh connections and connections reused
+  after 2 to 28 seconds idle all answered.

@@ -834,6 +834,35 @@ mod tests {
         assert_eq!(percent_decode("%41%zz"), b"A%zz");
     }
 
+    /// A local server that closes the first `drops` connections right after reading the
+    /// request, then answers; returns its URL.
+    fn dropping_server(drops: usize) -> Url {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for (i, stream) in listener.incoming().enumerate() {
+                let Ok(mut stream) = stream else { break };
+                let mut request = [0u8; 2048];
+                let _ = stream.read(&mut request);
+                if i < drops {
+                    continue; // dropped: closed before any response
+                }
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+            }
+        });
+        Url::parse(&format!("http://{address}/")).unwrap()
+    }
+
+    #[test]
+    fn retries_a_get_once_when_the_connection_closes_before_answering() {
+        let resp = fetch(&dropping_server(1)).expect("the retry gets the answer");
+        assert_eq!((resp.status, resp.body.as_slice()), (200, &b"ok"[..]));
+        let err = fetch(&dropping_server(2)).expect_err("only one retry");
+        assert!(err.contains("closed before a response"), "{err}");
+    }
+
     #[test]
     fn joins_relative_urls() {
         let base = Url::parse("https://e.com/docs/guide/intro.html?q=1").unwrap();
