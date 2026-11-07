@@ -41,6 +41,8 @@ struct Options {
 }
 
 fn main() -> ExitCode {
+    #[cfg(target_os = "macos")]
+    space_efficient_malloc();
     let mut targets: Vec<String> = Vec::new();
     let mut opts = Options {
         target: String::new(),
@@ -113,6 +115,29 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Restart once with `MallocSpaceEfficient=1`. macOS malloc otherwise keeps freed memory dirty
+/// in its per-CPU caches: after GitHub then example.com the window idled at 43 MB with 6.8 MB
+/// live, and peaked at 59 MB. With it: 29 MB idle, 48 MB peak, same timings (README,
+/// "Window memory"). libmalloc reads the variable only at process start, hence the exec. It is
+/// undocumented: if a macOS release ignores it, memory goes back up and nothing breaks.
+/// A value already set (including by the user, to turn it off with 0) is left alone.
+#[cfg(target_os = "macos")]
+fn space_efficient_malloc() {
+    use std::os::unix::process::CommandExt;
+    const VAR: &str = "MallocSpaceEfficient";
+    if std::env::var_os(VAR).is_some() {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    // `exec` only returns on failure; then carry on in this process with the default malloc.
+    let _ = std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env(VAR, "1")
+        .exec();
 }
 
 #[cfg(target_os = "macos")]

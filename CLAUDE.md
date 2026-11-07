@@ -73,7 +73,13 @@ casts), not taken from binding crates. Ask before proposing any dependency.
 - **Paint into the window's `IOSurface`, never into a separate buffer that is then copied.** At most two
   surfaces per window; the spare one is released when idle (`Window::release_spare`).
 - **Window memory is measured with `footprint <pid>` on a real window** (idle and `phys_footprint_peak`), not
-  only with the CLI: frame surfaces (16 MB each at Retina) and AppKit are on top of the page.
+  only with the CLI: frame surfaces (16 MB each at Retina) and AppKit are on top of the page. Measure a
+  sequence of heavy pages too, not only one page: freed memory left behind by earlier pages is what pushed the
+  peak past 60 MB in #1.
+- **`main` re-executes itself with `MallocSpaceEfficient=1` on macOS** (`space_efficient_malloc`). Without it
+  macOS malloc keeps 10+ MB of freed memory dirty after a heavy page. Nothing may run before that call
+  (threads, fonts, sockets): the exec replaces the process. If window memory jumps after a macOS update,
+  check this first.
 
 ### Tab invariants
 

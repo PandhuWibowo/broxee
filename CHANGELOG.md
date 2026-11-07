@@ -137,3 +137,6 @@
 - Fixed: a new page could show the previous page's image. The painter cached decoded images by their index
   within the page, so another page's image 0 drawn at the same size reused the old pixels; the cache is now
   cleared when the page changes, which also frees the old page's pixels.
+- macOS: `broxee` restarts itself once with `MallocSpaceEfficient=1`, so malloc returns freed memory instead
+  of keeping it dirty. Window peak: GitHub 58 → 48 MB, four tabs 61 → 46 MB, twelve heavy pages in a row
+  47 MB; idle about 29 MB. Timings unchanged (#1).

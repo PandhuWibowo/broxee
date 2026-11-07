@@ -162,6 +162,7 @@ time something reads it (most theme variables never are). A `var()` value is sub
 | 2026-11-07 | Progressive JPEG; scaled inverse DCT for every JPEG drawn smaller | 1.8 MB | 49.1 MB peak painted at 2x | 12 MP photo at 400 px: 15 to 18 MB peak, decode 21 to 32 ms |
 | 2026-11-07 | Brotli; faster gzip (hardware CRC, exact output allocation, chunked copies) | 1.9 MB | 49.2 MB peak painted at 2x | gzip 237 → 478 MB/s; Brotli 400 to 690 MB/s |
 | 2026-11-07 | Tabs that sleep to disk, profiles, session restore, sidebar | 2.0 MB | 49.3 MB peak painted at 2x | Window with four tabs: 60 to 61 MB peak (see below) |
+| 2026-11-07 | Space-efficient malloc on macOS (#1) | 2.0 MB | 49.3 MB peak painted at 2x | Window: GitHub 58 → 48 MB peak, four tabs 61 → 46 MB, twelve pages in a row 47 MB |
 
 Other pages after the layout milestone: GitHub home 22.7 MB peak (8,170 rules); Hacker News 11.5 MB.
 
@@ -170,15 +171,17 @@ variables used to be dropped as empty; keeping them grew the rule count 2.5x. Th
 49 MB. Lazy resolution, sets shared per matched-rule list, a `:root` bucket, unsorted candidate lists and
 trimming spare `Vec` capacity in parsed rules (6 MB alone) brought it to the numbers above.
 
-Window mode on a Retina display, measured with `footprint` (what Activity Monitor shows), 2026-11-07:
+Window mode on a Retina display, measured with `footprint` (what Activity Monitor shows), 2026-11-07, sidebar
+shown:
 
-| Page | Idle | Peak | |
+| Page | Idle | Peak | Before space-efficient malloc |
 |---|---|---|---|
-| example.com | 33 MB | 48 MB | baseline: AppKit, fonts, one 16 MB frame surface |
-| GitHub | 43 MB | 58 MB | |
-| Wikipedia "Cat" | 40 MB | 55 MB | |
-| Tabs: Wikipedia, MDN, example.com asleep, GitHub visible | 45 MB | 61 MB | 2026-11-07, sidebar shown |
-| Tabs: GitHub, MDN, example.com asleep, Wikipedia visible | 45 MB | 60 MB | |
+| example.com | 28 to 29 MB | 44 to 45 MB | 33 / 49 MB; baseline: AppKit, fonts, one 16 MB frame surface |
+| GitHub | 31 MB | 48 MB | 44 / 58 MB |
+| Wikipedia "Cat" | 30 MB | 46 MB | 40 / 55 MB |
+| Tabs: Wikipedia, MDN, example.com asleep, GitHub visible | 30 MB | 46 MB | 45 / 61 MB |
+| Tabs: GitHub, MDN, example.com asleep, Wikipedia visible | 29 MB | 47 MB | 45 / 60 MB |
+| 12 heavy pages built in a row (GitHub, Wikipedia, MDN, Hacker News, BBC, rust-lang.org, ...) | 29 MB | 47 MB | not measured; 11 sleeping tabs are 9.3 MB on disk |
 
 Two fixes got there. The window asked for 1280 points; macOS shrank it to fit the screen after the first frames,
 which rebuilt every surface while the old one was still on screen (74 MB peak on GitHub). The window is now
@@ -187,12 +190,15 @@ events (16 MB at Retina size); the next frame recreates it. Peaks happen while d
 exist. Releasing freed allocator pages (`malloc_zone_pressure_relief`) after loading changed nothing measurable:
 what remains is live data and fragmentation.
 
-Tabs: the sleeping tabs are not what moves the peak. Kept in memory, the three sleeping tabs above added about
-1 MB. On disk they add nothing, yet the peak stayed at 60 to 61 MB. The cost comes from having built a heavy page
-before: after GitHub, then example.com, the window idles at 45 MB instead of 33 MB. `heap` counts 6.8 MB of
-live allocations in that state, while `MALLOC_SMALL` holds 19 to 25 MB: freed memory that macOS malloc keeps
-dirty because live objects are scattered through its regions. Any long session that opens a heavy page
-pays this, with or without tabs. See Known issues.
+**Space-efficient malloc (issue #1).** Before it, a session that had built a heavy page peaked at 60 to 61 MB
+even with every other tab on disk. After GitHub, then example.com, `heap` counted 6.8 MB of live allocations
+while `MALLOC_SMALL` held 19 to 25 MB of dirty memory: freed blocks macOS malloc keeps in its per-CPU caches.
+`malloc_zone_pressure_relief` and skipping progress frames changed nothing. Starting the process with
+`MallocSpaceEfficient=1` did: 43 → 29 MB idle and 59 → 48 MB peak for that sequence, with parse, cascade,
+layout and paint times unchanged (stress page and saved GitHub, three runs each) and CLI peak RAM unchanged.
+libmalloc reads the variable only at process start, so `broxee` re-executes itself once with it set (about
+10 ms). It is not in `man malloc`: if a macOS release ignores it, memory returns to the old numbers and nothing
+else changes. Setting it yourself (`MallocSpaceEfficient=0` to compare) skips the restart.
 
 Earlier: Hacker News 48 MB with double buffering,
 of which 31 MB are the two 2560x1600 Retina frames. A third buffer appeared during loading (63 MB) until the
@@ -243,9 +249,6 @@ Where data lives, and what compression does for it (measured 2026-11-07):
   orange bar.
 - Tab reaches the header controls but not links inside the page yet; there is no visible focus for page links.
 - Reload cannot stop a load in progress (the load runs on the engine thread to completion).
-- **Window peak at the limit after heavy pages.** GitHub alone peaks at 58 MB; a session that has built
-  GitHub and then other pages peaks at 60 to 61 MB, because of allocator fragmentation (see the window table).
-  Tracked in #1.
 - No cookies, so nothing stays logged in yet. Profiles are separate in tabs, history and connections; cookie
   storage will be per profile when it exists.
 - Not built yet, so not shown: the ⌘K palette and the "Search or go to ⌘K" field in the sidebar, the ⋯ menu,
