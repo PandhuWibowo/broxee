@@ -28,6 +28,9 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
+Without pushing a tag: Actions > Release > Run workflow, with the tag name. A new tag is created on the latest
+commit of the default branch when the release is published.
+
 ## Run
 
 ```bash
