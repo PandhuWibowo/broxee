@@ -96,10 +96,20 @@ jobs:
           cp "target/${{ matrix.target }}/release/broxee" README.md "$dir/"
           tar -czf "$dir.tar.gz" "$dir"
           shasum -a 256 "$dir.tar.gz" > "$dir.tar.gz.sha256"
+      - name: Package .dmg
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          # Same binary as the tar.gz, wrapped in Broxee.app.
+          dmg="broxee-$TAG-${{ matrix.name }}.dmg"
+          ./scripts/macos-dmg.sh "target/${{ matrix.target }}/release/broxee" "$dmg"
+          shasum -a 256 "$dmg" > "$dmg.sha256"
       - uses: actions/upload-artifact@v4.6.2
         with:
           name: ${{ matrix.name }}
-          path: broxee-*.tar.gz*
+          path: |
+            broxee-*.tar.gz*
+            broxee-*.dmg*
 
   release:
     name: Publish
@@ -123,10 +133,13 @@ jobs:
             --prerelease \
             --notes "Early preview build of Broxee, a browser with its own engine written in Rust.
 
-          - **macOS** (arm64, x86_64): \`broxee <url> --window\` opens the browser window.
+          - **macOS** (arm64, x86_64): open the \`.dmg\` and drag Broxee to Applications. The \`.tar.gz\` holds the
+            same binary for the terminal: \`./broxee\` or \`./broxee <url> --window\` opens the browser window.
           - **Linux** (x86_64): CLI only for now (\`--png\`, \`--tree\`, \`--styles\`, \`--layout\`); no window yet.
 
-          The binaries are not signed. On macOS, after extracting run:
-          \`xattr -d com.apple.quarantine broxee\`
+          The binaries are not signed with a Developer ID. On macOS, the first time:
+          - Broxee.app: right-click > Open, or System Settings > Privacy & Security > Open Anyway
+            (or \`xattr -dr com.apple.quarantine /Applications/Broxee.app\`).
+          - tar.gz: \`xattr -d com.apple.quarantine broxee\` after extracting.
 
           Each archive has a \`.sha256\` checksum next to it."
