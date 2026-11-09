@@ -20,7 +20,7 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "css"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "html",
 ]
@@ -33,11 +33,11 @@ checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
 
 [[package]]
 name = "flate"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "font"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "getrandom"
@@ -52,18 +52,18 @@ dependencies = [
 
 [[package]]
 name = "html"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "image"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "flate",
 ]
 
 [[package]]
 name = "layout"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "css",
  "font",
@@ -78,7 +78,7 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "net"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "flate",
  "rustls",
@@ -93,7 +93,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "paint"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "css",
  "flate",
@@ -105,7 +105,7 @@ dependencies = [
 
 [[package]]
 name = "platform"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "ring"
@@ -157,7 +157,7 @@ dependencies = [
 
 [[package]]
 name = "shell"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "css",
  "font",

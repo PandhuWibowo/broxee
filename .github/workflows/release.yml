@@ -25,10 +25,22 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       sha: ${{ steps.sha.outputs.sha }}
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
+      - name: Clean tag name
+        id: tag
+        run: |
+          # A tag typed in the Run workflow form can carry spaces ("  v0.1.1"); strip them.
+          tag=$(printf '%s' "$TAG" | tr -d '[:space:]')
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "Tag '$tag' is not a version tag such as v0.1.1."
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
       - name: Commit for the tag
         id: sha
         env:
+          TAG: ${{ steps.tag.outputs.tag }}
           GH_TOKEN: ${{ github.token }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
@@ -44,6 +56,8 @@ jobs:
   build:
     name: Build (${{ matrix.target }})
     needs: resolve
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
     strategy:
       fail-fast: false
       matrix:
@@ -115,6 +129,8 @@ jobs:
     name: Publish
     needs: [resolve, build]
     runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
     steps:
       - uses: actions/download-artifact@v4.3.0
         with:

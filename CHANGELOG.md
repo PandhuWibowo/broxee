@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.1 (2026-11-09)
 
 ### Added
 - Release workflow run by hand creates the tag on the default branch when it does not exist yet.
