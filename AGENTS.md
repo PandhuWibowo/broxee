@@ -145,5 +145,7 @@ archives and `.sha256` checksums.
    git push origin vX.Y.Z
    ```
 
-The workflow refuses a tag that does not match the `Cargo.toml` version. To rebuild an existing tag, run the
-workflow by hand (`workflow_dispatch`) with that tag.
+The workflow refuses a tag that does not match the `Cargo.toml` version. It can also be run by hand
+(`workflow_dispatch`) with a tag name: an existing tag is rebuilt, and a new one is created on the latest commit of
+the default branch when the release is published. Use that when tags cannot be pushed (agent sessions that may only
+push branches).

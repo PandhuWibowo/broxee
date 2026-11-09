@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Added
+- Release workflow run by hand creates the tag on the default branch when it does not exist yet.
+
 ## 0.1.0 (2026-11-09)
 
 First preview release.
