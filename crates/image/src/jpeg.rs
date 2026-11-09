@@ -806,7 +806,7 @@ mod tests {
         }
         let body = &pnm[start..];
         let pixels = if magic == "P6" {
-            body.chunks_exact(3).map(|p| [p[0], p[1], p[2]]).collect()
+            body.as_chunks::<3>().0.to_vec()
         } else {
             body.iter().map(|&g| [g, g, g]).collect()
         };
