@@ -28,10 +28,15 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
+Without pushing a tag: Actions > Release > Run workflow, with the tag name. A new tag is created on the latest
+commit of the default branch when the release is published.
+
 ## Run
 
 ```bash
 cargo run --release -- https://example.com --window    # open it in a window (macOS)
+cargo run --release -- --window                        # bring back the last session
+cargo run --release -- a.com b.org --window            # one tab per address
 cargo run --release -- https://example.com --png out.png --scale 2   # render to an image
 cargo run --release -- https://example.com --tree      # fetch, parse, print the DOM tree
 cargo run --release -- https://example.com --styles    # the tree with computed styles
@@ -47,12 +52,52 @@ In the window:
 
 | Action | Keys or mouse |
 |---|---|
+| Palette: open tabs (every profile), this profile's history, commands, a typed address | ⌘K or "Search or go to" in the sidebar; type to filter, ↑ ↓ or Tab, Enter, Esc |
 | Scroll | trackpad or wheel, ↑ ↓, Space / Shift+Space, Page Up / Page Down, Home / End |
 | Follow a link | click it |
 | Back / forward / reload | the header buttons, or ⌘[ / ⌘] / ⌘R |
+| Stop loading | Esc, or the × that replaces reload while a page loads |
+| Page menu: copy the address, open in another profile, bookmark, reload, close | ⋯ at the right of the header, or Tab to it and Enter; ↑ ↓ Enter, Esc |
+| Tooltips | rest the pointer on a button or a sleeping tab for 0.6 s |
+| New tab (opens the palette) / close tab / reopen closed tab | ⌘T / ⌘W / ⌘⇧T, or "+ New tab" and the × on the active row |
+| Go to tab 1 to 8, the last tab | ⌘1 … ⌘8, ⌘9, or click the row (in the order shown: pinned, groups, the rest) |
+| Pin a tab, move it to a group, fold a group | palette: "Pin or unpin this tab", "Move this tab to a group" (an empty name takes it out), "Fold or unfold this tab's group"; or click a group's label to fold it |
+| Reorder tabs | drag a row; dropped under a label, it joins that section |
+| Scroll the sidebar, resize it | the wheel over it; drag its right edge (200 to 320 points) |
+| Switch profile | ⌘⇧P (cycles), a click on the profile name at the top of the sidebar, or "Switch to …" in the palette |
+| Add, rename, recolor or remove a profile | palette: "New profile", "Rename this profile", "Change this profile's color", "Remove this profile" (asks for its name; its tabs, history, cookies and bookmarks are deleted) |
+| Show or hide the sidebar | ⌘\\ |
+| Bookmark this page (or edit its bookmark) | ⌘D: name and folder, the last folder preselected; Tab between them, Enter saves, Esc cancels |
+| Bookmarks panel, in place of the tab list | ⌘⌥B: folders in name order; ↑ ↓ and Enter or a click opens, Esc goes back to tabs. Every bookmark is a ⌘K result too |
 | Address field | ⌘L or click the host; type or paste (⌘V), Enter to open, Esc to cancel |
-| Move between header controls | Tab / Shift+Tab, Enter or Space to activate |
+| Move between header controls and the page's links | Tab / Shift+Tab (a 2px ring marks the focused link; the page scrolls to it), Enter to activate or follow, Esc to leave |
 | Quit | ⌘Q or close the window |
+
+Tabs and profiles:
+
+- Pages load on their own thread while the current page stays on screen: scrolling, links, tabs, profiles and
+  the address field keep working. Opening another page, switching tab or switching profile stops the load (one
+  page is built at a time, for memory); the tab stays on the page it showed.
+- Each profile has its own tabs, history, closed tabs and **cookies**, so a login in Work never reaches
+  Personal. Switching profile closes every idle connection and forgets TLS sessions, so a server cannot link
+  the two through a reused connection either.
+- Cookies follow RFC 6265bis: `Domain`, `Path`, `Expires`, `Max-Age`, `Secure`, `HttpOnly`, `SameSite`
+  (Lax by default; Strict cookies stay behind on links from other sites; None needs Secure) and the
+  `__Secure-` / `__Host-` prefixes. **Third-party cookies are blocked**: a subresource from another site
+  neither sends nor sets them. A site cannot set a cookie for a public suffix (`co.uk`, `github.io`): the
+  Public Suffix List is built in (below). Persistent cookies are saved per profile in
+  `~/Library/Application Support/Broxee/profiles/<profile>/cookies` (0600, written atomically); session cookies
+  never touch the disk. "Clear this profile's cookies" is in the palette. Limits: 4 KB per cookie, 60 per
+  site, 3,000 per profile.
+- Only the visible tab is a live page. The others sleep: the HTML and stylesheets as they arrived (usually
+  Brotli or gzip) and the compressed images go to a private file in `~/Library/Caches/Broxee/tabs` (folder
+  0700, files 0600). Selecting the tab rebuilds it from that file, without the network, at its old scroll
+  position: 5 ms for MDN's home page, about 45 ms for GitHub. Sleeping tabs use no page memory, however many
+  there are. The files total at most 256 MB; past that the tabs seen longest ago keep only their history and
+  reload when selected. The folder is removed on exit, or at the next start when the browser was killed.
+- The session (profiles, tabs, history, scroll positions; no page contents) is written to
+  `~/Library/Application Support/Broxee/session` after each change. On start every tab comes back asleep and
+  only the visible one loads.
 
 ## Written from scratch
 
@@ -62,6 +107,12 @@ at risk. That is the only dependency; `libc` appears in the build only as a depe
 
 The window layer calls AppKit through the Objective-C runtime (`objc_msgSend`) and shows frames through
 `IOSurface`; process memory is read with a hand-declared `getrusage`.
+
+Data taken from elsewhere, as data: the Brotli dictionary and tables (RFC 7932, CRC-checked in tests) and the
+**Public Suffix List** (publicsuffix.org, Mozilla Public License 2.0), stored as
+`crates/net/src/public_suffix_list.gz`: its 10,406 rules, punycode for internationalised labels, 46 KB in the
+binary and about 150 KB in memory once a cookie first needs it. `scripts/update-public-suffixes.sh`
+refreshes it.
 
 ## Crates
 
@@ -142,7 +193,8 @@ time something reads it (most theme variables never are). A `var()` value is sub
 5. ✅ Painting to a window: the first visible page
 6. ✅ Scrolling, links, back/forward, address bar
 7. JavaScript (Boa) + a subset of the DOM API
-8. Then the product features: profiles, tab organisation, session restore, split view, bookmarks
+8. Product features: ✅ profiles, ✅ tabs that sleep to disk, ✅ session restore, ✅ ⌘K palette; next cookies,
+   split view, bookmarks, tab groups
 
 ## Budget log
 
@@ -166,6 +218,11 @@ time something reads it (most theme variables never are). A `var()` value is sub
 | 2026-11-07 | Inline boxes; attribute-aware rule pruning; window fitted to screen, spare surface released when idle | 1.8 MB | 49.2 MB peak painted at 2x | window: GitHub 43 MB idle / 58 MB peak (was 74 MB peak) |
 | 2026-11-07 | Progressive JPEG; scaled inverse DCT for every JPEG drawn smaller | 1.8 MB | 49.1 MB peak painted at 2x | 12 MP photo at 400 px: 15 to 18 MB peak, decode 21 to 32 ms |
 | 2026-11-07 | Brotli; faster gzip (hardware CRC, exact output allocation, chunked copies) | 1.9 MB | 49.2 MB peak painted at 2x | gzip 237 → 478 MB/s; Brotli 400 to 690 MB/s |
+| 2026-11-07 | Tabs that sleep to disk, profiles, session restore, sidebar | 2.0 MB | 49.3 MB peak painted at 2x | Window with four tabs: 60 to 61 MB peak (see below) |
+| 2026-11-07 | Space-efficient malloc on macOS (#1) | 2.0 MB | 49.3 MB peak painted at 2x | Window: GitHub 58 → 48 MB peak, four tabs 61 → 46 MB, twelve pages in a row 47 MB |
+| 2026-11-07 | Rules dropped from their selector text (#16) | 2.2 MB | 49.3 MB peak painted at 2x | GitHub's 30 sheets (3.4 MB): 15.0 → 11.7 ms, 155,109 → 34,167 allocations, same 820 rules |
+| 2026-11-08 | Display list skips runs of fragments out of view (#17) | 2.2 MB | 49.4 MB peak painted at 2x | Stress page: display list 0.65 → 0.01 ms a frame at any scroll; layout +0.8 ms once to index |
+| 2026-11-08 | Glyphs on quarter pixels (#18) | 2.2 MB | 49.5 MB peak painted at 2x | Repeated "i" at 13px, 1x: gaps 4/3/4/3 px (stdev 0.50) → 3.5 ± 0.15 px; GitHub glyph cache 46 → 88 KB |
 
 Other pages after the layout milestone: GitHub home 22.7 MB peak (8,170 rules); Hacker News 11.5 MB.
 
@@ -174,13 +231,17 @@ variables used to be dropped as empty; keeping them grew the rule count 2.5x. Th
 49 MB. Lazy resolution, sets shared per matched-rule list, a `:root` bucket, unsorted candidate lists and
 trimming spare `Vec` capacity in parsed rules (6 MB alone) brought it to the numbers above.
 
-Window mode on a Retina display, measured with `footprint` (what Activity Monitor shows), 2026-11-07:
+Window mode on a Retina display, measured with `footprint` (what Activity Monitor shows), 2026-11-07, sidebar
+shown:
 
-| Page | Idle | Peak | |
+| Page | Idle | Peak | Before space-efficient malloc |
 |---|---|---|---|
-| example.com | 33 MB | 48 MB | baseline: AppKit, fonts, one 16 MB frame surface |
-| GitHub | 43 MB | 58 MB | |
-| Wikipedia "Cat" | 40 MB | 55 MB | |
+| example.com | 28 to 29 MB | 44 to 45 MB | 33 / 49 MB; baseline: AppKit, fonts, one 16 MB frame surface |
+| GitHub | 31 MB | 48 MB | 44 / 58 MB |
+| Wikipedia "Cat" | 30 MB | 46 MB | 40 / 55 MB |
+| Tabs: Wikipedia, MDN, example.com asleep, GitHub visible | 30 MB | 46 MB | 45 / 61 MB |
+| Tabs: GitHub, MDN, example.com asleep, Wikipedia visible | 29 MB | 47 MB | 45 / 60 MB |
+| 12 heavy pages built in a row (GitHub, Wikipedia, MDN, Hacker News, BBC, rust-lang.org, ...) | 29 MB | 47 MB | not measured; 11 sleeping tabs are 9.3 MB on disk |
 
 Two fixes got there. The window asked for 1280 points; macOS shrank it to fit the screen after the first frames,
 which rebuilt every surface while the old one was still on screen (74 MB peak on GitHub). The window is now
@@ -188,6 +249,16 @@ fitted before it is shown. And the spare surface of the double buffer is release
 events (16 MB at Retina size); the next frame recreates it. Peaks happen while drawing, when both surfaces
 exist. Releasing freed allocator pages (`malloc_zone_pressure_relief`) after loading changed nothing measurable:
 what remains is live data and fragmentation.
+
+**Space-efficient malloc (issue #1).** Before it, a session that had built a heavy page peaked at 60 to 61 MB
+even with every other tab on disk. After GitHub, then example.com, `heap` counted 6.8 MB of live allocations
+while `MALLOC_SMALL` held 19 to 25 MB of dirty memory: freed blocks macOS malloc keeps in its per-CPU caches.
+`malloc_zone_pressure_relief` and skipping progress frames changed nothing. Starting the process with
+`MallocSpaceEfficient=1` did: 43 → 29 MB idle and 59 → 48 MB peak for that sequence, with parse, cascade,
+layout and paint times unchanged (stress page and saved GitHub, three runs each) and CLI peak RAM unchanged.
+libmalloc reads the variable only at process start, so `broxee` re-executes itself once with it set (about
+10 ms). It is not in `man malloc`: if a macOS release ignores it, memory returns to the old numbers and nothing
+else changes. Setting it yourself (`MallocSpaceEfficient=0` to compare) skips the restart.
 
 Earlier: Hacker News 48 MB with double buffering,
 of which 31 MB are the two 2560x1600 Retina frames. A third buffer appeared during loading (63 MB) until the
@@ -226,27 +297,28 @@ Where data lives, and what compression does for it (measured 2026-11-07):
 | CPU | gzip 6.5 → 3.3 ms for Wikipedia's 1.5 MB page (237 → 478 MB/s) | Profiling showed the CRC check and match copies, not decoding, dominated: CRC-32 now uses ARMv8 instructions (slicing-by-8 elsewhere), output is allocated once from gzip's size trailer, and short matches copy in 8-byte chunks. |
 | Memory: images | Keep compressed files; decode only what is on screen, at its drawn size | Re-decoding from the file is the cheapest compressed form: 1 to 30 ms even for a 12 MP photo. A compressed pixel cache would add code and save little. |
 | Memory: page | Not compressed while open | Layout and paint read text and styles constantly; compressing them would cost every frame. |
-| Memory: tabs (next) | Hibernate a background tab to its compressed sources (the bytes as received) | A page that is 15 to 20 MB live is 0.2 to 0.5 MB compressed; restoring needs no network. |
+| Memory: tabs | A sleeping tab is its sources as received plus compressed images, in a file on disk | GitHub 2.5 MB (92 KB of gzip HTML, 712 KB of CSS, 1.75 MB of images), Wikipedia "Cat" 1.2 MB, MDN 57 KB. Waking takes 5 to 45 ms without the network. In RAM, even a few of them would fill the headroom under 60 MB. |
 | Disk: binary | Keep `opt-level = 3` | `"s"` saves 0.31 MB (1.95 → 1.64) but layout is 55% slower and cascade 25%; `"z"` is 3x slower. |
 | Disk: caches (later) | Store responses in the encoding they arrived in | No re-compression work, and already the smallest form. |
 
 ## Known issues
 
-- `example.com` occasionally resets the first connection (seen three times, never on a retry). `net::fetch` now
-  retries a reset GET once, as browsers do. Cause not found.
 - No table layout and no presentational attributes (`bgcolor`, `align`): Hacker News renders centred without its
   orange bar.
-- Tab reaches the header controls but not links inside the page yet; there is no visible focus for page links.
-- Reload cannot stop a load in progress (the load runs on the engine thread to completion).
-- No cookies, so nothing stays logged in; profiles (DESIGN.md) wait for cookie storage.
-- The header omits the profile name, profile edge and the ⋯ menu from DESIGN.md until profiles and menu
-  actions exist, rather than showing controls that do nothing.
+- The palette cannot search the web: with no search engine chosen, a query that matches nothing says
+  "Broxee can't search the web yet." Bookmarks will join its results when they exist.
+- The UI font (Arial, until Figtree is bundled) has no ⌘ ⇧ ⌥ glyphs, so the chrome draws those three as
+  icons; page text that uses them shows nothing for them.
+- Bookmarks cannot be imported from other browsers yet, and folders are flat (no folders inside folders).
+  They are saved per profile in `profiles/<profile>/bookmarks` (0600).
+- Sidebar rows have no keyboard focus of their own: tabs are reached with ⌘1 … ⌘9 and the palette, which
+  also runs every sidebar action. Dragging needs the mouse.
+- Not built yet, so not shown: split view.
+- A tooltip can stay on screen when the pointer leaves the window over it, until the next input: the
+  window does not track the pointer leaving yet.
+- Profiles start as Personal and Work; up to 12, each with its own folder in `profiles/` (named by a fixed
+  id, so renaming moves nothing). Four colors exist (emerald, amber, rose, violet), so profiles past four
+  share them; their names always tell them apart.
 - GIF, WebP and SVG are sized from their headers but not drawn yet. Failed images draw nothing.
-- Building the display list walks every fragment each frame (0.7 ms on the 140k-fragment stress page). An index
-  by vertical position would make scrolling cost independent of page length.
-- Selectors keep each class, tag and id name as its own allocation. Since rules that cannot match are skipped this
-  matters far less (GitHub keeps 2,139 rules); interning names per stylesheet remains a possible step.
-- Glyphs are placed on whole device pixels, so spacing is slightly uneven at 1x; subpixel positioning later.
-- Parsing GitHub's CSS (8,170 rules) takes about 125 ms; worth profiling.
 - Painting will add a window framebuffer (about 16 MB at 2x for 1280x800). The stress page sits at 37 MB, so
   paint must stay within roughly 20 MB including glyph caches.

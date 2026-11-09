@@ -1,13 +1,15 @@
 name: Release
 
 # Push a tag such as v0.1.0 to build the binaries and publish a GitHub release.
+# Or run it by hand (Actions > Release > Run workflow) with a tag name: an existing tag is rebuilt; a new one is
+# created on the latest commit of the default branch when the release is published.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to (re)build, e.g. v0.1.0"
+        description: "Tag to build, e.g. v0.1.0 (created on the default branch if it does not exist)"
         required: true
 
 permissions:
@@ -18,8 +20,30 @@ env:
   TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
 jobs:
+  resolve:
+    name: Resolve commit
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+    steps:
+      - name: Commit for the tag
+        id: sha
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          # An existing tag builds that tag; a new one builds the head of the default branch.
+          if sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$TAG" --jq .sha 2>/dev/null); then
+            echo "Tag $TAG exists at $sha"
+          else
+            sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/heads/$DEFAULT_BRANCH" --jq .sha)
+            echo "Tag $TAG does not exist yet; building $DEFAULT_BRANCH at $sha"
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build (${{ matrix.target }})
+    needs: resolve
     strategy:
       fail-fast: false
       matrix:
@@ -37,13 +61,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4.2.2
         with:
-          ref: ${{ env.TAG }}
+          ref: ${{ needs.resolve.outputs.sha }}
+      - name: Tag matches Cargo.toml version
+        shell: bash
+        run: |
+          version=$(awk -F'"' '/^\[workspace.package\]/ { p = 1 } p && /^version/ { print $2; exit }' Cargo.toml)
+          if [ "$TAG" != "v$version" ]; then
+            echo "Tag $TAG does not match Cargo.toml version $version (expected v$version)."
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      - name: Clippy
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: cargo clippy --all-targets -- -D warnings
       - name: Tests
         if: matrix.target != 'x86_64-apple-darwin'
         run: cargo test
@@ -67,7 +103,7 @@ jobs:
 
   release:
     name: Publish
-    needs: build
+    needs: [resolve, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4.3.0
@@ -77,9 +113,12 @@ jobs:
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.resolve.outputs.sha }}
         run: |
+          # --target creates the tag on that commit when it does not exist yet (ignored when it does).
           gh release create "$TAG" dist/* \
             --repo "$GITHUB_REPOSITORY" \
+            --target "$SHA" \
             --title "Broxee $TAG" \
             --prerelease \
             --notes "Early preview build of Broxee, a browser with its own engine written in Rust.

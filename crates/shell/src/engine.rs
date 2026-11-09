@@ -34,7 +34,7 @@ const FONT_CANDIDATES: [(&str, &str); 3] = [
 ];
 
 /// What the page is laid out for.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Settings {
     pub width: f32,
     pub height: f32,
@@ -150,20 +150,8 @@ pub struct Sources {
     pub stylesheets: Vec<(String, net::Wire)>,
 }
 
-impl Sources {
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    pub fn bytes(&self) -> usize {
-        self.html.bytes.len()
-            + self
-                .stylesheets
-                .iter()
-                .map(|(url, w)| url.len() + w.bytes.len())
-                .sum::<usize>()
-    }
-}
-
 /// A page put to sleep: its sources and compressed images, and nothing built from them.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
 pub struct Snapshot {
     pub url: net::Url,
     pub status: u16,
@@ -171,15 +159,8 @@ pub struct Snapshot {
     pub images: ImageStore,
 }
 
-impl Snapshot {
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    pub fn bytes(&self) -> usize {
-        self.sources.bytes() + self.images.bytes()
-    }
-}
-
 /// Drop everything built from a page (DOM, styles, layout), keeping what rebuilds it.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
 pub fn snapshot(page: Loaded) -> Snapshot {
     Snapshot {
         url: page.url,
@@ -190,7 +171,7 @@ pub fn snapshot(page: Loaded) -> Snapshot {
 }
 
 /// Rebuild a sleeping page from its snapshot, without the network.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
 pub fn restore(
     snapshot: Snapshot,
     settings: Settings,
@@ -228,15 +209,26 @@ pub fn restore(
         settings,
         fonts,
         From::Snapshot(sources, images),
-        &mut |_| {},
-    );
+        &mut |_| true,
+    )
+    .expect("a load without a stop request finishes");
     page.sources.html = html;
     Ok(page)
 }
 
+/// A profile's cookie jar, for a load. `same_site_initiator`: the person started this
+/// navigation (typed, palette, back, reload) or a link on the same site did, so
+/// `SameSite=Strict` cookies go with it.
+#[derive(Clone, Copy)]
+pub struct Jar<'a> {
+    pub cookies: &'a net::Cookies,
+    pub same_site_initiator: bool,
+}
+
 /// Where a page's subresources come from.
-enum From {
-    Network,
+enum From<'a> {
+    /// Fetched, with the profile's cookies for subresources of the page's own site.
+    Network(Option<&'a net::Cookies>),
     /// A sleeping page waking: stylesheets from their stored bytes, images as they were.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Snapshot(Sources, ImageStore),
@@ -244,18 +236,26 @@ enum From {
     Nowhere,
 }
 
+/// The error `load` returns when its `progress` callback asked it to stop.
+pub const CANCELLED: &str = "cancelled";
+
 /// Fetch a page and build it. `progress` receives a fraction after each stage, for a
-/// loading indicator.
+/// loading indicator, and returns whether to go on: `false` stops the load at that point with
+/// `CANCELLED`, freeing what was built. A stage already running (a slow fetch) finishes first.
 pub fn load(
     url: &net::Url,
     settings: Settings,
     fonts: &FontStore,
-    progress: &mut dyn FnMut(f32),
+    jar: Option<Jar>,
+    progress: &mut dyn FnMut(f32) -> bool,
 ) -> Result<Loaded, String> {
     let started = Instant::now();
-    let resp = net::fetch(url)?;
+    let context = net::Context::top_level(jar.is_none_or(|j| j.same_site_initiator));
+    let resp = net::fetch_in(url, jar.map(|j| (j.cookies, &context)))?;
     let fetch_ms = millis(started);
-    progress(0.4);
+    if !progress(0.4) {
+        return Err(CANCELLED.into());
+    }
 
     let started = Instant::now();
     let dom = html::parse(&String::from_utf8_lossy(&resp.body));
@@ -272,10 +272,12 @@ pub fn load(
         drop(resp.body);
         resp.wire
     };
-    progress(0.5);
+    if !progress(0.5) {
+        return Err(CANCELLED.into());
+    }
 
     let from = if settings.fetch_css {
-        From::Network
+        From::Network(jar.map(|j| j.cookies))
     } else {
         From::Nowhere
     };
@@ -292,13 +294,14 @@ pub fn load(
         fonts,
         from,
         progress,
-    );
+    )
+    .ok_or(CANCELLED)?;
     page.sources.html = html;
     Ok(page)
 }
 
 /// Build a page from HTML Broxee generated itself (error and message pages). No network.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
 pub fn page_from_html(
     url: net::Url,
     source: &str,
@@ -317,7 +320,8 @@ pub fn page_from_html(
         fetch_ms: 0.0,
         parse_ms: 0.0,
     };
-    let mut page = finish(origin, dom, settings, fonts, From::Nowhere, &mut |_| {});
+    let mut page = finish(origin, dom, settings, fonts, From::Nowhere, &mut |_| true)
+        .expect("a load without a stop request finishes");
     page.sources.html = net::Wire {
         encoding: net::Encoding::Identity,
         bytes: source.as_bytes().to_vec(),
@@ -339,16 +343,18 @@ fn finish(
     settings: Settings,
     fonts: &FontStore,
     from: From,
-    progress: &mut dyn FnMut(f32),
-) -> Loaded {
+    progress: &mut dyn FnMut(f32) -> bool,
+) -> Option<Loaded> {
     let (css, images, stylesheets) = load_subresources(&dom, &source.url, from);
-    progress(0.75);
+    if !progress(0.75) {
+        return None;
+    }
     // Join stage 1 before layout, the first stage that measures text.
     let fonts_wait_ms = fonts.ready();
     let (styles, cascade_ms, layout, layout_ms) =
         style_and_layout(&dom, &css, &images, settings, fonts);
     progress(0.95);
-    Loaded {
+    Some(Loaded {
         url: source.url,
         status: source.status,
         bytes: source.bytes,
@@ -366,12 +372,12 @@ fn finish(
         cascade_ms,
         fonts_wait_ms,
         layout_ms,
-    }
+    })
 }
 
 /// Cascade and lay out again, for a new viewport size or color scheme. `@media` rules can
 /// change, so the cascade reruns as well.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
 pub fn relayout(page: &mut Loaded, settings: Settings, fonts: &FontStore) {
     let (styles, cascade_ms, layout, layout_ms) =
         style_and_layout(&page.dom, &page.css, &page.images, settings, fonts);
@@ -468,6 +474,13 @@ fn load_subresources(
     from: From,
 ) -> (LoadedCss, ImageStore, Vec<(String, net::Wire)>) {
     let external = !matches!(from, From::Nowhere);
+    let cookies = match from {
+        From::Network(cookies) => cookies,
+        _ => None,
+    };
+    // Subresources send and store cookies only for the page's own site.
+    let context = net::Context::subresource(base);
+    let jar = cookies.map(|c| (c, &context));
     let mut jobs = Vec::new();
     for id in dom.descendants(Dom::ROOT) {
         if jobs.len() >= MAX_STYLESHEETS {
@@ -499,10 +512,10 @@ fn load_subresources(
     let stored = stored_sheets.as_deref();
     let started = Instant::now();
     let results = pool::map_ordered(jobs, FETCH_WORKERS, |job| match job {
-        Job::Css(source) => Done::Css(load_css(source, &vocabulary, stored)),
+        Job::Css(source) => Done::Css(load_css(source, &vocabulary, stored, jar)),
         Job::Image(images::Source::Inline(bytes)) => Done::Image(Some(bytes)),
         Job::Image(images::Source::Url(url)) => Done::Image(
-            net::fetch(&url)
+            net::fetch_in(&url, jar)
                 .ok()
                 .filter(|r| r.status == 200)
                 .map(|r| r.body),
@@ -544,6 +557,7 @@ fn load_css(
     source: CssSource,
     vocabulary: &css::Vocabulary,
     stored: Option<&[(String, net::Wire)]>,
+    jar: Option<(&net::Cookies, &net::Context)>,
 ) -> CssResult {
     let failed = CssResult {
         sheet: None,
@@ -565,7 +579,7 @@ fn load_css(
                         Err(_) => return failed,
                     }
                 }
-                None => match net::fetch(&url) {
+                None => match net::fetch_in(&url, jar) {
                     Ok(mut resp) if resp.status == 200 => {
                         let wire = if resp.wire.bytes.is_empty() {
                             net::Wire {
@@ -606,11 +620,24 @@ fn is_stylesheet_link(dom: &Dom, id: NodeId) -> bool {
 
 /// A URL from the command line: an absolute URL or a local file path.
 pub fn to_url(target: &str) -> Result<net::Url, String> {
+    several_addresses(target)?;
     if target.contains("://") {
         return net::Url::parse(target);
     }
     let path = std::fs::canonicalize(target).map_err(|e| format!("{target}: {e}"))?;
     net::Url::parse(&format!("file://{}", path.display()))
+}
+
+/// Text with a space and a second `scheme://` is several addresses pasted together, not one
+/// URL with a space in its path (which the URL standard would accept).
+pub fn several_addresses(text: &str) -> Result<(), String> {
+    let text = text.trim();
+    if text.contains(char::is_whitespace) && text.matches("://").count() > 1 {
+        return Err(format!(
+            "That is more than one address. Open them one at a time: {text}"
+        ));
+    }
+    Ok(())
 }
 
 pub fn millis(since: Instant) -> f64 {
@@ -620,6 +647,25 @@ pub fn millis(since: Instant) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opens_files_with_spaces_in_their_names() {
+        let dir = std::env::temp_dir().join(format!("broxee space {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("my page.html");
+        std::fs::write(&file, "<title>Spaced</title>").unwrap();
+        let url = to_url(&file.display().to_string()).unwrap();
+        assert!(!url.to_string().contains(' '), "{url}");
+        let settings = Settings {
+            width: 400.0,
+            height: 300.0,
+            dark: false,
+            fetch_css: false,
+        };
+        let page = load(&url, settings, &FontStore::default(), None, &mut |_| true).unwrap();
+        assert_eq!(page.dom.title().as_deref(), Some("Spaced"));
+        assert!(to_url("https://a.com https://b.com").is_err());
+    }
 
     #[test]
     fn a_snapshot_rebuilds_the_same_page() {
@@ -651,40 +697,6 @@ mod tests {
             1,
             "inline styles come from the HTML"
         );
-    }
-
-    #[test]
-    #[ignore = "measures live sites"]
-    fn measure_snapshots() {
-        for site in [
-            "https://github.com/",
-            "https://en.wikipedia.org/wiki/Cat",
-            "https://example.com/",
-            "https://developer.mozilla.org/en-US/",
-        ] {
-            let fonts = FontStore::start();
-            let settings = Settings {
-                width: 1200.0,
-                height: 800.0,
-                dark: false,
-                fetch_css: true,
-            };
-            let url = net::Url::parse(site).unwrap();
-            let page = load(&url, settings, &fonts, &mut |_| {}).unwrap();
-            let html_raw = page.bytes;
-            let css: usize = page
-                .sources
-                .stylesheets
-                .iter()
-                .map(|(_, w)| w.bytes.len())
-                .sum();
-            let started = Instant::now();
-            let snap = snapshot(page);
-            let (src, img) = (snap.sources.bytes(), snap.images.bytes());
-            let restored = restore(snap, settings, &fonts).unwrap();
-            println!("{site}: html {} raw -> {} kept ({:?}), css kept {css}, images {img}, snapshot {} KB, wake {:.1} ms",
-                html_raw, restored.sources.html.bytes.len(), restored.sources.html.encoding, (src + img) / 1024, millis(started));
-        }
     }
 
     fn page(src: &str) -> Loaded {

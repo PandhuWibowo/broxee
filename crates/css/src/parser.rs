@@ -159,6 +159,13 @@ fn parse_rules(
             break;
         };
         let close = block_end(s, open);
+        // Most dropped rules fail on a class or id the page lacks: find those from the text,
+        // before building selectors for them.
+        if vocabulary.is_some_and(|v| !v.text_could_match(&s[i..open])) {
+            sheet.skipped += 1;
+            i = close + 1;
+            continue;
+        }
         let mut selectors = parse_selector_list(&s[i..open]);
         if let Some(vocabulary) = vocabulary {
             let before = selectors.len();

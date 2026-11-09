@@ -157,6 +157,12 @@ pub struct GlyphBitmap {
 const MAX_GLYPH_PX: f32 = 512.0;
 
 pub fn rasterize_glyph(face: &Font, glyph: u32, size_px: f32) -> GlyphBitmap {
+    rasterize_glyph_at(face, glyph, size_px, 0.0)
+}
+
+/// `rasterize_glyph` with the outline moved right by `shift` pixels (0 to 1): the part of a
+/// glyph's position that falls between pixels, so text is spaced as its advances say.
+pub fn rasterize_glyph_at(face: &Font, glyph: u32, size_px: f32, shift: f32) -> GlyphBitmap {
     let Some(outline) = face.outline(glyph) else {
         return GlyphBitmap::default();
     };
@@ -166,10 +172,10 @@ pub fn rasterize_glyph(face: &Font, glyph: u32, size_px: f32) -> GlyphBitmap {
     let scale = size_px / face.units_per_em();
     let x0 = (outline.x_min * scale).floor() - 1.0;
     let top = (outline.y_max * scale).ceil() + 1.0;
-    let width = ((outline.x_max * scale).ceil() - x0 + 1.0).max(1.0) as usize;
+    let width = ((outline.x_max * scale + shift).ceil() - x0 + 1.0).max(1.0) as usize;
     let height = (top - (outline.y_min * scale).floor() + 1.0).max(1.0) as usize;
     let map = |x: f32, y: f32| Point {
-        x: x * scale - x0,
+        x: x * scale - x0 + shift,
         y: top - y * scale,
     };
 
@@ -208,6 +214,42 @@ mod tests {
         r.line(x1, y0, x1, y1);
         r.line(x1, y1, x0, y1);
         r.line(x0, y1, x0, y0);
+    }
+
+    #[test]
+    fn shifted_glyphs_move_by_the_shift() {
+        // Any font the machine has; the CI images have one of these.
+        let font = [
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ]
+        .iter()
+        .find_map(|p| Font::load(std::path::Path::new(p)).ok());
+        let Some(font) = font else {
+            return;
+        };
+        let glyph = font.glyph('l');
+        // The horizontal centre of the ink, in the bitmap's own coordinates plus `left`.
+        let centre = |shift: f32| {
+            let g = rasterize_glyph_at(&font, glyph, 24.0, shift);
+            let (mut sum, mut weight) = (0.0, 0.0);
+            for y in 0..g.height {
+                for x in 0..g.width {
+                    let c = f32::from(g.coverage[y * g.width + x]);
+                    sum += c * (x as f32 + 0.5 + g.left as f32);
+                    weight += c;
+                }
+            }
+            sum / weight
+        };
+        let base = centre(0.0);
+        for shift in [0.25, 0.5, 0.75] {
+            let moved = centre(shift) - base;
+            assert!(
+                (moved - shift).abs() < 0.05,
+                "shift {shift} moved the ink by {moved}"
+            );
+        }
     }
 
     #[test]

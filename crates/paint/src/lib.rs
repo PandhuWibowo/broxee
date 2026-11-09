@@ -15,7 +15,7 @@ use font::{FontSet, TextMetrics};
 use html::{Dom, FastBuildHasher, NodeId};
 use layout::{Layout, Rect};
 
-pub use raster::{rasterize_glyph, GlyphBitmap, Rasterizer};
+pub use raster::{rasterize_glyph, rasterize_glyph_at, GlyphBitmap, Rasterizer};
 
 /// RGBA8 pixels, row by row from the top, fully opaque.
 pub struct Frame {
@@ -125,6 +125,16 @@ struct GlyphKey {
     glyph: u32,
     /// Device pixel size in quarter pixels.
     size: u32,
+    /// Where the glyph starts within its pixel, in quarters (0 to 3).
+    phase: u8,
+}
+
+/// A pen position in device pixels as the pixel to draw at and the quarter-pixel phase to
+/// rasterize with: glyphs keep the spacing their advances give instead of snapping to whole
+/// pixels, with at most four bitmaps per glyph and size.
+fn place(x: f32) -> (i32, u8) {
+    let quarters = (x * 4.0).round() as i32;
+    (quarters.div_euclid(4), quarters.rem_euclid(4) as u8)
 }
 
 /// x0, y0, x1, y1 in frame pixels; drawing outside is discarded.
@@ -313,9 +323,12 @@ impl Painter {
                 continue;
             }
             let bitmap = match page.fonts {
-                Some(fonts) => {
-                    rasterize_glyph(fonts.face(key.bold), key.glyph, key.size as f32 / 4.0)
-                }
+                Some(fonts) => rasterize_glyph_at(
+                    fonts.face(key.bold),
+                    key.glyph,
+                    key.size as f32 / 4.0,
+                    f32::from(key.phase) / 4.0,
+                ),
                 None => GlyphBitmap::default(),
             };
             stats.glyphs_rasterized += 1;
@@ -408,16 +421,19 @@ impl Painter {
                     let mut pen = x;
                     for ch in text.chars() {
                         if !ch.is_whitespace() {
+                            let (at, phase) = place(pen);
                             let key = GlyphKey {
                                 bold,
                                 glyph: fonts.face(bold).glyph(ch),
                                 size: size_key,
+                                phase,
                             };
                             self.glyphs.entry(key).or_insert_with(|| {
-                                rasterize_glyph(fonts.face(bold), key.glyph, size)
+                                let shift = f32::from(phase) / 4.0;
+                                rasterize_glyph_at(fonts.face(bold), key.glyph, size, shift)
                             });
                             items.push(Item::Glyph {
-                                x: pen.round() as i32,
+                                x: at,
                                 y: baseline.round() as i32,
                                 key,
                                 color,
@@ -441,7 +457,6 @@ impl Painter {
         composite_band(target.pixels, band, 0, &items, &self.glyphs, &self.images);
     }
 
-    /// Drop the glyph cache when it grows past `max_bytes`, so browsing many pages cannot grow it forever.
     /// Decode the images this frame draws that are not cached yet, in parallel, then evict
     /// images no longer drawn while the cache is over budget. Returns how many were decoded.
     fn decode_images(&mut self, pictures: Vec<(ImageKey, &[u8])>) -> usize {
@@ -505,11 +520,18 @@ impl Painter {
         decoded
     }
 
+    /// Drop the glyph cache when it grows past `max_bytes`, so browsing many pages cannot grow it forever.
     pub fn trim(&mut self, max_bytes: usize) {
         let bytes: usize = self.glyphs.values().map(|g| g.coverage.len()).sum();
         if bytes > max_bytes {
             self.glyphs.clear();
         }
+    }
+
+    /// Forget every decoded image. Call it when the page changes: image ids are only unique
+    /// within one page, so another page's image 0 at the same size must not reuse the pixels.
+    pub fn forget_images(&mut self) {
+        self.images = HashMap::default();
     }
 
     fn build<'p>(
@@ -558,6 +580,10 @@ impl Painter {
                 None => NO_CLIP,
             };
 
+            // Only runs of fragments that reach into the view, in page coordinates.
+            let (top, bottom) = (scroll, scroll + height as f32 / s);
+            let boxes = Layout::in_view(&layout.box_extents, boxes, top, bottom);
+            let texts = Layout::in_view(&layout.text_extents, texts, top, bottom);
             for i in boxes {
                 let clip = to_clip(box_clips.at(i as u32));
                 let b = &layout.boxes[i];
@@ -647,14 +673,16 @@ impl Painter {
                 for ch in layout.text(t).chars() {
                     if !ch.is_whitespace() {
                         if let Some(fonts) = page.fonts {
+                            let (at, phase) = place(pen * s);
                             let key = GlyphKey {
                                 bold,
                                 glyph: fonts.face(bold).glyph(ch),
                                 size: size_key,
+                                phase,
                             };
                             wanted.push(key);
                             items.push(Item::Glyph {
-                                x: (pen * s).round() as i32,
+                                x: at,
                                 y: device_baseline,
                                 key,
                                 color,
@@ -741,10 +769,12 @@ fn composite_band(
     let canvas = order(band.canvas);
     if band.fill_canvas {
         for row in rows.chunks_mut(band.stride) {
-            row[band.left * 4..(band.left + band.width) * 4]
+            for px in row[band.left * 4..(band.left + band.width) * 4]
                 .as_chunks_mut::<4>()
                 .0
-                .fill([canvas.r, canvas.g, canvas.b, 255]);
+            {
+                *px = [canvas.r, canvas.g, canvas.b, 255];
+            }
         }
     }
     let (lo, hi) = (band.clip.0.max(0), band.clip.1.min(band.width as i32));
@@ -1026,6 +1056,80 @@ mod tests {
         );
         for y in [0, 48, 96] {
             assert_eq!(pixel(&f, 36, y), [0x12, 0x34, 0x56], "row {y}");
+        }
+    }
+
+    #[test]
+    fn places_glyphs_on_quarter_pixels() {
+        assert_eq!(place(10.0), (10, 0));
+        assert_eq!(place(10.3), (10, 1));
+        assert_eq!(place(10.5), (10, 2));
+        assert_eq!(place(10.74), (10, 3));
+        assert_eq!(place(10.9), (11, 0), "rounds to the nearest quarter");
+        assert_eq!(place(-0.3), (-1, 3), "left of the edge too");
+    }
+
+    #[test]
+    fn skipping_runs_out_of_view_draws_the_same_pixels() {
+        // A long page: rows with a border and text, a fixed bar, and an absolutely positioned
+        // box far down (in its own layer, painted after the long flow).
+        let rows: String = (0..2000)
+            .map(|i| format!("<div class=r><p>Row {i} text</p></div>"))
+            .collect();
+        let dom = html::parse(&format!("<div id=bar></div><div id=abs></div>{rows}"));
+        let author = parse_stylesheet(
+            "body { margin: 0 } .r { border-bottom: 1px solid #888; height: 20px } \
+             p { margin: 0; font-size: 12px } #bar { position: fixed; top: 0; height: 10px; \
+             width: 50px; background: #f00 } #abs { position: absolute; top: 15000px; \
+             left: 5px; width: 30px; height: 30px; background: #00f }",
+        );
+        let styles = cascade(
+            &dom,
+            &[
+                (Origin::UserAgent, user_agent_stylesheet()),
+                (Origin::Author, &author),
+            ],
+            &Media::default(),
+        );
+        let mut laid_out = layout::layout(
+            &dom,
+            &styles,
+            &Approximate,
+            &layout::no_images,
+            200.0,
+            100.0,
+        );
+        assert!(laid_out.boxes.len() > 2000 && laid_out.box_extents.len() > 5);
+        let paint = |layout: &Layout, scroll_y: f32| {
+            let page = Page {
+                dom: &dom,
+                styles: &styles,
+                layout,
+                metrics: &Approximate,
+                fonts: None,
+                images: None,
+            };
+            let view = Viewport {
+                width: 200.0,
+                height: 100.0,
+                scale: 2.0,
+                scroll_y,
+            };
+            Painter::new().paint(&page, view).0.pixels
+        };
+        // Views whose edge is 40 points into a run of boxes (borders every 21 points are drawn
+        // there), where a wrong extent would drop them. Text draws nothing without fonts here.
+        let mut scrolls = vec![0.0, 5000.0, 14_980.0, 39_900.0];
+        for &(top, bottom) in &laid_out.box_extents[1..5] {
+            scrolls.push(bottom - 40.0);
+            scrolls.push(top - 100.0 + 40.0);
+        }
+        let fast: Vec<Vec<u8>> = scrolls.iter().map(|&y| paint(&laid_out, y)).collect();
+        // Without the index: one run covering everything.
+        laid_out.box_extents = vec![(f32::MIN, f32::MAX); laid_out.box_extents.len()];
+        laid_out.text_extents = vec![(f32::MIN, f32::MAX); laid_out.text_extents.len()];
+        for (i, &y) in scrolls.iter().enumerate() {
+            assert!(fast[i] == paint(&laid_out, y), "same pixels at scroll {y}");
         }
     }
 

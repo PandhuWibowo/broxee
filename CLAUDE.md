@@ -29,7 +29,7 @@ crates/
   flate/   DEFLATE, zlib, gzip and Brotli decoding (brotli.rs; RFC 7932 dictionary and tables as
            data, CRC-checked in tests), CRC-32, Adler-32
   net/     URL parse + join, HTTP/1.1 over TCP, TLS (rustls), keep-alive pool, chunked bodies, gzip,
-           redirects, file://
+           redirects, file://, cookies.rs (per-profile jars), psl.rs (Public Suffix List, as data)
   html/    tokenizer.rs (byte-oriented, raw-text elements), entities.rs, lib.rs (tree builder + arena DOM,
            fast hasher shared with css, layout and paint)
   css/     parser.rs (rules, declarations, shorthands, @media), media.rs (query evaluation), grid.rs,
@@ -43,8 +43,11 @@ crates/
   paint/   display list, glyph rasterizer + cache, image cache + parallel decode, band compositing,
            streaming PNG writer
   platform/ macOS window via the Objective-C runtime, IOSurface frames (empty module on other OSes)
-  shell/   the `broxee` binary: main.rs (CLI), engine.rs (page pipeline, FontStore), browser.rs (history,
-           navigation, input, Screen trait), chrome.rs (header from DESIGN.md), pool.rs (fetch pool)
+  shell/   the `broxee` binary: main.rs (CLI), engine.rs (page pipeline, FontStore, snapshot/restore),
+           browser.rs (profiles, tabs, history, navigation, input, session file, Screen trait),
+           hibernate.rs (sleeping tabs on disk), palette.rs (⌘K results and ranking),
+           chrome.rs (sidebar, header and palette drawing from DESIGN.md),
+           pool.rs (fetch pool)
 scripts/
   budget.sh  60 MB check: binary size + peak RAM on a generated 2.6 MB page with a <style> block
 ```
@@ -71,7 +74,32 @@ casts), not taken from binding crates. Ask before proposing any dependency.
 - **Paint into the window's `IOSurface`, never into a separate buffer that is then copied.** At most two
   surfaces per window; the spare one is released when idle (`Window::release_spare`).
 - **Window memory is measured with `footprint <pid>` on a real window** (idle and `phys_footprint_peak`), not
-  only with the CLI: frame surfaces (16 MB each at Retina) and AppKit are on top of the page.
+  only with the CLI: frame surfaces (16 MB each at Retina) and AppKit are on top of the page. Measure a
+  sequence of heavy pages too, not only one page: freed memory left behind by earlier pages is what pushed the
+  peak past 60 MB in #1.
+- **`main` re-executes itself with `MallocSpaceEfficient=1` on macOS** (`space_efficient_malloc`). Without it
+  macOS malloc keeps 10+ MB of freed memory dirty after a heavy page. Nothing may run before that call
+  (threads, fonts, sockets): the exec replaces the process. If window memory jumps after a macOS update,
+  check this first.
+
+### Tab invariants
+
+- **Only the visible tab is a live page** (`Browser::page`). Every other tab is a file in `TabStore` or just
+  its history. Never keep a second `Loaded` around: a heavy page is 10 to 20 MB live.
+- **A snapshot holds only what the page was built from**, as it arrived (`net::Wire`): rebuilding must give the
+  same DOM, so `NodeId`s in the stored `ImageStore` stay valid. Do not store anything derived (styles, layout).
+- **Image ids in the painter are per page.** `Painter::forget_images` runs whenever the page changes (show,
+  sleep); skipping it shows another page's pixels.
+- **Switching profile calls `net::forget_sessions`.** Nothing that could link profiles (connections, TLS
+  tickets, and cookies once they exist) may be shared between them.
+- **One page load at a time.** `Browser::navigate` stops the running load before starting another, and every
+  tab or profile change stops it too. A finished load always belongs to the visible tab, because nothing can
+  change the visible tab without stopping it first. Keep both true when adding background work.
+- **Cookies belong to a profile.** Every fetch for a page passes that profile's jar (`engine::Jar`);
+  subresources use `net::Context::subresource`, which blocks other sites' cookies. Never log or print cookie
+  values, never write session cookies to disk, and keep cookie and session files 0600 (`write_private`).
+- **Session and tab files are data, never trusted**: every length and count is checked against what is left,
+  and damage gives a reload, not a panic.
 
 ### Testing the browser
 
@@ -98,6 +126,8 @@ casts), not taken from binding crates. Ask before proposing any dependency.
 - **Positioned boxes cost nothing per fragment.** Paint order is `Layout::layers` (index ranges) and clipping is
   `Layout::clips` (nested ranges); a fragment's position in the lists decides both. Anything that reorders or
   inserts fragments after layout must keep those ranges valid. Fixed layers never add to the scroll height.
+- **`box_extents` / `text_extents` are computed at the end of `layout()`** (`Layout::index`). Anything that moves
+  fragments after that must recompute them, or painting skips what is on screen.
 - **Every box is laid out once.** Flex items and inline blocks are sized from intrinsic widths
   (`intrinsic_width`, memoized, no layout), laid out at their final size, then moved with `shift_range` or
   grown with `stretch`. Do not add a measure-by-layout pass: nested containers would multiply it.
@@ -111,6 +141,9 @@ casts), not taken from binding crates. Ask before proposing any dependency.
 - **Stylesheets are parsed against the document's vocabulary** (`css::Vocabulary`): rules needing a tag, id,
   class, attribute or exact attribute value (`[data-theme=dark]`) the DOM lacks are dropped. Correct only while the DOM cannot gain names. When scripts arrive, keep the
   source text and re-parse without a vocabulary (or add the new names and re-parse) before restyling.
+- **`Vocabulary::text_could_match` may only reject what `could_match` rejects.** It skips anything inside
+  parentheses, brackets or strings and any escaped name. After changing either, run
+  `CHECK=1 cargo run --release -p css --example parse_bench -- page.html sheets...` on real sites.
 - **Presentational hints** (`hints.rs`) apply between UA and author rules; elements with hints skip the
   matched-rule cache because the result depends on attributes.
 - **Unsupported selectors are dropped, never approximated.** A selector Broxee cannot evaluate must not match;

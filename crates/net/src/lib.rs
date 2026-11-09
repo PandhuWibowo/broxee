@@ -4,6 +4,12 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod cookies;
+mod psl;
+
+pub use cookies::{Context, Cookie, Cookies, SameSite};
+pub use psl::site;
+
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
@@ -20,19 +26,25 @@ pub struct Url {
 }
 
 impl Url {
+    /// Parse an absolute URL the way the URL standard does for what Broxee supports: leading
+    /// and trailing spaces and controls are dropped, tabs and newlines inside are removed,
+    /// spaces and other unsafe bytes in the path and query are percent-encoded, and a host
+    /// with a space or another forbidden character is an error.
     pub fn parse(input: &str) -> Result<Url, String> {
-        let input = input.trim();
+        let cleaned = clean(input);
+        let input = cleaned.as_str();
         let (scheme, rest) = input
             .split_once("://")
             .ok_or_else(|| format!("missing scheme: {input}"))?;
         let scheme = scheme.to_ascii_lowercase();
 
         if scheme == "file" {
+            let path = rest.split('#').next().unwrap_or_default();
             return Ok(Url {
                 scheme,
                 host: String::new(),
                 port: 0,
-                path: rest.to_string(),
+                path: encode_path(path),
             });
         }
 
@@ -49,24 +61,41 @@ impl Url {
             path.to_string()
         };
 
+        // Credentials (`user:pass@`) are never sent: Broxee has no HTTP authentication.
+        let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
         let (host, port) = match authority.rsplit_once(':') {
+            Some((h, "")) => (h, default_port),
             Some((h, p)) => (h, p.parse().map_err(|_| format!("bad port: {p}"))?),
             None => (authority, default_port),
         };
         if host.is_empty() {
             return Err(format!("empty host: {input}"));
         }
+        if let Some(c) = host.chars().find(|&c| forbidden_in_host(c)) {
+            let what = if c == ' ' {
+                "a space".to_string()
+            } else {
+                format!("\"{c}\"")
+            };
+            return Err(format!("a host name can't contain {what}: {input}"));
+        }
         Ok(Url {
             scheme,
             host: host.to_ascii_lowercase(),
             port,
-            path: normalize_path(&path),
+            path: encode_path(&normalize_path(&path)),
         })
+    }
+
+    /// The path for display or the file system: percent escapes decoded.
+    pub fn decoded_path(&self) -> String {
+        String::from_utf8_lossy(&percent_decode(&self.path)).into_owned()
     }
 
     /// Resolve `href` (absolute, protocol-relative, root-relative or relative) against this URL.
     pub fn join(&self, href: &str) -> Result<Url, String> {
-        let href = href.trim();
+        let cleaned = clean(href);
+        let href = cleaned.as_str();
         if href.contains("://") {
             return Url::parse(href);
         }
@@ -87,9 +116,42 @@ impl Url {
             let dir = &base[..base.rfind('/').map(|i| i + 1).unwrap_or(0)];
             format!("{dir}{href}")
         };
-        url.path = normalize_path(&url.path);
+        url.path = encode_path(&normalize_path(&url.path));
         Ok(url)
     }
+}
+
+/// Drop leading and trailing C0 controls and spaces, and every tab and newline (URL standard,
+/// "basic URL parser", first steps).
+fn clean(input: &str) -> String {
+    input
+        .trim_matches(|c: char| c <= ' ')
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect()
+}
+
+/// Characters the URL standard forbids in a host name.
+fn forbidden_in_host(c: char) -> bool {
+    c <= ' '
+        || matches!(
+            c,
+            '#' | '%' | '/' | ':' | '<' | '>' | '?' | '@' | '[' | '\\' | ']' | '^' | '|' | '\u{7f}'
+        )
+}
+
+/// Percent-encode what may not appear raw in a path or query: controls, space, `"`, `<`,
+/// `>`, `` ` ``, `{`, `}`, DEL and every non-ASCII byte (as UTF-8). Existing escapes stay.
+fn encode_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for &b in path.as_bytes() {
+        if b <= b' ' || b >= 0x7f || matches!(b, b'"' | b'<' | b'>' | b'`' | b'{' | b'}') {
+            out.push_str(&format!("%{b:02X}"));
+        } else {
+            out.push(b as char);
+        }
+    }
+    out
 }
 
 impl fmt::Display for Url {
@@ -302,15 +364,28 @@ const IO_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_IDLE: usize = 8;
 const IDLE_FOR: Duration = Duration::from_secs(30);
 
-/// GET a URL, following redirects. A request that fails on a reused or reset connection is
-/// retried once on a fresh one.
+/// GET a URL without cookies, following redirects.
 pub fn fetch(url: &Url) -> Result<Response, String> {
+    fetch_in(url, None)
+}
+
+/// GET a URL, following redirects, sending and storing cookies of a profile's jar when given.
+/// A request that fails on a reused or reset connection is retried once on a fresh one.
+pub fn fetch_in(url: &Url, cookies: Option<(&Cookies, &Context)>) -> Result<Response, String> {
     let mut url = url.clone();
     for _ in 0..MAX_REDIRECTS {
-        let resp = match fetch_once(&url) {
-            Err(FetchError::Retryable(_)) => fetch_once(&url)?,
+        let header = cookies.and_then(|(jar, context)| jar.header(&url, context));
+        let resp = match fetch_once(&url, header.as_deref()) {
+            Err(FetchError::Retryable(_)) => fetch_once(&url, header.as_deref())?,
             other => other?,
         };
+        if let Some((jar, context)) = cookies {
+            for (name, value) in &resp.headers {
+                if name.eq_ignore_ascii_case("set-cookie") {
+                    jar.store(&url, value, context);
+                }
+            }
+        }
         if (300..400).contains(&resp.status) {
             if let Some(location) = resp.header("location") {
                 url = url.join(location)?;
@@ -322,9 +397,10 @@ pub fn fetch(url: &Url) -> Result<Response, String> {
     Err(format!("too many redirects ending at {url}"))
 }
 
-fn fetch_once(url: &Url) -> Result<Response, FetchError> {
+fn fetch_once(url: &Url, cookie: Option<&str>) -> Result<Response, FetchError> {
     if url.scheme == "file" {
-        let body = std::fs::read(&url.path).map_err(|e| format!("{}: {e}", url.path))?;
+        let path = url.decoded_path();
+        let body = std::fs::read(&path).map_err(|e| format!("{path}: {e}"))?;
         return Ok(Response {
             url: url.clone(),
             status: 200,
@@ -338,7 +414,7 @@ fn fetch_once(url: &Url) -> Result<Response, FetchError> {
         Some(conn) => (conn, true),
         None => (Conn::open(url)?, false),
     };
-    match request(&mut conn, url) {
+    match request(&mut conn, url, cookie) {
         Ok((resp, reusable)) => {
             if reusable {
                 put_idle(key, conn);
@@ -348,7 +424,7 @@ fn fetch_once(url: &Url) -> Result<Response, FetchError> {
         // A pooled connection the server already closed: not the server's answer.
         Err(FetchError::Retryable(_)) if reused => {
             let mut conn = Conn::open(url)?;
-            let (resp, reusable) = request(&mut conn, url)?;
+            let (resp, reusable) = request(&mut conn, url, cookie)?;
             if reusable {
                 put_idle(key, conn);
             }
@@ -358,16 +434,22 @@ fn fetch_once(url: &Url) -> Result<Response, FetchError> {
     }
 }
 
-fn request(conn: &mut Conn, url: &Url) -> Result<(Response, bool), FetchError> {
+fn request(
+    conn: &mut Conn,
+    url: &Url,
+    cookie: Option<&str>,
+) -> Result<(Response, bool), FetchError> {
     let host_header = if Some(url.port) == default_port(&url.scheme) {
         url.host.clone()
     } else {
         format!("{}:{}", url.host, url.port)
     };
+    // Cookie values never hold CR or LF: the jar refuses them when storing.
+    let cookie = cookie.map_or(String::new(), |c| format!("Cookie: {c}\r\n"));
     let request = format!(
         "GET {} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: {USER_AGENT}\r\n\
          Accept: text/html,*/*;q=0.8\r\nAccept-Encoding: br, gzip, deflate\r\n\
-         Connection: keep-alive\r\n\r\n",
+         {cookie}Connection: keep-alive\r\n\r\n",
         url.path
     );
     conn.stream
@@ -726,6 +808,84 @@ mod tests {
         assert_eq!(Url::parse("http://localhost:8080").unwrap().path, "/");
         assert_eq!(Url::parse("http://h:8080/").unwrap().port, 8080);
         assert!(Url::parse("ftp://x").is_err());
+    }
+
+    #[test]
+    fn handles_whitespace_as_the_url_standard_does() {
+        let u = |s: &str| Url::parse(s).map(|u| u.to_string());
+        assert_eq!(u("  https://e.com/a\n \t").unwrap(), "https://e.com/a");
+        assert_eq!(u("https://e.c\tom/a\nb").unwrap(), "https://e.com/ab");
+        assert_eq!(
+            u("https://e.com/a b?q=c d#x y").unwrap(),
+            "https://e.com/a%20b?q=c%20d"
+        );
+        assert_eq!(
+            u("https://e.com/caf\u{e9}").unwrap(),
+            "https://e.com/caf%C3%A9"
+        );
+        assert_eq!(
+            u("https://e.com/a%20b").unwrap(),
+            "https://e.com/a%20b",
+            "escapes stay"
+        );
+        assert_eq!(
+            u("https://e.com:/x").unwrap(),
+            "https://e.com/x",
+            "empty port"
+        );
+        assert_eq!(u("https://user:pw@e.com/").unwrap(), "https://e.com/");
+        // Valid by the standard: the space is in the path. Callers that take typed text
+        // reject several addresses in one (`shell::engine::to_url`, the address field).
+        assert_eq!(
+            u("https://e.org/wiki/Cat https://d.org/").unwrap(),
+            "https://e.org/wiki/Cat%20https:/d.org/"
+        );
+        let err = u("https://e.com https://d.org/").unwrap_err();
+        assert!(err.contains("can't contain a space"), "{err}");
+        assert!(u("https://e c.com/").is_err());
+        assert!(u("https://e<c.com/").is_err());
+
+        let base = Url::parse("https://e.com/dir/page").unwrap();
+        assert_eq!(
+            base.join(" my page.html\n").unwrap().path,
+            "/dir/my%20page.html"
+        );
+        assert!(!base.join("a b").unwrap().to_string().contains(' '));
+
+        let file = Url::parse("file:///tmp/My File.html").unwrap();
+        assert_eq!(file.to_string(), "file:///tmp/My%20File.html");
+        assert_eq!(file.decoded_path(), "/tmp/My File.html");
+        assert_eq!(percent_decode("a%2"), b"a%2", "a cut escape stays as it is");
+        assert_eq!(percent_decode("%41%zz"), b"A%zz");
+    }
+
+    /// A local server that closes the first `drops` connections right after reading the
+    /// request, then answers; returns its URL.
+    fn dropping_server(drops: usize) -> Url {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for (i, stream) in listener.incoming().enumerate() {
+                let Ok(mut stream) = stream else { break };
+                let mut request = [0u8; 2048];
+                let _ = stream.read(&mut request);
+                if i < drops {
+                    continue; // dropped: closed before any response
+                }
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+            }
+        });
+        Url::parse(&format!("http://{address}/")).unwrap()
+    }
+
+    #[test]
+    fn retries_a_get_once_when_the_connection_closes_before_answering() {
+        let resp = fetch(&dropping_server(1)).expect("the retry gets the answer");
+        assert_eq!((resp.status, resp.body.as_slice()), (200, &b"ok"[..]));
+        let err = fetch(&dropping_server(2)).expect_err("only one retry");
+        assert!(err.contains("closed before a response"), "{err}");
     }
 
     #[test]
