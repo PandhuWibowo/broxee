@@ -769,8 +769,11 @@ fn composite_band(
     let canvas = order(band.canvas);
     if band.fill_canvas {
         for row in rows.chunks_mut(band.stride) {
-            for px in row[band.left * 4..(band.left + band.width) * 4].chunks_exact_mut(4) {
-                px.copy_from_slice(&[canvas.r, canvas.g, canvas.b, 255]);
+            for px in row[band.left * 4..(band.left + band.width) * 4]
+                .as_chunks_mut::<4>()
+                .0
+            {
+                *px = [canvas.r, canvas.g, canvas.b, 255];
             }
         }
     }

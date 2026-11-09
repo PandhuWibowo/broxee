@@ -2,7 +2,18 @@
 
 ## Unreleased
 
+## 0.1.0 (2026-11-09)
+
+First preview release.
+
+### Fixed
+- Clean under Rust 1.99 clippy: `as_chunks` instead of `chunks_exact` with a constant size; code used only by
+  the macOS window no longer counts as dead on Linux builds.
+- Release workflow: fails early when the tag does not match the `Cargo.toml` version, and runs clippy.
+
 ### Added
+- `AGENTS.md` (renamed from `AGENT.md`, which agent tools do not read): overview, layout, invariants per crate,
+  toolchain, testing, commit conventions and the release steps.
 - Release workflow: pushing a `v*` tag builds macOS (arm64, x86_64) and Linux (x86_64) binaries, runs the tests
   and the 60 MB budget, and publishes a GitHub release with checksums.
 - README: screenshots rendered by Broxee and a Download section.

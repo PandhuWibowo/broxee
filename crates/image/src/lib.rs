@@ -192,7 +192,13 @@ impl Scaler {
             self.emit();
         }
         self.acc_target_row = target_row;
-        for (x, px) in rgba.chunks_exact(4).take(self.width as usize).enumerate() {
+        for (x, px) in rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .take(self.width as usize)
+            .enumerate()
+        {
             let a = u32::from(px[3]);
             let at = self.columns[x] as usize * 4;
             self.acc[at] += u32::from(px[0]) * a;
