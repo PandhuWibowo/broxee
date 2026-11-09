@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/flate", "crates/image", "crates/net", "crates/html", "crates/css", "crates/font", "crates/layout", "crates/paint", "crates/platform", "crates/shell"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 # Size budget: Broxee must stay under 60 MB.
