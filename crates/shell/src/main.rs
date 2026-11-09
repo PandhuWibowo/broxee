@@ -1,4 +1,6 @@
 mod engine;
+#[cfg(any(target_os = "macos", test))]
+mod hibernate;
 mod images;
 mod pool;
 
@@ -6,6 +8,8 @@ mod pool;
 mod browser;
 #[cfg(any(target_os = "macos", test))]
 mod chrome;
+#[cfg(any(target_os = "macos", test))]
+mod palette;
 
 use std::process::ExitCode;
 
@@ -17,12 +21,14 @@ use paint::{Painter, Viewport};
 use engine::{FontStore, Settings};
 
 const USAGE: &str =
-    "usage: broxee [<url-or-file>] [--window | --png FILE | --paint] [--tree | --styles | --layout] \
+    "usage: broxee [<url-or-file>...] [--window | --png FILE | --paint] [--tree | --styles | --layout] \
                      [--depth N] [--width PX] [--height PX] [--scale N] [--no-css-fetch]";
 
 #[derive(Clone)]
 struct Options {
     target: String,
+    /// More addresses for the window, each opened in its own tab after `target`.
+    more: Vec<String>,
     tree: bool,
     styles: bool,
     layout: bool,
@@ -37,9 +43,12 @@ struct Options {
 }
 
 fn main() -> ExitCode {
-    let mut target = None;
+    #[cfg(target_os = "macos")]
+    space_efficient_malloc();
+    let mut targets: Vec<String> = Vec::new();
     let mut opts = Options {
         target: String::new(),
+        more: Vec::new(),
         tree: false,
         styles: false,
         layout: false,
@@ -77,7 +86,7 @@ fn main() -> ExitCode {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;
             }
-            _ if target.is_none() => target = Some(arg),
+            _ if !arg.starts_with("--") => targets.push(arg),
             _ => {
                 eprintln!("unexpected argument: {arg}\n{USAGE}");
                 return ExitCode::from(2);
@@ -85,11 +94,18 @@ fn main() -> ExitCode {
         }
     }
     if opts.window {
-        // Without an address the window brings back the last session.
-        opts.target = target.unwrap_or_default();
+        // Without an address the window brings back the last session; with several, each
+        // gets a tab and the last one is shown.
+        let mut targets = targets.into_iter();
+        opts.target = targets.next().unwrap_or_default();
+        opts.more = targets.collect();
         return run_window(opts);
     }
-    let Some(target) = target else {
+    if targets.len() > 1 {
+        eprintln!("unexpected argument: {}\n{USAGE}", targets[1]);
+        return ExitCode::from(2);
+    }
+    let Some(target) = targets.pop() else {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
@@ -101,6 +117,29 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Restart once with `MallocSpaceEfficient=1`. macOS malloc otherwise keeps freed memory dirty
+/// in its per-CPU caches: after GitHub then example.com the window idled at 43 MB with 6.8 MB
+/// live, and peaked at 59 MB. With it: 29 MB idle, 48 MB peak, same timings (README,
+/// "Window memory"). libmalloc reads the variable only at process start, hence the exec. It is
+/// undocumented: if a macOS release ignores it, memory goes back up and nothing breaks.
+/// A value already set (including by the user, to turn it off with 0) is left alone.
+#[cfg(target_os = "macos")]
+fn space_efficient_malloc() {
+    use std::os::unix::process::CommandExt;
+    const VAR: &str = "MallocSpaceEfficient";
+    if std::env::var_os(VAR).is_some() {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    // `exec` only returns on failure; then carry on in this process with the default malloc.
+    let _ = std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env(VAR, "1")
+        .exec();
 }
 
 #[cfg(target_os = "macos")]
@@ -124,7 +163,7 @@ fn run(opts: &Options) -> Result<(), String> {
         dark: false,
         fetch_css: opts.fetch_css,
     };
-    let page = engine::load(&url, settings, &fonts, &mut |_| {})?;
+    let page = engine::load(&url, settings, &fonts, None, &mut |_| true)?;
 
     if opts.layout {
         let mut out = String::new();

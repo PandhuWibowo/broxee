@@ -74,6 +74,9 @@ pub struct Clip {
     pub rect: Rect,
 }
 
+/// Fragments per chunk of `Layout::box_extents` / `text_extents`.
+pub const CHUNK: usize = 256;
+
 pub struct Layout {
     pub boxes: Vec<BoxFragment>,
     /// Chunked: the stress page has 160k of these, and Vec growth would briefly hold two copies.
@@ -84,6 +87,13 @@ pub struct Layout {
     pub clips: Vec<Clip>,
     pub width: f32,
     pub height: f32,
+    /// For each run of `CHUNK` boxes, the top of the highest and the bottom of the lowest, in
+    /// page coordinates. Painting skips runs outside the view, so the cost of a frame follows
+    /// what is on screen, not the page's length. Runs may mix layers; that only widens them.
+    pub box_extents: Vec<(f32, f32)>,
+    /// The same for text runs, from the baseline up and down by the font size (what painting
+    /// tests a text run against).
+    pub text_extents: Vec<(f32, f32)>,
 }
 
 impl Layout {
@@ -126,7 +136,48 @@ impl Layout {
             clips: Vec::new(),
             width: 0.0,
             height: 0.0,
+            box_extents: Vec::new(),
+            text_extents: Vec::new(),
         }
+    }
+
+    /// Group fragments into runs of `CHUNK` and record each run's vertical extent.
+    fn index(&mut self, styles: &StyleMap) {
+        let extent = |runs: &mut Vec<(f32, f32)>, i: usize, top: f32, bottom: f32| {
+            if i.is_multiple_of(CHUNK) {
+                runs.push((top, bottom));
+            } else if let Some(run) = runs.last_mut() {
+                run.0 = run.0.min(top);
+                run.1 = run.1.max(bottom);
+            }
+        };
+        let mut boxes = Vec::with_capacity(self.boxes.len().div_ceil(CHUNK));
+        for (i, b) in self.boxes.iter().enumerate() {
+            extent(&mut boxes, i, b.rect.y, b.rect.y + b.rect.height);
+        }
+        let mut texts = Vec::with_capacity(self.texts.len().div_ceil(CHUNK));
+        for i in 0..self.texts.len() {
+            let t = &self.texts[i];
+            let size = styles.style(t.node).font_size.to_f32();
+            extent(&mut texts, i, t.baseline - size, t.baseline + size);
+        }
+        self.box_extents = boxes;
+        self.text_extents = texts;
+    }
+
+    /// The fragments of `range` (indices into `boxes` or `texts`, per `extents`) whose run
+    /// reaches between `top` and `bottom`, in order.
+    pub fn in_view(
+        extents: &[(f32, f32)],
+        range: Range<usize>,
+        top: f32,
+        bottom: f32,
+    ) -> impl Iterator<Item = usize> + '_ {
+        let first = range.start / CHUNK;
+        let last = range.end.div_ceil(CHUNK);
+        (first..last.min(extents.len()))
+            .filter(move |&c| extents[c].1 >= top && extents[c].0 <= bottom)
+            .flat_map(move |c| range.start.max(c * CHUNK)..range.end.min((c + 1) * CHUNK))
     }
 
     pub fn text(&self, fragment: &TextFragment) -> &str {
@@ -171,6 +222,8 @@ pub fn layout(
             clips: Vec::new(),
             width,
             height: 0.0,
+            box_extents: Vec::new(),
+            text_extents: Vec::new(),
         },
         items: Vec::new(),
         words: String::new(),
@@ -203,6 +256,7 @@ pub fn layout(
     }
     // The scrollable height includes content that overflows its box (`html { height: 100% }`).
     engine.out.height = content.max(engine.bottom).max(height);
+    engine.out.index(styles);
     engine.out
 }
 
@@ -1453,6 +1507,25 @@ fn collapse(a: f32, b: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn picks_the_runs_that_reach_the_view() {
+        // Three runs: 0..256 spans 0-100, 256..512 spans 90-200, 512..600 spans 500-600.
+        let extents = [(0.0, 100.0), (90.0, 200.0), (500.0, 600.0)];
+        let pick = |range: Range<usize>, top, bottom| -> Vec<usize> {
+            Layout::in_view(&extents, range, top, bottom).collect()
+        };
+        assert_eq!(pick(0..600, 150.0, 160.0), (256..512).collect::<Vec<_>>());
+        assert_eq!(pick(0..600, 95.0, 96.0).len(), 512, "both runs reach it");
+        assert_eq!(pick(0..600, 100.0, 100.0).len(), 512, "edges count");
+        assert!(pick(0..600, 300.0, 400.0).is_empty());
+        assert_eq!(
+            pick(520..560, 550.0, 560.0),
+            (520..560).collect::<Vec<_>>(),
+            "a layer's range"
+        );
+        assert_eq!(pick(250..260, 0.0, 1000.0), (250..260).collect::<Vec<_>>());
+    }
     use css::{cascade, parse_stylesheet, user_agent_stylesheet, Media, Origin};
     use font::Approximate;
 

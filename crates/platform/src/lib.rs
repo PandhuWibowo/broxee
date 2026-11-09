@@ -13,11 +13,29 @@ pub use macos::{release_free_memory, run_app, Window};
 /// Input from the user, in window points with the origin at the top left of the content area.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
-    /// Positive `dy` moves the content down (the user scrolled up).
+    /// Positive `dy` moves the content down (the user scrolled up); (x, y) is the pointer.
     Scroll {
         dy: f64,
+        x: f64,
+        y: f64,
     },
+    /// The primary button went down.
     Click {
+        x: f64,
+        y: f64,
+    },
+    /// The pointer moved with the button down.
+    Drag {
+        x: f64,
+        y: f64,
+    },
+    /// The button came up.
+    Release {
+        x: f64,
+        y: f64,
+    },
+    /// The pointer moved with no button down (for tooltips).
+    Hover {
         x: f64,
         y: f64,
     },
@@ -37,6 +55,8 @@ pub struct KeyEvent {
     pub key: Key,
     pub command: bool,
     pub shift: bool,
+    /// The Option (Alt) key: ⌘⌥B opens the bookmarks panel.
+    pub option: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

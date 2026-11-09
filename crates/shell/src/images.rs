@@ -124,6 +124,32 @@ impl ImageStore {
     pub fn bytes(&self) -> usize {
         self.entries.iter().map(|e| e.data.len()).sum()
     }
+
+    /// The compressed files and which element shows which, for storing a sleeping tab.
+    pub fn parts(&self) -> (Vec<&[u8]>, Vec<(NodeId, u32)>) {
+        let mut uses: Vec<(NodeId, u32)> = self.by_node.iter().map(|(&n, &i)| (n, i)).collect();
+        uses.sort_unstable();
+        (
+            self.entries.iter().map(|e| e.data.as_slice()).collect(),
+            uses,
+        )
+    }
+
+    /// Rebuild a store from `parts`. Uses that point past the files are dropped.
+    pub fn from_parts(files: Vec<Vec<u8>>, uses: Vec<(NodeId, u32)>) -> ImageStore {
+        let entries: Vec<Entry> = files
+            .into_iter()
+            .map(|data| Entry {
+                info: image::probe(&data),
+                data,
+            })
+            .collect();
+        let by_node = uses
+            .into_iter()
+            .filter(|&(_, i)| (i as usize) < entries.len())
+            .collect();
+        ImageStore { entries, by_node }
+    }
 }
 
 impl paint::ImageSource for ImageStore {

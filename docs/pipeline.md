@@ -9,7 +9,8 @@ depends on document order stays sequential.
 | Thread | Owns | Why |
 |---|---|---|
 | **Main (UI)** | the AppKit event loop, the window, presenting frames | macOS only allows UI calls on the main thread. It never does engine work, so the window stays responsive while a page loads. |
-| **Engine worker** | one page: fetch, parse, cascade, layout, display list | Keeps every page-level data structure (DOM, styles, layout) on one thread, so none of them need locks. |
+| **Engine** | the browser state, input handling, painting, the visible page | Keeps every page-level data structure on one thread at a time, so none of them need locks. It never waits on the network: it polls a running load once per frame (16 ms) and otherwise sleeps until an event arrives. |
+| **Loader** (one per page load) | one load: fetch, parse, subresources, cascade, layout | A load builds its `Loaded` alone and sends it to the engine thread whole. At most one runs at a time for memory; dropping its channel cancels it at the next stage boundary (a fetch already waiting finishes first, then the thread frees what it built). |
 | **Fetch pool** (scoped, up to 6) | one subresource request each | Network waits dominate load time. Six concurrent requests per page matches what browsers allow per host. Finished connections go to a shared keep-alive pool (`net`, up to 8 idle for 30 s), so later requests to the same host skip the TCP and TLS handshakes. |
 | **Raster bands** (scoped, one per core) | one horizontal band of the framebuffer each | Bands never overlap, so each thread writes its own rows with no locking. |
 | **Font loader** | reading font files at startup | Independent of the page, so it overlaps with the HTML request. |
@@ -45,8 +46,10 @@ thread) and, later, the JavaScript event loop (single-threaded, as in every brow
 | AppKit delivers scroll, click, key, paste and resize events | event-driven | main |
 | Events cross to the engine over a channel | async hand-off | main to engine |
 | The engine handles every queued event, then paints once (30 scroll events cost one frame) | coalesced, sequential | engine |
-| Navigation runs stages 2 to 9; after each stage the header's loading line is repainted | sequential | engine |
+| Navigation runs stages 2 to 9 on the loader thread; after each stage it reports progress and the engine thread repaints the loading line on its next frame | sequential, off the engine thread | loader, then engine |
 | Frames are painted straight into one of two `IOSurface`s; the one on screen is never written | double-buffered | engine, then main |
+| Switching tab: the visible page is reduced to its sources, written to disk, then dropped; the selected tab is read back and rebuilt with stages 2 to 9 (no fetches) | sequential | engine |
+| The session file is rewritten (temporary file, then rename) after each tab or navigation change | sequential, a few KB | engine |
 
 If the window server still holds the spare surface, the engine waits up to 50 ms for it rather than
 allocating a third 16 MB buffer; past that it reuses it and accepts one possibly torn frame.

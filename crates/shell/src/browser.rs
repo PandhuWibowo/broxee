@@ -1,9 +1,9 @@
 //! The window: tabs and profiles, navigation, history, scrolling, links and the address field.
 //!
-//! Only the visible tab holds a built page (DOM, styles, layout). Every other tab sleeps as a
-//! snapshot of what it was built from, compressed as it arrived (`engine::Snapshot`), or as
-//! just its history once snapshots pass their budget. Selecting a tab rebuilds it from its
-//! snapshot without the network, at its old scroll position.
+//! Only the visible tab holds a built page (DOM, styles, layout). Every other tab sleeps: what
+//! its page was built from, compressed as it arrived, goes to a private file on disk
+//! (`hibernate`), or the tab keeps just its history once those files pass their budget.
+//! Selecting a tab rebuilds it from its file without the network, at its old scroll position.
 //!
 //! Runs on the engine thread. Input arrives from the main thread over a channel; every event
 //! queued while the engine was busy is handled before the next frame, so a burst of scroll
@@ -12,18 +12,24 @@
 //! The browser draws through the `Screen` trait: the real window on macOS, an in-memory screen
 //! in tests. Tests drive it with synthetic events and local files, never the real desktop.
 
+use std::borrow::Cow;
 use std::path::PathBuf;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
+use std::sync::Arc;
+use std::time::Duration;
 
 use html::NodeId;
 use paint::{Painter, Target, Viewport};
 use platform::{Event, Key, KeyEvent};
 
 use crate::chrome::{
-    self, Button, Chrome, FieldView, Frame, HeaderView, Hue, SidebarItem, SidebarView, TabView,
-    HEADER_HEIGHT, SIDEBAR_WIDTH,
+    self, Button, Chrome, DialogView, FieldView, Frame, HeaderView, HintView, Hue, ListRow,
+    MenuView, PaletteHit, PaletteRow, PaletteView, SidebarItem, SidebarView, HEADER_HEIGHT,
+    SIDEBAR_MAX, SIDEBAR_MIN, SIDEBAR_WIDTH,
 };
-use crate::engine::{self, FontStore, Loaded, Settings, Snapshot};
+use crate::engine::{self, FontStore, Loaded, Settings};
+use crate::hibernate::{Stored, TabStore};
+use crate::palette::{self, Action, Command, Hint};
 use crate::Options;
 
 /// Arrow keys scroll by this many points.
@@ -32,9 +38,17 @@ const LINE_STEP: f32 = 40.0;
 const PAGE_OVERLAP: f32 = 40.0;
 /// The glyph cache is dropped past this size, so long sessions cannot grow it without bound.
 const GLYPH_CACHE_LIMIT: usize = 8 << 20;
-/// All sleeping tabs' snapshots together stay under this; past it, the tabs used longest ago
+/// Sleeping tabs' files together stay under this on disk; past it, the tabs used longest ago
 /// keep only their history and reload from the network when selected.
-const SNAPSHOT_BUDGET: usize = 8 << 20;
+const SNAPSHOT_BUDGET: u64 = 256 << 20;
+/// The folder of a first bookmark.
+const DEFAULT_FOLDER: &str = "Bookmarks";
+/// A bookmarks file past this many is cut there when read.
+const BOOKMARK_LIMIT: usize = 10_000;
+/// A tooltip shows after the pointer rests this long on something that has one.
+const TOOLTIP_DELAY: Duration = Duration::from_millis(600);
+/// How often the engine thread looks at a running load's progress: once per frame at 60 Hz.
+const LOAD_POLL: Duration = Duration::from_millis(16);
 /// Closed tabs that ⌘⇧T can reopen, per profile.
 const CLOSED_LIMIT: usize = 20;
 /// Session file limits, so a damaged file cannot make startup slow.
@@ -58,6 +72,8 @@ pub trait Screen {
     ) -> Result<(), String>;
     /// Nothing has happened for a while: free what only drawing needs.
     fn idle(&self) {}
+    /// Put text on the clipboard.
+    fn copy(&self, _text: &str) {}
 }
 
 #[cfg(target_os = "macos")]
@@ -82,6 +98,10 @@ impl Screen for platform::Window {
         self.release_spare();
     }
 
+    fn copy(&self, text: &str) {
+        self.copy_text(text);
+    }
+
     fn render(
         &self,
         width: usize,
@@ -95,10 +115,13 @@ impl Screen for platform::Window {
 #[cfg(target_os = "macos")]
 pub fn run(opts: Options) -> std::process::ExitCode {
     let (width, height) = (f64::from(opts.width), f64::from(opts.height));
-    let session = std::env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join("Library/Application Support/Broxee/session"));
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let session = home
+        .as_ref()
+        .map(|home| home.join("Library/Application Support/Broxee/session"));
+    let store = home.and_then(|home| TabStore::open(&home.join("Library/Caches/Broxee/tabs")).ok());
     platform::run_app("Broxee", width, height, move |window, events| {
-        Browser::new(opts, window, session).run(&events);
+        Browser::new(opts, window, session, store).run(&events);
     })
 }
 
@@ -106,6 +129,8 @@ pub fn run(opts: Options) -> std::process::ExitCode {
 struct Entry {
     url: net::Url,
     scroll: f32,
+    /// The page's title when it was last shown, for the palette's history results.
+    title: String,
 }
 
 /// A tab. The visible one's page lives in `Browser::page`; the others sleep.
@@ -114,11 +139,18 @@ struct Tab {
     history: Vec<Entry>,
     index: usize,
     title: String,
-    /// What a sleeping tab is rebuilt from. `None` for the visible tab, for a tab whose snapshot
-    /// went over budget, and for tabs restored from a session.
-    snapshot: Option<Snapshot>,
+    /// The file a sleeping tab is rebuilt from. `None` for the visible tab, for a tab whose
+    /// file went over budget, and for tabs restored from a session.
+    snapshot: Option<Stored>,
     /// When the tab was last visible, for choosing which snapshots to drop first.
     seen: u64,
+    /// The link that had keyboard focus when the tab went to sleep; the page is rebuilt
+    /// identically from its snapshot, so the node id still names it.
+    focused_link: Option<NodeId>,
+    /// Kept at the top of the list.
+    pinned: bool,
+    /// The tab group it belongs to, by name.
+    group: Option<String>,
 }
 
 impl Tab {
@@ -137,6 +169,130 @@ impl Tab {
     }
 }
 
+/// A page loading on its own thread for the visible tab. Dropping it cancels the load: the
+/// loader's next progress report fails and it stops, freeing what it built.
+struct Load {
+    url: net::Url,
+    to: Destination,
+    settings: Settings,
+    messages: Receiver<LoadMessage>,
+}
+
+/// Where a finished load goes in the tab's history.
+#[derive(Clone, Copy)]
+enum Destination {
+    /// A new entry after the current one (forward entries are dropped).
+    Push,
+    /// This existing entry (back, forward, reload, waking), restoring its scroll position.
+    Entry(usize),
+}
+
+enum LoadMessage {
+    Progress(f32),
+    /// Boxed: a channel slot is as large as its largest message.
+    Done(Box<Result<Loaded, String>>),
+}
+
+/// The ⋯ menu while it is open.
+struct Menu {
+    items: Vec<(String, MenuAction)>,
+    /// Chosen with ↑ ↓; none when opened with the mouse.
+    selected: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MenuAction {
+    CopyAddress,
+    /// Open this page in a new tab of profile `n`.
+    OpenIn(usize),
+    Bookmark,
+    Reload,
+    CloseTab,
+}
+
+/// The pointer resting on something with a tooltip.
+struct Hover {
+    at: (f32, f32),
+    text: String,
+    since: std::time::Instant,
+    shown: bool,
+}
+
+/// A focused link and where it is drawn: one rectangle per line it spans, in page coordinates
+/// (`true` when the rectangle is in a fixed layer and does not scroll).
+struct LinkFocus {
+    node: NodeId,
+    rects: Vec<(layout::Rect, bool)>,
+}
+
+/// A saved page.
+#[derive(Clone, Debug, PartialEq)]
+struct Bookmark {
+    title: String,
+    url: net::Url,
+    folder: String,
+}
+
+/// A small dialog over the pane: ⌘D's bookmark (name, folder) or a tab's group (name).
+struct Dialog {
+    kind: DialogKind,
+    fields: Vec<Field>,
+    active: usize,
+    /// Why Enter did not go through, shown in place of the help line.
+    error: Option<String>,
+}
+
+enum DialogKind {
+    Bookmark {
+        url: net::Url,
+        /// Editing this bookmark rather than adding one.
+        existing: Option<usize>,
+    },
+    /// Move the visible tab to a group; an empty name takes it out of its group.
+    Group,
+    NewProfile,
+    RenameProfile,
+    /// Remove the visible profile once its name is typed.
+    RemoveProfile,
+}
+
+/// A press in the sidebar that may become a drag.
+#[derive(Clone, Copy, Debug)]
+enum Drag {
+    /// On a tab row; it becomes a move once the pointer travels a few points.
+    Pressed { tab: usize, y: f32 },
+    /// A tab being moved; it lands before row `drop` of the list.
+    Moving { tab: usize, drop: usize },
+    /// The sidebar's edge, resizing it.
+    Resizing,
+}
+
+/// What the sidebar lists.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SidebarList {
+    Tabs,
+    Bookmarks,
+}
+
+/// What a sidebar row stands for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RowTarget {
+    Tab(usize),
+    Bookmark(usize),
+    Folder,
+    /// A section label of the tab list.
+    Section(Section),
+}
+
+/// Where a tab sits in the list.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Section {
+    Pinned,
+    /// The group of tab `n` (its first tab).
+    Group(usize),
+    Rest,
+}
+
 /// A closed tab ⌘⇧T can bring back: its history, not its page.
 struct Closed {
     history: Vec<Entry>,
@@ -148,25 +304,100 @@ struct Closed {
 /// Work and personal browsing kept apart: each profile has its own tabs and history, and
 /// switching drops every open connection and TLS session (`net::forget_sessions`).
 struct Profile {
-    name: &'static str,
+    /// Shown everywhere the profile is named; the person can change it.
+    name: String,
+    /// The profile's folder under `profiles/`; fixed, so renaming moves nothing.
+    id: String,
     hue: Hue,
     tabs: Vec<Tab>,
     active: usize,
     closed: Vec<Closed>,
+    /// This profile's cookies: logins in one profile never reach the other.
+    cookies: Arc<net::Cookies>,
+    bookmarks: Vec<Bookmark>,
+    /// Preselected in ⌘D's dialog (DESIGN.md, section 7).
+    last_folder: String,
+    /// Tab groups shown folded, by name.
+    folded: Vec<String>,
 }
 
 impl Profile {
-    fn new(name: &'static str, hue: Hue) -> Profile {
+    /// Read this profile's cookies and bookmarks from its folder.
+    fn load_files(&mut self, session: Option<&std::path::Path>) {
+        let read = |file| {
+            profile_file(session, &self.id, file)
+                .and_then(|path| std::fs::read_to_string(path).ok())
+        };
+        if let Some(text) = read("cookies") {
+            self.cookies = Arc::new(net::Cookies::load(&text));
+        }
+        if let Some(text) = read("bookmarks") {
+            let (bookmarks, last) = parse_bookmarks(&text);
+            self.bookmarks = bookmarks;
+            if let Some(last) = last {
+                self.last_folder = last;
+            }
+        }
+    }
+
+    /// Keep tabs in the order the sidebar shows them: pinned tabs, then each group (in the
+    /// order groups first appear), then the rest. The sort is stable and the active tab stays
+    /// active, so `⌘1` … `⌘9` follow what is on screen.
+    fn normalize(&mut self) {
+        let mut groups: Vec<String> = Vec::new();
+        for tab in &self.tabs {
+            if let Some(g) = tab.group.as_ref().filter(|_| !tab.pinned) {
+                if !groups.contains(g) {
+                    groups.push(g.clone());
+                }
+            }
+        }
+        let key = |tab: &Tab| match (&tab.group, tab.pinned) {
+            (_, true) => 0,
+            (Some(g), false) => 1 + groups.iter().position(|x| x == g).unwrap_or(0),
+            (None, false) => usize::MAX,
+        };
+        let mut order: Vec<usize> = (0..self.tabs.len()).collect();
+        order.sort_by_key(|&i| key(&self.tabs[i]));
+        let active = order.iter().position(|&i| i == self.active).unwrap_or(0);
+        let mut old: Vec<Option<Tab>> = std::mem::take(&mut self.tabs)
+            .into_iter()
+            .map(Some)
+            .collect();
+        self.tabs = order.iter().filter_map(|&i| old[i].take()).collect();
+        self.active = active;
+        self.folded.retain(|f| groups.contains(f));
+    }
+}
+
+impl Profile {
+    fn new(id: &str, name: &str, hue: Hue) -> Profile {
         Profile {
-            name,
+            name: name.to_string(),
+            id: id.to_string(),
             hue,
             tabs: vec![Tab::default()],
             active: 0,
             closed: Vec::new(),
+            cookies: Arc::new(net::Cookies::new()),
+            bookmarks: Vec::new(),
+            last_folder: DEFAULT_FOLDER.into(),
+            folded: Vec::new(),
         }
     }
 }
 
+/// The ⌘K palette while it is open.
+struct Palette {
+    query: Field,
+    /// What matches the query, best first.
+    items: Vec<palette::Item>,
+    selected: usize,
+    /// The first visible result: the list scrolls to keep `selected` in view.
+    first: usize,
+}
+
+#[derive(Default)]
 struct Field {
     text: String,
     /// Byte offset of the caret, always on a char boundary.
@@ -221,7 +452,8 @@ struct Browser<S: Screen> {
     window: S,
     painter: Painter,
     chrome: Chrome,
-    fonts: FontStore,
+    /// Shared with the loader thread.
+    fonts: Arc<FontStore>,
     width: f32,
     height: f32,
     scale: f32,
@@ -237,24 +469,70 @@ struct Browser<S: Screen> {
     profile: usize,
     sidebar: bool,
     clock: u64,
-    snapshot_budget: usize,
+    snapshot_budget: u64,
     session: Option<PathBuf>,
+    /// The session read at startup, applied by `start`.
+    restored: Option<Session>,
+    /// Where sleeping tabs go; without it they keep only their history.
+    store: Option<TabStore>,
     field: Option<Field>,
+    palette: Option<Palette>,
+    dialog: Option<Dialog>,
+    menu: Option<Menu>,
+    hover: Option<Hover>,
+    /// Sidebar width in points, 200 to 320.
+    sidebar_width: f32,
+    /// How far the sidebar's list is scrolled.
+    sidebar_scroll: f32,
+    drag: Option<Drag>,
+    list: SidebarList,
+    /// The bookmark row chosen with ↑ ↓ while the bookmarks panel is open.
+    bookmark_row: Option<usize>,
     /// Header button with keyboard focus, reached with Tab.
     focus: Option<Button>,
+    /// A link in the page with keyboard focus, reached with Tab after the header.
+    link_focus: Option<LinkFocus>,
+    /// Progress of `load`, for the header's loading line.
     loading: Option<f32>,
+    load: Option<Load>,
 }
 
 impl<S: Screen> Browser<S> {
-    fn new(opts: Options, window: S, session: Option<PathBuf>) -> Browser<S> {
+    fn new(
+        opts: Options,
+        window: S,
+        session: Option<PathBuf>,
+        store: Option<TabStore>,
+    ) -> Browser<S> {
         let (width, height) = window.size();
         let (scale, dark) = (window.scale() as f32, window.dark());
+        // The profiles of the last session, or Personal and Work; their files are read now,
+        // their tabs in `start`.
+        let restored = session
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|text| parse_session(&text))
+            .filter(|s| !s.profiles.is_empty());
+        let mut profiles: Vec<Profile> = match &restored {
+            Some(session) => session
+                .profiles
+                .iter()
+                .map(|p| Profile::new(&p.id, &p.name, p.hue))
+                .collect(),
+            None => vec![
+                Profile::new("Personal", "Personal", Hue::Emerald),
+                Profile::new("Work", "Work", Hue::Amber),
+            ],
+        };
+        for profile in &mut profiles {
+            profile.load_files(session.as_deref());
+        }
         Browser {
             opts,
             window,
             painter: Painter::new(),
             chrome: Chrome::new(dark),
-            fonts: FontStore::start(),
+            fonts: Arc::new(FontStore::start()),
             width: width as f32,
             height: height as f32,
             scale,
@@ -262,18 +540,28 @@ impl<S: Screen> Browser<S> {
             page: None,
             scroll: 0.0,
             page_is_entry: false,
-            profiles: vec![
-                Profile::new("Personal", Hue::Emerald),
-                Profile::new("Work", Hue::Amber),
-            ],
+            profiles,
             profile: 0,
             sidebar: true,
             clock: 0,
             snapshot_budget: SNAPSHOT_BUDGET,
+            restored,
             session,
+            store,
             field: None,
+            palette: None,
+            dialog: None,
+            menu: None,
+            hover: None,
+            sidebar_width: SIDEBAR_WIDTH,
+            sidebar_scroll: 0.0,
+            drag: None,
+            list: SidebarList::Tabs,
+            bookmark_row: None,
             focus: None,
+            link_focus: None,
             loading: None,
+            load: None,
         }
     }
 
@@ -290,7 +578,7 @@ impl<S: Screen> Browser<S> {
     /// Left edge of the pane, in points.
     fn pane_left(&self) -> f32 {
         if self.sidebar {
-            SIDEBAR_WIDTH.min(self.width)
+            self.sidebar_width.min(self.width)
         } else {
             0.0
         }
@@ -316,28 +604,41 @@ impl<S: Screen> Browser<S> {
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn run(&mut self, events: &Receiver<Event>) {
         /// How long without events before the window frees its spare frame.
-        const IDLE_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+        const IDLE_AFTER: Duration = Duration::from_secs(1);
         self.start();
         let mut trimmed = false;
         loop {
-            let event = match events.recv_timeout(IDLE_AFTER) {
-                Ok(event) => event,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if !trimmed {
-                        self.window.idle();
-                        trimmed = true;
-                    }
-                    continue;
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            // While a page loads, wake every frame to show its progress; otherwise sleep until
+            // an event arrives.
+            let mut wait = if self.load.is_some() {
+                LOAD_POLL
+            } else {
+                IDLE_AFTER
             };
-            let mut dirty = self.handle(event);
-            for event in events.try_iter() {
-                dirty |= self.handle(event);
+            // Wake when a waiting tooltip is due.
+            if let Some(h) = self.hover.as_ref().filter(|h| !h.shown) {
+                wait = wait.min(TOOLTIP_DELAY.saturating_sub(h.since.elapsed()));
             }
+            let mut dirty = false;
+            let mut quiet = false;
+            match events.recv_timeout(wait) {
+                Ok(event) => {
+                    dirty |= self.handle(event);
+                    for event in events.try_iter() {
+                        dirty |= self.handle(event);
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => quiet = true,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+            dirty |= self.poll_load();
+            dirty |= self.tick();
             if dirty {
                 self.render();
                 trimmed = false;
+            } else if quiet && self.load.is_none() && !trimmed {
+                self.window.idle();
+                trimmed = true;
             }
         }
     }
@@ -348,56 +649,91 @@ impl<S: Screen> Browser<S> {
         // The header needs fonts; they load in a few milliseconds, before the first frame.
         self.fonts.ready();
         self.render();
-        if let Some(text) = self
-            .session
-            .as_ref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-        {
-            if let Some((profiles, visible)) = parse_session(&text) {
-                for (profile, (tabs, active)) in self.profiles.iter_mut().zip(profiles) {
-                    if !tabs.is_empty() {
-                        profile.active = active.min(tabs.len() - 1);
-                        profile.tabs = tabs;
-                    }
+        if let Some(session) = self.restored.take() {
+            for (profile, saved) in self.profiles.iter_mut().zip(session.profiles) {
+                if !saved.tabs.is_empty() {
+                    profile.active = saved.active.min(saved.tabs.len() - 1);
+                    profile.tabs = saved.tabs;
+                    profile.folded = saved.folded;
+                    profile.normalize();
                 }
-                self.profile = visible.min(self.profiles.len() - 1);
+            }
+            self.profile = session.visible.min(self.profiles.len() - 1);
+            if let Some((width, shown)) = session.sidebar {
+                self.sidebar_width = width;
+                self.sidebar = shown;
             }
         }
-        let target = self.opts.target.trim().to_string();
-        if target.is_empty() {
+        let targets: Vec<String> = std::iter::once(&self.opts.target)
+            .chain(&self.opts.more)
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if targets.is_empty() {
             self.wake();
-            return;
         }
-        match engine::to_url(&target) {
-            Ok(url) => {
-                let p = &self.profiles[self.profile];
-                let open = p
-                    .tabs
-                    .iter()
-                    .position(|t| t.entry().is_some_and(|e| e.url == url));
-                match open {
-                    Some(i) => {
-                        self.profiles[self.profile].active = i;
-                        self.wake();
-                    }
-                    None => {
-                        if !self.tab().history.is_empty() {
-                            let p = &mut self.profiles[self.profile];
-                            p.tabs.push(Tab::default());
-                            p.active = p.tabs.len() - 1;
-                        }
-                        self.navigate(url, true);
-                    }
-                }
+        let last = targets.len().saturating_sub(1);
+        for (i, target) in targets.iter().enumerate() {
+            self.open_target(target);
+            // Each page sleeps before the next one loads; only the last one loads in the
+            // background while the window answers input.
+            if i < last {
+                self.wait_for_load();
             }
-            Err(e) => self.show_message("Broxee couldn't open that", &e),
+        }
+    }
+
+    /// An address from the command line: select its tab if one already shows it, otherwise
+    /// open it in a new tab (or in the first, empty one).
+    fn open_target(&mut self, target: &str) {
+        let url = match engine::to_url(target) {
+            Ok(url) => url,
+            Err(e) => return self.show_message("Broxee couldn't open that", &e),
+        };
+        let p = &self.profiles[self.profile];
+        let open = p
+            .tabs
+            .iter()
+            .position(|t| t.entry().is_some_and(|e| e.url == url));
+        if self.page.is_some() {
+            self.sleep();
+        }
+        let p = &mut self.profiles[self.profile];
+        match open {
+            Some(i) => {
+                p.active = i;
+                self.wake();
+            }
+            None => {
+                if !p.tabs[p.active].history.is_empty() {
+                    p.tabs.push(Tab::default());
+                    p.active = p.tabs.len() - 1;
+                }
+                self.navigate(url, Destination::Push);
+            }
         }
     }
 
     /// Apply one event; returns whether the frame needs repainting.
     fn handle(&mut self, event: Event) -> bool {
-        match event {
-            Event::Scroll { dy } => self.scroll_by(-(dy as f32)),
+        if let Event::Hover { x, y } = event {
+            return self.hover_at(x as f32, y as f32);
+        }
+        // Anything else hides a tooltip.
+        let hid = self.hover.take().is_some_and(|h| h.shown);
+        hid | match event {
+            Event::Scroll { dy, x, .. } if (x as f32) < self.pane_left() => {
+                let rows = self.sidebar_rows();
+                let max =
+                    chrome::sidebar_max_scroll(rows.rows.len(), rows.footer.is_some(), self.height);
+                let before = self.sidebar_scroll;
+                self.sidebar_scroll = (self.sidebar_scroll - dy as f32).clamp(0.0, max);
+                self.sidebar_scroll != before
+            }
+            Event::Scroll { dy, .. } => self.scroll_by(-(dy as f32)),
+            Event::Drag { x, y } => self.drag_to(x as f32, y as f32),
+            Event::Release { x, y } => self.release(x as f32, y as f32),
+            Event::Hover { .. } => false,
             Event::Resize {
                 width,
                 height,
@@ -416,13 +752,21 @@ impl<S: Screen> Browser<S> {
             }
             Event::Click { x, y } => self.click(x as f32, y as f32),
             Event::Key(key) => self.key(key),
-            Event::Paste(text) => match self.field.as_mut() {
-                Some(field) => {
-                    field.insert(text.trim().lines().next().unwrap_or_default());
-                    true
+            Event::Paste(text) => {
+                let line = text.trim().lines().next().unwrap_or_default();
+                if let Some(palette) = self.palette.as_mut() {
+                    palette.query.insert(line);
+                    self.refresh_palette();
+                    return true;
                 }
-                None => false,
-            },
+                match self.field.as_mut() {
+                    Some(field) => {
+                        field.insert(line);
+                        true
+                    }
+                    None => false,
+                }
+            }
         }
     }
 
@@ -433,6 +777,10 @@ impl<S: Screen> Browser<S> {
             engine::relayout(page, settings, &self.fonts);
         }
         self.clamp_scroll();
+        // The focused link moved with the layout.
+        if let Some(node) = self.link_focus.take().map(|l| l.node) {
+            self.focus_link(node, false);
+        }
     }
 
     fn max_scroll(&self) -> f32 {
@@ -457,17 +805,89 @@ impl<S: Screen> Browser<S> {
 
     fn click(&mut self, x: f32, y: f32) -> bool {
         let left = self.pane_left();
-        if x < left {
-            self.field = None;
-            self.focus = None;
-            let p = &self.profiles[self.profile];
-            return match chrome::sidebar_hit(x, y, p.tabs.len(), p.active) {
-                Some(SidebarItem::Profile) => self.switch_profile(),
-                Some(SidebarItem::Tab(i)) => self.select_tab(i),
-                Some(SidebarItem::CloseTab(_)) => self.close_tab(),
-                Some(SidebarItem::NewTab) => self.new_tab(),
-                None => false,
+        let pane_width = self.pane_width();
+        if let Some(menu) = &self.menu {
+            let hit = (x >= left)
+                .then(|| chrome::menu_hit(x - left, y, pane_width, menu.items.len()))
+                .flatten();
+            return match hit {
+                Some(Some(i)) => self.run_menu(i),
+                Some(None) => false,
+                None => {
+                    self.close_menu();
+                    true
+                }
             };
+        }
+        if let Some(d) = &mut self.dialog {
+            if x >= left {
+                return match chrome::dialog_hit(x - left, y, pane_width, d.fields.len()) {
+                    Some(Some(field)) => {
+                        d.active = field;
+                        true
+                    }
+                    Some(None) => false,
+                    None => {
+                        self.dialog = None;
+                        self.chrome.forget_palette();
+                        true
+                    }
+                };
+            }
+            self.dialog = None;
+            self.chrome.forget_palette();
+        }
+        if let Some(p) = &self.palette {
+            if x >= left {
+                let rows = (p.items.len() - p.first).min(chrome::palette_capacity(self.height));
+                return match chrome::palette_hit(x - left, y, self.pane_width(), rows) {
+                    PaletteHit::Row(i) => self.activate(p.first + i),
+                    PaletteHit::Inside => false,
+                    PaletteHit::Outside => self.close_palette(),
+                };
+            }
+            self.close_palette();
+        }
+        let in_sidebar = self.sidebar && x < left + 1.0;
+        if in_sidebar {
+            let hit = {
+                let list = self.sidebar_rows();
+                chrome::sidebar_hit(
+                    x,
+                    y,
+                    left,
+                    self.sidebar_scroll,
+                    &list.rows,
+                    list.footer.is_some(),
+                )
+                .map(|item| match item {
+                    SidebarItem::Row(r) | SidebarItem::CloseRow(r) | SidebarItem::Label(r) => {
+                        (item, Some(list.targets[r]))
+                    }
+                    _ => (item, None),
+                })
+            };
+            if let Some((SidebarItem::Edge, _)) = hit {
+                self.drag = Some(Drag::Resizing);
+                return false;
+            }
+            if x < left {
+                self.field = None;
+                self.focus = None;
+                return match hit {
+                    Some((SidebarItem::Profile, _)) => self.switch_profile(),
+                    Some((SidebarItem::Search, _)) => self.open_palette(),
+                    Some((SidebarItem::CloseRow(_), _)) => self.close_tab(),
+                    Some((SidebarItem::Footer, _)) => self.new_tab(),
+                    Some((_, Some(RowTarget::Tab(i)))) => {
+                        self.drag = Some(Drag::Pressed { tab: i, y });
+                        self.select_tab(i)
+                    }
+                    Some((_, Some(RowTarget::Bookmark(i)))) => self.open_bookmark(i),
+                    Some((_, Some(RowTarget::Section(Section::Group(i))))) => self.fold_group(i),
+                    _ => false,
+                };
+            }
         }
         let x = x - left;
         if y < HEADER_HEIGHT {
@@ -475,42 +895,69 @@ impl<S: Screen> Browser<S> {
             return match chrome::hit(x, self.pane_width()) {
                 Some(Button::Back) => self.back(),
                 Some(Button::Forward) => self.forward(),
-                Some(Button::Reload) => self.reload(),
+                Some(Button::Reload) => self.reload_or_stop(),
                 Some(Button::Address) => self.focus_field(),
+                Some(Button::More) => self.open_menu(false),
                 None => false,
             };
         }
         let was_editing = self.field.take().is_some() | self.focus.take().is_some();
+        let was_editing = was_editing | self.link_focus.take().is_some();
         if let Some(url) = self.link_at(x, y - HEADER_HEIGHT) {
-            self.save_scroll();
-            self.navigate(url, true);
+            self.follow(url);
             return true;
         }
         was_editing
     }
 
     fn key(&mut self, k: KeyEvent) -> bool {
+        if self.menu.is_some() {
+            if !k.command {
+                return self.menu_key(k.key);
+            }
+            self.close_menu();
+        }
+        if self.dialog.is_some() {
+            if !k.command {
+                return self.dialog_key(k);
+            }
+            // ⌘D closes it; any other shortcut closes it and runs.
+            self.dialog = None;
+            self.chrome.forget_palette();
+            if k.key == Key::Char('d') {
+                return true;
+            }
+        }
+        if self.palette.is_some() {
+            if !k.command {
+                return self.palette_key(k);
+            }
+            // ⌘K closes it; any other shortcut closes it and runs.
+            self.close_palette();
+            if k.key == Key::Char('k') {
+                return true;
+            }
+        }
         if k.command {
             return match k.key {
-                Key::Char('t') if k.shift => self.reopen_tab(),
-                Key::Char('t') => self.new_tab(),
-                Key::Char('w') => self.close_tab(),
-                Key::Char('p') if k.shift => self.switch_profile(),
-                Key::Char('\\') => {
-                    self.sidebar = !self.sidebar;
-                    self.relayout();
-                    true
-                }
+                Key::Char('k') => self.open_palette(),
+                Key::Char('b') if k.option => self.run_command(Command::ShowBookmarks),
+                Key::Char('d') => self.run_command(Command::BookmarkPage),
+                Key::Char('t') if k.shift => self.run_command(Command::ReopenTab),
+                Key::Char('t') => self.run_command(Command::NewTab),
+                Key::Char('w') => self.run_command(Command::CloseTab),
+                Key::Char('p') if k.shift => self.run_command(Command::SwitchProfile),
+                Key::Char('\\') => self.run_command(Command::ToggleSidebar),
                 // ⌘9 is the last tab, as in other browsers.
                 Key::Char('9') => {
                     let last = self.profiles[self.profile].tabs.len() - 1;
                     self.select_tab(last)
                 }
                 Key::Char(c @ '1'..='8') => self.select_tab(c as usize - '1' as usize),
-                Key::Char('l') => self.focus_field(),
-                Key::Char('[') => self.back(),
-                Key::Char(']') => self.forward(),
-                Key::Char('r') => self.reload(),
+                Key::Char('l') => self.run_command(Command::FocusAddress),
+                Key::Char('[') => self.run_command(Command::Back),
+                Key::Char(']') => self.run_command(Command::Forward),
+                Key::Char('r') => self.run_command(Command::Reload),
                 Key::Char('a') => match self.field.as_mut() {
                     Some(field) => {
                         field.all_selected = true;
@@ -541,10 +988,8 @@ impl<S: Screen> Browser<S> {
                     self.open_input(&input);
                 }
                 Key::Escape => self.field = None,
-                Key::Tab => {
-                    self.field = None;
-                    return self.move_focus(k.shift);
-                }
+                // `move_focus` closes the field, after reading where focus was.
+                Key::Tab => return self.move_focus(k.shift),
                 _ => return false,
             }
             return true;
@@ -556,8 +1001,9 @@ impl<S: Screen> Browser<S> {
                     return match button {
                         Button::Back => self.back(),
                         Button::Forward => self.forward(),
-                        Button::Reload => self.reload(),
+                        Button::Reload => self.reload_or_stop(),
                         Button::Address => self.focus_field(),
+                        Button::More => self.open_menu(true),
                     };
                 }
                 Key::Escape => {
@@ -569,6 +1015,34 @@ impl<S: Screen> Browser<S> {
         }
         if k.key == Key::Tab {
             return self.move_focus(k.shift);
+        }
+        if self.list == SidebarList::Bookmarks && self.focus.is_none() && self.link_focus.is_none()
+        {
+            if let Some(done) = self.bookmarks_key(k.key) {
+                return done;
+            }
+        }
+        if let Some(node) = self.link_focus.as_ref().map(|l| l.node) {
+            match k.key {
+                Key::Enter => {
+                    let url = self.page.as_ref().and_then(|p| link_for(p, node));
+                    return match url {
+                        Some(url) => {
+                            self.follow(url);
+                            true
+                        }
+                        None => false,
+                    };
+                }
+                Key::Escape => {
+                    self.link_focus = None;
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        if k.key == Key::Escape {
+            return self.stop_load();
         }
         let page = self.page_height() - PAGE_OVERLAP;
         match k.key {
@@ -583,51 +1057,967 @@ impl<S: Screen> Browser<S> {
         }
     }
 
-    /// Tab order through the header: back, forward, reload, address field. Disabled buttons
-    /// are skipped; the order wraps around.
+    /// Tab order: back, forward, reload, the address field, then the page's links in document
+    /// order. Disabled buttons and links that are not shown are skipped; the order wraps.
     fn move_focus(&mut self, backwards: bool) -> bool {
-        let order = [
-            Button::Back,
-            Button::Forward,
-            Button::Reload,
-            Button::Address,
-        ];
-        let current = if self.field.is_some() {
-            Some(Button::Address)
-        } else {
-            self.focus
-        };
-        let start = current.and_then(|b| order.iter().position(|&o| o == b));
+        #[derive(Clone, Copy, PartialEq)]
+        enum Stop {
+            Header(Button),
+            Link(NodeId),
+        }
         let tab = self.tab();
         let enabled = |b: Button| match b {
             Button::Back => tab.index > 0,
             Button::Forward => tab.index + 1 < tab.history.len(),
-            Button::Reload => !tab.history.is_empty(),
-            Button::Address => true,
+            Button::Reload => !tab.history.is_empty() || self.load.is_some(),
+            Button::Address | Button::More => true,
+        };
+        let mut order: Vec<Stop> = [
+            Button::Back,
+            Button::Forward,
+            Button::Reload,
+            Button::Address,
+            Button::More,
+        ]
+        .into_iter()
+        .filter(|&b| enabled(b))
+        .map(Stop::Header)
+        .collect();
+        if let Some(page) = &self.page {
+            order.extend(focusable_links(page).into_iter().map(Stop::Link));
+        }
+        let current = if self.field.is_some() {
+            Some(Stop::Header(Button::Address))
+        } else if let Some(link) = &self.link_focus {
+            Some(Stop::Link(link.node))
+        } else {
+            self.focus.map(Stop::Header)
         };
         let n = order.len();
-        for step in 1..=n {
-            let i = match (start, backwards) {
-                (Some(s), false) => (s + step) % n,
-                (Some(s), true) => (s + n - step) % n,
-                (None, false) => step - 1,
-                (None, true) => n - step,
-            };
-            if enabled(order[i]) {
-                self.field = None;
-                self.focus = None;
-                if order[i] == Button::Address {
-                    self.focus_field();
-                } else {
-                    self.focus = Some(order[i]);
+        let next = match (
+            current.and_then(|c| order.iter().position(|&o| o == c)),
+            backwards,
+        ) {
+            (Some(i), false) => (i + 1) % n,
+            (Some(i), true) => (i + n - 1) % n,
+            (None, false) => 0,
+            (None, true) => n - 1,
+        };
+        self.field = None;
+        self.focus = None;
+        self.link_focus = None;
+        match order[next] {
+            Stop::Header(Button::Address) => {
+                self.focus_field();
+            }
+            Stop::Header(button) => self.focus = Some(button),
+            Stop::Link(node) => self.focus_link(node, true),
+        }
+        true
+    }
+
+    /// Give `node` (a link) keyboard focus; with `reveal`, scroll it into view.
+    fn focus_link(&mut self, node: NodeId, reveal: bool) {
+        let Some(page) = &self.page else {
+            return;
+        };
+        let rects = link_rects(page, node, self.fonts.metrics());
+        if rects.is_empty() {
+            return;
+        }
+        if reveal {
+            const MARGIN: f32 = 40.0;
+            let view = self.page_height();
+            let scrolling = rects.iter().filter(|(_, fixed)| !fixed).map(|(r, _)| r);
+            let top = scrolling.clone().map(|r| r.y).fold(f32::MAX, f32::min);
+            let bottom = scrolling.map(|r| r.y + r.height).fold(f32::MIN, f32::max);
+            if top < f32::MAX {
+                if top < self.scroll + MARGIN {
+                    self.scroll_to(top - MARGIN);
+                } else if bottom > self.scroll + view - MARGIN {
+                    self.scroll_to((bottom - view + MARGIN).min(top - MARGIN));
                 }
-                return true;
             }
         }
-        false
+        self.link_focus = Some(LinkFocus { node, rects });
+    }
+
+    /// Follow a link the person chose, by click or with Enter.
+    fn follow(&mut self, url: net::Url) {
+        self.save_scroll();
+        // A link from another site does not carry SameSite=Strict cookies.
+        let from = self
+            .page
+            .as_ref()
+            .map(|p| net::site(&p.url.host).to_string());
+        let same_site = from.is_none_or(|from| from == net::site(&url.host));
+        self.navigate_from(url, Destination::Push, same_site);
+    }
+
+    /// Run a command, from its shortcut or the palette.
+    fn run_command(&mut self, command: Command) -> bool {
+        match command {
+            Command::NewTab => self.new_tab(),
+            Command::CloseTab => self.close_tab(),
+            Command::ReopenTab => self.reopen_tab(),
+            Command::SwitchProfile => self.switch_profile(),
+            Command::ToggleSidebar => {
+                self.sidebar = !self.sidebar;
+                self.relayout();
+                true
+            }
+            Command::FocusAddress => self.focus_field(),
+            Command::BookmarkPage => self.open_bookmark_dialog(),
+            Command::ShowBookmarks => {
+                self.list = match self.list {
+                    SidebarList::Tabs => SidebarList::Bookmarks,
+                    SidebarList::Bookmarks => SidebarList::Tabs,
+                };
+                self.bookmark_row = None;
+                if !self.sidebar {
+                    self.sidebar = true;
+                    self.relayout();
+                }
+                true
+            }
+            Command::RemoveBookmark => {
+                let url = self.tab().entry().map(|e| e.url.clone());
+                let p = &mut self.profiles[self.profile];
+                let before = p.bookmarks.len();
+                p.bookmarks.retain(|b| Some(&b.url) != url.as_ref());
+                let removed = p.bookmarks.len() != before;
+                if removed {
+                    self.save_bookmarks();
+                }
+                removed
+            }
+            Command::TogglePin => {
+                let p = &mut self.profiles[self.profile];
+                let tab = &mut p.tabs[p.active];
+                tab.pinned = !tab.pinned;
+                p.normalize();
+                self.reveal_active_tab();
+                self.save_session();
+                true
+            }
+            Command::MoveToGroup => {
+                let group = self.tab().group.clone().unwrap_or_default();
+                self.open_dialog(DialogKind::Group, vec![group]);
+                true
+            }
+            Command::FoldGroup => {
+                let p = &self.profiles[self.profile];
+                match p.tabs[p.active].group.is_some() {
+                    true => self.fold_group(p.active),
+                    false => false,
+                }
+            }
+            Command::NewProfile => {
+                self.open_dialog(DialogKind::NewProfile, vec![String::new()]);
+                true
+            }
+            Command::RenameProfile => {
+                let name = self.profiles[self.profile].name.clone();
+                self.open_dialog(DialogKind::RenameProfile, vec![name]);
+                true
+            }
+            Command::RecolorProfile => {
+                let p = &mut self.profiles[self.profile];
+                let at = Hue::ALL.iter().position(|&h| h == p.hue).unwrap_or(0);
+                p.hue = Hue::ALL[(at + 1) % Hue::ALL.len()];
+                self.save_session();
+                true
+            }
+            Command::RemoveProfile => {
+                self.open_dialog(DialogKind::RemoveProfile, vec![String::new()]);
+                true
+            }
+            Command::ClearCookies => {
+                let cookies = &self.profiles[self.profile].cookies;
+                cookies.clear();
+                self.save_cookies();
+                // Connections may still be tied to the old cookies on the server's side.
+                net::forget_sessions();
+                true
+            }
+            Command::Back => self.back(),
+            Command::Forward => self.forward(),
+            Command::Reload => self.reload(),
+        }
+    }
+
+    fn open_palette(&mut self) -> bool {
+        self.field = None;
+        self.focus = None;
+        self.palette = Some(Palette {
+            query: Field::default(),
+            items: Vec::new(),
+            selected: 0,
+            first: 0,
+        });
+        self.refresh_palette();
+        true
+    }
+
+    /// ⌘D: name and file the visible page; a page already saved opens its bookmark.
+    fn open_bookmark_dialog(&mut self) -> bool {
+        let Some(entry) = self.tab().entry() else {
+            return false;
+        };
+        let url = entry.url.clone();
+        let title = self.tab().title().to_string();
+        let p = &self.profiles[self.profile];
+        let existing = p.bookmarks.iter().position(|b| b.url == url);
+        let (name, folder) = match existing {
+            Some(i) => (p.bookmarks[i].title.clone(), p.bookmarks[i].folder.clone()),
+            None => (title, p.last_folder.clone()),
+        };
+        self.open_dialog(DialogKind::Bookmark { url, existing }, vec![name, folder]);
+        true
+    }
+
+    /// Open a dialog with these field values; the first is selected, so typing replaces it.
+    fn open_dialog(&mut self, kind: DialogKind, values: Vec<String>) {
+        self.close_palette();
+        self.field = None;
+        self.focus = None;
+        let fields = values
+            .into_iter()
+            .enumerate()
+            .map(|(i, text)| Field {
+                cursor: text.len(),
+                text,
+                all_selected: i == 0,
+            })
+            .collect();
+        self.dialog = Some(Dialog {
+            kind,
+            fields,
+            active: 0,
+            error: None,
+        });
+    }
+
+    fn dialog_key(&mut self, k: KeyEvent) -> bool {
+        let Some(d) = self.dialog.as_mut() else {
+            return false;
+        };
+        let field = &mut d.fields[d.active];
+        match k.key {
+            Key::Char(c) => field.insert(c.encode_utf8(&mut [0; 4])),
+            Key::Backspace => field.backspace(),
+            Key::Left => field.left(),
+            Key::Right => field.right(),
+            Key::Home => {
+                field.all_selected = false;
+                field.cursor = 0;
+            }
+            Key::End => {
+                field.all_selected = false;
+                field.cursor = field.text.len();
+            }
+            Key::Tab | Key::Up | Key::Down => {
+                field.all_selected = false;
+                d.active = (d.active + 1) % d.fields.len();
+                // Typing replaces the field just reached, as in macOS dialogs.
+                d.fields[d.active].all_selected = true;
+            }
+            Key::Escape => {
+                self.dialog = None;
+                self.chrome.forget_palette();
+            }
+            Key::Enter => return self.finish_dialog(),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Enter in a dialog: save what it edits.
+    fn finish_dialog(&mut self) -> bool {
+        let Some(d) = self.dialog.take() else {
+            return false;
+        };
+        self.chrome.forget_palette();
+        let clean = |s: &str| s.trim().replace(['\t', '\n', '\r'], " ");
+        let (url, existing) = match d.kind {
+            DialogKind::Bookmark { url, existing } => (url, existing),
+            DialogKind::NewProfile | DialogKind::RenameProfile | DialogKind::RemoveProfile => {
+                return self.finish_profile_dialog(d);
+            }
+            DialogKind::Group => {
+                let name = clean(&d.fields[0].text);
+                let p = &mut self.profiles[self.profile];
+                let tab = &mut p.tabs[p.active];
+                tab.group = (!name.is_empty()).then_some(name);
+                tab.pinned = false;
+                p.normalize();
+                self.reveal_active_tab();
+                self.save_session();
+                return true;
+            }
+        };
+        let title = match clean(&d.fields[0].text) {
+            t if t.is_empty() => url.to_string(),
+            t => t,
+        };
+        let folder = match clean(&d.fields[1].text) {
+            f if f.is_empty() => DEFAULT_FOLDER.to_string(),
+            f => f,
+        };
+        let p = &mut self.profiles[self.profile];
+        let bookmark = Bookmark {
+            title,
+            url,
+            folder: folder.clone(),
+        };
+        match existing.filter(|&i| i < p.bookmarks.len()) {
+            Some(i) => p.bookmarks[i] = bookmark,
+            None => p.bookmarks.push(bookmark),
+        }
+        p.last_folder = folder;
+        self.save_bookmarks();
+        true
+    }
+
+    /// Enter in a profile dialog. A name that cannot be used keeps the dialog open and says why.
+    fn finish_profile_dialog(&mut self, mut d: Dialog) -> bool {
+        let name: String = d.fields[0]
+            .text
+            .trim()
+            .replace(['\t', '\n', '\r'], " ")
+            .chars()
+            .take(MAX_NAME)
+            .collect();
+        let taken = |except: Option<usize>| {
+            self.profiles
+                .iter()
+                .enumerate()
+                .any(|(i, p)| Some(i) != except && p.name.eq_ignore_ascii_case(&name))
+        };
+        let error = match d.kind {
+            DialogKind::RemoveProfile if self.profiles.len() == 1 => {
+                Some("Broxee needs at least one profile.".to_string())
+            }
+            DialogKind::RemoveProfile if name != self.profiles[self.profile].name => Some(format!(
+                "Type {} exactly to remove it.",
+                self.profiles[self.profile].name
+            )),
+            DialogKind::RemoveProfile => None,
+            _ if name.is_empty() => Some("A profile needs a name.".to_string()),
+            DialogKind::RenameProfile if taken(Some(self.profile)) => {
+                Some(format!("There is already a profile called {name}."))
+            }
+            DialogKind::NewProfile if taken(None) => {
+                Some(format!("There is already a profile called {name}."))
+            }
+            DialogKind::NewProfile if self.profiles.len() >= MAX_PROFILES => {
+                Some(format!("Broxee keeps at most {MAX_PROFILES} profiles."))
+            }
+            _ => None,
+        };
+        if let Some(error) = error {
+            d.error = Some(error);
+            self.dialog = Some(d);
+            return true;
+        }
+        match d.kind {
+            DialogKind::RenameProfile => {
+                self.profiles[self.profile].name = name;
+            }
+            DialogKind::NewProfile => {
+                // The first color no profile uses yet, or the least used.
+                let used = |h: Hue| self.profiles.iter().filter(|p| p.hue == h).count();
+                let hue = Hue::ALL
+                    .iter()
+                    .copied()
+                    .min_by_key(|&h| used(h))
+                    .unwrap_or(Hue::Emerald);
+                let mut n = self.profiles.len() + 1;
+                let id = loop {
+                    let id = format!("profile-{n}");
+                    if !self.profiles.iter().any(|p| p.id.eq_ignore_ascii_case(&id)) {
+                        break id;
+                    }
+                    n += 1;
+                };
+                let mut profile = Profile::new(&id, &name, hue);
+                profile.load_files(self.session.as_deref());
+                self.profiles.push(profile);
+                let last = self.profiles.len() - 1;
+                self.show_tab(last, 0);
+            }
+            DialogKind::RemoveProfile => {
+                self.stop_load();
+                self.page = None;
+                self.page_is_entry = false;
+                let gone = self.profiles.remove(self.profile);
+                // Its tabs, history, cookies and bookmarks go with it.
+                if let Some(dir) = profile_file(self.session.as_deref(), &gone.id, "") {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+                net::forget_sessions();
+                self.profile = self.profile.min(self.profiles.len() - 1);
+                self.wake();
+            }
+            _ => {}
+        }
+        self.save_session();
+        true
+    }
+
+    /// Open the ⋯ menu; from the keyboard, with its first item chosen.
+    fn open_menu(&mut self, keyboard: bool) -> bool {
+        self.close_palette();
+        self.field = None;
+        let entry = self.tab().entry().is_some();
+        let mut items = Vec::new();
+        if entry {
+            items.push(("Copy address".to_string(), MenuAction::CopyAddress));
+            for (i, p) in self.profiles.iter().enumerate() {
+                if i != self.profile {
+                    items.push((format!("Open in {}", p.name), MenuAction::OpenIn(i)));
+                }
+            }
+            items.push(("Bookmark this page".to_string(), MenuAction::Bookmark));
+            items.push(("Reload".to_string(), MenuAction::Reload));
+        }
+        items.push(("Close tab".to_string(), MenuAction::CloseTab));
+        self.menu = Some(Menu {
+            items,
+            selected: keyboard.then_some(0),
+        });
+        true
+    }
+
+    fn close_menu(&mut self) {
+        if self.menu.take().is_some() {
+            self.chrome.forget_palette();
+        }
+    }
+
+    fn menu_key(&mut self, key: Key) -> bool {
+        let Some(menu) = self.menu.as_mut() else {
+            return false;
+        };
+        let last = menu.items.len() - 1;
+        match key {
+            Key::Down | Key::Tab => {
+                menu.selected = Some(menu.selected.map_or(0, |i| (i + 1).min(last)));
+            }
+            Key::Up => menu.selected = Some(menu.selected.map_or(last, |i| i.saturating_sub(1))),
+            Key::Enter | Key::Char(' ') => {
+                return match menu.selected {
+                    Some(i) => self.run_menu(i),
+                    None => false,
+                };
+            }
+            Key::Escape => self.close_menu(),
+            _ => return false,
+        }
+        true
+    }
+
+    fn run_menu(&mut self, index: usize) -> bool {
+        let Some(action) = self
+            .menu
+            .as_ref()
+            .and_then(|m| m.items.get(index))
+            .map(|(_, a)| *a)
+        else {
+            return false;
+        };
+        self.close_menu();
+        let url = self.tab().entry().map(|e| e.url.clone());
+        match (action, url) {
+            (MenuAction::CopyAddress, Some(url)) => {
+                self.window.copy(&url.to_string());
+                true
+            }
+            (MenuAction::OpenIn(p), Some(url)) if p < self.profiles.len() => {
+                // A new tab in the other profile, with that profile's cookies.
+                self.sleep();
+                net::forget_sessions();
+                self.profile = p;
+                let profile = &mut self.profiles[p];
+                profile.tabs.push(Tab::default());
+                profile.active = profile.tabs.len() - 1;
+                self.navigate(url, Destination::Push);
+                self.reveal_active_tab();
+                self.save_session();
+                true
+            }
+            (MenuAction::Bookmark, Some(_)) => self.open_bookmark_dialog(),
+            (MenuAction::Reload, Some(_)) => self.reload(),
+            (MenuAction::CloseTab, _) => self.close_tab(),
+            _ => false,
+        }
+    }
+
+    /// What a tooltip at (x, y) would say: icon buttons and their shortcuts, sleeping tabs.
+    fn tooltip_at(&self, x: f32, y: f32) -> Option<String> {
+        let left = self.pane_left();
+        if x >= left && y < HEADER_HEIGHT {
+            return Some(
+                match chrome::hit(x - left, self.pane_width())? {
+                    Button::Back => "Back ⌘[",
+                    Button::Forward => "Forward ⌘]",
+                    Button::Reload if self.load.is_some() => "Stop Esc",
+                    Button::Reload => "Reload ⌘R",
+                    Button::More => "More",
+                    Button::Address => return None,
+                }
+                .to_string(),
+            );
+        }
+        if !self.sidebar || x >= left {
+            return None;
+        }
+        let list = self.sidebar_rows();
+        let item = chrome::sidebar_hit(x, y, left, self.sidebar_scroll, &list.rows, false)?;
+        let active = self.profiles[self.profile].active;
+        let text = match item {
+            SidebarItem::Profile => "Switch profile ⌘⇧P",
+            SidebarItem::CloseRow(_) => "Close tab ⌘W",
+            SidebarItem::Row(r) => match list.targets.get(r) {
+                Some(&RowTarget::Tab(i)) if i != active => "Asleep to save memory. Select to wake.",
+                _ => return None,
+            },
+            _ => return None,
+        };
+        Some(text.to_string())
+    }
+
+    /// The pointer moved: start waiting for a new tooltip, or hide the one shown.
+    fn hover_at(&mut self, x: f32, y: f32) -> bool {
+        let text = self.tooltip_at(x, y);
+        let same = self.hover.as_ref().map(|h| &h.text) == text.as_ref();
+        if same {
+            return false;
+        }
+        let was_shown = self.hover.as_ref().is_some_and(|h| h.shown);
+        self.hover = text.map(|text| Hover {
+            at: (x, y),
+            text,
+            since: std::time::Instant::now(),
+            shown: false,
+        });
+        was_shown
+    }
+
+    /// Timers: show a tooltip once the pointer has rested long enough.
+    fn tick(&mut self) -> bool {
+        match self.hover.as_mut() {
+            Some(h) if !h.shown && h.since.elapsed() >= TOOLTIP_DELAY => {
+                h.shown = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Fold or unfold the group of tab `tab`.
+    fn fold_group(&mut self, tab: usize) -> bool {
+        let p = &mut self.profiles[self.profile];
+        let Some(group) = p.tabs.get(tab).and_then(|t| t.group.clone()) else {
+            return false;
+        };
+        match p.folded.iter().position(|g| *g == group) {
+            Some(i) => {
+                p.folded.remove(i);
+            }
+            None => p.folded.push(group),
+        }
+        let max = {
+            let rows = self.sidebar_rows();
+            chrome::sidebar_max_scroll(rows.rows.len(), rows.footer.is_some(), self.height)
+        };
+        self.sidebar_scroll = self.sidebar_scroll.min(max);
+        self.save_session();
+        true
+    }
+
+    /// Scroll the sidebar so the active tab's row is in view.
+    fn reveal_active_tab(&mut self) {
+        if self.list != SidebarList::Tabs {
+            return;
+        }
+        let active = self.profiles[self.profile].active;
+        let (row, count, footer) = {
+            let rows = self.sidebar_rows();
+            let row = rows
+                .targets
+                .iter()
+                .position(|t| *t == RowTarget::Tab(active));
+            (row, rows.rows.len(), rows.footer.is_some())
+        };
+        let Some(row) = row else {
+            return;
+        };
+        let view = self.height - chrome::LIST_TOP;
+        let top = chrome::TAB_ROW * row as f32;
+        if top < self.sidebar_scroll {
+            self.sidebar_scroll = top;
+        } else if top + chrome::TAB_ROW > self.sidebar_scroll + view {
+            self.sidebar_scroll = top + chrome::TAB_ROW - view;
+        }
+        let max = chrome::sidebar_max_scroll(count, footer, self.height);
+        self.sidebar_scroll = self.sidebar_scroll.clamp(0.0, max);
+    }
+
+    /// The pointer moved with the button down: resize the sidebar or move a tab.
+    fn drag_to(&mut self, x: f32, y: f32) -> bool {
+        match self.drag {
+            Some(Drag::Resizing) => {
+                let width = x.round().clamp(SIDEBAR_MIN, SIDEBAR_MAX);
+                let changed = width != self.sidebar_width;
+                self.sidebar_width = width;
+                changed
+            }
+            Some(Drag::Pressed { tab, y: from }) if (y - from).abs() > 4.0 => {
+                let rows = self.sidebar_rows().rows.len();
+                let drop = chrome::sidebar_drop(y, self.sidebar_scroll, rows);
+                self.drag = Some(Drag::Moving { tab, drop });
+                true
+            }
+            Some(Drag::Moving { tab, drop }) => {
+                let rows = self.sidebar_rows().rows.len();
+                let to = chrome::sidebar_drop(y, self.sidebar_scroll, rows);
+                self.drag = Some(Drag::Moving { tab, drop: to });
+                to != drop
+            }
+            _ => false,
+        }
+    }
+
+    /// The button came up: finish a resize or a move.
+    fn release(&mut self, _x: f32, _y: f32) -> bool {
+        match self.drag.take() {
+            Some(Drag::Resizing) => {
+                // The page is laid out again once, for the final width.
+                self.relayout();
+                self.save_session();
+                true
+            }
+            Some(Drag::Moving { tab, drop }) => self.move_tab(tab, drop),
+            _ => false,
+        }
+    }
+
+    /// Move tab `tab` to land before row `drop` of the tab list. It joins the section it
+    /// lands in: pinned, a group, or neither.
+    fn move_tab(&mut self, tab: usize, drop: usize) -> bool {
+        let targets = self.sidebar_rows().targets;
+        let p = &mut self.profiles[self.profile];
+        if tab >= p.tabs.len() {
+            return false;
+        }
+        // The section of the row just above the landing point (or the first row's).
+        let above = drop.checked_sub(1).or((!targets.is_empty()).then_some(0));
+        let section = match above.and_then(|r| targets.get(r)) {
+            Some(RowTarget::Section(section)) => *section,
+            Some(&RowTarget::Tab(i)) if p.tabs[i].pinned => Section::Pinned,
+            Some(&RowTarget::Tab(i)) => match p.tabs[i].group {
+                Some(_) => Section::Group(i),
+                None => Section::Rest,
+            },
+            _ => Section::Rest,
+        };
+        let group = match section {
+            Section::Group(i) => p.tabs[i].group.clone(),
+            _ => None,
+        };
+        // Where it goes among the other tabs: after the tab above, or first in a section.
+        let after = targets[..drop.min(targets.len())]
+            .iter()
+            .rev()
+            .find_map(|t| match t {
+                RowTarget::Tab(i) if *i != tab => Some(*i),
+                _ => None,
+            });
+        let active_was = p.active;
+        let moved = p.tabs.remove(tab);
+        let index = |i: usize| if i > tab { i - 1 } else { i };
+        let at = match after {
+            Some(i) => index(i) + 1,
+            None => 0,
+        };
+        p.tabs.insert(at.min(p.tabs.len()), moved);
+        let tab_now = at.min(p.tabs.len() - 1);
+        p.tabs[tab_now].pinned = section == Section::Pinned;
+        p.tabs[tab_now].group = group;
+        // Keep the active tab active wherever it went.
+        p.active = if active_was == tab {
+            tab_now
+        } else {
+            let a = index(active_was);
+            if a >= tab_now {
+                a + 1
+            } else {
+                a
+            }
+        };
+        p.normalize();
+        self.save_session();
+        true
+    }
+
+    fn open_bookmark(&mut self, index: usize) -> bool {
+        let Some(url) = self.profiles[self.profile]
+            .bookmarks
+            .get(index)
+            .map(|b| b.url.clone())
+        else {
+            return false;
+        };
+        self.save_scroll();
+        self.navigate(url, Destination::Push);
+        true
+    }
+
+    /// ↑ ↓ Enter Esc while the bookmarks panel is open; `None` for keys it leaves alone.
+    fn bookmarks_key(&mut self, key: Key) -> Option<bool> {
+        let targets = self.sidebar_rows().targets;
+        let items: Vec<usize> = (0..targets.len())
+            .filter(|&r| matches!(targets[r], RowTarget::Bookmark(_)))
+            .collect();
+        let at = self
+            .bookmark_row
+            .and_then(|r| items.iter().position(|&i| i == r));
+        match key {
+            Key::Down | Key::Up if !items.is_empty() => {
+                let next = match (at, key == Key::Down) {
+                    (None, true) => 0,
+                    (None, false) => items.len() - 1,
+                    (Some(i), true) => (i + 1).min(items.len() - 1),
+                    (Some(i), false) => i.saturating_sub(1),
+                };
+                self.bookmark_row = Some(items[next]);
+                Some(true)
+            }
+            Key::Enter => {
+                let row = self.bookmark_row?;
+                match targets.get(row) {
+                    Some(&RowTarget::Bookmark(i)) => Some(self.open_bookmark(i)),
+                    _ => None,
+                }
+            }
+            Key::Escape => {
+                self.list = SidebarList::Tabs;
+                self.bookmark_row = None;
+                Some(true)
+            }
+            _ => None,
+        }
+    }
+
+    fn sidebar_rows(&self) -> SidebarRows<'_> {
+        sidebar_rows(&self.profiles[self.profile], self.list, self.bookmark_row)
+    }
+
+    /// Write the visible profile's bookmarks, readable by this user only.
+    fn save_bookmarks(&self) {
+        let profile = &self.profiles[self.profile];
+        let Some(path) = profile_file(self.session.as_deref(), &profile.id, "bookmarks") else {
+            return;
+        };
+        let text = write_bookmarks(&profile.bookmarks, &profile.last_folder);
+        if let Err(e) = write_private(&path, text.as_bytes()) {
+            self.window
+                .set_title(&format!("Broxee: couldn't save bookmarks ({e})"));
+        }
+    }
+
+    fn close_palette(&mut self) -> bool {
+        if self.palette.take().is_none() {
+            return false;
+        }
+        self.chrome.forget_palette();
+        true
+    }
+
+    /// Match the query again: a typed address first, then ranked tabs, history and commands.
+    fn refresh_palette(&mut self) {
+        let Some(query) = self.palette.as_ref().map(|p| p.query.text.clone()) else {
+            return;
+        };
+        let mut items = Vec::new();
+        if let Ok(url) = parse_input(&query) {
+            items.push(palette::Item {
+                title: format!("Open {}", url),
+                detail: "Address".into(),
+                hint: Hint::Label(String::new()),
+                action: Action::Open(url),
+            });
+        }
+        items.extend(palette::rank(&query, self.palette_candidates()));
+        if let Some(p) = self.palette.as_mut() {
+            p.items = items;
+            p.selected = 0;
+            p.first = 0;
+        }
+    }
+
+    /// Everything the palette can find, in the order shown for an empty query: open tabs (this
+    /// profile's first, most recent first), this profile's history, then commands. History stays
+    /// within the profile; tabs of the other profiles are listed with their profile's name.
+    fn palette_candidates(&self) -> Vec<palette::Item> {
+        let mut items = Vec::new();
+        let others = (0..self.profiles.len()).filter(|&p| p != self.profile);
+        for p in std::iter::once(self.profile).chain(others) {
+            let profile = &self.profiles[p];
+            let mut tabs: Vec<(usize, &Tab)> = profile
+                .tabs
+                .iter()
+                .enumerate()
+                .filter(|&(i, t)| {
+                    !(p == self.profile && i == profile.active) && t.entry().is_some()
+                })
+                .collect();
+            tabs.sort_by_key(|&(_, t)| std::cmp::Reverse(t.seen));
+            for (index, tab) in tabs {
+                items.push(palette::Item {
+                    title: tab.title().to_string(),
+                    detail: tab.entry().map(|e| e.url.to_string()).unwrap_or_default(),
+                    hint: Hint::Label(format!("Tab · {}", profile.name)),
+                    action: Action::Tab { profile: p, index },
+                });
+            }
+        }
+        for (i, p) in self.profiles.iter().enumerate() {
+            if i != self.profile {
+                items.push(palette::Item {
+                    title: format!("Switch to {}", p.name),
+                    detail: "Profile".into(),
+                    hint: Hint::Label(String::new()),
+                    action: Action::Profile(i),
+                });
+            }
+        }
+        let profile = &self.profiles[self.profile];
+        for b in &profile.bookmarks {
+            items.push(palette::Item {
+                title: b.title.clone(),
+                detail: b.url.to_string(),
+                hint: Hint::Label(format!("Bookmark · {}", b.folder)),
+                action: Action::Visit(b.url.clone()),
+            });
+        }
+        const HISTORY_LIMIT: usize = 200;
+        let profile = &self.profiles[self.profile];
+        let mut tabs: Vec<&Tab> = profile.tabs.iter().collect();
+        // The visible tab is the most recent.
+        tabs.sort_by_key(|t| std::cmp::Reverse(t.seen));
+        tabs.sort_by_key(|t| !std::ptr::eq(*t, &profile.tabs[profile.active]));
+        let mut seen = std::collections::HashSet::new();
+        'history: for tab in tabs {
+            for entry in tab.history.iter().rev() {
+                if seen.len() >= HISTORY_LIMIT {
+                    break 'history;
+                }
+                let url = entry.url.to_string();
+                if !seen.insert(url.clone()) {
+                    continue;
+                }
+                let title = if entry.title.is_empty() {
+                    host_of(&entry.url)
+                } else {
+                    entry.title.clone()
+                };
+                items.push(palette::Item {
+                    title,
+                    detail: url,
+                    hint: Hint::Label("History".into()),
+                    action: Action::Visit(entry.url.clone()),
+                });
+            }
+        }
+        for command in Command::ALL {
+            items.push(palette::Item {
+                title: command.label().into(),
+                detail: "Command".into(),
+                hint: command
+                    .keys()
+                    .map_or(Hint::Label(String::new()), Hint::Keys),
+                action: Action::Run(command),
+            });
+        }
+        items
+    }
+
+    /// A key while the palette is open: edit the query, move through results, open one.
+    fn palette_key(&mut self, k: KeyEvent) -> bool {
+        let rows = chrome::palette_capacity(self.height);
+        let Some(p) = self.palette.as_mut() else {
+            return false;
+        };
+        let step = |p: &mut Palette, delta: isize| {
+            if p.items.is_empty() {
+                return;
+            }
+            let last = p.items.len() as isize - 1;
+            p.selected = (p.selected as isize + delta).clamp(0, last) as usize;
+            if p.selected < p.first {
+                p.first = p.selected;
+            } else if p.selected >= p.first + rows {
+                p.first = p.selected + 1 - rows;
+            }
+        };
+        match k.key {
+            Key::Char(c) => {
+                p.query.insert(c.encode_utf8(&mut [0; 4]));
+                self.refresh_palette();
+            }
+            Key::Backspace => {
+                p.query.backspace();
+                self.refresh_palette();
+            }
+            Key::Left => p.query.left(),
+            Key::Right => p.query.right(),
+            Key::Home => p.query.cursor = 0,
+            Key::End => p.query.cursor = p.query.text.len(),
+            Key::Down => step(p, 1),
+            Key::Up => step(p, -1),
+            Key::Tab => step(p, if k.shift { -1 } else { 1 }),
+            Key::PageDown => step(p, rows as isize),
+            Key::PageUp => step(p, -(rows as isize)),
+            Key::Enter => {
+                let selected = p.selected;
+                return self.activate(selected);
+            }
+            Key::Escape => return self.close_palette(),
+        }
+        true
+    }
+
+    /// Open the palette's result `index`.
+    fn activate(&mut self, index: usize) -> bool {
+        let Some(action) = self
+            .palette
+            .as_ref()
+            .and_then(|p| p.items.get(index))
+            .map(|item| item.action.clone())
+        else {
+            return false;
+        };
+        self.close_palette();
+        match action {
+            Action::Open(url) | Action::Visit(url) => {
+                self.save_scroll();
+                self.navigate(url, Destination::Push);
+                true
+            }
+            Action::Tab { profile, index } => self.show_tab(profile, index),
+            Action::Profile(i) if i < self.profiles.len() => {
+                let active = self.profiles[i].active;
+                self.show_tab(i, active)
+            }
+            Action::Profile(_) => false,
+            Action::Run(command) => self.run_command(command),
+        }
     }
 
     fn focus_field(&mut self) -> bool {
+        self.close_palette();
         self.focus = None;
         let text = self
             .tab()
@@ -652,38 +2042,46 @@ impl<S: Screen> Browser<S> {
     }
 
     fn back(&mut self) -> bool {
-        if self.tab().index == 0 || self.loading.is_some() {
+        let index = self.tab().index;
+        if index == 0 {
             return false;
         }
-        self.save_scroll();
-        let tab = self.tab_mut();
-        tab.index -= 1;
-        let url = tab.history[tab.index].url.clone();
-        self.navigate(url, false);
+        self.go_to_entry(index - 1);
         true
     }
 
     fn forward(&mut self) -> bool {
-        let tab = self.tab();
-        if tab.index + 1 >= tab.history.len() || self.loading.is_some() {
+        let index = self.tab().index;
+        if index + 1 >= self.tab().history.len() {
             return false;
         }
-        self.save_scroll();
-        let tab = self.tab_mut();
-        tab.index += 1;
-        let url = tab.history[tab.index].url.clone();
-        self.navigate(url, false);
+        self.go_to_entry(index + 1);
         true
     }
 
     fn reload(&mut self) -> bool {
-        let Some(entry) = self.tab().entry() else {
+        if self.tab().entry().is_none() {
             return false;
-        };
-        let url = entry.url.clone();
-        self.save_scroll();
-        self.navigate(url, false);
+        }
+        self.go_to_entry(self.tab().index);
         true
+    }
+
+    /// The reload button turns into a stop button while a page loads.
+    fn reload_or_stop(&mut self) -> bool {
+        if self.load.is_some() {
+            self.stop_load()
+        } else {
+            self.reload()
+        }
+    }
+
+    /// Load the tab's history entry `index`. The tab moves to it only when the page arrives,
+    /// so a stopped load leaves the tab where it was.
+    fn go_to_entry(&mut self, index: usize) {
+        self.save_scroll();
+        let url = self.tab().history[index].url.clone();
+        self.navigate(url, Destination::Entry(index));
     }
 
     /// What the user typed in the address field.
@@ -691,92 +2089,210 @@ impl<S: Screen> Browser<S> {
         match parse_input(input) {
             Ok(url) => {
                 self.save_scroll();
-                self.navigate(url, true);
+                self.navigate(url, Destination::Push);
             }
             Err(message) => self.show_message("Broxee can't search yet", &message),
         }
     }
 
-    /// Load `url`. With `push`, it becomes a new history entry (dropping any forward entries);
-    /// without, it replaces the current one and its saved scroll position is restored.
-    fn navigate(&mut self, url: net::Url, push: bool) {
+    /// Start loading `url` on its own thread; `to` says where it goes in the history when it
+    /// arrives. The current page stays on screen and the window keeps answering input. A load
+    /// already running is cancelled: one page is built at a time.
+    fn navigate(&mut self, url: net::Url, to: Destination) {
+        // Typed, from the palette, back, forward, reload: started by the person.
+        self.navigate_from(url, to, true);
+    }
+
+    /// `navigate`, saying whether the navigation started on the same site as `url`.
+    fn navigate_from(&mut self, url: net::Url, to: Destination, same_site_initiator: bool) {
+        self.stop_load();
         self.field = None;
         self.focus = None;
+        let settings = self.settings();
+        let (sender, messages) = mpsc::channel();
+        let fonts = Arc::clone(&self.fonts);
+        let cookies = Arc::clone(&self.profiles[self.profile].cookies);
+        let target = url.clone();
+        let spawned = std::thread::Builder::new()
+            .name("load".into())
+            .spawn(move || {
+                let jar = engine::Jar {
+                    cookies: &cookies,
+                    same_site_initiator,
+                };
+                // A failed send means the browser dropped the load: stop at the next stage.
+                let result = engine::load(&target, settings, &fonts, Some(jar), &mut |progress| {
+                    sender.send(LoadMessage::Progress(progress)).is_ok()
+                });
+                let _ = sender.send(LoadMessage::Done(Box::new(result)));
+            });
+        let load = Load {
+            url,
+            to,
+            settings,
+            messages,
+        };
+        if let Err(e) = spawned {
+            return self.finish_load(load, Err(e.to_string()));
+        }
+        self.load = Some(load);
         self.loading = Some(0.1);
         self.render();
+    }
 
-        let settings = self.settings();
-        // The fonts move out for the load so the progress callback can render with them too.
-        let fonts = std::mem::take(&mut self.fonts);
-        let result = engine::load(&url, settings, &fonts, &mut |progress| {
-            self.loading = Some(progress);
-            self.render_with(&fonts);
-        });
-        self.fonts = fonts;
+    /// Apply what the loader has sent since the last look; returns whether to repaint.
+    fn poll_load(&mut self) -> bool {
+        let mut dirty = false;
+        loop {
+            let Some(load) = &self.load else {
+                return dirty;
+            };
+            match load.messages.try_recv() {
+                Ok(LoadMessage::Progress(p)) => {
+                    self.loading = Some(p);
+                    dirty = true;
+                }
+                Ok(LoadMessage::Done(result)) => {
+                    let load = self.load.take().expect("checked above");
+                    self.finish_load(load, *result);
+                    // `show` painted the new page already.
+                    return false;
+                }
+                Err(TryRecvError::Empty) => return dirty,
+                Err(TryRecvError::Disconnected) => {
+                    let load = self.load.take().expect("checked above");
+                    self.finish_load(load, Err("the page stopped loading".into()));
+                    return false;
+                }
+            }
+        }
+    }
+
+    /// Block until the running load, if any, has finished and is shown.
+    fn wait_for_load(&mut self) {
+        while let Some(load) = &self.load {
+            let message = load.messages.recv();
+            let load = match message {
+                Ok(LoadMessage::Progress(p)) => {
+                    self.loading = Some(p);
+                    continue;
+                }
+                Ok(LoadMessage::Done(result)) => (self.load.take(), *result),
+                Err(_) => (self.load.take(), Err("the page stopped loading".into())),
+            };
+            if let (Some(l), result) = load {
+                self.finish_load(l, result);
+            }
+        }
+    }
+
+    /// Stop the running load, keeping the page that is on screen.
+    fn stop_load(&mut self) -> bool {
+        if self.load.take().is_none() {
+            return false;
+        }
+        self.loading = None;
+        true
+    }
+
+    /// Show a finished load (or its error page) and record it in the tab's history.
+    fn finish_load(&mut self, load: Load, result: Result<Loaded, String>) {
+        self.loading = None;
+        self.save_cookies();
+        let url = load.url;
+        if matches!(&result, Err(e) if e == engine::CANCELLED) {
+            return;
+        }
         let loaded = result.is_ok();
-        let page = result.unwrap_or_else(|e| {
+        let mut page = result.unwrap_or_else(|e| {
             engine::page_from_html(
                 url.clone(),
                 &error_page(&url, &e, &self.chrome),
-                settings,
+                load.settings,
                 &self.fonts,
             )
         });
+        // The window may have changed size while the page loaded.
+        let settings = self.settings();
+        if settings != load.settings {
+            engine::relayout(&mut page, settings, &self.fonts);
+        }
 
         let tab = self.tab_mut();
-        let scroll = if push {
-            if !tab.history.is_empty() {
-                tab.history.truncate(tab.index + 1);
+        let scroll = match load.to {
+            Destination::Push => {
+                if !tab.history.is_empty() {
+                    tab.history.truncate(tab.index + 1);
+                }
+                tab.history.push(Entry {
+                    url: page.url.clone(),
+                    scroll: 0.0,
+                    title: String::new(),
+                });
+                tab.index = tab.history.len() - 1;
+                0.0
             }
-            tab.history.push(Entry {
-                url: page.url.clone(),
-                scroll: 0.0,
-            });
-            tab.index = tab.history.len() - 1;
-            0.0
-        } else {
-            tab.history[tab.index].scroll
+            Destination::Entry(i) if i < tab.history.len() => {
+                tab.index = i;
+                tab.history[i].scroll
+            }
+            Destination::Entry(_) => 0.0,
         };
-        self.tab_mut().title = self.show(page, scroll);
+        let title = self.show(page, scroll);
+        self.set_tab_title(title);
         self.page_is_entry = loaded;
         self.save_session();
     }
 
     /// Put the visible tab to sleep: keep what rebuilds its page, drop the page.
     fn sleep(&mut self) {
+        self.stop_load();
         self.save_scroll();
         self.field = None;
         self.focus = None;
+        let focused_link = self.link_focus.take().map(|l| l.node);
+        self.tab_mut().focused_link = focused_link;
         let page = self.page.take();
+        self.painter.forget_images();
         let keep = std::mem::take(&mut self.page_is_entry);
         self.clock += 1;
         let clock = self.clock;
+        // The page's DOM, styles and layout are freed first; then the sources are written and
+        // freed too. A tab that cannot be written keeps its history and reloads when selected.
+        let snapshot = page.filter(|_| keep).map(engine::snapshot);
+        let stored = match (snapshot, self.store.as_mut()) {
+            (Some(snapshot), Some(store)) => store.put(&snapshot).ok(),
+            _ => None,
+        };
         let tab = self.tab_mut();
         tab.seen = clock;
-        if let Some(page) = page.filter(|_| keep) {
-            tab.snapshot = Some(engine::snapshot(page));
-        }
+        tab.snapshot = stored;
         self.trim_snapshots();
     }
 
-    /// Drop the snapshots of the tabs seen longest ago until the rest fit the budget.
+    /// Fit the sleeping tabs' files in their budget, removing those seen longest ago first.
     fn trim_snapshots(&mut self) {
-        let mut sleeping: Vec<(u64, usize, usize, usize)> = Vec::new();
+        let mut sleeping: Vec<(u64, usize, usize)> = Vec::new();
+        let mut total = 0;
         for (p, profile) in self.profiles.iter().enumerate() {
             for (t, tab) in profile.tabs.iter().enumerate() {
-                if let Some(snapshot) = &tab.snapshot {
-                    sleeping.push((tab.seen, snapshot.bytes(), p, t));
+                if let Some(stored) = &tab.snapshot {
+                    sleeping.push((tab.seen, p, t));
+                    total += stored.bytes;
                 }
             }
         }
-        let mut total: usize = sleeping.iter().map(|s| s.1).sum();
         sleeping.sort_unstable_by_key(|s| s.0);
-        for (_, bytes, p, t) in sleeping {
+        for (_, p, t) in sleeping {
             if total <= self.snapshot_budget {
                 break;
             }
-            self.profiles[p].tabs[t].snapshot = None;
-            total -= bytes;
+            if let Some(stored) = self.profiles[p].tabs[t].snapshot.take() {
+                total -= stored.bytes;
+                if let Some(store) = &self.store {
+                    store.remove(stored);
+                }
+            }
         }
     }
 
@@ -784,26 +2300,38 @@ impl<S: Screen> Browser<S> {
     fn wake(&mut self) {
         let settings = self.settings();
         let tab = self.tab_mut();
-        let snapshot = tab.snapshot.take();
+        let stored = tab.snapshot.take();
         let entry = tab.entry().cloned();
         let title = tab.title().to_string();
+        let snapshot = match (stored, &self.store) {
+            (Some(stored), Some(store)) => store.take(stored).ok(),
+            _ => None,
+        };
         if let (Some(snapshot), Some(entry)) = (snapshot, &entry) {
             if let Ok(page) = engine::restore(snapshot, settings, &self.fonts) {
-                self.tab_mut().title = self.show(page, entry.scroll);
+                let title = self.show(page, entry.scroll);
+                self.set_tab_title(title);
+                if let Some(node) = self.tab_mut().focused_link.take() {
+                    self.focus_link(node, false);
+                    self.render();
+                }
                 self.page_is_entry = true;
                 self.save_session();
                 return;
             }
         }
         match entry {
-            Some(entry) => self.navigate(entry.url, false),
+            Some(entry) => {
+                let index = self.tab().index;
+                self.navigate(entry.url, Destination::Entry(index));
+            }
             None => {
-                // A new tab: an empty pane with the address field open.
+                // A new tab: the palette over an empty pane (DESIGN.md, section 7).
                 self.page = None;
                 self.page_is_entry = false;
                 self.scroll = 0.0;
                 self.window.set_title(&title);
-                self.focus_field();
+                self.open_palette();
                 self.save_session();
                 self.render();
             }
@@ -812,32 +2340,29 @@ impl<S: Screen> Browser<S> {
 
     fn select_tab(&mut self, i: usize) -> bool {
         let p = &self.profiles[self.profile];
-        if i >= p.tabs.len() || i == p.active || self.loading.is_some() {
+        if i >= p.tabs.len() || i == p.active {
             return false;
         }
         self.sleep();
         self.profiles[self.profile].active = i;
         self.wake();
+        self.reveal_active_tab();
         true
     }
 
     fn new_tab(&mut self) -> bool {
-        if self.loading.is_some() {
-            return false;
-        }
         self.sleep();
         let p = &mut self.profiles[self.profile];
         p.tabs.push(Tab::default());
         p.active = p.tabs.len() - 1;
         self.wake();
+        self.reveal_active_tab();
         true
     }
 
     /// Close the visible tab. The last tab of a profile is replaced by a new one.
     fn close_tab(&mut self) -> bool {
-        if self.loading.is_some() {
-            return false;
-        }
+        self.stop_load();
         self.save_scroll();
         self.page = None;
         self.page_is_entry = false;
@@ -865,7 +2390,7 @@ impl<S: Screen> Browser<S> {
     }
 
     fn reopen_tab(&mut self) -> bool {
-        if self.loading.is_some() || self.profiles[self.profile].closed.is_empty() {
+        if self.profiles[self.profile].closed.is_empty() {
             return false;
         }
         self.sleep();
@@ -887,15 +2412,50 @@ impl<S: Screen> Browser<S> {
     }
 
     fn switch_profile(&mut self) -> bool {
-        if self.loading.is_some() {
-            return false;
+        let next = (self.profile + 1) % self.profiles.len();
+        let active = self.profiles[next].active;
+        self.show_tab(next, active)
+    }
+
+    /// Show tab `index` of `profile`, switching profile if needed.
+    fn show_tab(&mut self, profile: usize, index: usize) -> bool {
+        if profile == self.profile {
+            return self.select_tab(index);
         }
         self.sleep();
         // Nothing a server could use to link the two profiles carries over.
         net::forget_sessions();
-        self.profile = (self.profile + 1) % self.profiles.len();
+        self.profile = profile;
+        let p = &mut self.profiles[profile];
+        p.active = index.min(p.tabs.len() - 1);
         self.wake();
         true
+    }
+
+    /// The visible tab's title, and its current history entry's.
+    fn set_tab_title(&mut self, title: String) {
+        let tab = self.tab_mut();
+        let index = tab.index;
+        if let Some(entry) = tab.history.get_mut(index) {
+            entry.title.clone_from(&title);
+        }
+        tab.title = title;
+    }
+
+    /// Write the visible profile's persistent cookies if they changed (atomically, readable by
+    /// this user only). Session cookies are never written.
+    fn save_cookies(&self) {
+        let profile = &self.profiles[self.profile];
+        if !profile.cookies.take_changed() {
+            return;
+        }
+        let Some(path) = profile_file(self.session.as_deref(), &profile.id, "cookies") else {
+            return;
+        };
+        if let Err(e) = write_private(&path, profile.cookies.save().as_bytes()) {
+            self.window
+                .set_title(&format!("Broxee: couldn't save cookies ({e})"));
+        }
     }
 
     /// Write the tabs and their history (not their pages) so the next start brings them back.
@@ -903,14 +2463,13 @@ impl<S: Screen> Browser<S> {
         let Some(path) = &self.session else {
             return;
         };
-        let text = write_session(&self.profiles, self.profile);
-        let tmp = path.with_extension("tmp");
-        let written = path
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| std::fs::write(&tmp, text))
-            .and_then(|()| std::fs::rename(&tmp, path));
-        if let Err(e) = written {
+        let text = write_session(
+            &self.profiles,
+            self.profile,
+            (self.sidebar_width, self.sidebar),
+        );
+        // History is private: the file is this user's only, like the cookies.
+        if let Err(e) = write_private(path, text.as_bytes()) {
             self.window
                 .set_title(&format!("Broxee: couldn't save the session ({e})"));
         }
@@ -918,6 +2477,7 @@ impl<S: Screen> Browser<S> {
 
     /// A page Broxee writes itself, without a history entry.
     fn show_message(&mut self, title: &str, detail: &str) {
+        self.stop_load();
         let url = net::Url::parse("file:///").expect("a file URL always parses");
         let html = message_page(title, detail, None, &self.chrome);
         let page = engine::page_from_html(url, &html, self.settings(), &self.fonts);
@@ -930,10 +2490,12 @@ impl<S: Screen> Browser<S> {
         self.window.set_title(&title);
         self.page_is_entry = false;
         self.page = Some(page);
+        self.link_focus = None;
         self.loading = None;
         self.scroll = scroll;
         self.clamp_scroll();
         self.painter.trim(GLYPH_CACHE_LIMIT);
+        self.painter.forget_images();
         // Loading freed a lot (the previous page, stylesheet text, parse scratch): hand it back
         // to the system before the frame that needs a second surface.
         #[cfg(target_os = "macos")]
@@ -980,9 +2542,8 @@ impl<S: Screen> Browser<S> {
     }
 
     fn render(&mut self) {
-        let fonts = std::mem::take(&mut self.fonts);
+        let fonts = Arc::clone(&self.fonts);
         self.render_with(&fonts);
-        self.fonts = fonts;
     }
 
     fn render_with(&mut self, fonts: &FontStore) {
@@ -998,10 +2559,10 @@ impl<S: Screen> Browser<S> {
         let tab = &profile.tabs[profile.active];
         let host = tab.entry().map(|e| host_of(&e.url)).unwrap_or_default();
         let header = HeaderView {
-            profile: profile.name,
+            profile: &profile.name,
             hue: profile.hue,
-            can_back: tab.index > 0 && self.loading.is_none(),
-            can_forward: tab.index + 1 < tab.history.len() && self.loading.is_none(),
+            can_back: tab.index > 0,
+            can_forward: tab.index + 1 < tab.history.len(),
             loading: self.loading,
             host: &host,
             field: self.field.as_ref().map(|f| FieldView {
@@ -1011,20 +2572,111 @@ impl<S: Screen> Browser<S> {
             }),
             focused: self.focus,
         };
-        let tabs: Vec<TabView> = profile
-            .tabs
-            .iter()
-            .enumerate()
-            .map(|(i, t)| TabView {
-                title: t.title(),
-                asleep: i != profile.active,
-            })
-            .collect();
+        let list = sidebar_rows(profile, self.list, self.bookmark_row);
+        let drop_at = match self.drag {
+            Some(Drag::Moving { drop, .. }) => Some(drop),
+            _ => None,
+        };
         let sidebar = (sidebar_px > 0).then_some(SidebarView {
-            profile: profile.name,
+            profile: &profile.name,
             hue: profile.hue,
-            tabs: &tabs,
-            active: profile.active,
+            rows: &list.rows,
+            selected: list.selected,
+            footer: list.footer,
+            scroll: self.sidebar_scroll,
+            drop_at,
+            empty: list.empty,
+        });
+        let remove_label = format!("Type {} to remove it", self.profiles[self.profile].name);
+        let (labels, heading, help): (Vec<&str>, &str, &str) =
+            match self.dialog.as_ref().map(|d| &d.kind) {
+                Some(DialogKind::Bookmark {
+                    existing: Some(_), ..
+                }) => (
+                    vec!["Name", "Folder"],
+                    "Edit bookmark",
+                    "Enter to save · Tab for the other field · Esc to cancel",
+                ),
+                Some(DialogKind::Bookmark { .. }) => (
+                    vec!["Name", "Folder"],
+                    "Bookmark this page",
+                    "Enter to save · Tab for the other field · Esc to cancel",
+                ),
+                Some(DialogKind::Group) => (
+                    vec!["Group"],
+                    "Move this tab to a group",
+                    "Enter to move · an empty name takes it out · Esc to cancel",
+                ),
+                Some(DialogKind::NewProfile) => (
+                    vec!["Name"],
+                    "New profile",
+                    "Its own tabs, history, cookies and bookmarks · Enter to create",
+                ),
+                Some(DialogKind::RenameProfile) => (
+                    vec!["Name"],
+                    "Rename profile",
+                    "Enter to rename · Esc to cancel",
+                ),
+                Some(DialogKind::RemoveProfile) => (
+                    vec![remove_label.as_str()],
+                    "Remove profile",
+                    "Its tabs, history, cookies and bookmarks are deleted · Esc to cancel",
+                ),
+                None => (Vec::new(), "", ""),
+            };
+        let dialog_fields: Vec<(&str, &str, usize)> =
+            self.dialog.as_ref().map_or(Vec::new(), |d| {
+                d.fields
+                    .iter()
+                    .zip(&labels)
+                    .map(|(f, label)| (*label, f.text.as_str(), f.cursor))
+                    .collect()
+            });
+        let dialog_view = self.dialog.as_ref().map(|d| DialogView {
+            heading,
+            fields: &dialog_fields,
+            active: d.active,
+            help: d.error.as_deref().unwrap_or(help),
+        });
+        let palette_rows: Vec<PaletteRow> = self.palette.as_ref().map_or(Vec::new(), |p| {
+            p.items
+                .iter()
+                .skip(p.first)
+                .take(chrome::palette_capacity(self.height))
+                .map(|item| PaletteRow {
+                    title: &item.title,
+                    detail: &item.detail,
+                    hint: match &item.hint {
+                        Hint::Label(label) => HintView::Label(label),
+                        Hint::Keys(keys) => HintView::Keys(keys),
+                    },
+                })
+                .collect()
+        });
+        let nothing = self
+            .palette
+            .as_ref()
+            .filter(|p| p.items.is_empty())
+            .map(|p| format!("Nothing matches \"{}\".", p.query.text.trim()));
+        let palette_view = self.palette.as_ref().map(|p| PaletteView {
+            query: &p.query.text,
+            cursor: p.query.cursor,
+            rows: &palette_rows,
+            selected: (!p.items.is_empty()).then(|| p.selected - p.first),
+            // Honest until a search engine is chosen (DESIGN.md asks for web search).
+            empty: nothing
+                .as_deref()
+                .map(|line| (line, "Broxee can't search the web yet.")),
+        });
+        // The focused link's rectangles in page-area points.
+        let ring: Vec<(f32, f32, f32, f32)> = self.link_focus.as_ref().map_or(Vec::new(), |l| {
+            l.rects
+                .iter()
+                .map(|(r, fixed)| {
+                    let y = if *fixed { r.y } else { r.y - self.scroll };
+                    (r.x, y, r.width, r.height)
+                })
+                .collect()
         });
         let view = self.page.as_ref().map(|p| engine::page_view(p, fonts));
         let viewport = Viewport {
@@ -1033,6 +2685,18 @@ impl<S: Screen> Browser<S> {
             scale,
             scroll_y: self.scroll,
         };
+        let menu_items: Vec<&str> = self.menu.as_ref().map_or(Vec::new(), |m| {
+            m.items.iter().map(|(label, _)| label.as_str()).collect()
+        });
+        let menu_view = self.menu.as_ref().map(|m| MenuView {
+            items: &menu_items,
+            selected: m.selected,
+        });
+        let tooltip = self
+            .hover
+            .as_ref()
+            .filter(|h| h.shown)
+            .map(|h| (h.at, h.text.as_str()));
         let (painter, chrome) = (&mut self.painter, &mut self.chrome);
         let blank = chrome.theme().surface;
         let shown = self
@@ -1064,6 +2728,16 @@ impl<S: Screen> Browser<S> {
                     }
                     _ => chrome::fill(bottom, stride, sidebar_px, pane_px, blank),
                 }
+                if !ring.is_empty() && page_rows > 0 {
+                    let frame = Frame {
+                        pixels: &mut *bottom,
+                        stride,
+                        left: sidebar_px,
+                        width: pane_px,
+                        scale,
+                    };
+                    chrome.draw_focus_ring(painter, frame, &ring);
+                }
                 let frame = Frame {
                     pixels: top,
                     stride,
@@ -1072,6 +2746,46 @@ impl<S: Screen> Browser<S> {
                     scale,
                 };
                 chrome.draw(painter, frame, fonts.set(), fonts.metrics(), &header);
+                if let Some(dialog) = &dialog_view {
+                    let frame = Frame {
+                        pixels: &mut *pixels,
+                        stride,
+                        left: sidebar_px,
+                        width: pane_px,
+                        scale,
+                    };
+                    chrome.draw_dialog(painter, frame, fonts.set(), fonts.metrics(), dialog);
+                }
+                if let Some(palette) = &palette_view {
+                    let frame = Frame {
+                        pixels: &mut *pixels,
+                        stride,
+                        left: sidebar_px,
+                        width: pane_px,
+                        scale,
+                    };
+                    chrome.draw_palette(painter, frame, fonts.set(), fonts.metrics(), palette);
+                }
+                if let Some(menu) = &menu_view {
+                    let frame = Frame {
+                        pixels: &mut *pixels,
+                        stride,
+                        left: sidebar_px,
+                        width: pane_px,
+                        scale,
+                    };
+                    chrome.draw_menu(painter, frame, fonts.set(), fonts.metrics(), menu);
+                }
+                if let Some((at, text)) = tooltip {
+                    let frame = Frame {
+                        pixels: &mut *pixels,
+                        stride,
+                        left: 0,
+                        width: width_px,
+                        scale,
+                    };
+                    chrome.draw_tooltip(painter, frame, fonts.set(), fonts.metrics(), at, text);
+                }
             });
         if let Err(e) = shown {
             self.window.set_title(&format!("Broxee: {e}"));
@@ -1079,52 +2793,345 @@ impl<S: Screen> Browser<S> {
     }
 }
 
+/// The sidebar's rows for the current list, what each stands for, and its footer and
+/// empty-state text.
+fn sidebar_rows(
+    profile: &Profile,
+    list: SidebarList,
+    bookmark_row: Option<usize>,
+) -> SidebarRows<'_> {
+    match list {
+        SidebarList::Tabs => {
+            // Tabs are kept in this order (`Profile::normalize`): pinned, groups, the rest.
+            // Labels appear once there is more than one kind of section.
+            let sectioned = profile.tabs.iter().any(|t| t.pinned || t.group.is_some());
+            let mut rows = Vec::new();
+            let mut targets = Vec::new();
+            let mut current: Option<Section> = None;
+            for (i, tab) in profile.tabs.iter().enumerate() {
+                let section = match (&tab.group, tab.pinned) {
+                    (_, true) => Section::Pinned,
+                    (Some(_), false) => match current {
+                        Some(Section::Group(first)) if profile.tabs[first].group == tab.group => {
+                            Section::Group(first)
+                        }
+                        _ => Section::Group(i),
+                    },
+                    (None, false) => Section::Rest,
+                };
+                let folded = matches!(section, Section::Group(_))
+                    && tab
+                        .group
+                        .as_ref()
+                        .is_some_and(|g| profile.folded.contains(g));
+                if sectioned && current != Some(section) {
+                    let label = match section {
+                        Section::Pinned => Cow::Borrowed("Pinned"),
+                        Section::Rest => Cow::Borrowed("Tabs"),
+                        Section::Group(_) => {
+                            let name = tab.group.as_deref().unwrap_or_default();
+                            if folded {
+                                let count =
+                                    profile.tabs.iter().filter(|t| t.group == tab.group).count();
+                                Cow::Owned(format!("{name} ({count})"))
+                            } else {
+                                Cow::Borrowed(name)
+                            }
+                        }
+                    };
+                    rows.push(ListRow::Label(label));
+                    targets.push(RowTarget::Section(section));
+                    current = Some(section);
+                }
+                // A folded group still shows its active tab.
+                if folded && i != profile.active {
+                    continue;
+                }
+                rows.push(ListRow::Item {
+                    title: tab.title(),
+                    muted: i != profile.active,
+                    closable: i == profile.active,
+                });
+                targets.push(RowTarget::Tab(i));
+            }
+            let selected = targets
+                .iter()
+                .position(|t| *t == RowTarget::Tab(profile.active));
+            SidebarRows {
+                rows,
+                targets,
+                selected,
+                footer: Some("+ New tab"),
+                empty: None,
+            }
+        }
+        SidebarList::Bookmarks => {
+            // Folders in name order; bookmarks in the order they were saved.
+            let mut folders: Vec<&str> = profile
+                .bookmarks
+                .iter()
+                .map(|b| b.folder.as_str())
+                .collect();
+            folders.sort_by_key(|f| f.to_lowercase());
+            folders.dedup();
+            let mut rows = Vec::new();
+            let mut targets = Vec::new();
+            for folder in folders {
+                rows.push(ListRow::Label(Cow::Borrowed(folder)));
+                targets.push(RowTarget::Folder);
+                for (i, b) in profile.bookmarks.iter().enumerate() {
+                    if b.folder == folder {
+                        rows.push(ListRow::Item {
+                            title: &b.title,
+                            muted: false,
+                            closable: false,
+                        });
+                        targets.push(RowTarget::Bookmark(i));
+                    }
+                }
+            }
+            SidebarRows {
+                rows,
+                targets,
+                selected: bookmark_row,
+                footer: None,
+                empty: Some(("No bookmarks yet.", "Press ⌘D on any page to save it.")),
+            }
+        }
+    }
+}
+
+/// Profiles at most, and characters in a profile's name.
+const MAX_PROFILES: usize = 12;
+const MAX_NAME: usize = 32;
+
+/// A profile folder name: letters, digits, `-` and `_` only, so it cannot leave `profiles/`.
+fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// The sidebar's list as rows, ready to draw or hit-test.
+struct SidebarRows<'a> {
+    rows: Vec<ListRow<'a>>,
+    targets: Vec<RowTarget>,
+    selected: Option<usize>,
+    footer: Option<&'static str>,
+    empty: Option<(&'static str, &'static str)>,
+}
+
+/// Where a profile keeps `file` (its cookies, its bookmarks): beside the session file, one
+/// folder per profile.
+fn profile_file(session: Option<&std::path::Path>, profile: &str, file: &str) -> Option<PathBuf> {
+    Some(session?.parent()?.join("profiles").join(profile).join(file))
+}
+
+/// Bookmarks as text: the last folder used, then one bookmark per line (folder, URL, title).
+fn write_bookmarks(bookmarks: &[Bookmark], last_folder: &str) -> String {
+    let mut out = format!("broxee-bookmarks 1\nlast\t{last_folder}\n");
+    for b in bookmarks {
+        out += &format!("mark\t{}\t{}\t{}\n", b.folder, b.url, b.title);
+    }
+    out
+}
+
+/// Read `write_bookmarks` text; lines that do not parse are skipped.
+fn parse_bookmarks(text: &str) -> (Vec<Bookmark>, Option<String>) {
+    let mut lines = text.lines();
+    if lines.next() != Some("broxee-bookmarks 1") {
+        return (Vec::new(), None);
+    }
+    let (mut bookmarks, mut last) = (Vec::new(), None);
+    for line in lines {
+        let fields: Vec<&str> = line.splitn(4, '\t').collect();
+        match fields.as_slice() {
+            ["last", folder] if !folder.trim().is_empty() => last = Some(folder.to_string()),
+            ["mark", folder, url, title] if bookmarks.len() < BOOKMARK_LIMIT => {
+                if let Ok(url) = net::Url::parse(url) {
+                    let folder = if folder.trim().is_empty() {
+                        DEFAULT_FOLDER
+                    } else {
+                        folder
+                    };
+                    bookmarks.push(Bookmark {
+                        title: title.to_string(),
+                        url,
+                        folder: folder.to_string(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    (bookmarks, last)
+}
+
+/// Write `data` to `path` through a temporary file and a rename, readable by this user only.
+fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(dir) = path.parent() {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(dir)?;
+    }
+    let tmp = path.with_extension("tmp");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(&tmp)?.write_all(data)?;
+    std::fs::rename(&tmp, path)
+}
+
 /// The session as text: one line per profile, tab and history entry, tab-separated. Pages
 /// are not saved; restored tabs reload when selected.
-fn write_session(profiles: &[Profile], visible: usize) -> String {
+fn write_session(profiles: &[Profile], visible: usize, sidebar: (f32, bool)) -> String {
     let clean = |s: &str| s.replace(['\t', '\n', '\r'], " ");
-    let mut out = format!("broxee-session 1\nvisible\t{visible}\n");
+    let mut out = format!(
+        "broxee-session 1\nvisible\t{visible}\nsidebar\t{}\t{}\n",
+        sidebar.0,
+        u8::from(sidebar.1)
+    );
     for profile in profiles {
-        out += &format!("profile\t{}\t{}\n", profile.active, profile.name);
+        out += &format!(
+            "profile\t{}\t{}\t{}\t{}\n",
+            profile.active,
+            clean(&profile.name),
+            profile.id,
+            profile.hue.key()
+        );
+        for group in &profile.folded {
+            out += &format!("folded\t{}\n", clean(group));
+        }
         for tab in &profile.tabs {
             out += &format!("tab\t{}\t{}\n", tab.index, clean(&tab.title));
+            if tab.pinned {
+                out += "pinned\n";
+            }
+            if let Some(group) = &tab.group {
+                out += &format!("group\t{}\n", clean(group));
+            }
             for entry in &tab.history {
-                out += &format!("entry\t{}\t{}\n", entry.scroll, entry.url);
+                out += &format!(
+                    "entry\t{}\t{}\t{}\n",
+                    entry.scroll,
+                    entry.url,
+                    clean(&entry.title)
+                );
             }
         }
     }
     out
 }
 
-type SessionProfile = (Vec<Tab>, usize);
+/// A profile as saved: who it is, its tabs, the active one and its folded groups.
+struct SavedProfile {
+    name: String,
+    id: String,
+    hue: Hue,
+    tabs: Vec<Tab>,
+    active: usize,
+    folded: Vec<String>,
+}
+
+struct Session {
+    profiles: Vec<SavedProfile>,
+    visible: usize,
+    /// Sidebar width and whether it is shown.
+    sidebar: Option<(f32, bool)>,
+}
 
 /// Read a session written by `write_session`; anything malformed is skipped, never trusted.
-fn parse_session(text: &str) -> Option<(Vec<SessionProfile>, usize)> {
+fn parse_session(text: &str) -> Option<Session> {
     let mut lines = text.lines();
     if lines.next()? != "broxee-session 1" {
         return None;
     }
     let mut visible = 0;
-    let mut profiles: Vec<SessionProfile> = Vec::new();
+    let mut sidebar = None;
+    let mut profiles: Vec<SavedProfile> = Vec::new();
     for line in lines {
         let mut parts = line.splitn(3, '\t');
         let (kind, a, b) = (parts.next()?, parts.next(), parts.next());
         let number = a.and_then(|a| a.parse::<usize>().ok()).unwrap_or(0);
+        let name = a.map(str::trim).filter(|n| !n.is_empty()).map(String::from);
         match kind {
             "visible" => visible = number,
-            "profile" => profiles.push((Vec::new(), number)),
+            "sidebar" => {
+                let width = a
+                    .and_then(|a| a.parse::<f32>().ok())
+                    .filter(|w| w.is_finite());
+                if let Some(width) = width {
+                    sidebar = Some((width.clamp(SIDEBAR_MIN, SIDEBAR_MAX), b != Some("0")));
+                }
+            }
+            "profile" => {
+                // "name" in older sessions; "name<tab>id<tab>hue" since profiles can change.
+                let mut fields = b.unwrap_or_default().split('\t');
+                let name = fields.next().unwrap_or_default().trim();
+                let id = fields.next().unwrap_or(name);
+                let hue = fields.next().and_then(Hue::from_key);
+                // The id names a folder: anything that is not a plain name is not trusted.
+                if valid_id(id) && !name.is_empty() && profiles.len() < MAX_PROFILES {
+                    let n = profiles.len();
+                    profiles.push(SavedProfile {
+                        name: name.chars().take(MAX_NAME).collect(),
+                        id: id.to_string(),
+                        // Older sessions: Personal emerald, Work amber, as before.
+                        hue: hue.unwrap_or(Hue::ALL[n % Hue::ALL.len()]),
+                        tabs: Vec::new(),
+                        active: number,
+                        folded: Vec::new(),
+                    });
+                } else {
+                    // Keep later lines from landing in the previous profile.
+                    profiles.push(SavedProfile {
+                        name: String::new(),
+                        id: String::new(),
+                        hue: Hue::Emerald,
+                        tabs: Vec::new(),
+                        active: 0,
+                        folded: Vec::new(),
+                    });
+                }
+            }
+            "folded" => {
+                if let (Some(p), Some(name)) = (profiles.last_mut(), name) {
+                    p.folded.push(name);
+                }
+            }
             "tab" => {
-                if let Some((tabs, _)) = profiles.last_mut().filter(|p| p.0.len() < SESSION_TABS) {
-                    tabs.push(Tab {
+                if let Some(p) = profiles.last_mut().filter(|p| p.tabs.len() < SESSION_TABS) {
+                    p.tabs.push(Tab {
                         index: number,
                         title: b.unwrap_or_default().to_string(),
                         ..Tab::default()
                     });
                 }
             }
+            "pinned" => {
+                if let Some(tab) = profiles.last_mut().and_then(|p| p.tabs.last_mut()) {
+                    tab.pinned = true;
+                }
+            }
+            "group" => {
+                if let Some(tab) = profiles.last_mut().and_then(|p| p.tabs.last_mut()) {
+                    tab.group = name;
+                }
+            }
             "entry" => {
-                let tab = profiles.last_mut().and_then(|p| p.0.last_mut());
-                let url = b.and_then(|u| net::Url::parse(u).ok());
+                let tab = profiles.last_mut().and_then(|p| p.tabs.last_mut());
+                // "url" or, since titles are kept, "url<tab>title".
+                let (url, title) = match b.map(|b| b.split_once('\t')) {
+                    Some(Some((url, title))) => (Some(url), title),
+                    _ => (b, ""),
+                };
+                let url = url.and_then(|u| net::Url::parse(u).ok());
                 let scroll = a
                     .and_then(|a| a.parse::<f32>().ok())
                     .filter(|s| s.is_finite());
@@ -1133,6 +3140,7 @@ fn parse_session(text: &str) -> Option<(Vec<SessionProfile>, usize)> {
                         tab.history.push(Entry {
                             url,
                             scroll: scroll.unwrap_or(0.0).max(0.0),
+                            title: title.to_string(),
                         });
                     }
                 }
@@ -1140,12 +3148,19 @@ fn parse_session(text: &str) -> Option<(Vec<SessionProfile>, usize)> {
             _ => {}
         }
     }
-    for (tabs, _) in &mut profiles {
-        for tab in tabs.iter_mut() {
+    profiles.retain(|p| !p.id.is_empty());
+    let mut seen = std::collections::HashSet::new();
+    profiles.retain(|p| seen.insert(p.id.to_lowercase()));
+    for p in &mut profiles {
+        for tab in p.tabs.iter_mut() {
             tab.index = tab.index.min(tab.history.len().saturating_sub(1));
         }
     }
-    Some((profiles, visible))
+    Some(Session {
+        profiles,
+        visible,
+        sidebar,
+    })
 }
 
 /// The nearest `<a href>` at or above `node`, resolved against the page URL. Only links Broxee
@@ -1171,9 +3186,82 @@ fn link_for(page: &Loaded, node: NodeId) -> Option<net::Url> {
     None
 }
 
+/// The links Tab can reach, in document order: `<a href>` elements that are visible and have
+/// something laid out.
+fn focusable_links(page: &Loaded) -> Vec<NodeId> {
+    let (dom, layout) = (&page.dom, &page.layout);
+    let mut shown = vec![false; dom.len()];
+    for t in &layout.texts {
+        shown[t.node as usize] = true;
+    }
+    for b in &layout.boxes {
+        shown[b.node as usize] = true;
+    }
+    dom.descendants(html::Dom::ROOT)
+        .filter(|&id| {
+            dom.tag_name(id) == Some("a")
+                && dom.attr(id, "href").is_some()
+                && {
+                    let style = page.styles.style(id);
+                    style.visible && !style.transparent
+                }
+                && dom.descendants(id).any(|d| shown[d as usize])
+        })
+        .collect()
+}
+
+/// Where link `node` is drawn: its boxes and text runs, with runs on one line joined.
+fn link_rects(
+    page: &Loaded,
+    node: NodeId,
+    metrics: &dyn font::TextMetrics,
+) -> Vec<(layout::Rect, bool)> {
+    let layout = &page.layout;
+    let inside: std::collections::HashSet<NodeId> = page.dom.descendants(node).collect();
+    let mut rects: Vec<(layout::Rect, bool)> = Vec::new();
+    for (i, b) in layout.boxes.iter().enumerate() {
+        if inside.contains(&b.node) {
+            rects.push((b.rect, layout.box_is_fixed(i)));
+        }
+    }
+    for (i, t) in layout.texts.iter().enumerate() {
+        if !inside.contains(&t.node) {
+            continue;
+        }
+        let style = page.styles.style(t.node);
+        if !style.visible {
+            continue;
+        }
+        let size = style.font_size.to_f32();
+        let top = t.baseline - metrics.ascent_em() * size;
+        let rect = layout::Rect {
+            x: t.x,
+            y: top,
+            width: t.width,
+            height: t.baseline + metrics.descent_em() * size - top,
+        };
+        let fixed = layout.text_is_fixed(i);
+        // Join with the previous run when it is on the same line and close by.
+        match rects.last_mut() {
+            Some((last, last_fixed))
+                if *last_fixed == fixed
+                    && (last.y - rect.y).abs() < 0.5
+                    && (last.height - rect.height).abs() < 0.5
+                    && rect.x >= last.x
+                    && rect.x <= last.x + last.width + size =>
+            {
+                last.width = rect.x + rect.width - last.x;
+            }
+            _ => rects.push((rect, fixed)),
+        }
+    }
+    rects
+}
+
 /// Typed text to a URL: full URLs as they are, `example.com` as https.
 fn parse_input(input: &str) -> Result<net::Url, String> {
     let input = input.trim();
+    engine::several_addresses(input)?;
     if input.contains("://") {
         return net::Url::parse(input);
     }
@@ -1188,7 +3276,8 @@ fn parse_input(input: &str) -> Result<net::Url, String> {
 
 fn host_of(url: &net::Url) -> String {
     if url.host.is_empty() {
-        url.path.rsplit('/').next().unwrap_or_default().to_string()
+        let path = url.decoded_path();
+        path.rsplit('/').next().unwrap_or_default().to_string()
     } else {
         url.host.clone()
     }
@@ -1251,6 +3340,7 @@ mod tests {
     struct FakeScreen {
         title: RefCell<String>,
         frame: RefCell<(usize, usize, Vec<u8>)>,
+        clipboard: RefCell<String>,
     }
 
     const PAD: usize = 16;
@@ -1270,6 +3360,10 @@ mod tests {
 
         fn set_title(&self, title: &str) {
             *self.title.borrow_mut() = title.to_string();
+        }
+
+        fn copy(&self, text: &str) {
+            *self.clipboard.borrow_mut() = text.to_string();
         }
 
         fn render(
@@ -1320,8 +3414,11 @@ mod tests {
     }
 
     fn browser_with(target: &Path, session: Option<PathBuf>) -> Browser<FakeScreen> {
+        let root = std::env::temp_dir().join(format!("broxee-tabs-{}", std::process::id()));
+        let store = TabStore::open(&root).expect("a folder for sleeping tabs");
         let opts = Options {
             target: target.display().to_string(),
+            more: Vec::new(),
             tree: false,
             styles: false,
             layout: false,
@@ -1334,9 +3431,18 @@ mod tests {
             scale: 1.0,
             fetch_css: false,
         };
-        let mut b = Browser::new(opts, FakeScreen::default(), session);
+        let mut b = Browser::new(opts, FakeScreen::default(), session, Some(store));
         b.start();
+        b.wait_for_load();
         b
+    }
+
+    /// Apply an event and wait for any page it started loading, as a person would before
+    /// looking at the result.
+    fn act(b: &mut Browser<FakeScreen>, event: Event) -> bool {
+        let dirty = b.handle(event);
+        b.wait_for_load();
+        dirty
     }
 
     fn key(key: Key) -> Event {
@@ -1344,6 +3450,7 @@ mod tests {
             key,
             command: false,
             shift: false,
+            option: false,
         })
     }
 
@@ -1352,6 +3459,7 @@ mod tests {
             key: Key::Char(c),
             command: true,
             shift: false,
+            option: false,
         })
     }
 
@@ -1372,10 +3480,13 @@ mod tests {
             SIDEBAR_WIDTH + run.x + run.width / 2.0,
             run.baseline - 4.0 - b.scroll + HEADER_HEIGHT,
         );
-        b.handle(Event::Click {
-            x: f64::from(x),
-            y: f64::from(y),
-        })
+        act(
+            b,
+            Event::Click {
+                x: f64::from(x),
+                y: f64::from(y),
+            },
+        )
     }
 
     #[test]
@@ -1386,11 +3497,14 @@ mod tests {
         assert!(click_text(&mut b, "Go to B"));
         assert_eq!(title(&b), "Page B");
         assert_eq!((b.tab().history.len(), b.tab().index), (2, 1));
-        assert!(b.handle(command('[')));
+        assert!(act(&mut b, command('[')));
         assert_eq!(title(&b), "Page A");
-        assert!(b.handle(command(']')));
+        assert!(act(&mut b, command(']')));
         assert_eq!(title(&b), "Page B");
-        assert!(!b.handle(command(']')), "nothing forward of the last page");
+        assert!(
+            !act(&mut b, command(']')),
+            "nothing forward of the last page"
+        );
         assert!(click_text(&mut b, "Back to A"));
         assert_eq!(
             (b.tab().history.len(), b.tab().index),
@@ -1403,27 +3517,34 @@ mod tests {
     fn scrolls_within_the_page_and_restores_position_on_back() {
         let (a, bpath) = site("scroll");
         let mut b = browser(&a);
-        assert!(b.handle(key(Key::PageDown)));
+        assert!(act(&mut b, key(Key::PageDown)));
         let saved = b.scroll;
         assert!(saved > 0.0);
-        assert!(b.handle(key(Key::End)));
+        assert!(act(&mut b, key(Key::End)));
         let bottom = b.scroll;
-        assert!(!b.handle(key(Key::Down)), "already at the bottom");
+        assert!(!act(&mut b, key(Key::Down)), "already at the bottom");
         assert!((bottom - b.max_scroll()).abs() < 0.01);
-        assert!(b.handle(Event::Scroll { dy: 10_000.0 }));
+        assert!(act(
+            &mut b,
+            Event::Scroll {
+                dy: 10_000.0,
+                x: 400.0,
+                y: 100.0
+            }
+        ));
         assert_eq!(b.scroll, 0.0, "scrolling up past the top stops at 0");
-        b.handle(key(Key::PageDown));
+        act(&mut b, key(Key::PageDown));
 
         // Open B through the address field, then come back to A at the same position.
-        assert!(b.handle(command('l')));
+        assert!(act(&mut b, command('l')));
         assert!(b.field.as_ref().is_some_and(|f| f.all_selected));
         for c in format!("file://{}", bpath.display()).chars() {
-            b.handle(key(Key::Char(c)));
+            act(&mut b, key(Key::Char(c)));
         }
-        b.handle(key(Key::Enter));
+        act(&mut b, key(Key::Enter));
         assert_eq!(title(&b), "Page B");
         assert_eq!(b.scroll, 0.0);
-        b.handle(command('['));
+        act(&mut b, command('['));
         assert_eq!(title(&b), "Page A");
         assert_eq!(b.scroll, saved);
     }
@@ -1437,34 +3558,113 @@ mod tests {
                 key: Key::Tab,
                 command: false,
                 shift,
+                option: false,
             })
         };
         // Only one page: back and forward are disabled, so Tab lands on reload first.
-        assert!(b.handle(tab(false)));
+        assert!(act(&mut b, tab(false)));
         assert_eq!(b.focus, Some(Button::Reload));
-        assert!(b.handle(tab(false)));
+        assert!(act(&mut b, tab(false)));
         assert!(b.field.is_some(), "then the address field");
-        assert!(b.handle(tab(false)));
-        assert_eq!(
-            b.focus,
-            Some(Button::Reload),
-            "wraps past the disabled buttons"
-        );
-        assert!(b.handle(tab(true)));
-        assert!(b.field.is_some(), "Shift+Tab goes backwards");
+        assert!(act(&mut b, tab(false)));
+        assert_eq!(b.focus, Some(Button::More), "then ⋯");
+        assert!(act(&mut b, tab(false)));
+        assert!(b.link_focus.is_some(), "then the page's first link");
+        assert!(act(&mut b, tab(true)));
+        assert_eq!(b.focus, Some(Button::More), "Shift+Tab goes backwards");
+        assert!(act(&mut b, tab(true)));
+        assert!(b.field.is_some());
 
         click_text(&mut b, "Go to B");
         assert_eq!(b.focus, None);
-        b.handle(tab(false));
+        act(&mut b, tab(false));
         assert_eq!(b.focus, Some(Button::Back));
         b.render();
-        assert!(b.handle(key(Key::Enter)));
+        assert!(act(&mut b, key(Key::Enter)));
         assert_eq!(
             title(&b),
             "Page A",
             "Enter on the focused back button goes back"
         );
-        assert!(b.handle(key(Key::Escape)) || b.focus.is_none());
+        assert!(act(&mut b, key(Key::Escape)) || b.focus.is_none());
+    }
+
+    #[test]
+    fn tab_reaches_page_links_scrolls_to_them_and_enter_follows() {
+        let dir = std::env::temp_dir().join(format!("broxee-focus-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let page = dir.join("links.html");
+        std::fs::write(
+            &page,
+            format!(
+                "<title>Links</title><style>body {{ margin: 0 }} p {{ margin: 0; line-height: 20px }} \
+                 .gone {{ display: none }} #ghost {{ visibility: hidden }}</style>\
+                 <p><a href=one.html>First</a> <a class=gone href=x.html>Gone</a> \
+                 <a id=ghost href=y.html>Ghost</a> <a name=anchor>No href</a></p>{}\
+                 <p><a href=two.html>Far down</a></p>",
+                "<p>line</p>".repeat(60)
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("one.html"), "<title>One</title>").unwrap();
+        std::fs::write(dir.join("two.html"), "<title>Two</title>").unwrap();
+        let mut b = browser(&page);
+        let tab = |shift| {
+            Event::Key(KeyEvent {
+                key: Key::Tab,
+                command: false,
+                shift,
+                option: false,
+            })
+        };
+        let focused = |b: &Browser<FakeScreen>| {
+            let node = b.link_focus.as_ref()?.node;
+            let page = b.page.as_ref()?;
+            Some(page.dom.text_content(node))
+        };
+        act(&mut b, tab(false)); // reload
+        act(&mut b, tab(false)); // address field
+        act(&mut b, tab(false)); // ⋯
+        act(&mut b, tab(false));
+        assert_eq!(focused(&b).as_deref(), Some("First"));
+        assert_eq!(b.scroll, 0.0);
+
+        // The focus ring: 2px of accent, 2px outside the link's text.
+        b.render();
+        let rect = b.link_focus.as_ref().unwrap().rects[0].0;
+        let accent = b.chrome.theme().accent;
+        let ring_x = (SIDEBAR_WIDTH + rect.x + rect.width) as usize + 3;
+        let ring_y = (HEADER_HEIGHT + rect.y + rect.height / 2.0) as usize;
+        assert_eq!(
+            b.window.pixel(ring_x, ring_y),
+            [accent.b, accent.g, accent.r, 255]
+        );
+
+        // Hidden links and anchors without href are skipped; the next one is scrolled to.
+        act(&mut b, tab(false));
+        assert_eq!(focused(&b).as_deref(), Some("Far down"));
+        assert!(b.scroll > 0.0, "scrolled into view");
+        let far = b.link_focus.as_ref().unwrap().rects[0].0;
+        assert!(far.y >= b.scroll && far.y + far.height <= b.scroll + b.page_height());
+
+        // Wrapping goes back to the header; Shift+Tab comes back.
+        act(&mut b, tab(false));
+        assert!(b.link_focus.is_none() && b.focus.is_some());
+        act(&mut b, tab(true));
+        assert_eq!(focused(&b).as_deref(), Some("Far down"));
+
+        // The focus comes back with a sleeping tab; Enter follows the link.
+        act(&mut b, command('t'));
+        act(&mut b, key(Key::Escape));
+        act(&mut b, command('1'));
+        assert_eq!(
+            focused(&b).as_deref(),
+            Some("Far down"),
+            "restored on waking"
+        );
+        assert!(act(&mut b, key(Key::Enter)));
+        assert_eq!(title(&b), "Two");
+        assert!(b.link_focus.is_none(), "a new page starts without focus");
     }
 
     #[test]
@@ -1485,7 +3685,7 @@ mod tests {
         .unwrap();
         std::fs::write(dir.join("target.html"), "<title>Target</title>").unwrap();
         let mut b = browser(&page);
-        b.handle(key(Key::PageDown));
+        act(&mut b, key(Key::PageDown));
         assert!(b.scroll > 100.0);
         // The pinned link is still at the top of the page area after scrolling.
         let layout = &b.page.as_ref().unwrap().layout;
@@ -1495,23 +3695,29 @@ mod tests {
         let t = layout.texts[pinned];
         assert!(layout.text_is_fixed(pinned));
         let (x, y) = (SIDEBAR_WIDTH + t.x + 2.0, t.baseline - 4.0 + HEADER_HEIGHT);
-        assert!(b.handle(Event::Click {
-            x: f64::from(x),
-            y: f64::from(y)
-        }));
+        assert!(act(
+            &mut b,
+            Event::Click {
+                x: f64::from(x),
+                y: f64::from(y)
+            }
+        ));
         assert_eq!(title(&b), "Target");
 
-        b.handle(command('['));
-        b.handle(key(Key::Home));
+        act(&mut b, command('['));
+        act(&mut b, key(Key::Home));
         let layout = &b.page.as_ref().unwrap().layout;
         let ghost = (0..layout.texts.len())
             .find(|&i| layout.text(&layout.texts[i]) == "Ghost")
             .unwrap();
         let t = layout.texts[ghost];
-        b.handle(Event::Click {
-            x: f64::from(SIDEBAR_WIDTH + t.x + 2.0),
-            y: f64::from(t.baseline - 4.0 + HEADER_HEIGHT),
-        });
+        act(
+            &mut b,
+            Event::Click {
+                x: f64::from(SIDEBAR_WIDTH + t.x + 2.0),
+                y: f64::from(t.baseline - 4.0 + HEADER_HEIGHT),
+            },
+        );
         assert_eq!(title(&b), "Fixed", "a hidden link does not navigate");
     }
 
@@ -1519,15 +3725,16 @@ mod tests {
     fn shows_error_and_message_pages() {
         let (a, _) = site("errors");
         let mut b = browser(&a);
-        b.handle(command('l'));
-        b.handle(Event::Paste(
-            "file:///no/such/broxee/page.html\nsecond line".into(),
-        ));
+        act(&mut b, command('l'));
+        act(
+            &mut b,
+            Event::Paste("file:///no/such/broxee/page.html\nsecond line".into()),
+        );
         assert_eq!(
             b.field.as_ref().map(|f| f.text.as_str()),
             Some("file:///no/such/broxee/page.html")
         );
-        b.handle(key(Key::Enter));
+        act(&mut b, key(Key::Enter));
         assert_eq!(title(&b), "Couldn't reach page.html");
         assert!(b
             .page
@@ -1537,11 +3744,11 @@ mod tests {
             .text_content(html::Dom::ROOT)
             .contains("Try again"));
 
-        b.handle(command('l'));
+        act(&mut b, command('l'));
         for c in "what is rust".chars() {
-            b.handle(key(Key::Char(c)));
+            act(&mut b, key(Key::Char(c)));
         }
-        b.handle(key(Key::Enter));
+        act(&mut b, key(Key::Enter));
         assert_eq!(title(&b), "Broxee can't search yet");
     }
 
@@ -1572,13 +3779,16 @@ mod tests {
             [255, 255, 255, 255],
             "page canvas below the header"
         );
-        assert!(b.handle(Event::Resize {
-            width: 490.0,
-            height: 300.0,
-            scale: 1.0
-        }));
+        assert!(act(
+            &mut b,
+            Event::Resize {
+                width: 490.0,
+                height: 300.0,
+                scale: 1.0
+            }
+        ));
         assert_eq!(b.page.as_ref().unwrap().layout.width, 250.0);
-        assert!(b.handle(command('\\')), "⌘\\ hides the sidebar");
+        assert!(act(&mut b, command('\\')), "⌘\\ hides the sidebar");
         assert_eq!(b.page.as_ref().unwrap().layout.width, 490.0);
     }
 
@@ -1587,13 +3797,14 @@ mod tests {
             key: Key::Char(c),
             command: true,
             shift: true,
+            option: false,
         })
     }
 
     fn open(b: &mut Browser<FakeScreen>, path: &Path) {
-        b.handle(command('l'));
-        b.handle(Event::Paste(format!("file://{}", path.display())));
-        b.handle(key(Key::Enter));
+        act(b, command('l'));
+        act(b, Event::Paste(format!("file://{}", path.display())));
+        act(b, key(Key::Enter));
     }
 
     fn tab_titles(b: &Browser<FakeScreen>) -> Vec<String> {
@@ -1605,13 +3816,13 @@ mod tests {
     fn sleeping_tabs_wake_from_their_snapshot_without_the_network() {
         let (a, bpath) = site("sleep");
         let mut b = browser(&a);
-        b.handle(key(Key::PageDown));
+        act(&mut b, key(Key::PageDown));
         let saved = b.scroll;
         assert!(saved > 0.0);
 
-        assert!(b.handle(command('t')));
+        assert!(act(&mut b, command('t')));
         assert!(b.page.is_none(), "a new tab is empty");
-        assert_eq!(b.field.as_ref().map(|f| f.text.as_str()), Some(""));
+        assert!(b.palette.is_some(), "with the palette open");
         assert_eq!(tab_titles(&b), ["Page A", "New tab"]);
         open(&mut b, &bpath);
         assert_eq!(title(&b), "Page B");
@@ -1622,7 +3833,7 @@ mod tests {
 
         // With A's file gone, only the snapshot can bring it back.
         std::fs::remove_file(&a).unwrap();
-        assert!(b.handle(command('1')));
+        assert!(act(&mut b, command('1')));
         assert_eq!(title(&b), "Page A");
         assert_eq!(b.scroll, saved, "at the same scroll position");
         assert!(b.profiles[0].tabs[1].snapshot.is_some());
@@ -1630,13 +3841,13 @@ mod tests {
             b.profiles[0].tabs[0].snapshot.is_none(),
             "the visible tab is awake"
         );
-        assert!(!b.handle(command('1')), "already selected");
+        assert!(!act(&mut b, command('1')), "already selected");
 
         // Clicking the second row in the sidebar selects it.
-        assert!(b.handle(Event::Click { x: 100.0, y: 93.0 }));
+        assert!(act(&mut b, Event::Click { x: 100.0, y: 127.0 }));
         assert_eq!(title(&b), "Page B");
-        b.handle(command('1'));
-        assert!(b.handle(command('9')), "⌘9 is the last tab");
+        act(&mut b, command('1'));
+        assert!(act(&mut b, command('9')), "⌘9 is the last tab");
         assert_eq!(b.profiles[0].active, 1);
     }
 
@@ -1645,10 +3856,10 @@ mod tests {
         let (a, bpath) = site("budget");
         let mut b = browser(&a);
         b.snapshot_budget = 0;
-        b.handle(command('t'));
+        act(&mut b, command('t'));
         open(&mut b, &bpath);
         assert!(b.profiles[0].tabs[0].snapshot.is_none());
-        assert!(b.handle(command('1')));
+        assert!(act(&mut b, command('1')));
         assert_eq!(title(&b), "Page A", "reloaded from its URL");
     }
 
@@ -1656,26 +3867,26 @@ mod tests {
     fn closes_and_reopens_tabs() {
         let (a, bpath) = site("close");
         let mut b = browser(&a);
-        b.handle(command('t'));
+        act(&mut b, command('t'));
         open(&mut b, &bpath);
-        assert!(b.handle(command('w')));
+        assert!(act(&mut b, command('w')));
         assert_eq!(tab_titles(&b), ["Page A"]);
         assert_eq!(title(&b), "Page A");
-        assert!(b.handle(command_shift('t')));
+        assert!(act(&mut b, command_shift('t')));
         assert_eq!(tab_titles(&b), ["Page A", "Page B"]);
         assert_eq!((b.profiles[0].active, title(&b).as_str()), (1, "Page B"));
-        assert!(!b.handle(command_shift('t')), "nothing left to reopen");
+        assert!(!act(&mut b, command_shift('t')), "nothing left to reopen");
 
         // The close button on the active row.
-        assert!(b.handle(Event::Click { x: 220.0, y: 93.0 }));
-        assert!(b.handle(command('w')));
+        assert!(act(&mut b, Event::Click { x: 220.0, y: 127.0 }));
+        assert!(act(&mut b, command('w')));
         assert_eq!(
             tab_titles(&b),
             ["New tab"],
             "the last tab becomes a new tab"
         );
         assert!(b.page.is_none());
-        assert!(b.handle(command_shift('t')));
+        assert!(act(&mut b, command_shift('t')));
         assert_eq!(tab_titles(&b), ["Page A", "New tab"]);
     }
 
@@ -1683,7 +3894,7 @@ mod tests {
     fn profiles_keep_their_own_tabs() {
         let (a, bpath) = site("profiles");
         let mut b = browser(&a);
-        assert!(b.handle(command_shift('p')));
+        assert!(act(&mut b, command_shift('p')));
         assert_eq!(b.profiles[b.profile].name, "Work");
         assert_eq!(tab_titles(&b), ["New tab"]);
         assert_eq!(title(&b), "New tab");
@@ -1694,10 +3905,13 @@ mod tests {
         open(&mut b, &bpath);
         assert_eq!(title(&b), "Page B");
 
-        assert!(b.handle(command_shift('p')));
+        assert!(act(&mut b, command_shift('p')));
         assert_eq!(tab_titles(&b), ["Page A"]);
         assert_eq!(title(&b), "Page A");
-        assert!(b.handle(Event::Click { x: 100.0, y: 10.0 }), "the switcher");
+        assert!(
+            act(&mut b, Event::Click { x: 100.0, y: 10.0 }),
+            "the switcher"
+        );
         assert_eq!(title(&b), "Page B");
     }
 
@@ -1707,11 +3921,11 @@ mod tests {
         let path = a.with_file_name("session");
         let _ = std::fs::remove_file(&path);
         let mut b = browser_with(&a, Some(path.clone()));
-        b.handle(command('t'));
+        act(&mut b, command('t'));
         open(&mut b, &bpath);
-        b.handle(key(Key::Down));
-        b.handle(command_shift('p'));
-        b.handle(command_shift('p'));
+        act(&mut b, key(Key::Down));
+        act(&mut b, command_shift('p'));
+        act(&mut b, command_shift('p'));
         drop(b);
 
         let b = browser_with(Path::new(""), Some(path.clone()));
@@ -1731,31 +3945,1055 @@ mod tests {
     fn reads_damaged_sessions_safely() {
         assert!(parse_session("").is_none());
         assert!(parse_session("something else\nvisible\t1").is_none());
-        let (profiles, visible) = parse_session(
+        let session = parse_session(
             "broxee-session 1\nvisible\t7\nentry\t0\thttps://orphan.example/\n\
              profile\t0\tPersonal\ntab\t9\tKept\nentry\tNaN\thttps://a.example/\n\
              entry\t5\tnot a url\nbogus line\n",
         )
         .unwrap();
-        assert_eq!(visible, 7, "clamped by the caller");
-        let tab = &profiles[0].0[0];
+        assert_eq!(session.visible, 7, "clamped by the caller");
+        assert_eq!(session.sidebar, None);
+        let tab = &session.profiles[0].tabs[0];
         assert_eq!(
             (tab.title.as_str(), tab.index, tab.history.len()),
             ("Kept", 0, 1)
         );
         assert_eq!(tab.history[0].scroll, 0.0);
 
-        let mut personal = Profile::new("Personal", Hue::Emerald);
+        let mut personal = Profile::new("Personal", "Personal", Hue::Emerald);
         personal.tabs[0].title = "A\ttab\nname".into();
         personal.tabs[0].history.push(Entry {
             url: net::Url::parse("https://a.example/x").unwrap(),
             scroll: 12.5,
+            title: "Page\tX".into(),
         });
-        let text = write_session(&[personal], 0);
-        let (profiles, _) = parse_session(&text).unwrap();
-        let tab = &profiles[0].0[0];
+        personal.tabs[0].pinned = true;
+        personal.tabs.push(Tab {
+            group: Some("Re\tsearch".into()),
+            ..Tab::default()
+        });
+        personal.folded.push("Research".into());
+        let text = write_session(&[personal], 0, (999.0, false));
+        let session = parse_session(&text).unwrap();
+        assert_eq!(
+            session.sidebar,
+            Some((SIDEBAR_MAX, false)),
+            "width kept in range"
+        );
+        let saved = &session.profiles[0];
+        assert_eq!(saved.folded, ["Research"]);
+        assert!(saved.tabs[0].pinned && saved.tabs[1].group.as_deref() == Some("Re search"));
+        let tab = &saved.tabs[0];
         assert_eq!(tab.title, "A tab name");
         assert_eq!(tab.history[0].scroll, 12.5);
+        assert_eq!(tab.history[0].title, "Page X");
+    }
+
+    #[test]
+    fn a_new_page_never_reuses_the_last_pages_images() {
+        let dir = std::env::temp_dir().join(format!("broxee-images-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Two pages, each with one 20x20 image at the same size: both are image 0.
+        let page = |name: &str, rgb: [u8; 3]| {
+            let pixels: Vec<u8> = (0..400)
+                .flat_map(|_| [rgb[0], rgb[1], rgb[2], 255])
+                .collect();
+            let png: String = paint::png::encode(20, 20, &pixels)
+                .iter()
+                .map(|b| format!("%{b:02X}"))
+                .collect();
+            let path = dir.join(name);
+            std::fs::write(
+                &path,
+                format!("<style>body {{ margin: 0 }}</style><img src=\"data:image/png,{png}\">"),
+            )
+            .unwrap();
+            path
+        };
+        let (red, blue) = (
+            page("red.html", [255, 0, 0]),
+            page("blue.html", [0, 0, 255]),
+        );
+        let mut b = browser(&red);
+        b.opts.fetch_css = true;
+        act(&mut b, command('r'));
+        let at = (SIDEBAR_WIDTH as usize + 10, HEADER_HEIGHT as usize + 10);
+        assert_eq!(b.window.pixel(at.0, at.1), [0, 0, 255, 255], "red, as BGRA");
+        open(&mut b, &blue);
+        assert_eq!(
+            b.window.pixel(at.0, at.1),
+            [255, 0, 0, 255],
+            "blue, not the cached red"
+        );
+    }
+
+    /// A local HTTP server that holds each response until `release` sends a message or is
+    /// dropped: a slow site, without the network.
+    fn slow_server(title: &'static str) -> (String, mpsc::Sender<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release, wait) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request);
+                let _ = wait.recv();
+                let body = format!("<title>{title}</title><p>slow");
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (format!("http://{address}/"), release)
+    }
+
+    /// Start loading `url` from the address field without waiting for it.
+    fn start_loading(b: &mut Browser<FakeScreen>, url: &str) {
+        act(b, command('l'));
+        act(b, Event::Paste(url.to_string()));
+        b.handle(key(Key::Enter));
+        assert!(b.load.is_some() && b.loading.is_some(), "loading {url}");
+    }
+
+    #[test]
+    fn the_window_answers_while_a_page_loads() {
+        let (a, _) = site("async");
+        let (slow, release) = slow_server("Slow");
+        let mut b = browser(&a);
+
+        // A new tab while a page loads: answered at once, and the load is dropped.
+        start_loading(&mut b, &slow);
+        let started = std::time::Instant::now();
+        assert!(b.handle(command('t')));
+        // The server has not answered: a window waiting on it would not get here at all. The
+        // bound only guards against a regression that waits for the network's timeout.
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(b.load.is_none() && b.loading.is_none());
+        assert_eq!(tab_titles(&b), ["Page A", "New tab"]);
+        act(&mut b, command('w'));
+        assert_eq!(title(&b), "Page A");
+
+        // Esc stops a load and keeps the page and history as they were.
+        start_loading(&mut b, &slow);
+        assert!(b.handle(key(Key::Escape)));
+        assert!(b.load.is_none() && b.loading.is_none());
+        assert_eq!(title(&b), "Page A");
+        assert_eq!(b.tab().history.len(), 1);
+        assert!(!b.handle(key(Key::Escape)), "nothing left to stop");
+
+        // So does the reload button, which is a stop button while loading.
+        start_loading(&mut b, &slow);
+        assert!(b.handle(Event::Click {
+            x: f64::from(SIDEBAR_WIDTH + 80.0),
+            y: 18.0
+        }));
+        assert!(b.load.is_none());
+        assert_eq!(title(&b), "Page A");
+
+        // Following a link while a page loads replaces that load.
+        start_loading(&mut b, &slow);
+        assert!(click_text(&mut b, "Go to B"));
+        assert_eq!(title(&b), "Page B");
+        assert_eq!(b.tab().history.len(), 2);
+
+        // Going back while a page loads cancels it and goes back.
+        start_loading(&mut b, &slow);
+        assert!(act(&mut b, command('[')));
+        assert_eq!((title(&b).as_str(), b.tab().index), ("Page A", 0));
+
+        // Switching profile while loading answers at once too.
+        start_loading(&mut b, &slow);
+        assert!(b.handle(command_shift('p')));
+        assert!(b.load.is_none());
+        assert_eq!(b.profiles[b.profile].name, "Work");
+        drop(release);
+    }
+
+    #[test]
+    fn a_page_loading_in_the_background_arrives_in_its_tab() {
+        let (a, _) = site("arrive");
+        let (slow, release) = slow_server("Slow page");
+        let mut b = browser(&a);
+        start_loading(&mut b, &slow);
+        // Scrolling the current page still works meanwhile.
+        assert!(b.handle(key(Key::PageDown)));
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while b.load.is_some() && std::time::Instant::now() < deadline {
+            b.poll_load();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(title(&b), "Slow page");
+        assert_eq!(b.tab().history.len(), 2);
+        assert_eq!(b.scroll, 0.0, "a new page starts at the top");
+        assert!(b.loading.is_none());
+    }
+
+    fn type_text(b: &mut Browser<FakeScreen>, text: &str) {
+        for c in text.chars() {
+            act(b, key(Key::Char(c)));
+        }
+    }
+
+    fn results(b: &Browser<FakeScreen>) -> Vec<String> {
+        let p = b.palette.as_ref().expect("the palette is open");
+        p.items.iter().map(|i| i.title.clone()).collect()
+    }
+
+    #[test]
+    fn the_palette_finds_tabs_in_every_profile_history_and_commands() {
+        let (a, bpath) = site("palette");
+        let mut b = browser(&a);
+        // Work profile: one tab showing B. Personal: A, with B in its history.
+        act(&mut b, command_shift('p'));
+        act(&mut b, key(Key::Escape));
+        open(&mut b, &bpath);
+        act(&mut b, command_shift('p'));
+        assert_eq!(title(&b), "Page A");
+        assert!(click_text(&mut b, "Go to B"));
+        act(&mut b, command('['));
+
+        assert!(act(&mut b, command('k')));
+        let all = results(&b);
+        assert_eq!(
+            all[0], "Page B",
+            "the other profile's tab first: Personal has no other tab"
+        );
+        assert!(
+            all.contains(&"Reopen closed tab".to_string()),
+            "commands are listed"
+        );
+        let p = b.palette.as_ref().unwrap();
+        assert_eq!(p.items[0].hint, Hint::Label("Tab · Work".into()));
+        assert!(p
+            .items
+            .iter()
+            .any(|i| i.hint == Hint::Label("History".into())));
+
+        // Typing narrows; Enter on another profile's tab switches to it.
+        type_text(&mut b, "page b");
+        assert_eq!(results(&b)[0], "Page B");
+        assert!(act(&mut b, key(Key::Enter)));
+        assert!(b.palette.is_none());
+        assert_eq!(b.profiles[b.profile].name, "Work");
+        assert_eq!(title(&b), "Page B");
+
+        // Commands run from the palette, with their shortcut shown.
+        act(&mut b, command('k'));
+        type_text(&mut b, "switch prof");
+        let p = b.palette.as_ref().unwrap();
+        assert_eq!(p.items[0].hint, Hint::Keys("⌘⇧P"));
+        act(&mut b, key(Key::Enter));
+        assert_eq!(b.profiles[b.profile].name, "Personal");
+
+        // History stays within the profile: Work's history is not offered here.
+        act(&mut b, command('k'));
+        let history: Vec<_> = b
+            .palette
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .filter(|i| i.hint == Hint::Label("History".into()))
+            .map(|i| i.title.clone())
+            .collect();
+        assert_eq!(history, ["Page B", "Page A"], "most recent first");
+        assert!(act(&mut b, key(Key::Escape)));
+        assert!(b.palette.is_none());
+    }
+
+    #[test]
+    fn the_palette_opens_typed_addresses_and_says_when_nothing_matches() {
+        let (a, bpath) = site("palette-open");
+        let mut b = browser(&a);
+        act(&mut b, command('k'));
+        type_text(&mut b, "zzqx");
+        assert!(results(&b).is_empty());
+        b.render();
+        assert!(!act(&mut b, key(Key::Enter)), "nothing to open");
+        assert!(b.palette.is_some());
+
+        for _ in 0..4 {
+            act(&mut b, key(Key::Backspace));
+        }
+        act(&mut b, Event::Paste(format!("file://{}", bpath.display())));
+        assert!(results(&b)[0].starts_with("Open file://"));
+        act(&mut b, key(Key::Enter));
+        assert_eq!(title(&b), "Page B");
+        assert_eq!(b.tab().history.len(), 2);
+
+        // A new tab opens with the palette; Esc leaves an empty tab.
+        act(&mut b, command('t'));
+        assert!(b.palette.is_some());
+        act(&mut b, key(Key::Escape));
+        assert!(b.palette.is_none() && b.page.is_none());
+        // ⌘K toggles; another shortcut closes it and runs.
+        act(&mut b, command('k'));
+        assert!(act(&mut b, command('k')));
+        assert!(b.palette.is_none());
+        act(&mut b, command('k'));
+        act(&mut b, command('l'));
+        assert!(b.palette.is_none() && b.field.is_some());
+    }
+
+    #[test]
+    fn the_palette_is_drawn_and_answers_the_mouse() {
+        let (a, _) = site("palette-mouse");
+        let mut b = browser(&a);
+        // The sidebar's search field opens it.
+        assert!(act(&mut b, Event::Click { x: 100.0, y: 58.0 }));
+        assert!(b.palette.is_some());
+        b.render();
+        let theme = b.chrome.theme();
+        // Pane 400 points wide, window 300 tall: 368 wide from x = 16, top 48, four rows fit
+        // (bottom at 48 + 57 + 176 = 281).
+        assert_eq!(chrome::palette_capacity(300.0), 4);
+        let (left, top) = (SIDEBAR_WIDTH as usize + 16, 48);
+        assert_eq!(
+            b.window.pixel(left + 100, top + 30),
+            [theme.surface.b, theme.surface.g, theme.surface.r, 255],
+            "the input row"
+        );
+        let shadow = b.window.pixel(left + 100, 287);
+        assert!(
+            shadow[0] < 255 && shadow[0] > 200,
+            "a soft shadow under it: {shadow:?}"
+        );
+
+        // Results are rows; clicking the second runs it.
+        type_text(&mut b, "tab");
+        let second = results(&b)[1].clone();
+        assert!(act(&mut b, key(Key::Down)));
+        let y = 48.0 + 44.0 + 1.0 + 6.0 + 44.0 + 20.0;
+        let x = f64::from(SIDEBAR_WIDTH + 100.0);
+        assert_eq!(second, "Close tab");
+        assert!(act(&mut b, Event::Click { x, y }));
+        assert_eq!(tab_titles(&b), ["New tab"], "Close tab ran");
+        assert!(
+            b.palette.is_some(),
+            "the new tab that replaced it opens the palette"
+        );
+
+        // A click outside closes it without doing anything else.
+        assert!(act(
+            &mut b,
+            Event::Click {
+                x: f64::from(SIDEBAR_WIDTH + 5.0),
+                y: 280.0
+            }
+        ));
+        assert!(b.palette.is_none());
+    }
+
+    /// A local HTTP server that sets `id=<n>` (persistent) and `s=1` (session) on its first
+    /// visit from a jar without them, and titles each page with the Cookie header it received.
+    fn cookie_server() -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for (n, stream) in listener.incoming().enumerate() {
+                let Ok(mut stream) = stream else { break };
+                let mut request = [0u8; 4096];
+                let len = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..len]).into_owned();
+                let cookie = request
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Cookie: "))
+                    .unwrap_or("none")
+                    .to_string();
+                let set = if cookie.contains("id=") {
+                    String::new()
+                } else {
+                    format!("Set-Cookie: id={n}; Max-Age=3600\r\nSet-Cookie: s=1\r\n")
+                };
+                let body = format!("<title>{cookie}</title>");
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\n{set}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        format!("http://{address}/")
+    }
+
+    fn visit(b: &mut Browser<FakeScreen>, url: &str) {
+        act(b, command('l'));
+        act(b, Event::Paste(url.to_string()));
+        act(b, key(Key::Enter));
+    }
+
+    #[test]
+    fn cookies_stay_in_their_profile_and_survive_a_restart() {
+        let (a, _) = site("cookies");
+        let server = cookie_server();
+        let session = a.with_file_name("cookie-session");
+        let _ = std::fs::remove_dir_all(a.with_file_name("profiles"));
+        let mut b = browser_with(&a, Some(session.clone()));
+
+        visit(&mut b, &server);
+        assert_eq!(title(&b), "none", "first visit: nothing to send");
+        act(&mut b, command('r'));
+        let personal = title(&b);
+        assert!(
+            personal.starts_with("id=") && personal.ends_with("; s=1"),
+            "{personal}"
+        );
+
+        // Work has its own jar.
+        act(&mut b, command_shift('p'));
+        act(&mut b, key(Key::Escape));
+        visit(&mut b, &server);
+        assert_eq!(title(&b), "none", "Personal's cookies do not reach Work");
+        act(&mut b, command('r'));
+        let work = title(&b);
+        assert!(
+            work.starts_with("id=") && work != personal,
+            "{work} vs {personal}"
+        );
+
+        // Saved per profile, private to this user; session cookies are not saved.
+        let file = a
+            .with_file_name("profiles")
+            .join("Personal")
+            .join("cookies");
+        let saved = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            saved.contains("id\t") && !saved.contains("s\t1\t"),
+            "{saved}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        drop(b);
+
+        // After a restart the persistent cookie comes back; the session one does not.
+        let mut b = browser_with(Path::new(""), Some(session.clone()));
+        act(&mut b, command_shift('p'));
+        if b.profiles[b.profile].name != "Personal" {
+            act(&mut b, command_shift('p'));
+        }
+        visit(&mut b, &server);
+        assert_eq!(title(&b), personal.trim_end_matches("; s=1"));
+
+        // Clearing works from the palette, for this profile only.
+        act(&mut b, command('k'));
+        type_text(&mut b, "clear this");
+        act(&mut b, key(Key::Enter));
+        assert!(b.profiles[b.profile].cookies.is_empty());
+        assert!(!b.profiles[1 - b.profile].cookies.is_empty());
+    }
+
+    fn command_option(c: char) -> Event {
+        Event::Key(KeyEvent {
+            key: Key::Char(c),
+            command: true,
+            shift: false,
+            option: true,
+        })
+    }
+
+    #[test]
+    fn bookmarks_are_saved_in_folders_found_and_opened() {
+        let (a, _) = site("bookmarks");
+        let session = a.with_file_name("bookmark-session");
+        let _ = std::fs::remove_dir_all(a.with_file_name("profiles"));
+        let mut b = browser_with(&a, Some(session.clone()));
+
+        // ⌘D on page A: its title, the default folder; Enter saves.
+        assert!(act(&mut b, command('d')));
+        let d = b.dialog.as_ref().unwrap();
+        assert_eq!(
+            (d.fields[0].text.as_str(), d.fields[1].text.as_str()),
+            ("Page A", "Bookmarks")
+        );
+        b.render();
+        act(&mut b, key(Key::Enter));
+        assert!(b.dialog.is_none());
+
+        // Page B, renamed, in a new folder: typing replaces the field Tab reaches.
+        click_text(&mut b, "Go to B");
+        act(&mut b, command('d'));
+        type_text(&mut b, "Second page");
+        act(&mut b, key(Key::Tab));
+        type_text(&mut b, "Reading");
+        act(&mut b, key(Key::Enter));
+        let p = &b.profiles[0];
+        assert_eq!(p.bookmarks.len(), 2);
+        assert_eq!(
+            (
+                p.bookmarks[1].title.as_str(),
+                p.bookmarks[1].folder.as_str()
+            ),
+            ("Second page", "Reading")
+        );
+        assert_eq!(p.last_folder, "Reading");
+
+        // ⌘D on a saved page edits it; Esc leaves it as it was.
+        act(&mut b, command('d'));
+        assert!(matches!(
+            b.dialog.as_ref().unwrap().kind,
+            DialogKind::Bookmark {
+                existing: Some(1),
+                ..
+            }
+        ));
+        type_text(&mut b, "x");
+        act(&mut b, key(Key::Escape));
+        assert_eq!(b.profiles[0].bookmarks[1].title, "Second page");
+
+        // ⌘⌥B: folders in name order, as labels; ↓ Enter opens a bookmark.
+        assert!(act(&mut b, command_option('b')));
+        let list = b.sidebar_rows();
+        let rows: Vec<String> = list
+            .rows
+            .iter()
+            .map(|r| match r {
+                ListRow::Label(l) => format!("[{l}]"),
+                ListRow::Item { title, .. } => title.to_string(),
+            })
+            .collect();
+        assert_eq!(rows, ["[Bookmarks]", "Page A", "[Reading]", "Second page"]);
+        b.render();
+        act(&mut b, key(Key::Down));
+        assert_eq!(b.bookmark_row, Some(1));
+        act(&mut b, key(Key::Enter));
+        assert_eq!(title(&b), "Page A");
+        // A click on a row opens it too (rows start at 82, 30 points each).
+        assert!(act(
+            &mut b,
+            Event::Click {
+                x: 100.0,
+                y: 82.0 + 30.0 * 3.0 + 15.0
+            }
+        ));
+        assert_eq!(title(&b), "Page B");
+        act(&mut b, key(Key::Escape));
+        assert_eq!(b.list, SidebarList::Tabs);
+
+        // The palette finds bookmarks, with their folder.
+        act(&mut b, command('k'));
+        type_text(&mut b, "second");
+        let p = b.palette.as_ref().unwrap();
+        assert_eq!(p.items[0].hint, Hint::Label("Bookmark · Reading".into()));
+        act(&mut b, key(Key::Escape));
+
+        // Work has none, and says how to add one.
+        act(&mut b, command_shift('p'));
+        act(&mut b, key(Key::Escape));
+        act(&mut b, command_option('b'));
+        assert!(b.sidebar_rows().rows.is_empty() && b.sidebar_rows().empty.is_some());
+        b.render();
+        act(&mut b, command_option('b'));
+        act(&mut b, command_shift('p'));
+
+        // Saved per profile, private, and back after a restart; removing works too.
+        let file = a
+            .with_file_name("profiles")
+            .join("Personal")
+            .join("bookmarks");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        drop(b);
+        let mut b = browser_with(Path::new(""), Some(session));
+        assert_eq!(b.profiles[0].bookmarks.len(), 2);
+        assert_eq!(b.profiles[0].last_folder, "Reading");
+        if b.profiles[b.profile].name != "Personal" {
+            act(&mut b, command_shift('p'));
+        }
+        act(&mut b, command('k'));
+        type_text(&mut b, "remove this");
+        act(&mut b, key(Key::Enter));
+        assert_eq!(b.profiles[0].bookmarks.len(), 1);
+    }
+
+    #[test]
+    fn reads_damaged_bookmark_files_safely() {
+        assert_eq!(parse_bookmarks(""), (Vec::new(), None));
+        let (marks, last) = parse_bookmarks(
+            "broxee-bookmarks 1\nlast\tWork stuff\nmark\t\thttps://a.example/\tA\n\
+             mark\tF\tnot a url\tB\nmark\tshort\nnonsense\nmark\tF\thttps://c.example/\tC\twith tab\n",
+        );
+        assert_eq!(last.as_deref(), Some("Work stuff"));
+        assert_eq!(marks.len(), 2);
+        assert_eq!(
+            marks[0].folder, DEFAULT_FOLDER,
+            "an empty folder becomes the default"
+        );
+        assert_eq!(marks[1].title, "C\twith tab");
+        let text = write_bookmarks(&marks, "F");
+        assert_eq!(parse_bookmarks(&text).0, marks);
+    }
+
+    /// The tab list as labels in brackets and tab titles, as drawn.
+    fn sidebar_text(b: &Browser<FakeScreen>) -> Vec<String> {
+        b.sidebar_rows()
+            .rows
+            .iter()
+            .map(|r| match r {
+                ListRow::Label(l) => format!("[{l}]"),
+                ListRow::Item { title, .. } => title.to_string(),
+            })
+            .collect()
+    }
+
+    fn row_center(row: usize) -> f64 {
+        f64::from(chrome::LIST_TOP + chrome::TAB_ROW * row as f32 + 15.0)
+    }
+
+    fn run_palette(b: &mut Browser<FakeScreen>, text: &str) {
+        act(b, command('k'));
+        type_text(b, text);
+        act(b, key(Key::Enter));
+    }
+
+    #[test]
+    fn tabs_can_be_pinned_grouped_folded_dragged_and_restored() {
+        let (a, bpath) = site("organise");
+        let session = a.with_file_name("organise-session");
+        let _ = std::fs::remove_file(&session);
+        let mut b = browser_with(&a, Some(session.clone()));
+        act(&mut b, command('t'));
+        open(&mut b, &bpath);
+        act(&mut b, command('t'));
+        open(&mut b, &a);
+        assert_eq!(sidebar_text(&b), ["Page A", "Page B", "Page A"]);
+
+        // Pinning moves the tab to the top, under a label, and ⌘1 follows the new order.
+        run_palette(&mut b, "pin or unpin");
+        assert_eq!(
+            sidebar_text(&b),
+            ["[Pinned]", "Page A", "[Tabs]", "Page A", "Page B"]
+        );
+        assert_eq!(b.profiles[0].active, 0, "the pinned tab stays active");
+
+        // A group, through its dialog.
+        act(&mut b, command('2'));
+        run_palette(&mut b, "move this tab");
+        assert!(matches!(b.dialog.as_ref().unwrap().kind, DialogKind::Group));
+        type_text(&mut b, "Research");
+        act(&mut b, key(Key::Enter));
+        assert_eq!(
+            sidebar_text(&b),
+            [
+                "[Pinned]",
+                "Page A",
+                "[Research]",
+                "Page A",
+                "[Tabs]",
+                "Page B"
+            ]
+        );
+
+        // Folding hides the group's tabs except the active one; a click on the label folds.
+        act(&mut b, command('3'));
+        assert!(act(
+            &mut b,
+            Event::Click {
+                x: 100.0,
+                y: row_center(2)
+            }
+        ));
+        assert_eq!(
+            sidebar_text(&b),
+            ["[Pinned]", "Page A", "[Research (1)]", "[Tabs]", "Page B"]
+        );
+        assert!(act(
+            &mut b,
+            Event::Click {
+                x: 100.0,
+                y: row_center(2)
+            }
+        ));
+        assert_eq!(sidebar_text(&b).len(), 6, "unfolded");
+
+        // Dragging Page B (row 5) to just under the Research label joins the group.
+        act(
+            &mut b,
+            Event::Click {
+                x: 100.0,
+                y: row_center(5),
+            },
+        );
+        assert!(act(
+            &mut b,
+            Event::Drag {
+                x: 100.0,
+                y: row_center(5) - 20.0
+            }
+        ));
+        assert!(act(
+            &mut b,
+            Event::Drag {
+                x: 100.0,
+                y: row_center(3) - 15.0
+            }
+        ));
+        assert!(matches!(b.drag, Some(Drag::Moving { drop: 3, .. })));
+        b.render();
+        assert!(act(
+            &mut b,
+            Event::Release {
+                x: 100.0,
+                y: row_center(3) - 15.0
+            }
+        ));
+        assert_eq!(
+            sidebar_text(&b),
+            ["[Pinned]", "Page A", "[Research]", "Page B", "Page A"]
+        );
+        assert_eq!(
+            title(&b),
+            "Page B",
+            "the dragged tab is still the one shown"
+        );
+
+        // Resizing by the edge lays the page out once, at the end.
+        assert!(!act(&mut b, Event::Click { x: 238.0, y: 200.0 }));
+        assert!(act(&mut b, Event::Drag { x: 300.0, y: 200.0 }));
+        assert!(act(&mut b, Event::Drag { x: 900.0, y: 200.0 }));
+        assert_eq!(b.sidebar_width, SIDEBAR_MAX);
+        assert!(act(&mut b, Event::Release { x: 900.0, y: 200.0 }));
+        assert_eq!(b.page.as_ref().unwrap().layout.width, 640.0 - SIDEBAR_MAX);
+        drop(b);
+
+        // All of it comes back.
+        let b = browser_with(Path::new(""), Some(session));
+        assert_eq!(b.sidebar_width, SIDEBAR_MAX);
+        assert_eq!(
+            sidebar_text(&b),
+            ["[Pinned]", "Page A", "[Research]", "Page B", "Page A"]
+        );
+    }
+
+    #[test]
+    fn the_sidebar_scrolls_and_keeps_the_active_tab_in_view() {
+        let (a, _) = site("sidebar-scroll");
+        let mut b = browser(&a);
+        for _ in 0..12 {
+            act(&mut b, command('t'));
+            act(&mut b, key(Key::Escape));
+        }
+        // 13 tabs and "+ New tab" in 218 points: the list scrolls, and showed the new tab.
+        assert!(b.sidebar_scroll > 0.0);
+        let bottom = b.sidebar_scroll;
+        assert!(act(&mut b, command('1')));
+        assert_eq!(b.sidebar_scroll, 0.0, "⌘1 scrolls back to the first tab");
+        assert!(act(
+            &mut b,
+            Event::Scroll {
+                dy: -1000.0,
+                x: 100.0,
+                y: 200.0
+            }
+        ));
+        // Revealing a tab shows its row at the bottom edge; the wheel goes on to the footer.
+        assert_eq!(bottom, chrome::TAB_ROW * 13.0 - (300.0 - chrome::LIST_TOP));
+        let max = chrome::sidebar_max_scroll(13, true, 300.0);
+        assert_eq!(
+            b.sidebar_scroll, max,
+            "the wheel scrolls to the end, no further"
+        );
+        assert_eq!(b.scroll, 0.0, "the page did not scroll");
+        b.render();
+        // Clicks land on the rows as scrolled.
+        let first_visible = (b.sidebar_scroll / chrome::TAB_ROW).ceil() as usize;
+        let y = row_center(first_visible) - f64::from(b.sidebar_scroll);
+        assert!(act(&mut b, Event::Click { x: 100.0, y }));
+        assert_eq!(b.profiles[0].active, first_visible);
+    }
+
+    #[test]
+    fn profiles_can_be_added_renamed_recoloured_and_removed() {
+        let (a, bpath) = site("manage-profiles");
+        let session = a.with_file_name("manage-session");
+        let _ = std::fs::remove_file(&session);
+        let _ = std::fs::remove_dir_all(a.with_file_name("profiles"));
+        let mut b = browser_with(&a, Some(session.clone()));
+
+        // A new profile: named in a dialog, given the first unused color, shown at once.
+        run_palette(&mut b, "new profile");
+        type_text(&mut b, "work");
+        act(&mut b, key(Key::Enter));
+        let error = b.dialog.as_ref().and_then(|d| d.error.clone());
+        assert_eq!(
+            error.as_deref(),
+            Some("There is already a profile called work.")
+        );
+        for _ in 0..4 {
+            act(&mut b, key(Key::Backspace));
+        }
+        type_text(&mut b, "Side project");
+        act(&mut b, key(Key::Enter));
+        assert!(b.dialog.is_none());
+        let names: Vec<&str> = b.profiles.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["Personal", "Work", "Side project"]);
+        assert_eq!(b.profile, 2);
+        assert_eq!(
+            (b.profiles[2].hue, b.profiles[2].id.as_str()),
+            (Hue::Rose, "profile-3")
+        );
+        act(&mut b, key(Key::Escape));
+        open(&mut b, &bpath);
+        b.render();
+        let rose = b.chrome.theme().profile(Hue::Rose);
+        assert_eq!(
+            b.window.pixel(440, 0),
+            [rose.b, rose.g, rose.r, 255],
+            "its edge"
+        );
+
+        // Rename and recolor; the folder stays.
+        run_palette(&mut b, "rename this");
+        type_text(&mut b, "Projects");
+        act(&mut b, key(Key::Enter));
+        run_palette(&mut b, "change this profile");
+        assert_eq!(
+            (b.profiles[2].name.as_str(), b.profiles[2].hue),
+            ("Projects", Hue::Violet)
+        );
+        assert_eq!(b.profiles[2].id, "profile-3");
+
+        // ⌘⇧P cycles through all three; the palette switches by name.
+        act(&mut b, command_shift('p'));
+        assert_eq!(b.profile, 0);
+        act(&mut b, key(Key::Escape));
+        run_palette(&mut b, "switch to projects");
+        assert_eq!(b.profile, 2);
+        assert_eq!(title(&b), "Page B");
+        drop(b);
+
+        // Back after a restart, with names, colors and tabs.
+        let mut b = browser_with(Path::new(""), Some(session.clone()));
+        let names: Vec<&str> = b.profiles.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["Personal", "Work", "Projects"]);
+        assert_eq!(b.profiles[2].hue, Hue::Violet);
+        assert_eq!((b.profile, title(&b).as_str()), (2, "Page B"));
+
+        // Removing asks for the name, then deletes the profile's folder.
+        b.profiles[2].cookies.store(
+            &net::Url::parse("https://a.example/").unwrap(),
+            "k=1; Max-Age=60",
+            &net::Context::top_level(true),
+        );
+        b.save_cookies();
+        let folder = a.with_file_name("profiles").join("profile-3");
+        assert!(folder.exists());
+        run_palette(&mut b, "remove this profile");
+        type_text(&mut b, "projects");
+        act(&mut b, key(Key::Enter));
+        assert!(
+            b.dialog.as_ref().is_some_and(|d| d.error.is_some()),
+            "exact name only"
+        );
+        for _ in 0..8 {
+            act(&mut b, key(Key::Backspace));
+        }
+        type_text(&mut b, "Projects");
+        act(&mut b, key(Key::Enter));
+        assert_eq!(b.profiles.len(), 2);
+        assert!(!folder.exists(), "its cookies went with it");
+        assert_eq!(b.profile, 1);
+
+        // The last profile cannot go. (Work's new tab opened the palette: close it first.)
+        act(&mut b, key(Key::Escape));
+        run_palette(&mut b, "remove this profile");
+        type_text(&mut b, "Work");
+        act(&mut b, key(Key::Enter));
+        run_palette(&mut b, "remove this profile");
+        type_text(&mut b, "Personal");
+        act(&mut b, key(Key::Enter));
+        let error = b.dialog.as_ref().and_then(|d| d.error.clone());
+        assert_eq!(error.as_deref(), Some("Broxee needs at least one profile."));
+    }
+
+    #[test]
+    fn session_profile_folders_are_never_trusted() {
+        let session = parse_session(
+            "broxee-session 1\nprofile\t0\tEvil\t../../etc\trose\ntab\t0\tStolen\n\
+             profile\t0\tFine\tprofile-2\tviolet\nprofile\t0\tTwin\tPROFILE-2\tamber\n\
+             profile\t0\tOld\n",
+        )
+        .unwrap();
+        let ids: Vec<&str> = session.profiles.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["profile-2", "Old"],
+            "unsafe and duplicate folders dropped"
+        );
+        assert!(
+            session.profiles[0].tabs.is_empty(),
+            "the bad profile's tab did not move over"
+        );
+        assert_eq!(session.profiles[0].hue, Hue::Violet);
+        assert!(!valid_id("a/b") && !valid_id("..") && !valid_id("") && valid_id("Work_2-x"));
+    }
+
+    #[test]
+    fn the_more_menu_copies_opens_in_another_profile_and_closes_tabs() {
+        let (a, _) = site("menu");
+        let mut b = browser(&a);
+        let more = (f64::from(SIDEBAR_WIDTH) + 400.0 - 8.0 - 14.0, 18.0);
+
+        // Mouse: the ⋯ button opens it; an item runs; outside closes.
+        assert!(act(
+            &mut b,
+            Event::Click {
+                x: more.0,
+                y: more.1
+            }
+        ));
+        let labels: Vec<&str> = b
+            .menu
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .map(|(l, _)| l.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "Copy address",
+                "Open in Work",
+                "Bookmark this page",
+                "Reload",
+                "Close tab"
+            ]
+        );
+        b.render();
+        // Rows from 34 + 6, 30 points each; the menu's right edge is 8 from the pane's.
+        assert!(act(
+            &mut b,
+            Event::Click {
+                x: more.0 - 50.0,
+                y: 40.0 + 15.0
+            }
+        ));
+        assert!(b.menu.is_none());
+        assert!(b.window.clipboard.borrow().starts_with("file://"));
+        assert!(b.window.clipboard.borrow().ends_with("a.html"));
+        act(
+            &mut b,
+            Event::Click {
+                x: more.0,
+                y: more.1,
+            },
+        );
+        assert!(act(
+            &mut b,
+            Event::Click {
+                x: f64::from(SIDEBAR_WIDTH) + 20.0,
+                y: 250.0
+            }
+        ));
+        assert!(b.menu.is_none(), "a click outside closes it");
+
+        // Keyboard: Tab to ⋯, Enter opens with the first item chosen, ↓ Enter runs the second.
+        for _ in 0..3 {
+            act(&mut b, key(Key::Tab));
+        }
+        assert_eq!(b.focus, Some(Button::More));
+        act(&mut b, key(Key::Enter));
+        assert_eq!(b.menu.as_ref().unwrap().selected, Some(0));
+        act(&mut b, key(Key::Down));
+        act(&mut b, key(Key::Enter));
+        assert_eq!(b.profiles[b.profile].name, "Work");
+        assert_eq!(title(&b), "Page A", "opened in a new tab of Work");
+        assert_eq!(b.profiles[1].tabs.len(), 2);
+
+        // A new tab's menu has only what makes sense there.
+        act(&mut b, command('t'));
+        act(&mut b, key(Key::Escape));
+        act(
+            &mut b,
+            Event::Click {
+                x: more.0,
+                y: more.1,
+            },
+        );
+        let labels: Vec<&str> = b
+            .menu
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .map(|(l, _)| l.as_str())
+            .collect();
+        assert_eq!(labels, ["Close tab"]);
+        act(&mut b, key(Key::Escape));
+        assert!(b.menu.is_none());
+    }
+
+    #[test]
+    fn tooltips_wait_then_show_and_hide_on_any_input() {
+        let (a, _) = site("tooltips");
+        let mut b = browser(&a);
+        act(&mut b, command('t'));
+        act(&mut b, key(Key::Escape));
+        // Pointer on the back button: nothing at first, the tooltip after the delay.
+        let back = Event::Hover {
+            x: f64::from(SIDEBAR_WIDTH) + 20.0,
+            y: 18.0,
+        };
+        assert!(!b.handle(back.clone()));
+        assert!(!b.tick(), "not yet");
+        assert_eq!(b.hover.as_ref().unwrap().text, "Back ⌘[");
+        b.hover.as_mut().unwrap().since -= TOOLTIP_DELAY;
+        assert!(b.tick());
+        b.render();
+        // Moving within the same button keeps it; moving off hides it.
+        assert!(!b.handle(Event::Hover {
+            x: f64::from(SIDEBAR_WIDTH) + 22.0,
+            y: 19.0
+        }));
+        assert!(b.hover.as_ref().unwrap().shown);
+        assert!(b.handle(Event::Hover {
+            x: f64::from(SIDEBAR_WIDTH) + 200.0,
+            y: 200.0
+        }));
+        assert!(b.hover.is_none());
+
+        // A sleeping tab says why it is quiet; the active tab has no tooltip.
+        b.handle(Event::Hover {
+            x: 100.0,
+            y: row_center(0),
+        });
+        assert_eq!(
+            b.hover.as_ref().unwrap().text,
+            "Asleep to save memory. Select to wake."
+        );
+        b.handle(Event::Hover {
+            x: 100.0,
+            y: row_center(1),
+        });
+        assert!(b.hover.is_none());
+        b.handle(Event::Hover {
+            x: 220.0,
+            y: row_center(1),
+        });
+        assert_eq!(b.hover.as_ref().unwrap().text, "Close tab ⌘W");
+
+        // Any other input hides a shown tooltip.
+        b.hover.as_mut().unwrap().since -= TOOLTIP_DELAY;
+        b.tick();
+        assert!(b.handle(key(Key::Down)) || b.hover.is_none());
+        assert!(b.hover.is_none());
     }
 
     #[test]
@@ -1795,6 +5033,11 @@ mod tests {
         );
         assert_eq!(parse_input("localhost:8080").unwrap().port, 8080);
         assert!(parse_input("what is rust").is_err());
+        assert!(parse_input("https://a.com/x https://b.com/").is_err());
+        assert_eq!(
+            parse_input("https://a.com/my page").unwrap().to_string(),
+            "https://a.com/my%20page"
+        );
         assert!(parse_input("").is_err());
     }
 

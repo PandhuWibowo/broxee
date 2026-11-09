@@ -72,6 +72,86 @@ impl Vocabulary {
         v
     }
 
+    /// A quick look at a rule's selector text, before it is parsed: false only when every
+    /// selector in the list names a class or id the document does not have. Names inside
+    /// parentheses (`:not(.x)`), brackets, strings or with escapes are not looked at, so this
+    /// never rejects a list `could_match` would keep; it saves building selectors for the many
+    /// rules that are dropped anyway.
+    pub fn text_could_match(&self, list: &str) -> bool {
+        let b = list.as_bytes();
+        let (mut depth, mut i, mut start) = (0usize, 0, 0);
+        let mut quote = None;
+        let mut impossible = true;
+        while i <= b.len() {
+            let c = b.get(i).copied();
+            match (quote, c) {
+                (Some(q), Some(c)) if c == q => quote = None,
+                (Some(_), Some(b'\\')) => i += 1,
+                (Some(_), Some(_)) => {}
+                (None, Some(b'"' | b'\'')) => quote = c,
+                (None, Some(b'(' | b'[')) => depth += 1,
+                (None, Some(b')' | b']')) => depth = depth.saturating_sub(1),
+                (None, Some(b',')) | (_, None) if depth == 0 || c.is_none() => {
+                    if !self.selector_text_impossible(&list[start..i.min(b.len())]) {
+                        impossible = false;
+                        break;
+                    }
+                    start = i + 1;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        !impossible
+    }
+
+    /// One selector's text needs a class or id outside parentheses and brackets that the
+    /// document lacks.
+    fn selector_text_impossible(&self, selector: &str) -> bool {
+        let b = selector.as_bytes();
+        let (mut depth, mut i) = (0usize, 0);
+        let mut quote = None;
+        while i < b.len() {
+            let c = b[i];
+            match quote {
+                Some(q) if c == q => quote = None,
+                Some(_) if c == b'\\' => i += 1,
+                Some(_) => {}
+                None => match c {
+                    b'"' | b'\'' => quote = Some(c),
+                    b'(' | b'[' => depth += 1,
+                    b')' | b']' => depth = depth.saturating_sub(1),
+                    b'.' | b'#' if depth == 0 => {
+                        let name_end = selector[i + 1..]
+                            .find(|ch: char| {
+                                !(ch.is_alphanumeric()
+                                    || ch == '-'
+                                    || ch == '_'
+                                    || ch == '\\'
+                                    || !ch.is_ascii())
+                            })
+                            .map_or(b.len(), |n| i + 1 + n);
+                        let name = &selector[i + 1..name_end];
+                        let known = if c == b'.' {
+                            self.classes.contains(name)
+                        } else {
+                            self.ids.contains(name)
+                        };
+                        // An escaped name is compared after unescaping, by `could_match`.
+                        if !name.is_empty() && !name.contains('\\') && !known {
+                            return true;
+                        }
+                        i = name_end;
+                        continue;
+                    }
+                    _ => {}
+                },
+            }
+            i += 1;
+        }
+        false
+    }
+
     /// False when the selector needs a tag, id or class the document does not have.
     pub fn could_match(&self, selector: &Selector) -> bool {
         selector
@@ -105,6 +185,50 @@ impl Vocabulary {
 mod tests {
     use super::*;
     use crate::parse_selector_list;
+
+    #[test]
+    fn the_text_check_never_rejects_what_the_full_check_keeps() {
+        let dom = html::parse(
+            "<div id=main class='box wide md:flex é-class' data-theme=Light><p>x</p></div>",
+        );
+        let v = Vocabulary::of(&dom);
+        let lists = [
+            "div.box > p",
+            "#main .wide",
+            ".absent p",
+            ".absent, .box",
+            ".absent, #nope",
+            ":not(.absent)",
+            ":is(.absent, .box) p",
+            "[class~=absent] .box",
+            "a[href='.absent'] .box",
+            ".md\\:flex",
+            ".é-class",
+            "#main:hover .wide::before",
+            ".box.absent",
+            "p",
+            "*",
+            "",
+            "div:nth-child(2.5)",
+        ];
+        for list in lists {
+            let full = parse_selector_list(list).iter().any(|s| v.could_match(s));
+            let quick = v.text_could_match(list);
+            assert!(
+                quick || !full,
+                "{list:?}: the quick check rejected a possible rule"
+            );
+        }
+        assert!(!v.text_could_match(".absent p"));
+        assert!(!v.text_could_match(".absent, #nope"));
+        assert!(!v.text_could_match(".box.absent"));
+        assert!(v.text_could_match(".absent, .box"));
+        assert!(v.text_could_match(":not(.absent)"));
+        assert!(
+            v.text_could_match(".md\\:flex"),
+            "escaped: left to the full check"
+        );
+    }
 
     #[test]
     fn rejects_selectors_needing_absent_names() {
