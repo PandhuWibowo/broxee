@@ -1255,6 +1255,35 @@ impl Chrome {
         );
     }
 
+    /// The caret of a focused form field: (x, top, height) in points from the pane's top
+    /// left, one device pixel wide (at least).
+    pub fn draw_caret(&self, painter: &mut Painter, frame: Frame, caret: (f32, f32, f32)) {
+        let s = frame.scale;
+        let px = |v: f32| (v * s).round() as i32;
+        let (x, y, h) = caret;
+        let ops = [Op::Fill {
+            x0: px(x),
+            y0: px(y),
+            x1: px(x) + px(1.0).max(1),
+            y1: px(y + h),
+            color: Color::rgb(0, 0, 0),
+        }];
+        let (stride, left, width) = (frame.stride, frame.left, frame.width);
+        painter.overlay(
+            Target {
+                pixels: frame.pixels,
+                stride,
+                bgra: true,
+                left,
+            },
+            width,
+            (0, width as i32),
+            None,
+            &font::Approximate,
+            &ops,
+        );
+    }
+
     /// The shapes of a floating panel (palette, dialog): its shadow, hairline and body. Only the
     /// current size is kept, since a panel's height changes with its contents.
     fn panel_masks(

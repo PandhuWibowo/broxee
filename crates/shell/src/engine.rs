@@ -10,6 +10,7 @@ use font::{Approximate, Font, FontSet, TextMetrics};
 use html::{Dom, NodeId};
 use layout::Layout;
 
+use crate::forms::Forms;
 use crate::images::{self, ImageStore};
 use crate::pool;
 
@@ -130,6 +131,8 @@ pub struct Loaded {
     pub dom: Dom,
     pub css: LoadedCss,
     pub images: ImageStore,
+    /// Form controls and what has been typed into them.
+    pub forms: Forms,
     /// The HTML and stylesheets as they arrived, to rebuild the page without the network.
     pub sources: Sources,
     pub styles: StyleMap,
@@ -249,9 +252,21 @@ pub fn load(
     jar: Option<Jar>,
     progress: &mut dyn FnMut(f32) -> bool,
 ) -> Result<Loaded, String> {
+    load_with(url, None, settings, fonts, jar, progress)
+}
+
+/// `load`, POSTing `body` when there is one (a submitted form).
+pub fn load_with(
+    url: &net::Url,
+    body: Option<&net::Body>,
+    settings: Settings,
+    fonts: &FontStore,
+    jar: Option<Jar>,
+    progress: &mut dyn FnMut(f32) -> bool,
+) -> Result<Loaded, String> {
     let started = Instant::now();
     let context = net::Context::top_level(jar.is_none_or(|j| j.same_site_initiator));
-    let resp = net::fetch_in(url, jar.map(|j| (j.cookies, &context)))?;
+    let resp = net::send_in(url, body, jar.map(|j| (j.cookies, &context)))?;
     let fetch_ms = millis(started);
     if !progress(0.4) {
         return Err(CANCELLED.into());
@@ -339,12 +354,14 @@ struct Source {
 
 fn finish(
     source: Source,
-    dom: Dom,
+    mut dom: Dom,
     settings: Settings,
     fonts: &FontStore,
     from: From,
     progress: &mut dyn FnMut(f32) -> bool,
 ) -> Option<Loaded> {
+    // Controls get the nodes they draw with before anything reads the DOM.
+    let forms = Forms::prepare(&mut dom);
     let (css, images, stylesheets) = load_subresources(&dom, &source.url, from);
     if !progress(0.75) {
         return None;
@@ -361,6 +378,7 @@ fn finish(
         dom,
         css,
         images,
+        forms,
         sources: Sources {
             html: net::Wire::default(),
             stylesheets,

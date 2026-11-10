@@ -28,6 +28,7 @@ use crate::chrome::{
     SIDEBAR_MAX, SIDEBAR_MIN, SIDEBAR_WIDTH,
 };
 use crate::engine::{self, FontStore, Loaded, Settings};
+use crate::forms;
 use crate::hibernate::{Stored, TabStore};
 use crate::palette::{self, Action, Command, Hint};
 use crate::Options;
@@ -530,6 +531,9 @@ struct Browser<S: Screen> {
     /// Progress of `load`, for the header's loading line.
     loading: Option<f32>,
     load: Option<Load>,
+    /// The text of the focused form field, with its caret. The control itself is
+    /// `link_focus.node`.
+    editing: Option<Field>,
     /// Set by an event handler whose change shows only in the header.
     header_change: bool,
     /// Window size, scale and pane edge of the last full frame: a header alone can be drawn
@@ -602,6 +606,7 @@ impl<S: Screen> Browser<S> {
             link_focus: None,
             loading: None,
             load: None,
+            editing: None,
             header_change: false,
             frame_geometry: None,
         }
@@ -824,6 +829,16 @@ impl<S: Screen> Browser<S> {
                     self.refresh_palette();
                     return true;
                 }
+                let control = self.focused_control();
+                if let (Some(field), Some(i)) = (self.editing.as_mut(), control) {
+                    field.insert(line);
+                    let text = field.text.clone();
+                    if let Some(page) = self.page.as_mut() {
+                        page.forms.set_value(&mut page.dom, i, &text);
+                    }
+                    self.relayout_page();
+                    return true;
+                }
                 match self.field.as_mut() {
                     Some(field) => {
                         field.insert(line);
@@ -973,11 +988,203 @@ impl<S: Screen> Browser<S> {
         }
         let was_editing = self.field.take().is_some() | self.focus.take().is_some();
         let was_editing = was_editing | self.link_focus.take().is_some();
+        self.editing = None;
+        if let Some(i) = self.control_at(x, y - HEADER_HEIGHT) {
+            self.focus_control(i);
+            self.press_control(i);
+            return true;
+        }
         if let Some(url) = self.link_at(x, y - HEADER_HEIGHT) {
             self.follow(url);
             return true;
         }
         was_editing
+    }
+
+    /// Where the caret of the focused field is: x, top and height in page-area points.
+    fn caret(&self, metrics: &dyn font::TextMetrics) -> Option<(f32, f32, f32)> {
+        let field = self.editing.as_ref()?;
+        let i = self.focused_control()?;
+        let page = self.page.as_ref()?;
+        let c = &page.forms.controls[i];
+        let layout = &page.layout;
+        let b = (0..layout.boxes.len()).find(|&k| layout.boxes[k].node == c.node)?;
+        let (r, fixed) = (layout.boxes[b].rect, layout.box_is_fixed(b));
+        let style = page.styles.style(c.node);
+        let size = style.font_size.to_f32();
+        let bold = style.font_weight >= 600;
+        let (ascent, descent) = (metrics.ascent_em() * size, metrics.descent_em() * size);
+        // Where its text starts: the first run of the value or placeholder.
+        let (shown, placeholder) = page.forms.text_nodes(i);
+        let first = layout
+            .texts
+            .iter()
+            .find(|t| Some(t.node) == shown || Some(t.node) == placeholder)
+            .map(|t| (t.x, t.baseline));
+        let edge = style.border_width[3].to_f32() + 2.0;
+        let (x0, baseline) = first.unwrap_or((
+            r.x + edge,
+            r.y + style.border_width[0].to_f32() + 1.0 + ascent,
+        ));
+        let before = &field.text[..field.cursor];
+        let line = before.matches('\n').count() as f32;
+        let tail = before.rsplit('\n').next().unwrap_or("");
+        let width: f32 = if c.kind == forms::Kind::Password {
+            tail.chars().count() as f32 * metrics.advance_em('•', bold) * size
+        } else {
+            tail.chars()
+                .map(|ch| metrics.advance_em(ch, bold) * size)
+                .sum()
+        };
+        let line_height = (ascent + descent) * 1.15;
+        let x = (x0 + width).min(r.x + r.width - edge).max(r.x + 1.0);
+        let top = baseline - ascent + line * line_height;
+        let top = if fixed { top } else { top - self.scroll };
+        Some((x, top, ascent + descent))
+    }
+
+    /// The form control at (x, y) in pane points, if any.
+    fn control_at(&self, x: f32, y_view: f32) -> Option<usize> {
+        let page = self.page.as_ref()?;
+        let layout = &page.layout;
+        (0..layout.boxes.len()).rev().find_map(|i| {
+            let b = layout.boxes[i];
+            let y = if layout.box_is_fixed(i) {
+                y_view
+            } else {
+                y_view + self.scroll
+            };
+            let r = b.rect;
+            let inside = (r.x..=r.x + r.width).contains(&x) && (r.y..=r.y + r.height).contains(&y);
+            let style = page.styles.style(b.node);
+            let control = page.forms.at(&page.dom, b.node)?;
+            (inside && style.visible && page.forms.focusable(&page.dom, control)).then_some(control)
+        })
+    }
+
+    /// The form control with keyboard focus.
+    fn focused_control(&self) -> Option<usize> {
+        let page = self.page.as_ref()?;
+        let node = self.link_focus.as_ref()?.node;
+        page.forms
+            .controls
+            .binary_search_by_key(&node, |c| c.node)
+            .ok()
+    }
+
+    /// Give control `i` keyboard focus; a text field gets its caret at the end.
+    fn focus_control(&mut self, i: usize) {
+        let Some(page) = &self.page else {
+            return;
+        };
+        let c = &page.forms.controls[i];
+        let node = c.node;
+        self.editing = page.forms.is_text(i).then(|| Field {
+            text: c.value.clone(),
+            cursor: c.value.len(),
+            all_selected: false,
+        });
+        self.focus_link(node, true);
+    }
+
+    /// A click on control `i`, or Space on it: toggle, choose, submit or reset.
+    fn press_control(&mut self, i: usize) {
+        let Some(page) = self.page.as_mut() else {
+            return;
+        };
+        let changed = match page.forms.controls[i].kind {
+            forms::Kind::Checkbox | forms::Kind::Radio => page.forms.toggle(&mut page.dom, i),
+            forms::Kind::Select => page.forms.choose(&mut page.dom, i, 1),
+            forms::Kind::Submit => {
+                self.submit(i);
+                return;
+            }
+            forms::Kind::Reset => {
+                page.forms.reset(&mut page.dom, i);
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            self.relayout_page();
+        }
+    }
+
+    /// Lay the page out again after a control changed what it shows.
+    fn relayout_page(&mut self) {
+        let node = self.link_focus.as_ref().map(|l| l.node);
+        self.relayout();
+        if let Some(node) = node {
+            self.focus_link(node, false);
+        }
+    }
+
+    /// Submit the form of control `i` (the button pressed, or the field where Enter was).
+    fn submit(&mut self, i: usize) {
+        let Some(page) = &self.page else {
+            return;
+        };
+        let Some(sent) = page.forms.submission(&page.dom, i, &page.url) else {
+            return;
+        };
+        self.editing = None;
+        self.link_focus = None;
+        self.save_scroll();
+        self.navigate_with(sent.url, sent.body, Destination::Push, true);
+    }
+
+    /// Keys for the focused control `i`. `None` lets the key do what it does elsewhere.
+    fn control_key(&mut self, i: usize, k: KeyEvent) -> Option<bool> {
+        let kind = self.page.as_ref()?.forms.controls[i].kind;
+        if let Some(field) = self.editing.as_mut() {
+            match k.key {
+                Key::Char(c) => field.insert(c.encode_utf8(&mut [0; 4])),
+                Key::Backspace => field.backspace(),
+                Key::Left => field.left(),
+                Key::Right => field.right(),
+                Key::Home | Key::Up => field.cursor = 0,
+                Key::End | Key::Down => field.cursor = field.text.len(),
+                Key::Enter if kind == forms::Kind::TextArea => field.insert("\n"),
+                Key::Enter => {
+                    self.submit(i);
+                    return Some(true);
+                }
+                Key::Escape => {
+                    self.editing = None;
+                    self.link_focus = None;
+                    return Some(true);
+                }
+                _ => return None,
+            }
+            let text = field.text.clone();
+            let page = self.page.as_mut()?;
+            page.forms.set_value(&mut page.dom, i, &text);
+            self.relayout_page();
+            return Some(true);
+        }
+        match (kind, k.key) {
+            (forms::Kind::Select, Key::Up) => {
+                let page = self.page.as_mut()?;
+                let changed = page.forms.choose(&mut page.dom, i, -1);
+                changed.then(|| self.relayout_page());
+                Some(changed)
+            }
+            (forms::Kind::Select, Key::Down) => {
+                let page = self.page.as_mut()?;
+                let changed = page.forms.choose(&mut page.dom, i, 1);
+                changed.then(|| self.relayout_page());
+                Some(changed)
+            }
+            (_, Key::Char(' ')) | (forms::Kind::Submit | forms::Kind::Reset, Key::Enter) => {
+                self.press_control(i);
+                Some(true)
+            }
+            (_, Key::Escape) => {
+                self.link_focus = None;
+                Some(true)
+            }
+            _ => None,
+        }
     }
 
     fn key(&mut self, k: KeyEvent) -> bool {
@@ -1096,6 +1303,11 @@ impl<S: Screen> Browser<S> {
                 return done;
             }
         }
+        if let Some(i) = self.focused_control() {
+            if let Some(done) = self.control_key(i, k) {
+                return done;
+            }
+        }
         if let Some(node) = self.link_focus.as_ref().map(|l| l.node) {
             match k.key {
                 Key::Enter => {
@@ -1131,8 +1343,9 @@ impl<S: Screen> Browser<S> {
         }
     }
 
-    /// Tab order: back, forward, reload, the address field, then the page's links in document
-    /// order. Disabled buttons and links that are not shown are skipped; the order wraps.
+    /// Tab order: back, forward, reload, the address field, then the page's links and form
+    /// controls in document order. Disabled buttons and links that are not shown are skipped;
+    /// the order wraps.
     fn move_focus(&mut self, backwards: bool) -> bool {
         #[derive(Clone, Copy, PartialEq)]
         enum Stop {
@@ -1180,12 +1393,24 @@ impl<S: Screen> Browser<S> {
         self.field = None;
         self.focus = None;
         self.link_focus = None;
+        self.editing = None;
         match order[next] {
             Stop::Header(Button::Address) => {
                 self.focus_field();
             }
             Stop::Header(button) => self.focus = Some(button),
-            Stop::Link(node) => self.focus_link(node, true),
+            Stop::Link(node) => {
+                let control = self.page.as_ref().and_then(|p| {
+                    p.forms
+                        .controls
+                        .binary_search_by_key(&node, |c| c.node)
+                        .ok()
+                });
+                match control {
+                    Some(i) => self.focus_control(i),
+                    None => self.focus_link(node, true),
+                }
+            }
         }
         true
     }
@@ -1195,7 +1420,20 @@ impl<S: Screen> Browser<S> {
         let Some(page) = &self.page else {
             return;
         };
-        let rects = link_rects(page, node, self.fonts.metrics());
+        let rects = if page
+            .forms
+            .controls
+            .binary_search_by_key(&node, |c| c.node)
+            .is_ok()
+        {
+            // A control's ring goes around its border box, not each run of its text.
+            (0..page.layout.boxes.len())
+                .filter(|&i| page.layout.boxes[i].node == node)
+                .map(|i| (page.layout.boxes[i].rect, page.layout.box_is_fixed(i)))
+                .collect()
+        } else {
+            link_rects(page, node, self.fonts.metrics())
+        };
         if rects.is_empty() {
             return;
         }
@@ -2179,7 +2417,19 @@ impl<S: Screen> Browser<S> {
 
     /// `navigate`, saying whether the navigation started on the same site as `url`.
     fn navigate_from(&mut self, url: net::Url, to: Destination, same_site_initiator: bool) {
+        self.navigate_with(url, None, to, same_site_initiator);
+    }
+
+    /// `navigate_from`, POSTing `body` when there is one (a submitted form).
+    fn navigate_with(
+        &mut self,
+        url: net::Url,
+        body: Option<net::Body>,
+        to: Destination,
+        same_site_initiator: bool,
+    ) {
         self.stop_load();
+        self.editing = None;
         self.field = None;
         self.focus = None;
         let settings = self.settings();
@@ -2195,9 +2445,14 @@ impl<S: Screen> Browser<S> {
                     same_site_initiator,
                 };
                 // A failed send means the browser dropped the load: stop at the next stage.
-                let result = engine::load(&target, settings, &fonts, Some(jar), &mut |progress| {
-                    sender.send(LoadMessage::Progress(progress)).is_ok()
-                });
+                let result = engine::load_with(
+                    &target,
+                    body.as_ref(),
+                    settings,
+                    &fonts,
+                    Some(jar),
+                    &mut |progress| sender.send(LoadMessage::Progress(progress)).is_ok(),
+                );
                 let _ = sender.send(LoadMessage::Done(Box::new(result)));
             });
         let load = Load {
@@ -2565,6 +2820,7 @@ impl<S: Screen> Browser<S> {
         self.page_is_entry = false;
         self.page = Some(page);
         self.link_focus = None;
+        self.editing = None;
         self.loading = None;
         self.scroll = scroll;
         self.clamp_scroll();
@@ -2797,6 +3053,7 @@ impl<S: Screen> Browser<S> {
                 })
                 .collect()
         });
+        let caret = self.caret(fonts.metrics());
         let view = self.page.as_ref().map(|p| engine::page_view(p, fonts));
         let viewport = Viewport {
             width: pane_px as f32 / scale,
@@ -2856,6 +3113,16 @@ impl<S: Screen> Browser<S> {
                         scale,
                     };
                     chrome.draw_focus_ring(painter, frame, &ring);
+                }
+                if let (Some(caret), true) = (caret, page_rows > 0) {
+                    let frame = Frame {
+                        pixels: &mut *bottom,
+                        stride,
+                        left: sidebar_px,
+                        width: pane_px,
+                        scale,
+                    };
+                    chrome.draw_caret(painter, frame, caret);
                 }
                 let frame = Frame {
                     pixels: top,
@@ -3346,10 +3613,13 @@ fn focusable_links(page: &Loaded) -> Vec<NodeId> {
     for b in &layout.boxes {
         shown[b.node as usize] = true;
     }
+    let control = |id: NodeId| match page.forms.controls.binary_search_by_key(&id, |c| c.node) {
+        Ok(i) => page.forms.focusable(dom, i),
+        Err(_) => false,
+    };
     dom.descendants(html::Dom::ROOT)
         .filter(|&id| {
-            dom.tag_name(id) == Some("a")
-                && dom.attr(id, "href").is_some()
+            (dom.tag_name(id) == Some("a") && dom.attr(id, "href").is_some() || control(id))
                 && {
                     let style = page.styles.style(id);
                     style.visible && !style.transparent
@@ -4361,6 +4631,136 @@ mod tests {
             b.window.frames.get(),
             frames + 1,
             "the menu overlaps the header"
+        );
+    }
+
+    /// A local server for form tests: `/` is a page with a GET form and a POST form; other
+    /// requests answer with their request line and body as the title.
+    fn form_server() -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = stream.read(&mut chunk).unwrap_or(0);
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    let done = text.find("\r\n\r\n").is_some_and(|end| {
+                        let len = text
+                            .lines()
+                            .find_map(|l| l.strip_prefix("Content-Length: "))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        buf.len() >= end + 4 + len
+                    });
+                    if done || n == 0 {
+                        break;
+                    }
+                }
+                let text = String::from_utf8_lossy(&buf).to_string();
+                let line = text.lines().next().unwrap_or("").to_string();
+                let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+                let page = if line.starts_with("GET / ") {
+                    "<!doctype html><style>body { margin: 0 }</style>\
+                     <form action=/s><input name=q><input type=checkbox name=c>\
+                     <input type=submit value=Go></form>\
+                     <form method=post action=/p><input type=password name=pw></form>"
+                        .to_string()
+                } else {
+                    let path = line.split(' ').nth(1).unwrap_or("");
+                    let method = line.split(' ').next().unwrap_or("");
+                    format!("<title>{method} {path} {body}</title>")
+                };
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{page}",
+                    page.len()
+                );
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        });
+        format!("http://{address}/")
+    }
+
+    /// Click the middle of control `i` of the page on screen.
+    fn click_control(b: &mut Browser<FakeScreen>, i: usize) -> bool {
+        let page = b.page.as_ref().expect("a page");
+        let node = page.forms.controls[i].node;
+        let r = page
+            .layout
+            .boxes
+            .iter()
+            .find(|x| x.node == node)
+            .expect("the control has a box")
+            .rect;
+        let (x, y) = (r.x + r.width / 2.0, r.y + r.height / 2.0);
+        let event = Event::Click {
+            x: f64::from(x + b.pane_left()),
+            y: f64::from(y + HEADER_HEIGHT - b.scroll),
+        };
+        act(b, event)
+    }
+
+    #[test]
+    fn fills_in_and_submits_forms() {
+        let url = form_server();
+        let mut b = browser(Path::new(&url));
+        let value = |b: &Browser<FakeScreen>, i: usize| {
+            b.page.as_ref().unwrap().forms.controls[i].value.clone()
+        };
+        assert!(click_control(&mut b, 0), "clicking the field focuses it");
+        assert_eq!(b.focused_control(), Some(0));
+        type_text(&mut b, "hello wörld");
+        act(&mut b, key(Key::Left));
+        act(&mut b, key(Key::Backspace));
+        assert_eq!(value(&b, 0), "hello wörd");
+        let shown = b.page.as_ref().unwrap();
+        assert_eq!(
+            shown.dom.text_content(shown.forms.controls[0].node),
+            "hello wörd"
+        );
+        b.render();
+        assert!(b.caret(b.fonts.metrics()).is_some(), "a caret is drawn");
+
+        assert!(click_control(&mut b, 1));
+        assert!(
+            b.page.as_ref().unwrap().forms.controls[1].checked,
+            "click checks the box"
+        );
+        assert_eq!(b.apply(key(Key::Char(' '))), Repaint::Frame);
+        assert!(
+            !b.page.as_ref().unwrap().forms.controls[1].checked,
+            "Space unchecks it"
+        );
+        b.apply(key(Key::Char(' ')));
+
+        // Back in the field, Enter submits with GET.
+        click_control(&mut b, 0);
+        act(&mut b, key(Key::Enter));
+        assert_eq!(
+            b.window.title.borrow().trim(),
+            "GET /s?q=hello+w%C3%B6rd&c=on"
+        );
+        assert_eq!(
+            b.tab().entry().unwrap().url.path,
+            "/s?q=hello+w%C3%B6rd&c=on"
+        );
+
+        // The POST form, reached with Tab from the address field.
+        act(&mut b, command('['));
+        let i = b.page.as_ref().unwrap().forms.controls.len() - 1;
+        click_control(&mut b, i);
+        type_text(&mut b, "s3cret pw");
+        act(&mut b, key(Key::Enter));
+        assert_eq!(b.window.title.borrow().trim(), "POST /p pw=s3cret+pw");
+        assert_eq!(
+            b.tab().entry().unwrap().url.path,
+            "/p",
+            "the body is not in the history"
         );
     }
 

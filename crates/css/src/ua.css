@@ -47,3 +47,27 @@ th { text-align: center }
 center { text-align: -webkit-center }
 
 a { color: #0000ee; text-decoration: underline }
+
+/* Form controls. Their parts (broxee-*) are nodes the browser adds (shell/src/forms.rs). */
+input, select, textarea, button {
+  display: inline-block; font-size: 13px; font-family: sans-serif; font-weight: normal;
+  font-style: normal; color: #000; background-color: #fff; border: 1px solid #767676;
+  padding: 1px 2px; white-space: pre; overflow: hidden; text-align: left; line-height: normal;
+  text-decoration: none; text-indent: 0; letter-spacing: normal; word-spacing: normal
+}
+input { width: 150px; min-height: 15px }
+textarea { width: 160px; height: 32px; white-space: pre-wrap; vertical-align: text-bottom }
+select { padding: 1px 4px; min-height: 15px }
+button, input[type=submit], input[type=reset], input[type=button], input[type=file],
+input[type=image], input[type=color], input[type=range] {
+  width: auto; padding: 1px 6px; background-color: #efefef; text-align: center
+}
+input[type=checkbox], input[type=radio] {
+  width: 11px; height: 11px; min-height: 0; padding: 0; margin: 3px 3px 3px 4px;
+  vertical-align: middle
+}
+input[type=hidden], option, optgroup, datalist { display: none }
+broxee-placeholder { color: #757575 }
+broxee-check { display: block; width: 7px; height: 7px; margin: 2px; background-color: #1a73e8 }
+broxee-uncheck { display: none }
+broxee-arrow { margin-left: 6px; font-size: 8px; color: #444; vertical-align: 1px }

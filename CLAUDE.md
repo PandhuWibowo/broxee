@@ -46,6 +46,7 @@ crates/
   platform/ macOS window via the Objective-C runtime, IOSurface frames (empty module on other OSes)
   shell/   the `broxee` binary: main.rs (CLI), engine.rs (page pipeline, FontStore, snapshot/restore),
            browser.rs (profiles, tabs, history, navigation, input, session file, Screen trait),
+           forms.rs (form controls: injected parts, state, submission),
            hibernate.rs (sleeping tabs on disk), palette.rs (⌘K results and ranking),
            chrome.rs (sidebar, header and palette drawing from DESIGN.md),
            pool.rs (fetch pool)
@@ -99,6 +100,9 @@ casts), not taken from binding crates. Ask before proposing any dependency.
 - **Cookies belong to a profile.** Every fetch for a page passes that profile's jar (`engine::Jar`);
   subresources use `net::Context::subresource`, which blocks other sites' cookies. Never log or print cookie
   values, never write session cookies to disk, and keep cookie and session files 0600 (`write_private`).
+- **Form controls draw with nodes the browser adds** (`forms::Forms::prepare`, before anything reads the
+  DOM): they go after the page's own nodes so no id changes, and rebuilding from the sources gives the same
+  DOM. Typed values live in `Loaded::forms` only; passwords are never logged or written to disk.
 - **Session and tab files are data, never trusted**: every length and count is checked against what is left,
   and damage gives a reload, not a panic.
 

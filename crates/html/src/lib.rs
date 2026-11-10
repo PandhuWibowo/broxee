@@ -354,6 +354,42 @@ impl Dom {
         id
     }
 
+    /// Append a new element without attributes as the last child of `parent`. Used to give
+    /// form controls the parts they draw (a value, a placeholder, a check mark); the page's
+    /// own nodes keep their ids.
+    pub fn append_element(&mut self, parent: NodeId, tag: &str) -> NodeId {
+        let atom = self.intern(tag);
+        let first = self.attrs.len() as u32;
+        self.append(parent, Kind::Element, atom, first, 0)
+    }
+
+    /// Append a text node as the last child of `parent`.
+    pub fn append_text(&mut self, parent: NodeId, text: &str) -> NodeId {
+        let (start, len) = self.push_text(text);
+        self.append(parent, Kind::Text, start, len, 0)
+    }
+
+    /// Replace the text of text node `id`. The old text stays in the buffer unused, so this
+    /// is for small values that change rarely (what is typed into a form field).
+    pub fn set_text(&mut self, id: NodeId, text: &str) {
+        if self.nodes[id as usize].kind != Kind::Text {
+            return;
+        }
+        let (start, len) = self.push_text(text);
+        let n = &mut self.nodes[id as usize];
+        n.a = start;
+        n.b = len;
+    }
+
+    /// Rename element `id` (its attributes stay).
+    pub fn set_tag(&mut self, id: NodeId, tag: &str) {
+        if self.nodes[id as usize].kind != Kind::Element {
+            return;
+        }
+        let atom = self.intern(tag);
+        self.nodes[id as usize].a = atom;
+    }
+
     /// Indented tree for debugging, skipping comments and whitespace-only text.
     pub fn dump(&self, max_depth: usize) -> String {
         let mut out = String::new();
@@ -606,6 +642,23 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn appends_and_edits_nodes_keeping_ids() {
+        let mut dom = parse("<p>a</p><input name=q>");
+        let before = dom.len();
+        let input = dom.find_first("input").unwrap();
+        let part = dom.append_element(input, "broxee-value");
+        let text = dom.append_text(part, "hello");
+        assert_eq!(part as usize, before, "new nodes go at the end");
+        assert_eq!(dom.text_content(input), "hello");
+        dom.set_text(text, "héllo wörld");
+        assert_eq!(dom.text_content(input), "héllo wörld");
+        dom.set_tag(part, "broxee-other");
+        assert_eq!(dom.tag_name(part), Some("broxee-other"));
+        assert_eq!(dom.attr(input, "name"), Some("q"));
+        assert_eq!(dom.children(input).collect::<Vec<_>>(), [part]);
+    }
 
     fn tags_under(dom: &Dom, id: NodeId) -> Vec<String> {
         dom.children(id)

@@ -372,11 +372,34 @@ pub fn fetch(url: &Url) -> Result<Response, String> {
 /// GET a URL, following redirects, sending and storing cookies of a profile's jar when given.
 /// A request that fails on a reused or reset connection is retried once on a fresh one.
 pub fn fetch_in(url: &Url, cookies: Option<(&Cookies, &Context)>) -> Result<Response, String> {
+    send_in(url, None, cookies)
+}
+
+/// A request body: what a form sends with POST.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Body {
+    /// Without CR or LF (`application/x-www-form-urlencoded` for forms).
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+}
+
+/// GET `url`, or POST `body` to it, following redirects as `fetch_in` does. After a 301,
+/// 302 or 303 the body is dropped and the next request is a GET, as browsers do; 307 and 308
+/// send it again. A POST is not repeated on a fresh connection unless the first one was a
+/// reused connection the server had already closed.
+pub fn send_in(
+    url: &Url,
+    body: Option<&Body>,
+    cookies: Option<(&Cookies, &Context)>,
+) -> Result<Response, String> {
     let mut url = url.clone();
+    let mut body = body;
     for _ in 0..MAX_REDIRECTS {
         let header = cookies.and_then(|(jar, context)| jar.header(&url, context));
-        let resp = match fetch_once(&url, header.as_deref()) {
-            Err(FetchError::Retryable(_)) => fetch_once(&url, header.as_deref())?,
+        let resp = match fetch_once(&url, header.as_deref(), body) {
+            Err(FetchError::Retryable(_)) if body.is_none() => {
+                fetch_once(&url, header.as_deref(), None)?
+            }
             other => other?,
         };
         if let Some((jar, context)) = cookies {
@@ -389,6 +412,9 @@ pub fn fetch_in(url: &Url, cookies: Option<(&Cookies, &Context)>) -> Result<Resp
         if (300..400).contains(&resp.status) {
             if let Some(location) = resp.header("location") {
                 url = url.join(location)?;
+                if !matches!(resp.status, 307 | 308) {
+                    body = None;
+                }
                 continue;
             }
         }
@@ -397,7 +423,11 @@ pub fn fetch_in(url: &Url, cookies: Option<(&Cookies, &Context)>) -> Result<Resp
     Err(format!("too many redirects ending at {url}"))
 }
 
-fn fetch_once(url: &Url, cookie: Option<&str>) -> Result<Response, FetchError> {
+fn fetch_once(
+    url: &Url,
+    cookie: Option<&str>,
+    body: Option<&Body>,
+) -> Result<Response, FetchError> {
     if url.scheme == "file" {
         let path = url.decoded_path();
         let body = std::fs::read(&path).map_err(|e| format!("{path}: {e}"))?;
@@ -414,7 +444,7 @@ fn fetch_once(url: &Url, cookie: Option<&str>) -> Result<Response, FetchError> {
         Some(conn) => (conn, true),
         None => (Conn::open(url)?, false),
     };
-    match request(&mut conn, url, cookie) {
+    match request(&mut conn, url, cookie, body) {
         Ok((resp, reusable)) => {
             if reusable {
                 put_idle(key, conn);
@@ -424,7 +454,7 @@ fn fetch_once(url: &Url, cookie: Option<&str>) -> Result<Response, FetchError> {
         // A pooled connection the server already closed: not the server's answer.
         Err(FetchError::Retryable(_)) if reused => {
             let mut conn = Conn::open(url)?;
-            let (resp, reusable) = request(&mut conn, url, cookie)?;
+            let (resp, reusable) = request(&mut conn, url, cookie, body)?;
             if reusable {
                 put_idle(key, conn);
             }
@@ -438,6 +468,7 @@ fn request(
     conn: &mut Conn,
     url: &Url,
     cookie: Option<&str>,
+    body: Option<&Body>,
 ) -> Result<(Response, bool), FetchError> {
     let host_header = if Some(url.port) == default_port(&url.scheme) {
         url.host.clone()
@@ -446,15 +477,28 @@ fn request(
     };
     // Cookie values never hold CR or LF: the jar refuses them when storing.
     let cookie = cookie.map_or(String::new(), |c| format!("Cookie: {c}\r\n"));
-    let request = format!(
-        "GET {} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: {USER_AGENT}\r\n\
+    let (method, content) = match body {
+        Some(b) => (
+            "POST",
+            format!(
+                "Content-Type: {}\r\nContent-Length: {}\r\n",
+                b.content_type.replace(['\r', '\n'], ""),
+                b.bytes.len()
+            ),
+        ),
+        None => ("GET", String::new()),
+    };
+    let mut request = format!(
+        "{method} {} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: {USER_AGENT}\r\n\
          Accept: text/html,*/*;q=0.8\r\nAccept-Encoding: br, gzip, deflate\r\n\
-         {cookie}Connection: keep-alive\r\n\r\n",
+         {cookie}{content}Connection: keep-alive\r\n\r\n",
         url.path
-    );
-    conn.stream
-        .write_all(request.as_bytes())
-        .map_err(io_error)?;
+    )
+    .into_bytes();
+    if let Some(b) = body {
+        request.extend_from_slice(&b.bytes);
+    }
+    conn.stream.write_all(&request).map_err(io_error)?;
     conn.stream.flush().map_err(io_error)?;
     let raw = read_response(&mut conn.reader())?;
     let reusable = raw.reusable;
@@ -878,6 +922,64 @@ mod tests {
             }
         });
         Url::parse(&format!("http://{address}/")).unwrap()
+    }
+
+    #[test]
+    fn posts_a_body_and_follows_a_see_other_with_get() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for stream in listener.incoming().take(2) {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                // Read the head, then as many body bytes as Content-Length says.
+                loop {
+                    let n = stream.read(&mut chunk).unwrap_or(0);
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len = text
+                            .lines()
+                            .find_map(|l| l.strip_prefix("Content-Length: "))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + len || n == 0 {
+                            break;
+                        }
+                    }
+                    if n == 0 {
+                        break;
+                    }
+                }
+                let text = String::from_utf8_lossy(&buf).to_string();
+                let reply: &[u8] = if text.starts_with("POST") {
+                    b"HTTP/1.1 303 See Other\r\nLocation: /done\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndone"
+                };
+                let _ = stream.write_all(reply);
+                seen.push(text);
+            }
+            seen
+        });
+        let url = Url::parse(&format!("http://{address}/login")).unwrap();
+        let body = Body {
+            content_type: "application/x-www-form-urlencoded".into(),
+            bytes: b"user=a&pass=b+c".to_vec(),
+        };
+        let resp = send_in(&url, Some(&body), None).expect("posted");
+        assert_eq!((resp.status, resp.body.as_slice()), (200, &b"done"[..]));
+        let seen = server.join().unwrap();
+        assert!(seen[0].starts_with("POST /login HTTP/1.1"), "{}", seen[0]);
+        assert!(seen[0].contains("Content-Type: application/x-www-form-urlencoded\r\n"));
+        assert!(seen[0].contains("Content-Length: 15\r\n"));
+        assert!(seen[0].ends_with("\r\n\r\nuser=a&pass=b+c"));
+        assert!(
+            seen[1].starts_with("GET /done HTTP/1.1"),
+            "303 turns into a GET"
+        );
     }
 
     #[test]

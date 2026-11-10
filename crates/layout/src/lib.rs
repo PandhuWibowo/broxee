@@ -1219,9 +1219,18 @@ impl<'a> Engine<'a> {
         let texts = start.1..self.out.texts.len();
         let outer_height = margin[0] + height + margin[2];
         // The baseline is that of its last line of text, or its bottom margin edge when it has
-        // none or clips its overflow (CSS 2.1 10.8.1).
+        // none or clips its overflow (CSS 2.1 10.8.1). Form controls clip but line up with the
+        // text around them, empty or not, as in browsers.
+        let control = matches!(
+            self.dom.tag_name(id),
+            Some("input" | "select" | "button" | "textarea")
+        );
         let above = match texts.clone().last() {
-            Some(i) if !s.clips => self.out.texts[i].baseline.min(outer_height),
+            Some(i) if !s.clips || control => self.out.texts[i].baseline.min(outer_height),
+            None if control => {
+                let first_line = margin[0] + edges.border[0] + edges.padding[0];
+                (first_line + self.extent(s).above).min(outer_height)
+            }
             _ => outer_height,
         };
         self.atomics.push((

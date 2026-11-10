@@ -1,4 +1,5 @@
 mod engine;
+mod forms;
 #[cfg(any(target_os = "macos", test))]
 mod hibernate;
 mod images;

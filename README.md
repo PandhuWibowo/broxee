@@ -55,6 +55,7 @@ In the window:
 | Palette: open tabs (every profile), this profile's history, commands, a typed address | ⌘K or "Search or go to" in the sidebar; type to filter, ↑ ↓ or Tab, Enter, Esc |
 | Scroll | trackpad or wheel, ↑ ↓, Space / Shift+Space, Page Up / Page Down, Home / End |
 | Follow a link | click it |
+| Fill in a form | click a field or Tab to it; type, paste, ← → Home End Backspace; Enter submits (in a text area it adds a line); Space checks a box, picks a radio button or presses a button; ↑ ↓ change a select; Esc leaves the field |
 | Back / forward / reload | the header buttons, or ⌘[ / ⌘] / ⌘R |
 | Stop loading | Esc, or the × that replaces reload while a page loads |
 | Page menu: copy the address, open in another profile, bookmark, reload, close | ⋯ at the right of the header, or Tab to it and Enter; ↑ ↓ Enter, Esc |
@@ -127,7 +128,7 @@ refreshes it.
 | `paint` | Display list, anti-aliased glyph rasterizer, glyph cache, image cache with parallel decoding, parallel band compositing, streaming PNG writer | ✅ |
 | `image` | PNG (all color types and depths, `tRNS`, Adam7), JPEG baseline and progressive (any subsampling, restarts, Adobe RGB) with a scaled inverse DCT, GIF (first frame, interlaced, transparency), WebP lossy, lossless, alpha and the first animation frame, and an SVG subset rasterized at the drawn size; all decoded straight to the drawn size | ✅ |
 | `platform` | macOS window, menu, app delegate, main-thread hand-off, zero-copy frames through `IOSurface` | ✅ (macOS) |
-| `shell` | The `broxee` binary: CLI, the page pipeline (`engine.rs`), the browser (`browser.rs`: history, navigation, scrolling, links, address field) and its header (`chrome.rs`) | ✅ |
+| `shell` | The `broxee` binary: CLI, the page pipeline (`engine.rs`), the browser (`browser.rs`: history, navigation, scrolling, links, address field), form controls and submission (`forms.rs`) and its header (`chrome.rs`) | ✅ |
 
 How the stages run (sequential, parallel, which thread) is documented in [`docs/pipeline.md`](docs/pipeline.md).
 
@@ -225,6 +226,7 @@ time something reads it (most theme variables never are). A `var()` value is sub
 | 2026-11-08 | Glyphs on quarter pixels (#18) | 2.2 MB | 49.5 MB peak painted at 2x | Repeated "i" at 13px, 1x: gaps 4/3/4/3 px (stdev 0.50) → 3.5 ± 0.15 px; GitHub glyph cache 46 → 88 KB |
 | 2026-11-10 | GIF, WebP and SVG drawn (#14) | 2.4 MB | 49.4 MB peak painted at 2x | 4000x4000 lossy WebP at 400 px: 17.9 MB peak (empty page 16.7), 296 ms; 4000x3000 lossless: 20.5 MB, 154 ms |
 | 2026-11-10 | Header in its own layer (#15) | 2.4 MB | 49.4 MB peak painted at 2x | Typing and the loading line paint a 36-point strip, not the 16 MB frame; GitHub load in a window: 37 MB idle, peak 48 to 54 MB, 0.3 s CPU (before: 37 MB, 51 to 53 MB, 0.3 s) |
+| 2026-11-10 | Forms: controls, editing, GET and POST (#13) | 2.4 MB | 49.4 MB peak painted at 2x | Wikipedia's search form submits from the keyboard; a keystroke lays the page out again (no incremental layout yet) |
 
 Other pages after the layout milestone: GitHub home 22.7 MB peak (8,170 rules); Hacker News 11.5 MB.
 
@@ -325,6 +327,11 @@ Where data lives, and what compression does for it (measured 2026-11-07):
 - Profiles start as Personal and Work; up to 12, each with its own folder in `profiles/` (named by a fixed
   id, so renaming moves nothing). Four colors exist (emerald, amber, rose, violet), so profiles past four
   share them; their names always tell them apart.
+- Forms: text fields, passwords, text areas, checkboxes, radio buttons, selects (↑ ↓ or a click steps
+  through the options; no dropdown list yet) and buttons; GET and POST as
+  `application/x-www-form-urlencoded` (multipart and file uploads are not sent). Long values are clipped at
+  the field's edge instead of scrolling. Typed values live with the page: a tab that sleeps forgets them, and
+  passwords are never written to disk.
 - GIF animations and animated WebP show their first frame. SVG draws shapes, strokes, `use`, simple `<style>`
   rules and transforms; gradients are drawn as the average of their stops, and text, filters, masks and clip
   paths are skipped. Failed images draw nothing.
