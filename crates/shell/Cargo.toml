@@ -16,3 +16,4 @@ layout = { path = "../layout" }
 paint = { path = "../paint" }
 platform = { path = "../platform" }
 image = { path = "../image" }
+js = { path = "../js" }

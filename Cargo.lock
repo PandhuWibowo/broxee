@@ -63,6 +63,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "js"
+version = "0.1.1"
+
+[[package]]
 name = "layout"
 version = "0.1.1"
 dependencies = [
@@ -164,6 +168,7 @@ dependencies = [
  "font",
  "html",
  "image",
+ "js",
  "layout",
  "net",
  "paint",

@@ -381,6 +381,170 @@ impl Dom {
         n.b = len;
     }
 
+    /// A new element with no parent, for a script to insert later (`createElement`).
+    pub fn create_element(&mut self, tag: &str) -> NodeId {
+        let atom = self.intern(tag);
+        let id = self.nodes.len() as NodeId;
+        self.nodes.push(Node {
+            parent: NONE,
+            first_child: NONE,
+            last_child: NONE,
+            next_sibling: NONE,
+            a: atom,
+            b: self.attrs.len() as u32,
+            attr_count: 0,
+            kind: Kind::Element,
+        });
+        id
+    }
+
+    /// A new text node with no parent (`createTextNode`).
+    pub fn create_text(&mut self, text: &str) -> NodeId {
+        let (start, len) = self.push_text(text);
+        let id = self.nodes.len() as NodeId;
+        self.nodes.push(Node {
+            parent: NONE,
+            first_child: NONE,
+            last_child: NONE,
+            next_sibling: NONE,
+            a: start,
+            b: len,
+            attr_count: 0,
+            kind: Kind::Text,
+        });
+        id
+    }
+
+    /// Take `id` out of its parent's children; it keeps its own subtree.
+    pub fn detach(&mut self, id: NodeId) {
+        let parent = self.nodes[id as usize].parent;
+        if parent == NONE {
+            return;
+        }
+        let next = self.nodes[id as usize].next_sibling;
+        let p = &self.nodes[parent as usize];
+        if p.first_child == id {
+            self.nodes[parent as usize].first_child = next;
+            if next == NONE {
+                self.nodes[parent as usize].last_child = NONE;
+            }
+        } else {
+            let mut prev = p.first_child;
+            while prev != NONE && self.nodes[prev as usize].next_sibling != id {
+                prev = self.nodes[prev as usize].next_sibling;
+            }
+            if prev != NONE {
+                self.nodes[prev as usize].next_sibling = next;
+                if next == NONE {
+                    self.nodes[parent as usize].last_child = prev;
+                }
+            }
+        }
+        let n = &mut self.nodes[id as usize];
+        n.parent = NONE;
+        n.next_sibling = NONE;
+    }
+
+    /// Make `child` the last child of `parent`, taking it from where it was. Refused when
+    /// `child` is `parent` or one of its ancestors (it would make a cycle).
+    pub fn append_child(&mut self, parent: NodeId, child: NodeId) -> bool {
+        let mut a = Some(parent);
+        while let Some(n) = a {
+            if n == child {
+                return false;
+            }
+            a = self.parent(n);
+        }
+        self.detach(child);
+        let prev_last = self.nodes[parent as usize].last_child;
+        self.nodes[child as usize].parent = parent;
+        self.nodes[parent as usize].last_child = child;
+        if prev_last == NONE {
+            self.nodes[parent as usize].first_child = child;
+        } else {
+            self.nodes[prev_last as usize].next_sibling = child;
+        }
+        true
+    }
+
+    /// Put `child` right before `before`, a child of `parent`.
+    pub fn insert_before(&mut self, parent: NodeId, child: NodeId, before: NodeId) -> bool {
+        if self.parent(before) != Some(parent) || child == before {
+            return self.append_child(parent, child);
+        }
+        if !self.append_child(parent, child) {
+            return false;
+        }
+        // Move it from the end to its place: unlink the last child, relink before `before`.
+        self.detach(child);
+        self.nodes[child as usize].parent = parent;
+        if self.nodes[parent as usize].first_child == before {
+            self.nodes[parent as usize].first_child = child;
+        } else {
+            let mut prev = self.nodes[parent as usize].first_child;
+            while self.nodes[prev as usize].next_sibling != before {
+                prev = self.nodes[prev as usize].next_sibling;
+            }
+            self.nodes[prev as usize].next_sibling = child;
+        }
+        self.nodes[child as usize].next_sibling = before;
+        true
+    }
+
+    /// Set attribute `name` of element `id`. Its attributes move to the end of the shared
+    /// list (they are stored together), so this is for the few changes scripts make.
+    pub fn set_attr(&mut self, id: NodeId, name: &str, value: &str) {
+        if self.nodes[id as usize].kind != Kind::Element {
+            return;
+        }
+        let atom = self.intern(name);
+        let n = &self.nodes[id as usize];
+        let (first, count) = (n.b as usize, usize::from(n.attr_count));
+        let mut attrs: Vec<Attr> = self.attrs[first..first + count].to_vec();
+        let start = self.values.len() as u32;
+        self.values.push_str(value);
+        let new = Attr {
+            name: atom,
+            start,
+            len: value.len() as u32,
+        };
+        match attrs.iter().position(|a| a.name == atom) {
+            Some(i) => attrs[i] = new,
+            None if attrs.len() < usize::from(u16::MAX) => attrs.push(new),
+            None => return,
+        }
+        let at = self.attrs.len() as u32;
+        self.attrs.extend_from_slice(&attrs);
+        let n = &mut self.nodes[id as usize];
+        n.b = at;
+        n.attr_count = attrs.len() as u16;
+    }
+
+    /// Remove attribute `name` from element `id`.
+    pub fn remove_attr(&mut self, id: NodeId, name: &str) {
+        let Some(atom) = self.atom(name) else {
+            return;
+        };
+        let n = &self.nodes[id as usize];
+        if n.kind != Kind::Element {
+            return;
+        }
+        let (first, count) = (n.b as usize, usize::from(n.attr_count));
+        let attrs: Vec<Attr> = self.attrs[first..first + count]
+            .iter()
+            .filter(|a| a.name != atom)
+            .copied()
+            .collect();
+        if attrs.len() == count {
+            return;
+        }
+        let at = self.attrs.len() as u32;
+        self.attrs.extend_from_slice(&attrs);
+        let n = &mut self.nodes[id as usize];
+        n.b = at;
+        n.attr_count = attrs.len() as u16;
+    }
+
     /// Rename element `id` (its attributes stay).
     pub fn set_tag(&mut self, id: NodeId, tag: &str) {
         if self.nodes[id as usize].kind != Kind::Element {
@@ -658,6 +822,36 @@ mod tests {
         assert_eq!(dom.tag_name(part), Some("broxee-other"));
         assert_eq!(dom.attr(input, "name"), Some("q"));
         assert_eq!(dom.children(input).collect::<Vec<_>>(), [part]);
+    }
+
+    #[test]
+    fn scripts_can_move_nodes_and_change_attributes() {
+        let mut dom = parse("<ul><li id=a>1<li id=b>2</ul>");
+        let ul = dom.find_first("ul").unwrap();
+        let items: Vec<NodeId> = dom.children(ul).collect();
+        let li = dom.create_element("li");
+        let text = dom.create_text("3");
+        assert!(dom.append_child(li, text));
+        assert!(dom.append_child(ul, li));
+        assert_eq!(dom.text_content(ul), "123");
+        assert!(dom.insert_before(ul, li, items[0]));
+        assert_eq!(dom.text_content(ul), "312");
+        dom.detach(items[1]);
+        assert_eq!(dom.text_content(ul), "31");
+        assert!(dom.append_child(ul, items[1]));
+        assert_eq!(dom.text_content(ul), "312");
+        assert!(!dom.append_child(li, ul), "no cycles");
+        dom.set_attr(items[0], "class", "on big");
+        dom.set_attr(items[0], "id", "first");
+        assert_eq!(dom.attr(items[0], "class"), Some("on big"));
+        assert_eq!(dom.attr(items[0], "id"), Some("first"));
+        dom.remove_attr(items[0], "class");
+        assert_eq!(dom.attr(items[0], "class"), None);
+        assert_eq!(
+            dom.attr(items[1], "id"),
+            Some("b"),
+            "other elements untouched"
+        );
     }
 
     fn tags_under(dom: &Dom, id: NodeId) -> Vec<String> {

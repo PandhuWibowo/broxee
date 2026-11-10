@@ -742,9 +742,12 @@ impl<S: Screen> Browser<S> {
             } else {
                 IDLE_AFTER
             };
-            // Wake when a waiting tooltip is due.
+            // Wake when a waiting tooltip is due, or a script timer.
             if let Some(h) = self.hover.as_ref().filter(|h| !h.shown) {
                 wait = wait.min(TOOLTIP_DELAY.saturating_sub(h.since.elapsed()));
+            }
+            if let Some(due) = self.next_page_timer() {
+                wait = wait.min(due);
             }
             let mut repaint = Repaint::Nothing;
             let mut quiet = false;
@@ -762,7 +765,7 @@ impl<S: Screen> Browser<S> {
                 // Progress moves the loading line; a finished load painted its page already.
                 repaint = repaint.max(Repaint::Header);
             }
-            if self.tick() {
+            if self.tick() || self.run_page_timers() {
                 repaint = Repaint::Frame;
             }
             if repaint != Repaint::Nothing {
@@ -1225,6 +1228,19 @@ impl<S: Screen> Browser<S> {
         let was_editing = self.field.take().is_some() | self.focus.take().is_some();
         let was_editing = was_editing | self.link_focus.take().is_some();
         self.editing = None;
+        // Scripts hear the click first; preventDefault() keeps links and buttons still.
+        if let Some(node) = self.node_at(x, y - HEADER_HEIGHT) {
+            let (changed, prevented) = self.dispatch_page(node, "click");
+            if prevented {
+                return true;
+            }
+            if changed
+                && self.control_at(x, y - HEADER_HEIGHT).is_none()
+                && self.link_at(x, y - HEADER_HEIGHT).is_none()
+            {
+                return true;
+            }
+        }
         if let Some(i) = self.control_at(x, y - HEADER_HEIGHT) {
             self.focus_control(i);
             self.press_control(i);
@@ -1277,6 +1293,76 @@ impl<S: Screen> Browser<S> {
         let top = baseline - ascent + line * line_height;
         let top = if fixed { top } else { top - self.scroll };
         Some((x, top, ascent + descent))
+    }
+
+    /// The innermost node drawn at (x, y) in pane points: a run of text, else a box.
+    fn node_at(&self, x: f32, y_view: f32) -> Option<NodeId> {
+        let page = self.page.as_ref()?;
+        let layout = &page.layout;
+        let metrics = self.fonts.metrics();
+        let doc_y = |fixed: bool| if fixed { y_view } else { y_view + self.scroll };
+        for i in (0..layout.texts.len()).rev() {
+            let t = &layout.texts[i];
+            let size = page.styles.style(t.node).font_size.to_f32();
+            let y = doc_y(layout.text_is_fixed(i));
+            let top = t.baseline - metrics.ascent_em() * size;
+            let bottom = t.baseline + metrics.descent_em() * size;
+            if (t.x..=t.x + t.width).contains(&x) && (top..=bottom).contains(&y) {
+                return Some(t.node);
+            }
+        }
+        (0..layout.boxes.len()).rev().find_map(|i| {
+            let r = layout.boxes[i].rect;
+            let y = doc_y(layout.box_is_fixed(i));
+            ((r.x..=r.x + r.width).contains(&x) && (r.y..=r.y + r.height).contains(&y))
+                .then_some(layout.boxes[i].node)
+        })
+    }
+
+    /// Fire `kind` at `node` for the page's scripts. Returns (the page changed and was laid
+    /// out again, a listener prevented the default action).
+    fn dispatch_page(&mut self, node: NodeId, kind: &str) -> (bool, bool) {
+        let Some(page) = self.page.as_mut() else {
+            return (false, false);
+        };
+        let Some(script) = page.script.as_mut() else {
+            return (false, false);
+        };
+        let r = crate::script::dispatch(
+            script,
+            &mut page.dom,
+            &mut page.forms,
+            &page.url,
+            node,
+            kind,
+        );
+        if r.0 {
+            self.relayout_page();
+        }
+        r
+    }
+
+    /// How long until the page's next script timer.
+    fn next_page_timer(&self) -> Option<Duration> {
+        self.page.as_ref()?.script.as_ref()?.next_timer()
+    }
+
+    /// Run the page's due timers; returns whether the page changed (and was laid out again).
+    fn run_page_timers(&mut self) -> bool {
+        if !self.next_page_timer().is_some_and(|d| d.is_zero()) {
+            return false;
+        }
+        let Some(page) = self.page.as_mut() else {
+            return false;
+        };
+        let Some(script) = page.script.as_mut() else {
+            return false;
+        };
+        let changed = crate::script::run_timers(script, &mut page.dom, &mut page.forms, &page.url);
+        if changed {
+            self.relayout_page();
+        }
+        changed
     }
 
     /// The form control at (x, y) in pane points, if any.
@@ -5131,6 +5217,22 @@ mod tests {
         );
     }
 
+    impl Browser<FakeScreen> {
+        /// A point inside the first text run of the first `tag` element: x, y in page points.
+        fn link_rect_of(&self, tag: &str) -> (f32, f32) {
+            let p = self.page.as_ref().unwrap();
+            let node = p.dom.find_first(tag).unwrap();
+            let inside: Vec<NodeId> = p.dom.descendants(node).collect();
+            let t = p
+                .layout
+                .texts
+                .iter()
+                .find(|t| inside.contains(&t.node))
+                .unwrap();
+            (t.x + 2.0, t.baseline - 4.0)
+        }
+    }
+
     /// The pixels of a pane's area in the last frame.
     fn pane_pixels(b: &Browser<FakeScreen>, j: usize) -> Vec<u8> {
         let frame = b.window.frame.borrow();
@@ -5226,6 +5328,82 @@ mod tests {
         assert_eq!(b.panes.len(), 1);
         assert_eq!(b.tab().title(), "Page A");
         assert_eq!(b.settings().width, 640.0 - b.sidebar_edge());
+    }
+
+    #[test]
+    fn runs_page_scripts_on_load_click_and_timer() {
+        let dir = std::env::temp_dir().join(format!("broxee-js-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let page = dir.join("js.html");
+        std::fs::write(
+            &page,
+            "<!doctype html><style>body { margin: 0 } .big { font-size: 40px }</style>\
+             <title>Before</title><button id=b>0</button><p><a href=other.html id=l>stay</a></p>\
+             <script>document.title = 'Counter'; let n = 0;\
+             const b = document.getElementById('b');\
+             b.addEventListener('click', () => { b.textContent = ++n; b.classList.add('big') });\
+             document.getElementById('l').addEventListener('click', e => e.preventDefault());\
+             setTimeout(() => document.querySelector('p').append(' and later'), 30);</script>",
+        )
+        .unwrap();
+        let mut b = browser(&page);
+        assert_eq!(
+            b.tab().title(),
+            "Counter",
+            "the script set the title before the tab took it"
+        );
+        let node_text = |b: &Browser<FakeScreen>, tag: &str| {
+            let p = b.page.as_ref().unwrap();
+            p.dom.text_content(p.dom.find_first(tag).unwrap())
+        };
+        let button = {
+            let p = b.page.as_ref().unwrap();
+            let node = p.dom.find_first("button").unwrap();
+            p.layout.boxes.iter().find(|x| x.node == node).unwrap().rect
+        };
+        let width_before = button.width;
+        let click = Event::Click {
+            x: f64::from(button.x + 3.0 + b.pane_left()),
+            y: f64::from(button.y + button.height / 2.0 + HEADER_HEIGHT),
+        };
+        assert!(act(&mut b, click));
+        assert_eq!(node_text(&b, "button"), "1");
+        let wider = {
+            let p = b.page.as_ref().unwrap();
+            let node = p.dom.find_first("button").unwrap();
+            p.layout
+                .boxes
+                .iter()
+                .find(|x| x.node == node)
+                .unwrap()
+                .rect
+                .width
+        };
+        assert!(
+            wider > width_before,
+            "the new class was styled and laid out"
+        );
+
+        // The link's listener prevents navigation.
+        let entries = b.tab().history.len();
+        let link = b.link_rect_of("a");
+        let at = Event::Click {
+            x: f64::from(link.0 + b.pane_left()),
+            y: f64::from(link.1 + HEADER_HEIGHT),
+        };
+        act(&mut b, at);
+        assert_eq!(
+            b.tab().history.len(),
+            entries,
+            "preventDefault kept the page"
+        );
+        assert!(b.load.is_none());
+
+        // The timer, as the run loop would fire it.
+        assert!(b.next_page_timer().is_some());
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(b.run_page_timers());
+        assert!(node_text(&b, "p").ends_with("and later"));
     }
 
     fn type_text(b: &mut Browser<FakeScreen>, text: &str) {

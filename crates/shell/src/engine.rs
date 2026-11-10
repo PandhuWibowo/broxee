@@ -133,6 +133,8 @@ pub struct Loaded {
     pub images: ImageStore,
     /// Form controls and what has been typed into them.
     pub forms: Forms,
+    /// The page's scripts, when it has any.
+    pub script: Option<Box<crate::script::PageScript>>,
     /// The HTML and stylesheets as they arrived, to rebuild the page without the network.
     pub sources: Sources,
     pub styles: StyleMap,
@@ -151,6 +153,8 @@ pub struct Sources {
     pub html: net::Wire,
     /// External stylesheets by URL, in document order.
     pub stylesheets: Vec<(String, net::Wire)>,
+    /// External scripts by URL, in document order.
+    pub scripts: Vec<(String, net::Wire)>,
 }
 
 /// A page put to sleep: its sources and compressed images, and nothing built from them.
@@ -361,8 +365,22 @@ fn finish(
     progress: &mut dyn FnMut(f32) -> bool,
 ) -> Option<Loaded> {
     // Controls get the nodes they draw with before anything reads the DOM.
-    let forms = Forms::prepare(&mut dom);
-    let (css, images, stylesheets) = load_subresources(&dom, &source.url, from);
+    let mut forms = Forms::prepare(&mut dom);
+    // Images are found among the parser's nodes only: nodes scripts add are not rebuilt the
+    // same way when a sleeping tab wakes, and stored images refer to nodes by id.
+    let parser_nodes = dom.len();
+    let context = net::Context::subresource(&source.url);
+    let script_from = match &from {
+        From::Network(cookies) => {
+            crate::script::ScriptFrom::Network(cookies.map(|c| (c, &context)))
+        }
+        From::Snapshot(sources, _) => crate::script::ScriptFrom::Stored(&sources.scripts),
+        From::Nowhere => crate::script::ScriptFrom::Inline,
+    };
+    let (script, scripts) =
+        crate::script::run_page_scripts(&mut dom, &mut forms, &source.url, script_from);
+    let (css, images, stylesheets) =
+        load_subresources(&dom, &source.url, from, script.is_some(), parser_nodes);
     if !progress(0.75) {
         return None;
     }
@@ -379,9 +397,11 @@ fn finish(
         css,
         images,
         forms,
+        script,
         sources: Sources {
             html: net::Wire::default(),
             stylesheets,
+            scripts,
         },
         styles,
         layout,
@@ -490,6 +510,8 @@ fn load_subresources(
     dom: &Dom,
     base: &net::Url,
     from: From,
+    scripted: bool,
+    parser_nodes: usize,
 ) -> (LoadedCss, ImageStore, Vec<(String, net::Wire)>) {
     let external = !matches!(from, From::Nowhere);
     let cookies = match from {
@@ -519,14 +541,19 @@ fn load_subresources(
         _ => (None, None),
     };
     let (image_sources, image_uses) = if external && stored_images.is_none() {
-        images::discover(dom, base)
+        images::discover(dom, base, parser_nodes)
     } else {
         Default::default()
     };
     jobs.extend(image_sources.into_iter().map(Job::Image));
 
-    // Rules that need names this document lacks are dropped while parsing.
-    let vocabulary = css::Vocabulary::of(dom);
+    // Rules that need names this document lacks are dropped while parsing, unless scripts
+    // can add those names later.
+    let vocabulary = if scripted {
+        css::Vocabulary::everything()
+    } else {
+        css::Vocabulary::of(dom)
+    };
     let stored = stored_sheets.as_deref();
     let started = Instant::now();
     let results = pool::map_ordered(jobs, FETCH_WORKERS, |job| match job {

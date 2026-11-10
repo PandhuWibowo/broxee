@@ -4,6 +4,7 @@ mod forms;
 mod hibernate;
 mod images;
 mod pool;
+mod script;
 
 #[cfg(any(target_os = "macos", test))]
 mod browser;

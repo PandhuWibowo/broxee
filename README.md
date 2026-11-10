@@ -129,6 +129,7 @@ refreshes it.
 | `paint` | Display list, anti-aliased glyph rasterizer, glyph cache, image cache with parallel decoding, parallel band compositing, streaming PNG writer | ✅ |
 | `image` | PNG (all color types and depths, `tRNS`, Adam7), JPEG baseline and progressive (any subsampling, restarts, Adobe RGB) with a scaled inverse DCT, GIF (first frame, interlaced, transparency), WebP lossy, lossless, alpha and the first animation frame, and an SVG subset rasterized at the drawn size; all decoded straight to the drawn size | ✅ |
 | `platform` | macOS window, menu, app delegate, main-thread hand-off, zero-copy frames through `IOSurface` | ✅ (macOS) |
+| `js` | JavaScript interpreter: lexer, parser, tree-walking evaluation over a per-page arena heap with step and object limits; builtins (Object, Array, String, Number, Math, JSON, Map, Set, RegExp with its own engine, Date, timers, console, storage) and DOM bindings (querySelector, textContent, innerHTML, classList, style, attributes, tree changes, addEventListener, form values) | ✅ (first milestone) |
 | `shell` | The `broxee` binary: CLI, the page pipeline (`engine.rs`), the browser (`browser.rs`: history, navigation, scrolling, links, address field), form controls and submission (`forms.rs`) and its header (`chrome.rs`) | ✅ |
 
 How the stages run (sequential, parallel, which thread) is documented in [`docs/pipeline.md`](docs/pipeline.md).
@@ -194,7 +195,7 @@ time something reads it (most theme variables never are). A `var()` value is sub
 4. ✅ Layout: block, inline, text wrapping
 5. ✅ Painting to a window: the first visible page
 6. ✅ Scrolling, links, back/forward, address bar
-7. JavaScript (Boa) + a subset of the DOM API
+7. ✅ JavaScript, written here (not Boa: no engine crate, the owner's rule) + a subset of the DOM API
 8. Product features: ✅ profiles, ✅ tabs that sleep to disk, ✅ session restore, ✅ ⌘K palette, ✅ cookies,
    ✅ bookmarks, ✅ tab groups, ✅ split view, ✅ forms
 
@@ -229,6 +230,7 @@ time something reads it (most theme variables never are). A `var()` value is sub
 | 2026-11-10 | Header in its own layer (#15) | 2.4 MB | 49.4 MB peak painted at 2x | Typing and the loading line paint a 36-point strip, not the 16 MB frame; GitHub load in a window: 37 MB idle, peak 48 to 54 MB, 0.3 s CPU (before: 37 MB, 51 to 53 MB, 0.3 s) |
 | 2026-11-10 | Forms: controls, editing, GET and POST (#13) | 2.4 MB | 49.4 MB peak painted at 2x | Wikipedia's search form submits from the keyboard; a keystroke lays the page out again (no incremental layout yet) |
 | 2026-11-10 | Split view, 1/2/4 panes (#7) | 2.4 MB | 49.4 MB peak painted at 2x | Window with GitHub, Wikipedia, HN, example.com: 1 pane 30 MB idle / 44 MB peak, 2 panes 33 / 47 MB, 4 panes 31 / 45 MB |
+| 2026-11-10 | JavaScript, written here (#12) | 2.9 MB | 49.6 MB peak painted at 2x | example.com 20 MB, HN 22 MB, Wikipedia 27 MB, GitHub 32 MB peak with their scripts run; scripts that use unsupported syntax are skipped and logged |
 
 Other pages after the layout milestone: GitHub home 22.7 MB peak (8,170 rules); Hacker News 11.5 MB.
 
@@ -336,6 +338,11 @@ Where data lives, and what compression does for it (measured 2026-11-07):
   `application/x-www-form-urlencoded` (multipart and file uploads are not sent). Long values are clipped at
   the field's edge instead of scrolling. Typed values live with the page: a tab that sleeps forgets them, and
   passwords are never written to disk.
+- JavaScript: classic scripts (inline and `src`) run; modules, classes, generators, getters and setters,
+  promises, `fetch` and `XMLHttpRequest` do not. A script using unsupported syntax is skipped as a whole and
+  the reason goes to stderr (`console:`), with what scripts log. Events: `click` (bubbling, `preventDefault`,
+  `onclick` attributes and properties), `DOMContentLoaded`, `load`; timers and `requestAnimationFrame`. Every
+  DOM change restyles and lays out the whole page.
 - GIF animations and animated WebP show their first frame. SVG draws shapes, strokes, `use`, simple `<style>`
   rules and transforms; gradients are drawn as the average of their stops, and text, filters, masks and clip
   paths are skipped. Failed images draw nothing.

@@ -41,12 +41,15 @@ crates/
            flex.rs (flex containers, intrinsic widths), grid.rs (grid containers), table.rs (tables)
   image/   PNG, JPEG, GIF, WebP (vp8.rs lossy, vp8l.rs lossless, vp8_tables.rs from RFC 6386) decoders
            that scale while decoding; svg.rs (XML subset, flattened paths, scanline rasterizer)
+  js/      JavaScript, written here: lexer.rs, parser.rs (syntax tree), interp.rs (arena heap, scopes,
+           evaluation, limits), builtins.rs (globals, DOM bindings, events), regex.rs; the DOM through `Host`
   paint/   display list, glyph rasterizer + cache, image cache + parallel decode, band compositing,
            streaming PNG writer
   platform/ macOS window via the Objective-C runtime, IOSurface frames (empty module on other OSes)
   shell/   the `broxee` binary: main.rs (CLI), engine.rs (page pipeline, FontStore, snapshot/restore),
            browser.rs (profiles, tabs, history, navigation, input, session file, Screen trait),
            forms.rs (form controls: injected parts, state, submission),
+           script.rs (which scripts run, `js::Host` over the DOM, dispatch and timers),
            hibernate.rs (sleeping tabs on disk), palette.rs (⌘K results and ranking),
            chrome.rs (sidebar, header and palette drawing from DESIGN.md),
            pool.rs (fetch pool)
@@ -116,6 +119,20 @@ casts), not taken from binding crates. Ask before proposing any dependency.
   machine; keystrokes can land in another app. Drive `Browser` through `FakeScreen` in `browser.rs` tests with
   local files, and render PNGs from it when a visual check is needed.
 
+### Script invariants
+
+- **JavaScript is written here** (`crates/js`), not taken from an engine crate: the owner's rule, and it keeps
+  memory in our hands. Decided for #12; recorded in README.
+- **A page's heap is an arena dropped with the page.** No collector: objects have a ceiling (`OBJECT_LIMIT`),
+  scopes of calls that made no closure are popped, every entry (script, handler, timer) has a step limit.
+  Past a limit the page's scripts stop for good; the page keeps working without them.
+- **Script work runs on a large-stack thread** (`script::on_script_stack`, `js::STACK_SIZE`): the interpreter
+  recurses. The runtime is `Send` (`Arc`, not `Rc`) so a `Loaded` can still cross from the loader thread.
+- **Scripts run before styles**, after form controls are prepared; later DOM changes (events, timers) restyle
+  and lay out the page again. Image ids come from parser nodes only, so a waking tab finds them again even if
+  its scripts behave differently the second time.
+- **Scripts see no cookies, cannot fetch or navigate, and store nothing on disk.** Widen this only on purpose.
+
 ### Compression invariants
 
 - **Measure before adding a format or a cache.** README's "Compression" table records each decision with its
@@ -148,8 +165,9 @@ casts), not taken from binding crates. Ask before proposing any dependency.
 ### CSS invariants
 
 - **Stylesheets are parsed against the document's vocabulary** (`css::Vocabulary`): rules needing a tag, id,
-  class, attribute or exact attribute value (`[data-theme=dark]`) the DOM lacks are dropped. Correct only while the DOM cannot gain names. When scripts arrive, keep the
-  source text and re-parse without a vocabulary (or add the new names and re-parse) before restyling.
+  class, attribute or exact attribute value (`[data-theme=dark]`) the DOM lacks are dropped. Correct only while
+  the DOM cannot gain names: a page with scripts parses its sheets with `Vocabulary::everything()`, since its
+  scripts can add names at any time.
 - **`Vocabulary::text_could_match` may only reject what `could_match` rejects.** It skips anything inside
   parentheses, brackets or strings and any escaped name. After changing either, run
   `CHECK=1 cargo run --release -p css --example parse_bench -- page.html sheets...` on real sites.
