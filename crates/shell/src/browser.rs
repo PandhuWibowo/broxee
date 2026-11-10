@@ -65,18 +65,14 @@ pub trait Screen {
     fn dark(&self) -> bool;
     fn set_title(&self, title: &str);
     /// Paint a `width` x `height` device-pixel frame (BGRA rows of `stride` bytes) and show it.
-    fn render(
-        &self,
-        width: usize,
-        height: usize,
-        draw: &mut dyn FnMut(&mut [u8], usize),
-    ) -> Result<(), String>;
-    /// Paint only the header strip: `width` x `height` device pixels, `left` pixels from the
-    /// window's left edge, shown over the last frame. `Ok(false)` when the screen cannot, and
-    /// a full frame is needed instead.
+    /// `draw` also gets the previous frame when it has the same layout, to copy from.
+    fn render(&self, width: usize, height: usize, draw: &mut DrawFrame) -> Result<(), String>;
+    /// Paint only the header strip: `width` x `height` device pixels at (`left`, `top`),
+    /// shown over the last frame. `Ok(false)` when the screen cannot, and a full frame is
+    /// needed instead.
     fn render_header(
         &self,
-        _left: usize,
+        _at: (usize, usize),
         _width: usize,
         _height: usize,
         _draw: &mut dyn FnMut(&mut [u8], usize),
@@ -115,28 +111,31 @@ impl Screen for platform::Window {
         self.copy_text(text);
     }
 
-    fn render(
-        &self,
-        width: usize,
-        height: usize,
-        draw: &mut dyn FnMut(&mut [u8], usize),
-    ) -> Result<(), String> {
-        platform::Window::render(self, width, height, |pixels, stride| draw(pixels, stride))
+    fn render(&self, width: usize, height: usize, draw: &mut DrawFrame) -> Result<(), String> {
+        platform::Window::render(self, width, height, |pixels, stride, previous| {
+            draw(pixels, stride, previous)
+        })
     }
 
     fn render_header(
         &self,
-        left: usize,
+        at: (usize, usize),
         width: usize,
         height: usize,
         draw: &mut dyn FnMut(&mut [u8], usize),
     ) -> Result<bool, String> {
-        platform::Window::render_header(self, left, width, height, |pixels, stride| {
+        platform::Window::render_header(self, at, width, height, |pixels, stride| {
             draw(pixels, stride)
         })?;
         Ok(true)
     }
 }
+
+/// Paints a frame: its pixels and stride, and the previous frame to copy from, if any.
+type DrawFrame<'a> = dyn FnMut(&mut [u8], usize, Option<&[u8]>) + 'a;
+
+/// Frame width and height, header rows, sidebar edge (device pixels), and pane count.
+type Geometry = (usize, usize, usize, usize, usize);
 
 /// How much of the window a change needs repainted. Ordered: combining changes keeps the
 /// larger.
@@ -170,8 +169,9 @@ struct Entry {
 }
 
 /// A tab. The visible one's page lives in `Browser::page`; the others sleep.
-#[derive(Default)]
 struct Tab {
+    /// Names the tab for the panes of a split, whatever its position in the list.
+    id: u64,
     history: Vec<Entry>,
     index: usize,
     title: String,
@@ -187,6 +187,33 @@ struct Tab {
     pinned: bool,
     /// The tab group it belongs to, by name.
     group: Option<String>,
+}
+
+impl Default for Tab {
+    fn default() -> Tab {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Tab {
+            id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            history: Vec::new(),
+            index: 0,
+            title: String::new(),
+            snapshot: None,
+            seen: 0,
+            focused_link: None,
+            pinned: false,
+            group: None,
+        }
+    }
+}
+
+/// One pane of a split. The focused pane shows the visible tab, live; the others keep the
+/// pixels they had when focus left them (copied from frame to frame), so they cost no memory.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Pane {
+    profile: usize,
+    tab: u64,
+    /// Its area of the last frame holds its page (it was focused since the layout changed).
+    painted: bool,
 }
 
 impl Tab {
@@ -534,11 +561,14 @@ struct Browser<S: Screen> {
     /// The text of the focused form field, with its caret. The control itself is
     /// `link_focus.node`.
     editing: Option<Field>,
+    /// One, two or four panes, and which has focus (and the live page).
+    panes: Vec<Pane>,
+    focused: usize,
     /// Set by an event handler whose change shows only in the header.
     header_change: bool,
-    /// Window size, scale and pane edge of the last full frame: a header alone can be drawn
-    /// over it only while these hold.
-    frame_geometry: Option<(usize, usize, usize, usize)>,
+    /// Window size, header rows, sidebar edge and pane count of the last full frame: a
+    /// header alone, or a pane's old pixels, can be reused only while these hold.
+    frame_geometry: Option<Geometry>,
 }
 
 impl<S: Screen> Browser<S> {
@@ -607,6 +637,12 @@ impl<S: Screen> Browser<S> {
             loading: None,
             load: None,
             editing: None,
+            panes: vec![Pane {
+                profile: 0,
+                tab: 0,
+                painted: false,
+            }],
+            focused: 0,
             header_change: false,
             frame_geometry: None,
         }
@@ -622,8 +658,8 @@ impl<S: Screen> Browser<S> {
         &mut p.tabs[p.active]
     }
 
-    /// Left edge of the pane, in points.
-    fn pane_left(&self) -> f32 {
+    /// Right edge of the sidebar (0 when hidden), in points: where the panes begin.
+    fn sidebar_edge(&self) -> f32 {
         if self.sidebar {
             self.sidebar_width.min(self.width)
         } else {
@@ -631,8 +667,52 @@ impl<S: Screen> Browser<S> {
         }
     }
 
+    /// Each pane's x, y, width and height in points: one, two side by side, or a 2x2 grid,
+    /// with a 1-point hairline between them.
+    fn pane_rects(&self) -> Vec<(f32, f32, f32, f32)> {
+        let x0 = self.sidebar_edge();
+        let (w, h) = ((self.width - x0).max(1.0), self.height.max(1.0));
+        let half = |len: f32| ((len - 1.0) / 2.0).floor().max(1.0);
+        let (a, b) = (half(w), half(h));
+        match self.panes.len() {
+            2 => vec![
+                (x0, 0.0, a, h),
+                (x0 + a + 1.0, 0.0, (w - a - 1.0).max(1.0), h),
+            ],
+            4 => {
+                let (rw, bh) = ((w - a - 1.0).max(1.0), (h - b - 1.0).max(1.0));
+                vec![
+                    (x0, 0.0, a, b),
+                    (x0 + a + 1.0, 0.0, rw, b),
+                    (x0, b + 1.0, a, bh),
+                    (x0 + a + 1.0, b + 1.0, rw, bh),
+                ]
+            }
+            _ => vec![(x0, 0.0, w, h)],
+        }
+    }
+
+    /// The focused pane.
+    fn pane_rect(&self) -> (f32, f32, f32, f32) {
+        let rects = self.pane_rects();
+        rects[self.focused.min(rects.len() - 1)]
+    }
+
+    /// Left edge of the focused pane, in points.
+    fn pane_left(&self) -> f32 {
+        self.pane_rect().0
+    }
+
+    fn pane_top(&self) -> f32 {
+        self.pane_rect().1
+    }
+
     fn pane_width(&self) -> f32 {
-        (self.width - self.pane_left()).max(1.0)
+        self.pane_rect().2.max(1.0)
+    }
+
+    fn pane_height(&self) -> f32 {
+        self.pane_rect().3.max(1.0)
     }
 
     fn settings(&self) -> Settings {
@@ -645,7 +725,7 @@ impl<S: Screen> Browser<S> {
     }
 
     fn page_height(&self) -> f32 {
-        (self.height - HEADER_HEIGHT).max(1.0)
+        (self.pane_height() - HEADER_HEIGHT).max(1.0)
     }
 
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -733,6 +813,17 @@ impl<S: Screen> Browser<S> {
                 self.wait_for_load();
             }
         }
+        if self.opts.panes > 1 {
+            self.wait_for_load();
+            self.set_split(self.opts.panes);
+            self.render();
+            // Show each pane once, last to first, so every one has its page on screen.
+            for j in (0..self.panes.len()).rev() {
+                self.focus_pane(j);
+                self.wait_for_load();
+                self.render();
+            }
+        }
     }
 
     /// An address from the command line: select its tab if one already shows it, otherwise
@@ -786,13 +877,17 @@ impl<S: Screen> Browser<S> {
     }
 
     fn handle(&mut self, event: Event) -> bool {
+        let event = match self.route(event) {
+            Ok(event) => event,
+            Err(dirty) => return dirty,
+        };
         if let Event::Hover { x, y } = event {
             return self.hover_at(x as f32, y as f32);
         }
         // Anything else hides a tooltip, which needs a full frame.
         let hid = self.hover.take().is_some_and(|h| h.shown);
         let dirty = match event {
-            Event::Scroll { dy, x, .. } if (x as f32) < self.pane_left() => {
+            Event::Scroll { dy, x, .. } if (x as f32) < self.sidebar_edge() => {
                 let rows = self.sidebar_rows();
                 let max =
                     chrome::sidebar_max_scroll(rows.rows.len(), rows.footer.is_some(), self.height);
@@ -853,6 +948,145 @@ impl<S: Screen> Browser<S> {
             self.header_change = false;
         }
         hid | dirty
+    }
+
+    /// Pointer events over the panes. In the focused pane, y becomes relative to its top, so
+    /// everything below works as with one pane; a click on another pane focuses it, and other
+    /// events there are dropped (`Err` says whether to repaint).
+    fn route(&mut self, event: Event) -> Result<Event, bool> {
+        let (x, y) = match event {
+            Event::Click { x, y }
+            | Event::Hover { x, y }
+            | Event::Drag { x, y }
+            | Event::Release { x, y }
+            | Event::Scroll { x, y, .. } => (x as f32, y as f32),
+            _ => return Ok(event),
+        };
+        // The sidebar, and drags that started there, keep window coordinates.
+        if self.drag.is_some() || x < self.sidebar_edge() {
+            return Ok(event);
+        }
+        let rects = self.pane_rects();
+        let inside = |r: &(f32, f32, f32, f32)| {
+            x >= r.0 && x < r.0 + r.2 + 1.0 && y >= r.1 && y < r.1 + r.3 + 1.0
+        };
+        let Some(j) = rects.iter().position(inside) else {
+            return Ok(event);
+        };
+        if j != self.focused.min(rects.len() - 1) {
+            return Err(match event {
+                Event::Click { .. } => self.focus_pane(j),
+                Event::Hover { .. } => self.hover.take().is_some_and(|h| h.shown),
+                _ => false,
+            });
+        }
+        let top = f64::from(rects[j].1);
+        Ok(match event {
+            Event::Click { x, y } => Event::Click { x, y: y - top },
+            Event::Hover { x, y } => Event::Hover { x, y: y - top },
+            Event::Drag { x, y } => Event::Drag { x, y: y - top },
+            Event::Release { x, y } => Event::Release { x, y: y - top },
+            Event::Scroll { dy, x, y } => Event::Scroll { dy, x, y: y - top },
+            other => other,
+        })
+    }
+
+    /// Record which tab the focused pane shows.
+    fn sync_pane(&mut self) {
+        let p = &self.profiles[self.profile];
+        let tab = p.tabs[p.active].id;
+        let f = self.focused.min(self.panes.len() - 1);
+        self.panes[f].profile = self.profile;
+        self.panes[f].tab = tab;
+    }
+
+    /// Give pane `j` focus: the focused tab sleeps (its pixels stay on screen) and pane
+    /// `j`'s tab wakes at that pane's size.
+    fn focus_pane(&mut self, j: usize) -> bool {
+        if j >= self.panes.len() || j == self.focused {
+            return false;
+        }
+        self.sync_pane();
+        let current = self.geometry();
+        self.panes[self.focused].painted = self.frame_geometry == Some(current);
+        self.menu = None;
+        self.dialog = None;
+        if self.palette.is_some() {
+            self.close_palette();
+        }
+        self.hover = None;
+        self.focused = j;
+        let pane = self.panes[j];
+        let profile = pane.profile.min(self.profiles.len() - 1);
+        let p = &self.profiles[profile];
+        let index = p
+            .tabs
+            .iter()
+            .position(|t| t.id == pane.tab)
+            .unwrap_or(p.active);
+        if profile == self.profile && index == p.active {
+            // Both panes show this tab: lay it out for its new size.
+            self.relayout();
+        } else {
+            self.show_tab(profile, index);
+        }
+        true
+    }
+
+    /// Show one, two or four panes (⌘⇧1, ⌘⇧2, ⌘⇧4). The focused pane comes first and keeps
+    /// focus; new panes show the profile's next tabs that are in no pane, or new tabs.
+    fn set_split(&mut self, n: usize) -> bool {
+        if n == self.panes.len() || !matches!(n, 1 | 2 | 4) {
+            return false;
+        }
+        self.sync_pane();
+        let focused = self.panes[self.focused];
+        let mut panes = vec![focused];
+        panes.extend(
+            self.panes
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| i != self.focused)
+                .map(|(_, p)| *p),
+        );
+        panes.truncate(n);
+        let profile = self.profile;
+        while panes.len() < n {
+            let shown: Vec<u64> = panes
+                .iter()
+                .filter(|q| q.profile == profile)
+                .map(|q| q.tab)
+                .collect();
+            let p = &mut self.profiles[profile];
+            let count = p.tabs.len();
+            let next = (1..=count)
+                .map(|k| &p.tabs[(p.active + k) % count])
+                .find(|t| !shown.contains(&t.id))
+                .map(|t| t.id);
+            let tab = match next {
+                Some(id) => id,
+                None => {
+                    let t = Tab::default();
+                    let id = t.id;
+                    p.tabs.push(t);
+                    id
+                }
+            };
+            panes.push(Pane {
+                profile,
+                tab,
+                painted: false,
+            });
+        }
+        for pane in &mut panes {
+            pane.painted = false;
+        }
+        self.panes = panes;
+        self.focused = 0;
+        self.menu = None;
+        self.relayout();
+        self.save_session();
+        true
     }
 
     /// Lay the page out again for a new pane size.
@@ -924,7 +1158,8 @@ impl<S: Screen> Browser<S> {
         }
         if let Some(p) = &self.palette {
             if x >= left {
-                let rows = (p.items.len() - p.first).min(chrome::palette_capacity(self.height));
+                let rows =
+                    (p.items.len() - p.first).min(chrome::palette_capacity(self.pane_height()));
                 return match chrome::palette_hit(x - left, y, self.pane_width(), rows) {
                     PaletteHit::Row(i) => self.activate(p.first + i),
                     PaletteHit::Inside => false,
@@ -933,14 +1168,15 @@ impl<S: Screen> Browser<S> {
             }
             self.close_palette();
         }
-        let in_sidebar = self.sidebar && x < left + 1.0;
+        let edge = self.sidebar_edge();
+        let in_sidebar = self.sidebar && x < edge + 1.0;
         if in_sidebar {
             let hit = {
                 let list = self.sidebar_rows();
                 chrome::sidebar_hit(
                     x,
                     y,
-                    left,
+                    edge,
                     self.sidebar_scroll,
                     &list.rows,
                     list.footer.is_some(),
@@ -956,7 +1192,7 @@ impl<S: Screen> Browser<S> {
                 self.drag = Some(Drag::Resizing);
                 return false;
             }
-            if x < left {
+            if x < edge {
                 self.field = None;
                 self.focus = None;
                 return match hit {
@@ -1217,6 +1453,10 @@ impl<S: Screen> Browser<S> {
         }
         if k.command {
             return match k.key {
+                // With Shift, macOS reports the shifted character on some layouts.
+                Key::Char('1' | '!') if k.shift => self.set_split(1),
+                Key::Char('2' | '@') if k.shift => self.set_split(2),
+                Key::Char('4' | '$') if k.shift => self.set_split(4),
                 Key::Char('k') => self.open_palette(),
                 Key::Char('b') if k.option => self.run_command(Command::ShowBookmarks),
                 Key::Char('d') => self.run_command(Command::BookmarkPage),
@@ -2258,7 +2498,7 @@ impl<S: Screen> Browser<S> {
 
     /// A key while the palette is open: edit the query, move through results, open one.
     fn palette_key(&mut self, k: KeyEvent) -> bool {
-        let rows = chrome::palette_capacity(self.height);
+        let rows = chrome::palette_capacity(self.pane_height());
         let Some(p) = self.palette.as_mut() else {
             return false;
         };
@@ -2876,14 +3116,37 @@ impl<S: Screen> Browser<S> {
         self.render_with(&fonts);
     }
 
-    /// The frame in device pixels: width, height, header rows, and the pane's left edge.
-    fn geometry(&self) -> (usize, usize, usize, usize) {
+    /// The frame in device pixels: width, height, header rows, the sidebar's edge, and how
+    /// many panes there are.
+    fn geometry(&self) -> Geometry {
         let scale = self.scale;
         let width_px = (self.width * scale).round().max(1.0) as usize;
         let height_px = (self.height * scale).round().max(1.0) as usize;
         let header_rows = ((HEADER_HEIGHT * scale).round() as usize).min(height_px);
-        let sidebar_px = ((self.pane_left() * scale).round() as usize).min(width_px - 1);
-        (width_px, height_px, header_rows, sidebar_px)
+        let sidebar_px = ((self.sidebar_edge() * scale).round() as usize).min(width_px - 1);
+        (
+            width_px,
+            height_px,
+            header_rows,
+            sidebar_px,
+            self.panes.len(),
+        )
+    }
+
+    /// Each pane's x, y, width and height in device pixels, inside a frame of
+    /// `width` x `height`.
+    fn pane_rects_px(&self, width: usize, height: usize) -> Vec<(usize, usize, usize, usize)> {
+        let s = self.scale;
+        self.pane_rects()
+            .into_iter()
+            .map(|(x, y, w, h)| {
+                let x0 = ((x * s).round() as usize).min(width.saturating_sub(1));
+                let y0 = ((y * s).round() as usize).min(height.saturating_sub(1));
+                let x1 = (((x + w) * s).round() as usize).clamp(x0 + 1, width);
+                let y1 = (((y + h) * s).round() as usize).clamp(y0 + 1, height);
+                (x0, y0, x1 - x0, y1 - y0)
+            })
+            .collect()
     }
 
     /// Repaint only the header, over the last frame. Falls back to a full frame when
@@ -2891,8 +3154,10 @@ impl<S: Screen> Browser<S> {
     /// would be lost.
     fn render_header(&mut self) {
         let geometry = self.geometry();
-        let (width_px, _, header_rows, sidebar_px) = geometry;
-        let pane_px = width_px - sidebar_px;
+        let (width_px, height_px, header_rows, _, _) = geometry;
+        let (pane_x, pane_y, pane_px, pane_h) =
+            self.pane_rects_px(width_px, height_px)[self.focused.min(self.panes.len() - 1)];
+        let header_rows = header_rows.min(pane_h);
         let covered = self.menu.is_some()
             || self.dialog.is_some()
             || self.hover.as_ref().is_some_and(|h| h.shown);
@@ -2911,18 +3176,21 @@ impl<S: Screen> Browser<S> {
             self.loading,
         );
         let (painter, chrome) = (&mut self.painter, &mut self.chrome);
-        let shown =
-            self.window
-                .render_header(sidebar_px, pane_px, header_rows, &mut |pixels, stride| {
-                    let frame = Frame {
-                        pixels,
-                        stride,
-                        left: 0,
-                        width: pane_px,
-                        scale,
-                    };
-                    chrome.draw(painter, frame, fonts.set(), fonts.metrics(), &header);
-                });
+        let shown = self.window.render_header(
+            (pane_x, pane_y),
+            pane_px,
+            header_rows,
+            &mut |pixels, stride| {
+                let frame = Frame {
+                    pixels,
+                    stride,
+                    left: 0,
+                    width: pane_px,
+                    scale,
+                };
+                chrome.draw(painter, frame, fonts.set(), fonts.metrics(), &header);
+            },
+        );
         match shown {
             Ok(true) => {}
             Ok(false) => self.render(),
@@ -2933,10 +3201,55 @@ impl<S: Screen> Browser<S> {
     fn render_with(&mut self, fonts: &FontStore) {
         let scale = self.scale;
         let geometry = self.geometry();
-        let (width_px, height_px, header_rows, sidebar_px) = geometry;
+        let (width_px, height_px, header_rows, sidebar_px, _) = geometry;
+        // A pane's old pixels can be reused only if the panes have not moved since.
+        if self.frame_geometry != Some(geometry) {
+            for pane in &mut self.panes {
+                pane.painted = false;
+            }
+        }
         self.frame_geometry = Some(geometry);
-        let page_rows = height_px - header_rows;
-        let pane_px = width_px - sidebar_px;
+        self.sync_pane();
+        let rects_px = self.pane_rects_px(width_px, height_px);
+        let focused = self.focused.min(rects_px.len() - 1);
+        let (pane_x, pane_y, pane_px, pane_h) = rects_px[focused];
+        let header_rows = header_rows.min(pane_h);
+        let page_rows = pane_h - header_rows;
+        // The other panes: their headers, and their old pixels or a placeholder.
+        let others: Vec<(usize, bool, String, String)> = self
+            .panes
+            .iter()
+            .enumerate()
+            .filter(|&(j, _)| j != focused)
+            .map(|(j, pane)| {
+                let profile = &self.profiles[pane.profile.min(self.profiles.len() - 1)];
+                let tab = profile.tabs.iter().find(|t| t.id == pane.tab);
+                let host = tab
+                    .and_then(|t| t.entry())
+                    .map(|e| host_of(&e.url))
+                    .unwrap_or_default();
+                let title = tab.map_or("New tab", |t| t.title()).to_string();
+                (j, pane.painted, host, title)
+            })
+            .collect();
+        let other_headers: Vec<HeaderView> = others
+            .iter()
+            .map(|(j, _, host, _)| {
+                let pane = self.panes[*j];
+                let profile = &self.profiles[pane.profile.min(self.profiles.len() - 1)];
+                let tab = profile.tabs.iter().find(|t| t.id == pane.tab);
+                HeaderView {
+                    profile: &profile.name,
+                    hue: profile.hue,
+                    can_back: tab.is_some_and(|t| t.index > 0),
+                    can_forward: tab.is_some_and(|t| t.index + 1 < t.history.len()),
+                    loading: None,
+                    host,
+                    field: None,
+                    focused: None,
+                }
+            })
+            .collect();
 
         let profile = &self.profiles[self.profile];
         let host = header_host(profile);
@@ -3017,7 +3330,7 @@ impl<S: Screen> Browser<S> {
             p.items
                 .iter()
                 .skip(p.first)
-                .take(chrome::palette_capacity(self.height))
+                .take(chrome::palette_capacity(self.pane_height()))
                 .map(|item| PaletteRow {
                     title: &item.title,
                     detail: &item.detail,
@@ -3068,16 +3381,69 @@ impl<S: Screen> Browser<S> {
             items: &menu_items,
             selected: m.selected,
         });
-        let tooltip = self
-            .hover
-            .as_ref()
-            .filter(|h| h.shown)
-            .map(|h| (h.at, h.text.as_str()));
+        // Hover positions over the pane are relative to its top (see `route`).
+        let edge = self.sidebar_edge();
+        let top_pt = self.pane_top();
+        let tooltip = self.hover.as_ref().filter(|h| h.shown).map(|h| {
+            let (x, y) = h.at;
+            ((x, if x >= edge { y + top_pt } else { y }), h.text.as_str())
+        });
         let (painter, chrome) = (&mut self.painter, &mut self.chrome);
         let blank = chrome.theme().surface;
+        let line = chrome.theme().line;
         let shown = self
             .window
-            .render(width_px, height_px, &mut |pixels, stride| {
+            .render(width_px, height_px, &mut |pixels, stride, previous| {
+                // Hairlines between panes: the column right of the first pane, and with four
+                // panes the row under the top ones.
+                if rects_px.len() > 1 {
+                    let (x, _, w, h) = rects_px[0];
+                    let right = rects_px[1].0;
+                    chrome::fill(pixels, stride, x + w, right - (x + w), line);
+                    if rects_px.len() == 4 {
+                        let below = rects_px[2].1;
+                        let strip = &mut pixels[h * stride..below * stride];
+                        chrome::fill(strip, stride, sidebar_px, width_px - sidebar_px, line);
+                    }
+                }
+                for ((j, painted, _, title), header) in others.iter().zip(&other_headers) {
+                    let (x, y, w, h) = rects_px[*j];
+                    let rows = &mut pixels[y * stride..(y + h) * stride];
+                    let head = header_rows.min(h);
+                    match previous {
+                        Some(old) if *painted => {
+                            let old = &old[y * stride..(y + h) * stride];
+                            for (row, from) in rows.chunks_mut(stride).zip(old.chunks(stride)) {
+                                row[x * 4..(x + w) * 4].copy_from_slice(&from[x * 4..(x + w) * 4]);
+                            }
+                        }
+                        _ => {
+                            chrome::fill(rows, stride, x, w, blank);
+                            let frame = Frame {
+                                pixels: &mut rows[head * stride..],
+                                stride,
+                                left: x,
+                                width: w,
+                                scale,
+                            };
+                            chrome.draw_placeholder(
+                                painter,
+                                frame,
+                                fonts.set(),
+                                fonts.metrics(),
+                                title,
+                            );
+                        }
+                    }
+                    let frame = Frame {
+                        pixels: &mut rows[..head * stride],
+                        stride,
+                        left: x,
+                        width: w,
+                        scale,
+                    };
+                    chrome.draw(painter, frame, fonts.set(), fonts.metrics(), header);
+                }
                 if let Some(sidebar) = &sidebar {
                     let frame = Frame {
                         pixels: &mut *pixels,
@@ -3088,7 +3454,8 @@ impl<S: Screen> Browser<S> {
                     };
                     chrome.draw_sidebar(painter, frame, fonts.set(), fonts.metrics(), sidebar);
                 }
-                let (top, bottom) = pixels.split_at_mut(header_rows * stride);
+                let pane_rows = &mut pixels[pane_y * stride..(pane_y + pane_h) * stride];
+                let (top, bottom) = pane_rows.split_at_mut(header_rows * stride);
                 match &view {
                     Some(view) if page_rows > 0 => {
                         painter.paint_into(
@@ -3098,17 +3465,17 @@ impl<S: Screen> Browser<S> {
                                 pixels: bottom,
                                 stride,
                                 bgra: true,
-                                left: sidebar_px,
+                                left: pane_x,
                             },
                         );
                     }
-                    _ => chrome::fill(bottom, stride, sidebar_px, pane_px, blank),
+                    _ => chrome::fill(bottom, stride, pane_x, pane_px, blank),
                 }
                 if !ring.is_empty() && page_rows > 0 {
                     let frame = Frame {
                         pixels: &mut *bottom,
                         stride,
-                        left: sidebar_px,
+                        left: pane_x,
                         width: pane_px,
                         scale,
                     };
@@ -3118,7 +3485,7 @@ impl<S: Screen> Browser<S> {
                     let frame = Frame {
                         pixels: &mut *bottom,
                         stride,
-                        left: sidebar_px,
+                        left: pane_x,
                         width: pane_px,
                         scale,
                     };
@@ -3127,16 +3494,16 @@ impl<S: Screen> Browser<S> {
                 let frame = Frame {
                     pixels: top,
                     stride,
-                    left: sidebar_px,
+                    left: pane_x,
                     width: pane_px,
                     scale,
                 };
                 chrome.draw(painter, frame, fonts.set(), fonts.metrics(), &header);
                 if let Some(dialog) = &dialog_view {
                     let frame = Frame {
-                        pixels: &mut *pixels,
+                        pixels: &mut *pane_rows,
                         stride,
-                        left: sidebar_px,
+                        left: pane_x,
                         width: pane_px,
                         scale,
                     };
@@ -3144,9 +3511,9 @@ impl<S: Screen> Browser<S> {
                 }
                 if let Some(palette) = &palette_view {
                     let frame = Frame {
-                        pixels: &mut *pixels,
+                        pixels: &mut *pane_rows,
                         stride,
-                        left: sidebar_px,
+                        left: pane_x,
                         width: pane_px,
                         scale,
                     };
@@ -3154,9 +3521,9 @@ impl<S: Screen> Browser<S> {
                 }
                 if let Some(menu) = &menu_view {
                     let frame = Frame {
-                        pixels: &mut *pixels,
+                        pixels: &mut *pane_rows,
                         stride,
-                        left: sidebar_px,
+                        left: pane_x,
                         width: pane_px,
                         scale,
                     };
@@ -3788,15 +4155,14 @@ mod tests {
             *self.clipboard.borrow_mut() = text.to_string();
         }
 
-        fn render(
-            &self,
-            width: usize,
-            height: usize,
-            draw: &mut dyn FnMut(&mut [u8], usize),
-        ) -> Result<(), String> {
+        fn render(&self, width: usize, height: usize, draw: &mut DrawFrame) -> Result<(), String> {
             let stride = width * 4 + PAD;
             let mut pixels = vec![0u8; stride * height];
-            draw(&mut pixels, stride);
+            {
+                let old = self.frame.borrow();
+                let previous = ((old.0, old.1) == (width, height)).then_some(old.2.as_slice());
+                draw(&mut pixels, stride, previous);
+            }
             *self.frame.borrow_mut() = (width, height, pixels);
             self.frames.set(self.frames.get() + 1);
             Ok(())
@@ -3806,7 +4172,7 @@ mod tests {
         /// the window's header layer covers it.
         fn render_header(
             &self,
-            left: usize,
+            (left, top): (usize, usize),
             width: usize,
             height: usize,
             draw: &mut dyn FnMut(&mut [u8], usize),
@@ -3817,7 +4183,7 @@ mod tests {
             let mut frame = self.frame.borrow_mut();
             let frame_stride = frame.0 * 4 + PAD;
             for y in 0..height {
-                let to = y * frame_stride + left * 4;
+                let to = (top + y) * frame_stride + left * 4;
                 frame.2[to..to + width * 4]
                     .copy_from_slice(&strip[y * stride..y * stride + width * 4]);
             }
@@ -3876,6 +4242,7 @@ mod tests {
             height: 300.0,
             scale: 1.0,
             fetch_css: false,
+            panes: 1,
         };
         let mut b = Browser::new(opts, FakeScreen::default(), session, Some(store));
         b.start();
@@ -4762,6 +5129,103 @@ mod tests {
             "/p",
             "the body is not in the history"
         );
+    }
+
+    /// The pixels of a pane's area in the last frame.
+    fn pane_pixels(b: &Browser<FakeScreen>, j: usize) -> Vec<u8> {
+        let frame = b.window.frame.borrow();
+        let (x, y, w, h) = b.pane_rects_px(frame.0, frame.1)[j];
+        let stride = frame.0 * 4 + PAD;
+        (y..y + h)
+            .flat_map(|row| frame.2[row * stride + x * 4..row * stride + (x + w) * 4].to_vec())
+            .collect()
+    }
+
+    #[test]
+    fn splits_into_panes_with_one_live_page() {
+        let (a, bpath) = site("split");
+        let mut b = browser(&a);
+        // A second tab with page B, then back to A.
+        act(&mut b, command('t'));
+        b.close_palette();
+        let url = engine::to_url(&bpath.display().to_string()).unwrap();
+        b.navigate(url, Destination::Push);
+        b.wait_for_load();
+        act(&mut b, command('1'));
+        assert_eq!(b.tab().title(), "Page A");
+
+        assert!(b.apply(command_shift('2')) == Repaint::Frame, "⌘⇧2");
+        b.render();
+        assert_eq!(b.panes.len(), 2);
+        let (_, _, w, _) = b.pane_rects()[0];
+        assert_eq!(
+            b.settings().width,
+            w,
+            "the page is laid out at the pane's width"
+        );
+        assert!(w < 200.0);
+        let left_before = pane_pixels(&b, 0);
+
+        // A click in the right pane gives it focus: B wakes there, A's pixels stay.
+        let (x1, _, _, _) = b.pane_rects()[1];
+        assert!(act(
+            &mut b,
+            Event::Click {
+                x: f64::from(x1) + 40.0,
+                y: 120.0
+            }
+        ));
+        assert_eq!(b.focused, 1);
+        assert_eq!(b.tab().title(), "Page B");
+        b.render();
+        assert!(
+            pane_pixels(&b, 0) == left_before,
+            "the left pane is copied, not rebuilt"
+        );
+        let (_, _, w1, _) = b.pane_rects()[1];
+        assert_eq!(b.settings().width, w1);
+
+        // The right pane switches profile; the left keeps its own.
+        act(&mut b, command_shift('p'));
+        assert_eq!(b.profile, 1);
+        let x0 = f64::from(b.pane_rects()[0].0);
+        act(
+            &mut b,
+            Event::Click {
+                x: x0 + 40.0,
+                y: 120.0,
+            },
+        );
+        assert_eq!((b.focused, b.profile), (0, 0));
+        assert_eq!(b.tab().title(), "Page A");
+        assert_eq!(
+            b.panes[1].profile, 1,
+            "the right pane remembers its profile"
+        );
+
+        // Four panes, then back to one: the focused pane's tab stays.
+        act(&mut b, command_shift('4'));
+        assert_eq!(b.panes.len(), 4);
+        b.render();
+        if let Ok(path) = std::env::var("SPLIT_PNG") {
+            let frame = b.window.frame.borrow();
+            let stride = frame.0 * 4 + PAD;
+            let rgba: Vec<u8> = (0..frame.1)
+                .flat_map(|y| {
+                    frame.2[y * stride..y * stride + frame.0 * 4]
+                        .chunks(4)
+                        .flat_map(|p| [p[2], p[1], p[0], 255])
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            std::fs::write(path, paint::png::encode(frame.0, frame.1, &rgba)).unwrap();
+        }
+        let rects = b.pane_rects();
+        assert!(rects[2].1 > 100.0, "a 2x2 grid");
+        act(&mut b, command_shift('1'));
+        assert_eq!(b.panes.len(), 1);
+        assert_eq!(b.tab().title(), "Page A");
+        assert_eq!(b.settings().width, 640.0 - b.sidebar_edge());
     }
 
     fn type_text(b: &mut Browser<FakeScreen>, text: &str) {

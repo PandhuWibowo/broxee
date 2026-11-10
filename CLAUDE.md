@@ -94,6 +94,10 @@ casts), not taken from binding crates. Ask before proposing any dependency.
   sleep); skipping it shows another page's pixels.
 - **Switching profile calls `net::forget_sessions`.** Nothing that could link profiles (connections, TLS
   tickets, and cookies once they exist) may be shared between them.
+- **Split view keeps one live page.** Only the focused pane has a `Loaded`; the others are pixels copied from
+  the previous frame surface (`Screen::render` hands it over), so they cost no memory. Giving a pane focus
+  sleeps the focused tab and wakes the pane's tab at the pane's size. Events over the focused pane get
+  pane-relative y (`Browser::route`); anything that draws in the pane uses its rows of the frame.
 - **One page load at a time.** `Browser::navigate` stops the running load before starting another, and every
   tab or profile change stops it too. A finished load always belongs to the visible tab, because nothing can
   change the visible tab without stopping it first. Keep both true when adding background work.

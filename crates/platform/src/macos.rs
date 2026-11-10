@@ -242,6 +242,7 @@ pub struct Window {
 struct HeaderFrame {
     surface: *mut c_void,
     left: usize,
+    top: usize,
     width: usize,
     height: usize,
     scale: f64,
@@ -287,13 +288,14 @@ impl Window {
     }
 
     /// Paint a frame of `width` x `height` device pixels and show it. `draw` receives surface
-    /// memory (BGRA, rows of `stride` bytes) and must fill every pixel. The frame includes the
-    /// header, so the header layer is hidden when it appears.
+    /// memory (BGRA, rows of `stride` bytes), which it must fill, and the previous frame when it
+    /// has the same size and stride, to copy parts that did not change (panes that are not
+    /// focused). The frame includes the header, so the header layer is hidden when it appears.
     pub fn render(
         &self,
         width: usize,
         height: usize,
-        draw: impl FnOnce(&mut [u8], usize),
+        draw: impl FnOnce(&mut [u8], usize, Option<&[u8]>),
     ) -> Result<(), String> {
         let surface = paint(&mut self.pool.borrow_mut(), width, height, draw)?;
         // SAFETY: the main queue outlives the process; `surface_on_main` releases the
@@ -302,19 +304,25 @@ impl Window {
         Ok(())
     }
 
-    /// Paint only the header: `width` x `height` device pixels whose left edge is `left`
-    /// pixels from the window's, shown in the header layer above the last frame.
+    /// Paint only the header: `width` x `height` device pixels at `left`, `top` from the
+    /// content area's top left, shown in the header layer above the last frame.
     pub fn render_header(
         &self,
-        left: usize,
+        (left, top): (usize, usize),
         width: usize,
         height: usize,
         draw: impl FnOnce(&mut [u8], usize),
     ) -> Result<(), String> {
-        let surface = paint(&mut self.header_pool.borrow_mut(), width, height, draw)?;
+        let surface = paint(
+            &mut self.header_pool.borrow_mut(),
+            width,
+            height,
+            |m, s, _| draw(m, s),
+        )?;
         let frame = Box::new(HeaderFrame {
             surface,
             left,
+            top,
             width,
             height,
             scale: self.scale,
@@ -337,7 +345,7 @@ fn paint(
     pool: &mut Pool,
     width: usize,
     height: usize,
-    draw: impl FnOnce(&mut [u8], usize),
+    draw: impl FnOnce(&mut [u8], usize, Option<&[u8]>),
 ) -> Result<*mut c_void, String> {
     // SAFETY: IOSurface calls are thread-safe. The memory is touched only between lock and
     // unlock, and never while the surface is on screen (see `pick`).
@@ -360,7 +368,25 @@ fn paint(
             IOSurfaceGetBaseAddress(surface).cast::<u8>(),
             stride * rows,
         );
-        draw(memory, stride);
+        // The previous frame, locked for reading only (the window server may be showing it).
+        const READ_ONLY: u32 = 1;
+        let last = pool.last;
+        let previous = (!last.is_null()
+            && last != surface
+            && IOSurfaceGetBytesPerRow(last) == stride
+            && IOSurfaceGetHeight(last) == rows
+            && IOSurfaceLock(last, READ_ONLY, std::ptr::null_mut()) == 0)
+            .then(|| {
+                std::slice::from_raw_parts(
+                    IOSurfaceGetBaseAddress(last).cast::<u8>().cast_const(),
+                    stride * rows,
+                )
+            });
+        let locked_previous = previous.is_some();
+        draw(memory, stride, previous);
+        if locked_previous {
+            IOSurfaceUnlock(last, READ_ONLY, std::ptr::null_mut());
+        }
         IOSurfaceUnlock(surface, 0, std::ptr::null_mut());
         pool.last = surface;
         // The main thread gets its own reference and releases it after handing the surface
@@ -506,7 +532,7 @@ extern "C" fn header_on_main(context: *mut c_void) {
             // The view's layer has its origin at the bottom left: the header sits at the top.
             let rect = CGRect {
                 x: frame.left as f64 / s,
-                y: bounds(view).height - height,
+                y: bounds(view).height - frame.top as f64 / s - height,
                 width: frame.width as f64 / s,
                 height,
             };

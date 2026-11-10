@@ -68,6 +68,7 @@ In the window:
 | Switch profile | ⌘⇧P (cycles), a click on the profile name at the top of the sidebar, or "Switch to …" in the palette |
 | Add, rename, recolor or remove a profile | palette: "New profile", "Rename this profile", "Change this profile's color", "Remove this profile" (asks for its name; its tabs, history, cookies and bookmarks are deleted) |
 | Show or hide the sidebar | ⌘\\ |
+| One pane, two side by side, four in a grid | ⌘⇧1 / ⌘⇧2 / ⌘⇧4, or `--panes 2` with several addresses; click a pane to give it focus. Each pane keeps its own profile |
 | Bookmark this page (or edit its bookmark) | ⌘D: name and folder, the last folder preselected; Tab between them, Enter saves, Esc cancels |
 | Bookmarks panel, in place of the tab list | ⌘⌥B: folders in name order; ↑ ↓ and Enter or a click opens, Esc goes back to tabs. Every bookmark is a ⌘K result too |
 | Address field | ⌘L or click the host; type or paste (⌘V), Enter to open, Esc to cancel |
@@ -194,8 +195,8 @@ time something reads it (most theme variables never are). A `var()` value is sub
 5. ✅ Painting to a window: the first visible page
 6. ✅ Scrolling, links, back/forward, address bar
 7. JavaScript (Boa) + a subset of the DOM API
-8. Product features: ✅ profiles, ✅ tabs that sleep to disk, ✅ session restore, ✅ ⌘K palette; next cookies,
-   split view, bookmarks, tab groups
+8. Product features: ✅ profiles, ✅ tabs that sleep to disk, ✅ session restore, ✅ ⌘K palette, ✅ cookies,
+   ✅ bookmarks, ✅ tab groups, ✅ split view, ✅ forms
 
 ## Budget log
 
@@ -227,6 +228,7 @@ time something reads it (most theme variables never are). A `var()` value is sub
 | 2026-11-10 | GIF, WebP and SVG drawn (#14) | 2.4 MB | 49.4 MB peak painted at 2x | 4000x4000 lossy WebP at 400 px: 17.9 MB peak (empty page 16.7), 296 ms; 4000x3000 lossless: 20.5 MB, 154 ms |
 | 2026-11-10 | Header in its own layer (#15) | 2.4 MB | 49.4 MB peak painted at 2x | Typing and the loading line paint a 36-point strip, not the 16 MB frame; GitHub load in a window: 37 MB idle, peak 48 to 54 MB, 0.3 s CPU (before: 37 MB, 51 to 53 MB, 0.3 s) |
 | 2026-11-10 | Forms: controls, editing, GET and POST (#13) | 2.4 MB | 49.4 MB peak painted at 2x | Wikipedia's search form submits from the keyboard; a keystroke lays the page out again (no incremental layout yet) |
+| 2026-11-10 | Split view, 1/2/4 panes (#7) | 2.4 MB | 49.4 MB peak painted at 2x | Window with GitHub, Wikipedia, HN, example.com: 1 pane 30 MB idle / 44 MB peak, 2 panes 33 / 47 MB, 4 panes 31 / 45 MB |
 
 Other pages after the layout milestone: GitHub home 22.7 MB peak (8,170 rules); Hacker News 11.5 MB.
 
@@ -321,7 +323,9 @@ Where data lives, and what compression does for it (measured 2026-11-07):
   They are saved per profile in `profiles/<profile>/bookmarks` (0600).
 - Sidebar rows have no keyboard focus of their own: tabs are reached with ⌘1 … ⌘9 and the palette, which
   also runs every sidebar action. Dragging needs the mouse.
-- Not built yet, so not shown: split view.
+- Split view: panes are not saved with the session yet, the tab list does not mark which tabs are in a pane,
+  and tabs cannot be dragged onto a pane. A pane that has not had focus since the layout changed shows its
+  tab's title until it is clicked.
 - A tooltip can stay on screen when the pointer leaves the window over it, until the next input: the
   window does not track the pointer leaving yet.
 - Profiles start as Personal and Work; up to 12, each with its own folder in `profiles/` (named by a fixed

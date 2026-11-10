@@ -1255,6 +1255,49 @@ impl Chrome {
         );
     }
 
+    /// A pane whose page is not shown yet: the tab's title in the middle of a blank pane,
+    /// until the pane gets focus.
+    pub fn draw_placeholder(
+        &self,
+        painter: &mut Painter,
+        frame: Frame,
+        fonts: Option<&FontSet>,
+        metrics: &dyn TextMetrics,
+        title: &str,
+    ) {
+        let s = frame.scale;
+        let size = 13.0 * s;
+        let height = frame.pixels.len() / frame.stride.max(1);
+        let max = frame.width as f32 - 32.0 * s;
+        let text = fit(title, max.max(0.0), size, metrics);
+        let width: f32 = text
+            .chars()
+            .map(|c| metrics.advance_em(c, false) * size)
+            .sum();
+        let ops = [Op::Text {
+            x: ((frame.width as f32 - width) / 2.0).max(0.0),
+            baseline: (height as f32 / 2.0).round(),
+            text: &text,
+            size,
+            bold: false,
+            color: self.theme.text_2,
+        }];
+        let (stride, left, width) = (frame.stride, frame.left, frame.width);
+        painter.overlay(
+            Target {
+                pixels: frame.pixels,
+                stride,
+                bgra: true,
+                left,
+            },
+            width,
+            (0, width as i32),
+            fonts,
+            metrics,
+            &ops,
+        );
+    }
+
     /// The caret of a focused form field: (x, top, height) in points from the pane's top
     /// left, one device pixel wide (at least).
     pub fn draw_caret(&self, painter: &mut Painter, frame: Frame, caret: (f32, f32, f32)) {
