@@ -27,7 +27,8 @@ thread) and, later, the JavaScript event loop (single-threaded, as in every brow
 | 1 | Load fonts | nothing | **parallel** with 2 to 4 | font loader | done |
 | 2 | Fetch HTML | URL | sequential (one request) | engine | done |
 | 3 | Parse HTML into the DOM | whole body | sequential (streaming later) | engine | done |
-| 4 | Discover stylesheets and images | DOM | sequential scan, document order recorded | engine | done |
+| 3b | Prepare form controls, run scripts | DOM | sequential: external scripts fetched in document order, then run in order on a scoped thread with a 64 MB reserved stack (`script::on_script_stack`), then `DOMContentLoaded` and `load` | loader + scoped | done |
+| 4 | Discover stylesheets and images | DOM | sequential scan, document order recorded; images among the parser's nodes only | engine | done |
 | 5 | Fetch stylesheets, then images | URLs from 4 | **parallel**, bounded to 6, stylesheets queued first; images keep compressed bytes and their header size only | fetch pool | done |
 | 6 | Parse each stylesheet | its own body + the DOM's tags, ids and classes | **parallel**, inside its fetch thread; rules that cannot match the document are skipped | fetch pool | done |
 | 7 | Join | all of 6 | **barrier**: sheets back in document order | engine | done |
@@ -48,6 +49,7 @@ thread) and, later, the JavaScript event loop (single-threaded, as in every brow
 | The engine handles every queued event, then paints once (30 scroll events cost one frame) | coalesced, sequential | engine |
 | Navigation runs stages 2 to 9 on the loader thread; after each stage it reports progress and the engine thread repaints the loading line on its next frame | sequential, off the engine thread | loader, then engine |
 | Frames are painted straight into one of two `IOSurface`s; the one on screen is never written | double-buffered | engine, then main |
+| A change to the header alone (typing in the address field, the loading line) paints only the header, into the header layer's own two small surfaces; a full frame includes the header and hides that layer | double-buffered | engine, then main |
 | Switching tab: the visible page is reduced to its sources, written to disk, then dropped; the selected tab is read back and rebuilt with stages 2 to 9 (no fetches) | sequential | engine |
 | The session file is rewritten (temporary file, then rename) after each tab or navigation change | sequential, a few KB | engine |
 

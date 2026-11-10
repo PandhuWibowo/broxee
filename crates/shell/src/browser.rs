@@ -28,6 +28,7 @@ use crate::chrome::{
     SIDEBAR_MAX, SIDEBAR_MIN, SIDEBAR_WIDTH,
 };
 use crate::engine::{self, FontStore, Loaded, Settings};
+use crate::forms;
 use crate::hibernate::{Stored, TabStore};
 use crate::palette::{self, Action, Command, Hint};
 use crate::Options;
@@ -64,12 +65,20 @@ pub trait Screen {
     fn dark(&self) -> bool;
     fn set_title(&self, title: &str);
     /// Paint a `width` x `height` device-pixel frame (BGRA rows of `stride` bytes) and show it.
-    fn render(
+    /// `draw` also gets the previous frame when it has the same layout, to copy from.
+    fn render(&self, width: usize, height: usize, draw: &mut DrawFrame) -> Result<(), String>;
+    /// Paint only the header strip: `width` x `height` device pixels at (`left`, `top`),
+    /// shown over the last frame. `Ok(false)` when the screen cannot, and a full frame is
+    /// needed instead.
+    fn render_header(
         &self,
-        width: usize,
-        height: usize,
-        draw: &mut dyn FnMut(&mut [u8], usize),
-    ) -> Result<(), String>;
+        _at: (usize, usize),
+        _width: usize,
+        _height: usize,
+        _draw: &mut dyn FnMut(&mut [u8], usize),
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
     /// Nothing has happened for a while: free what only drawing needs.
     fn idle(&self) {}
     /// Put text on the clipboard.
@@ -102,14 +111,40 @@ impl Screen for platform::Window {
         self.copy_text(text);
     }
 
-    fn render(
+    fn render(&self, width: usize, height: usize, draw: &mut DrawFrame) -> Result<(), String> {
+        platform::Window::render(self, width, height, |pixels, stride, previous| {
+            draw(pixels, stride, previous)
+        })
+    }
+
+    fn render_header(
         &self,
+        at: (usize, usize),
         width: usize,
         height: usize,
         draw: &mut dyn FnMut(&mut [u8], usize),
-    ) -> Result<(), String> {
-        platform::Window::render(self, width, height, |pixels, stride| draw(pixels, stride))
+    ) -> Result<bool, String> {
+        platform::Window::render_header(self, at, width, height, |pixels, stride| {
+            draw(pixels, stride)
+        })?;
+        Ok(true)
     }
+}
+
+/// Paints a frame: its pixels and stride, and the previous frame to copy from, if any.
+type DrawFrame<'a> = dyn FnMut(&mut [u8], usize, Option<&[u8]>) + 'a;
+
+/// Frame width and height, header rows, sidebar edge (device pixels), and pane count.
+type Geometry = (usize, usize, usize, usize, usize);
+
+/// How much of the window a change needs repainted. Ordered: combining changes keeps the
+/// larger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Repaint {
+    Nothing,
+    /// Only the pane header (the address field, the loading line).
+    Header,
+    Frame,
 }
 
 #[cfg(target_os = "macos")]
@@ -134,8 +169,9 @@ struct Entry {
 }
 
 /// A tab. The visible one's page lives in `Browser::page`; the others sleep.
-#[derive(Default)]
 struct Tab {
+    /// Names the tab for the panes of a split, whatever its position in the list.
+    id: u64,
     history: Vec<Entry>,
     index: usize,
     title: String,
@@ -151,6 +187,33 @@ struct Tab {
     pinned: bool,
     /// The tab group it belongs to, by name.
     group: Option<String>,
+}
+
+impl Default for Tab {
+    fn default() -> Tab {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Tab {
+            id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            history: Vec::new(),
+            index: 0,
+            title: String::new(),
+            snapshot: None,
+            seen: 0,
+            focused_link: None,
+            pinned: false,
+            group: None,
+        }
+    }
+}
+
+/// One pane of a split. The focused pane shows the visible tab, live; the others keep the
+/// pixels they had when focus left them (copied from frame to frame), so they cost no memory.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Pane {
+    profile: usize,
+    tab: u64,
+    /// Its area of the last frame holds its page (it was focused since the layout changed).
+    painted: bool,
 }
 
 impl Tab {
@@ -495,6 +558,17 @@ struct Browser<S: Screen> {
     /// Progress of `load`, for the header's loading line.
     loading: Option<f32>,
     load: Option<Load>,
+    /// The text of the focused form field, with its caret. The control itself is
+    /// `link_focus.node`.
+    editing: Option<Field>,
+    /// One, two or four panes, and which has focus (and the live page).
+    panes: Vec<Pane>,
+    focused: usize,
+    /// Set by an event handler whose change shows only in the header.
+    header_change: bool,
+    /// Window size, header rows, sidebar edge and pane count of the last full frame: a
+    /// header alone, or a pane's old pixels, can be reused only while these hold.
+    frame_geometry: Option<Geometry>,
 }
 
 impl<S: Screen> Browser<S> {
@@ -562,6 +636,15 @@ impl<S: Screen> Browser<S> {
             link_focus: None,
             loading: None,
             load: None,
+            editing: None,
+            panes: vec![Pane {
+                profile: 0,
+                tab: 0,
+                painted: false,
+            }],
+            focused: 0,
+            header_change: false,
+            frame_geometry: None,
         }
     }
 
@@ -575,8 +658,8 @@ impl<S: Screen> Browser<S> {
         &mut p.tabs[p.active]
     }
 
-    /// Left edge of the pane, in points.
-    fn pane_left(&self) -> f32 {
+    /// Right edge of the sidebar (0 when hidden), in points: where the panes begin.
+    fn sidebar_edge(&self) -> f32 {
         if self.sidebar {
             self.sidebar_width.min(self.width)
         } else {
@@ -584,8 +667,52 @@ impl<S: Screen> Browser<S> {
         }
     }
 
+    /// Each pane's x, y, width and height in points: one, two side by side, or a 2x2 grid,
+    /// with a 1-point hairline between them.
+    fn pane_rects(&self) -> Vec<(f32, f32, f32, f32)> {
+        let x0 = self.sidebar_edge();
+        let (w, h) = ((self.width - x0).max(1.0), self.height.max(1.0));
+        let half = |len: f32| ((len - 1.0) / 2.0).floor().max(1.0);
+        let (a, b) = (half(w), half(h));
+        match self.panes.len() {
+            2 => vec![
+                (x0, 0.0, a, h),
+                (x0 + a + 1.0, 0.0, (w - a - 1.0).max(1.0), h),
+            ],
+            4 => {
+                let (rw, bh) = ((w - a - 1.0).max(1.0), (h - b - 1.0).max(1.0));
+                vec![
+                    (x0, 0.0, a, b),
+                    (x0 + a + 1.0, 0.0, rw, b),
+                    (x0, b + 1.0, a, bh),
+                    (x0 + a + 1.0, b + 1.0, rw, bh),
+                ]
+            }
+            _ => vec![(x0, 0.0, w, h)],
+        }
+    }
+
+    /// The focused pane.
+    fn pane_rect(&self) -> (f32, f32, f32, f32) {
+        let rects = self.pane_rects();
+        rects[self.focused.min(rects.len() - 1)]
+    }
+
+    /// Left edge of the focused pane, in points.
+    fn pane_left(&self) -> f32 {
+        self.pane_rect().0
+    }
+
+    fn pane_top(&self) -> f32 {
+        self.pane_rect().1
+    }
+
     fn pane_width(&self) -> f32 {
-        (self.width - self.pane_left()).max(1.0)
+        self.pane_rect().2.max(1.0)
+    }
+
+    fn pane_height(&self) -> f32 {
+        self.pane_rect().3.max(1.0)
     }
 
     fn settings(&self) -> Settings {
@@ -598,7 +725,7 @@ impl<S: Screen> Browser<S> {
     }
 
     fn page_height(&self) -> f32 {
-        (self.height - HEADER_HEIGHT).max(1.0)
+        (self.pane_height() - HEADER_HEIGHT).max(1.0)
     }
 
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -615,26 +742,34 @@ impl<S: Screen> Browser<S> {
             } else {
                 IDLE_AFTER
             };
-            // Wake when a waiting tooltip is due.
+            // Wake when a waiting tooltip is due, or a script timer.
             if let Some(h) = self.hover.as_ref().filter(|h| !h.shown) {
                 wait = wait.min(TOOLTIP_DELAY.saturating_sub(h.since.elapsed()));
             }
-            let mut dirty = false;
+            if let Some(due) = self.next_page_timer() {
+                wait = wait.min(due);
+            }
+            let mut repaint = Repaint::Nothing;
             let mut quiet = false;
             match events.recv_timeout(wait) {
                 Ok(event) => {
-                    dirty |= self.handle(event);
+                    repaint = repaint.max(self.apply(event));
                     for event in events.try_iter() {
-                        dirty |= self.handle(event);
+                        repaint = repaint.max(self.apply(event));
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => quiet = true,
                 Err(RecvTimeoutError::Disconnected) => break,
             }
-            dirty |= self.poll_load();
-            dirty |= self.tick();
-            if dirty {
-                self.render();
+            if self.poll_load() {
+                // Progress moves the loading line; a finished load painted its page already.
+                repaint = repaint.max(Repaint::Header);
+            }
+            if self.tick() || self.run_page_timers() {
+                repaint = Repaint::Frame;
+            }
+            if repaint != Repaint::Nothing {
+                self.repaint(repaint);
                 trimmed = false;
             } else if quiet && self.load.is_none() && !trimmed {
                 self.window.idle();
@@ -681,6 +816,17 @@ impl<S: Screen> Browser<S> {
                 self.wait_for_load();
             }
         }
+        if self.opts.panes > 1 {
+            self.wait_for_load();
+            self.set_split(self.opts.panes);
+            self.render();
+            // Show each pane once, last to first, so every one has its page on screen.
+            for j in (0..self.panes.len()).rev() {
+                self.focus_pane(j);
+                self.wait_for_load();
+                self.render();
+            }
+        }
     }
 
     /// An address from the command line: select its tab if one already shows it, otherwise
@@ -715,14 +861,36 @@ impl<S: Screen> Browser<S> {
     }
 
     /// Apply one event; returns whether the frame needs repainting.
+    /// Handle `event` and say what needs repainting.
+    fn apply(&mut self, event: Event) -> Repaint {
+        self.header_change = false;
+        match (self.handle(event), self.header_change) {
+            (false, _) => Repaint::Nothing,
+            (true, true) => Repaint::Header,
+            (true, false) => Repaint::Frame,
+        }
+    }
+
+    fn repaint(&mut self, repaint: Repaint) {
+        match repaint {
+            Repaint::Nothing => {}
+            Repaint::Header => self.render_header(),
+            Repaint::Frame => self.render(),
+        }
+    }
+
     fn handle(&mut self, event: Event) -> bool {
+        let event = match self.route(event) {
+            Ok(event) => event,
+            Err(dirty) => return dirty,
+        };
         if let Event::Hover { x, y } = event {
             return self.hover_at(x as f32, y as f32);
         }
-        // Anything else hides a tooltip.
+        // Anything else hides a tooltip, which needs a full frame.
         let hid = self.hover.take().is_some_and(|h| h.shown);
-        hid | match event {
-            Event::Scroll { dy, x, .. } if (x as f32) < self.pane_left() => {
+        let dirty = match event {
+            Event::Scroll { dy, x, .. } if (x as f32) < self.sidebar_edge() => {
                 let rows = self.sidebar_rows();
                 let max =
                     chrome::sidebar_max_scroll(rows.rows.len(), rows.footer.is_some(), self.height);
@@ -759,15 +927,169 @@ impl<S: Screen> Browser<S> {
                     self.refresh_palette();
                     return true;
                 }
+                let control = self.focused_control();
+                if let (Some(field), Some(i)) = (self.editing.as_mut(), control) {
+                    field.insert(line);
+                    let text = field.text.clone();
+                    if let Some(page) = self.page.as_mut() {
+                        page.forms.set_value(&mut page.dom, i, &text);
+                    }
+                    self.relayout_page();
+                    return true;
+                }
                 match self.field.as_mut() {
                     Some(field) => {
                         field.insert(line);
+                        self.header_change = true;
                         true
                     }
                     None => false,
                 }
             }
+        };
+        if hid {
+            self.header_change = false;
         }
+        hid | dirty
+    }
+
+    /// Pointer events over the panes. In the focused pane, y becomes relative to its top, so
+    /// everything below works as with one pane; a click on another pane focuses it, and other
+    /// events there are dropped (`Err` says whether to repaint).
+    fn route(&mut self, event: Event) -> Result<Event, bool> {
+        let (x, y) = match event {
+            Event::Click { x, y }
+            | Event::Hover { x, y }
+            | Event::Drag { x, y }
+            | Event::Release { x, y }
+            | Event::Scroll { x, y, .. } => (x as f32, y as f32),
+            _ => return Ok(event),
+        };
+        // The sidebar, and drags that started there, keep window coordinates.
+        if self.drag.is_some() || x < self.sidebar_edge() {
+            return Ok(event);
+        }
+        let rects = self.pane_rects();
+        let inside = |r: &(f32, f32, f32, f32)| {
+            x >= r.0 && x < r.0 + r.2 + 1.0 && y >= r.1 && y < r.1 + r.3 + 1.0
+        };
+        let Some(j) = rects.iter().position(inside) else {
+            return Ok(event);
+        };
+        if j != self.focused.min(rects.len() - 1) {
+            return Err(match event {
+                Event::Click { .. } => self.focus_pane(j),
+                Event::Hover { .. } => self.hover.take().is_some_and(|h| h.shown),
+                _ => false,
+            });
+        }
+        let top = f64::from(rects[j].1);
+        Ok(match event {
+            Event::Click { x, y } => Event::Click { x, y: y - top },
+            Event::Hover { x, y } => Event::Hover { x, y: y - top },
+            Event::Drag { x, y } => Event::Drag { x, y: y - top },
+            Event::Release { x, y } => Event::Release { x, y: y - top },
+            Event::Scroll { dy, x, y } => Event::Scroll { dy, x, y: y - top },
+            other => other,
+        })
+    }
+
+    /// Record which tab the focused pane shows.
+    fn sync_pane(&mut self) {
+        let p = &self.profiles[self.profile];
+        let tab = p.tabs[p.active].id;
+        let f = self.focused.min(self.panes.len() - 1);
+        self.panes[f].profile = self.profile;
+        self.panes[f].tab = tab;
+    }
+
+    /// Give pane `j` focus: the focused tab sleeps (its pixels stay on screen) and pane
+    /// `j`'s tab wakes at that pane's size.
+    fn focus_pane(&mut self, j: usize) -> bool {
+        if j >= self.panes.len() || j == self.focused {
+            return false;
+        }
+        self.sync_pane();
+        let current = self.geometry();
+        self.panes[self.focused].painted = self.frame_geometry == Some(current);
+        self.menu = None;
+        self.dialog = None;
+        if self.palette.is_some() {
+            self.close_palette();
+        }
+        self.hover = None;
+        self.focused = j;
+        let pane = self.panes[j];
+        let profile = pane.profile.min(self.profiles.len() - 1);
+        let p = &self.profiles[profile];
+        let index = p
+            .tabs
+            .iter()
+            .position(|t| t.id == pane.tab)
+            .unwrap_or(p.active);
+        if profile == self.profile && index == p.active {
+            // Both panes show this tab: lay it out for its new size.
+            self.relayout();
+        } else {
+            self.show_tab(profile, index);
+        }
+        true
+    }
+
+    /// Show one, two or four panes (⌘⇧1, ⌘⇧2, ⌘⇧4). The focused pane comes first and keeps
+    /// focus; new panes show the profile's next tabs that are in no pane, or new tabs.
+    fn set_split(&mut self, n: usize) -> bool {
+        if n == self.panes.len() || !matches!(n, 1 | 2 | 4) {
+            return false;
+        }
+        self.sync_pane();
+        let focused = self.panes[self.focused];
+        let mut panes = vec![focused];
+        panes.extend(
+            self.panes
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| i != self.focused)
+                .map(|(_, p)| *p),
+        );
+        panes.truncate(n);
+        let profile = self.profile;
+        while panes.len() < n {
+            let shown: Vec<u64> = panes
+                .iter()
+                .filter(|q| q.profile == profile)
+                .map(|q| q.tab)
+                .collect();
+            let p = &mut self.profiles[profile];
+            let count = p.tabs.len();
+            let next = (1..=count)
+                .map(|k| &p.tabs[(p.active + k) % count])
+                .find(|t| !shown.contains(&t.id))
+                .map(|t| t.id);
+            let tab = match next {
+                Some(id) => id,
+                None => {
+                    let t = Tab::default();
+                    let id = t.id;
+                    p.tabs.push(t);
+                    id
+                }
+            };
+            panes.push(Pane {
+                profile,
+                tab,
+                painted: false,
+            });
+        }
+        for pane in &mut panes {
+            pane.painted = false;
+        }
+        self.panes = panes;
+        self.focused = 0;
+        self.menu = None;
+        self.relayout();
+        self.save_session();
+        true
     }
 
     /// Lay the page out again for a new pane size.
@@ -839,7 +1161,8 @@ impl<S: Screen> Browser<S> {
         }
         if let Some(p) = &self.palette {
             if x >= left {
-                let rows = (p.items.len() - p.first).min(chrome::palette_capacity(self.height));
+                let rows =
+                    (p.items.len() - p.first).min(chrome::palette_capacity(self.pane_height()));
                 return match chrome::palette_hit(x - left, y, self.pane_width(), rows) {
                     PaletteHit::Row(i) => self.activate(p.first + i),
                     PaletteHit::Inside => false,
@@ -848,14 +1171,15 @@ impl<S: Screen> Browser<S> {
             }
             self.close_palette();
         }
-        let in_sidebar = self.sidebar && x < left + 1.0;
+        let edge = self.sidebar_edge();
+        let in_sidebar = self.sidebar && x < edge + 1.0;
         if in_sidebar {
             let hit = {
                 let list = self.sidebar_rows();
                 chrome::sidebar_hit(
                     x,
                     y,
-                    left,
+                    edge,
                     self.sidebar_scroll,
                     &list.rows,
                     list.footer.is_some(),
@@ -871,7 +1195,7 @@ impl<S: Screen> Browser<S> {
                 self.drag = Some(Drag::Resizing);
                 return false;
             }
-            if x < left {
+            if x < edge {
                 self.field = None;
                 self.focus = None;
                 return match hit {
@@ -903,11 +1227,286 @@ impl<S: Screen> Browser<S> {
         }
         let was_editing = self.field.take().is_some() | self.focus.take().is_some();
         let was_editing = was_editing | self.link_focus.take().is_some();
+        self.editing = None;
+        // Scripts hear the click first; preventDefault() keeps links and buttons still.
+        if let Some(node) = self.node_at(x, y - HEADER_HEIGHT) {
+            let (changed, prevented) = self.dispatch_page(node, "click");
+            if prevented {
+                return true;
+            }
+            if changed
+                && self.control_at(x, y - HEADER_HEIGHT).is_none()
+                && self.link_at(x, y - HEADER_HEIGHT).is_none()
+            {
+                return true;
+            }
+        }
+        if let Some(i) = self.control_at(x, y - HEADER_HEIGHT) {
+            self.focus_control(i);
+            self.press_control(i);
+            return true;
+        }
         if let Some(url) = self.link_at(x, y - HEADER_HEIGHT) {
             self.follow(url);
             return true;
         }
         was_editing
+    }
+
+    /// Where the caret of the focused field is: x, top and height in page-area points.
+    fn caret(&self, metrics: &dyn font::TextMetrics) -> Option<(f32, f32, f32)> {
+        let field = self.editing.as_ref()?;
+        let i = self.focused_control()?;
+        let page = self.page.as_ref()?;
+        let c = &page.forms.controls[i];
+        let layout = &page.layout;
+        let b = (0..layout.boxes.len()).find(|&k| layout.boxes[k].node == c.node)?;
+        let (r, fixed) = (layout.boxes[b].rect, layout.box_is_fixed(b));
+        let style = page.styles.style(c.node);
+        let size = style.font_size.to_f32();
+        let bold = style.font_weight >= 600;
+        let (ascent, descent) = (metrics.ascent_em() * size, metrics.descent_em() * size);
+        // Where its text starts: the first run of the value or placeholder.
+        let (shown, placeholder) = page.forms.text_nodes(i);
+        let first = layout
+            .texts
+            .iter()
+            .find(|t| Some(t.node) == shown || Some(t.node) == placeholder)
+            .map(|t| (t.x, t.baseline));
+        let edge = style.border_width[3].to_f32() + 2.0;
+        let (x0, baseline) = first.unwrap_or((
+            r.x + edge,
+            r.y + style.border_width[0].to_f32() + 1.0 + ascent,
+        ));
+        let before = &field.text[..field.cursor];
+        let line = before.matches('\n').count() as f32;
+        let tail = before.rsplit('\n').next().unwrap_or("");
+        let width: f32 = if c.kind == forms::Kind::Password {
+            tail.chars().count() as f32 * metrics.advance_em('•', bold) * size
+        } else {
+            tail.chars()
+                .map(|ch| metrics.advance_em(ch, bold) * size)
+                .sum()
+        };
+        let line_height = (ascent + descent) * 1.15;
+        let x = (x0 + width).min(r.x + r.width - edge).max(r.x + 1.0);
+        let top = baseline - ascent + line * line_height;
+        let top = if fixed { top } else { top - self.scroll };
+        Some((x, top, ascent + descent))
+    }
+
+    /// The innermost node drawn at (x, y) in pane points: a run of text, else a box.
+    fn node_at(&self, x: f32, y_view: f32) -> Option<NodeId> {
+        let page = self.page.as_ref()?;
+        let layout = &page.layout;
+        let metrics = self.fonts.metrics();
+        let doc_y = |fixed: bool| if fixed { y_view } else { y_view + self.scroll };
+        for i in (0..layout.texts.len()).rev() {
+            let t = &layout.texts[i];
+            let size = page.styles.style(t.node).font_size.to_f32();
+            let y = doc_y(layout.text_is_fixed(i));
+            let top = t.baseline - metrics.ascent_em() * size;
+            let bottom = t.baseline + metrics.descent_em() * size;
+            if (t.x..=t.x + t.width).contains(&x) && (top..=bottom).contains(&y) {
+                return Some(t.node);
+            }
+        }
+        (0..layout.boxes.len()).rev().find_map(|i| {
+            let r = layout.boxes[i].rect;
+            let y = doc_y(layout.box_is_fixed(i));
+            ((r.x..=r.x + r.width).contains(&x) && (r.y..=r.y + r.height).contains(&y))
+                .then_some(layout.boxes[i].node)
+        })
+    }
+
+    /// Fire `kind` at `node` for the page's scripts. Returns (the page changed and was laid
+    /// out again, a listener prevented the default action).
+    fn dispatch_page(&mut self, node: NodeId, kind: &str) -> (bool, bool) {
+        let Some(page) = self.page.as_mut() else {
+            return (false, false);
+        };
+        let Some(script) = page.script.as_mut() else {
+            return (false, false);
+        };
+        let r = crate::script::dispatch(
+            script,
+            &mut page.dom,
+            &mut page.forms,
+            &page.url,
+            node,
+            kind,
+        );
+        if r.0 {
+            self.relayout_page();
+        }
+        r
+    }
+
+    /// How long until the page's next script timer.
+    fn next_page_timer(&self) -> Option<Duration> {
+        self.page.as_ref()?.script.as_ref()?.next_timer()
+    }
+
+    /// Run the page's due timers; returns whether the page changed (and was laid out again).
+    fn run_page_timers(&mut self) -> bool {
+        if !self.next_page_timer().is_some_and(|d| d.is_zero()) {
+            return false;
+        }
+        let Some(page) = self.page.as_mut() else {
+            return false;
+        };
+        let Some(script) = page.script.as_mut() else {
+            return false;
+        };
+        let changed = crate::script::run_timers(script, &mut page.dom, &mut page.forms, &page.url);
+        if changed {
+            self.relayout_page();
+        }
+        changed
+    }
+
+    /// The form control at (x, y) in pane points, if any.
+    fn control_at(&self, x: f32, y_view: f32) -> Option<usize> {
+        let page = self.page.as_ref()?;
+        let layout = &page.layout;
+        (0..layout.boxes.len()).rev().find_map(|i| {
+            let b = layout.boxes[i];
+            let y = if layout.box_is_fixed(i) {
+                y_view
+            } else {
+                y_view + self.scroll
+            };
+            let r = b.rect;
+            let inside = (r.x..=r.x + r.width).contains(&x) && (r.y..=r.y + r.height).contains(&y);
+            let style = page.styles.style(b.node);
+            let control = page.forms.at(&page.dom, b.node)?;
+            (inside && style.visible && page.forms.focusable(&page.dom, control)).then_some(control)
+        })
+    }
+
+    /// The form control with keyboard focus.
+    fn focused_control(&self) -> Option<usize> {
+        let page = self.page.as_ref()?;
+        let node = self.link_focus.as_ref()?.node;
+        page.forms
+            .controls
+            .binary_search_by_key(&node, |c| c.node)
+            .ok()
+    }
+
+    /// Give control `i` keyboard focus; a text field gets its caret at the end.
+    fn focus_control(&mut self, i: usize) {
+        let Some(page) = &self.page else {
+            return;
+        };
+        let c = &page.forms.controls[i];
+        let node = c.node;
+        self.editing = page.forms.is_text(i).then(|| Field {
+            text: c.value.clone(),
+            cursor: c.value.len(),
+            all_selected: false,
+        });
+        self.focus_link(node, true);
+    }
+
+    /// A click on control `i`, or Space on it: toggle, choose, submit or reset.
+    fn press_control(&mut self, i: usize) {
+        let Some(page) = self.page.as_mut() else {
+            return;
+        };
+        let changed = match page.forms.controls[i].kind {
+            forms::Kind::Checkbox | forms::Kind::Radio => page.forms.toggle(&mut page.dom, i),
+            forms::Kind::Select => page.forms.choose(&mut page.dom, i, 1),
+            forms::Kind::Submit => {
+                self.submit(i);
+                return;
+            }
+            forms::Kind::Reset => {
+                page.forms.reset(&mut page.dom, i);
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            self.relayout_page();
+        }
+    }
+
+    /// Lay the page out again after a control changed what it shows.
+    fn relayout_page(&mut self) {
+        let node = self.link_focus.as_ref().map(|l| l.node);
+        self.relayout();
+        if let Some(node) = node {
+            self.focus_link(node, false);
+        }
+    }
+
+    /// Submit the form of control `i` (the button pressed, or the field where Enter was).
+    fn submit(&mut self, i: usize) {
+        let Some(page) = &self.page else {
+            return;
+        };
+        let Some(sent) = page.forms.submission(&page.dom, i, &page.url) else {
+            return;
+        };
+        self.editing = None;
+        self.link_focus = None;
+        self.save_scroll();
+        self.navigate_with(sent.url, sent.body, Destination::Push, true);
+    }
+
+    /// Keys for the focused control `i`. `None` lets the key do what it does elsewhere.
+    fn control_key(&mut self, i: usize, k: KeyEvent) -> Option<bool> {
+        let kind = self.page.as_ref()?.forms.controls[i].kind;
+        if let Some(field) = self.editing.as_mut() {
+            match k.key {
+                Key::Char(c) => field.insert(c.encode_utf8(&mut [0; 4])),
+                Key::Backspace => field.backspace(),
+                Key::Left => field.left(),
+                Key::Right => field.right(),
+                Key::Home | Key::Up => field.cursor = 0,
+                Key::End | Key::Down => field.cursor = field.text.len(),
+                Key::Enter if kind == forms::Kind::TextArea => field.insert("\n"),
+                Key::Enter => {
+                    self.submit(i);
+                    return Some(true);
+                }
+                Key::Escape => {
+                    self.editing = None;
+                    self.link_focus = None;
+                    return Some(true);
+                }
+                _ => return None,
+            }
+            let text = field.text.clone();
+            let page = self.page.as_mut()?;
+            page.forms.set_value(&mut page.dom, i, &text);
+            self.relayout_page();
+            return Some(true);
+        }
+        match (kind, k.key) {
+            (forms::Kind::Select, Key::Up) => {
+                let page = self.page.as_mut()?;
+                let changed = page.forms.choose(&mut page.dom, i, -1);
+                changed.then(|| self.relayout_page());
+                Some(changed)
+            }
+            (forms::Kind::Select, Key::Down) => {
+                let page = self.page.as_mut()?;
+                let changed = page.forms.choose(&mut page.dom, i, 1);
+                changed.then(|| self.relayout_page());
+                Some(changed)
+            }
+            (_, Key::Char(' ')) | (forms::Kind::Submit | forms::Kind::Reset, Key::Enter) => {
+                self.press_control(i);
+                Some(true)
+            }
+            (_, Key::Escape) => {
+                self.link_focus = None;
+                Some(true)
+            }
+            _ => None,
+        }
     }
 
     fn key(&mut self, k: KeyEvent) -> bool {
@@ -940,6 +1539,10 @@ impl<S: Screen> Browser<S> {
         }
         if k.command {
             return match k.key {
+                // With Shift, macOS reports the shifted character on some layouts.
+                Key::Char('1' | '!') if k.shift => self.set_split(1),
+                Key::Char('2' | '@') if k.shift => self.set_split(2),
+                Key::Char('4' | '$') if k.shift => self.set_split(4),
                 Key::Char('k') => self.open_palette(),
                 Key::Char('b') if k.option => self.run_command(Command::ShowBookmarks),
                 Key::Char('d') => self.run_command(Command::BookmarkPage),
@@ -961,6 +1564,7 @@ impl<S: Screen> Browser<S> {
                 Key::Char('a') => match self.field.as_mut() {
                     Some(field) => {
                         field.all_selected = true;
+                        self.header_change = true;
                         true
                     }
                     None => false,
@@ -986,12 +1590,15 @@ impl<S: Screen> Browser<S> {
                     let input = std::mem::take(&mut field.text);
                     self.field = None;
                     self.open_input(&input);
+                    return true;
                 }
                 Key::Escape => self.field = None,
                 // `move_focus` closes the field, after reading where focus was.
                 Key::Tab => return self.move_focus(k.shift),
                 _ => return false,
             }
+            // Editing the field changes nothing but the header.
+            self.header_change = true;
             return true;
         }
         if let Some(button) = self.focus {
@@ -1019,6 +1626,11 @@ impl<S: Screen> Browser<S> {
         if self.list == SidebarList::Bookmarks && self.focus.is_none() && self.link_focus.is_none()
         {
             if let Some(done) = self.bookmarks_key(k.key) {
+                return done;
+            }
+        }
+        if let Some(i) = self.focused_control() {
+            if let Some(done) = self.control_key(i, k) {
                 return done;
             }
         }
@@ -1057,8 +1669,9 @@ impl<S: Screen> Browser<S> {
         }
     }
 
-    /// Tab order: back, forward, reload, the address field, then the page's links in document
-    /// order. Disabled buttons and links that are not shown are skipped; the order wraps.
+    /// Tab order: back, forward, reload, the address field, then the page's links and form
+    /// controls in document order. Disabled buttons and links that are not shown are skipped;
+    /// the order wraps.
     fn move_focus(&mut self, backwards: bool) -> bool {
         #[derive(Clone, Copy, PartialEq)]
         enum Stop {
@@ -1106,12 +1719,24 @@ impl<S: Screen> Browser<S> {
         self.field = None;
         self.focus = None;
         self.link_focus = None;
+        self.editing = None;
         match order[next] {
             Stop::Header(Button::Address) => {
                 self.focus_field();
             }
             Stop::Header(button) => self.focus = Some(button),
-            Stop::Link(node) => self.focus_link(node, true),
+            Stop::Link(node) => {
+                let control = self.page.as_ref().and_then(|p| {
+                    p.forms
+                        .controls
+                        .binary_search_by_key(&node, |c| c.node)
+                        .ok()
+                });
+                match control {
+                    Some(i) => self.focus_control(i),
+                    None => self.focus_link(node, true),
+                }
+            }
         }
         true
     }
@@ -1121,7 +1746,20 @@ impl<S: Screen> Browser<S> {
         let Some(page) = &self.page else {
             return;
         };
-        let rects = link_rects(page, node, self.fonts.metrics());
+        let rects = if page
+            .forms
+            .controls
+            .binary_search_by_key(&node, |c| c.node)
+            .is_ok()
+        {
+            // A control's ring goes around its border box, not each run of its text.
+            (0..page.layout.boxes.len())
+                .filter(|&i| page.layout.boxes[i].node == node)
+                .map(|i| (page.layout.boxes[i].rect, page.layout.box_is_fixed(i)))
+                .collect()
+        } else {
+            link_rects(page, node, self.fonts.metrics())
+        };
         if rects.is_empty() {
             return;
         }
@@ -1946,7 +2584,7 @@ impl<S: Screen> Browser<S> {
 
     /// A key while the palette is open: edit the query, move through results, open one.
     fn palette_key(&mut self, k: KeyEvent) -> bool {
-        let rows = chrome::palette_capacity(self.height);
+        let rows = chrome::palette_capacity(self.pane_height());
         let Some(p) = self.palette.as_mut() else {
             return false;
         };
@@ -2105,7 +2743,19 @@ impl<S: Screen> Browser<S> {
 
     /// `navigate`, saying whether the navigation started on the same site as `url`.
     fn navigate_from(&mut self, url: net::Url, to: Destination, same_site_initiator: bool) {
+        self.navigate_with(url, None, to, same_site_initiator);
+    }
+
+    /// `navigate_from`, POSTing `body` when there is one (a submitted form).
+    fn navigate_with(
+        &mut self,
+        url: net::Url,
+        body: Option<net::Body>,
+        to: Destination,
+        same_site_initiator: bool,
+    ) {
         self.stop_load();
+        self.editing = None;
         self.field = None;
         self.focus = None;
         let settings = self.settings();
@@ -2121,9 +2771,14 @@ impl<S: Screen> Browser<S> {
                     same_site_initiator,
                 };
                 // A failed send means the browser dropped the load: stop at the next stage.
-                let result = engine::load(&target, settings, &fonts, Some(jar), &mut |progress| {
-                    sender.send(LoadMessage::Progress(progress)).is_ok()
-                });
+                let result = engine::load_with(
+                    &target,
+                    body.as_ref(),
+                    settings,
+                    &fonts,
+                    Some(jar),
+                    &mut |progress| sender.send(LoadMessage::Progress(progress)).is_ok(),
+                );
                 let _ = sender.send(LoadMessage::Done(Box::new(result)));
             });
         let load = Load {
@@ -2491,6 +3146,7 @@ impl<S: Screen> Browser<S> {
         self.page_is_entry = false;
         self.page = Some(page);
         self.link_focus = None;
+        self.editing = None;
         self.loading = None;
         self.scroll = scroll;
         self.clamp_scroll();
@@ -2546,32 +3202,150 @@ impl<S: Screen> Browser<S> {
         self.render_with(&fonts);
     }
 
-    fn render_with(&mut self, fonts: &FontStore) {
+    /// The frame in device pixels: width, height, header rows, the sidebar's edge, and how
+    /// many panes there are.
+    fn geometry(&self) -> Geometry {
         let scale = self.scale;
         let width_px = (self.width * scale).round().max(1.0) as usize;
         let height_px = (self.height * scale).round().max(1.0) as usize;
         let header_rows = ((HEADER_HEIGHT * scale).round() as usize).min(height_px);
-        let page_rows = height_px - header_rows;
-        let sidebar_px = ((self.pane_left() * scale).round() as usize).min(width_px - 1);
-        let pane_px = width_px - sidebar_px;
+        let sidebar_px = ((self.sidebar_edge() * scale).round() as usize).min(width_px - 1);
+        (
+            width_px,
+            height_px,
+            header_rows,
+            sidebar_px,
+            self.panes.len(),
+        )
+    }
+
+    /// Each pane's x, y, width and height in device pixels, inside a frame of
+    /// `width` x `height`.
+    fn pane_rects_px(&self, width: usize, height: usize) -> Vec<(usize, usize, usize, usize)> {
+        let s = self.scale;
+        self.pane_rects()
+            .into_iter()
+            .map(|(x, y, w, h)| {
+                let x0 = ((x * s).round() as usize).min(width.saturating_sub(1));
+                let y0 = ((y * s).round() as usize).min(height.saturating_sub(1));
+                let x1 = (((x + w) * s).round() as usize).clamp(x0 + 1, width);
+                let y1 = (((y + h) * s).round() as usize).clamp(y0 + 1, height);
+                (x0, y0, x1 - x0, y1 - y0)
+            })
+            .collect()
+    }
+
+    /// Repaint only the header, over the last frame. Falls back to a full frame when
+    /// something drawn over the header (a tooltip, the menu, a dialog) or a new window size
+    /// would be lost.
+    fn render_header(&mut self) {
+        let geometry = self.geometry();
+        let (width_px, height_px, header_rows, _, _) = geometry;
+        let (pane_x, pane_y, pane_px, pane_h) =
+            self.pane_rects_px(width_px, height_px)[self.focused.min(self.panes.len() - 1)];
+        let header_rows = header_rows.min(pane_h);
+        let covered = self.menu.is_some()
+            || self.dialog.is_some()
+            || self.hover.as_ref().is_some_and(|h| h.shown);
+        if covered || header_rows == 0 || self.frame_geometry != Some(geometry) {
+            return self.render();
+        }
+        let fonts = Arc::clone(&self.fonts);
+        let scale = self.scale;
+        let profile = &self.profiles[self.profile];
+        let host = header_host(profile);
+        let header = header_view(
+            profile,
+            &host,
+            self.field.as_ref(),
+            self.focus,
+            self.loading,
+        );
+        let (painter, chrome) = (&mut self.painter, &mut self.chrome);
+        let shown = self.window.render_header(
+            (pane_x, pane_y),
+            pane_px,
+            header_rows,
+            &mut |pixels, stride| {
+                let frame = Frame {
+                    pixels,
+                    stride,
+                    left: 0,
+                    width: pane_px,
+                    scale,
+                };
+                chrome.draw(painter, frame, fonts.set(), fonts.metrics(), &header);
+            },
+        );
+        match shown {
+            Ok(true) => {}
+            Ok(false) => self.render(),
+            Err(e) => self.window.set_title(&format!("Broxee: {e}")),
+        }
+    }
+
+    fn render_with(&mut self, fonts: &FontStore) {
+        let scale = self.scale;
+        let geometry = self.geometry();
+        let (width_px, height_px, header_rows, sidebar_px, _) = geometry;
+        // A pane's old pixels can be reused only if the panes have not moved since.
+        if self.frame_geometry != Some(geometry) {
+            for pane in &mut self.panes {
+                pane.painted = false;
+            }
+        }
+        self.frame_geometry = Some(geometry);
+        self.sync_pane();
+        let rects_px = self.pane_rects_px(width_px, height_px);
+        let focused = self.focused.min(rects_px.len() - 1);
+        let (pane_x, pane_y, pane_px, pane_h) = rects_px[focused];
+        let header_rows = header_rows.min(pane_h);
+        let page_rows = pane_h - header_rows;
+        // The other panes: their headers, and their old pixels or a placeholder.
+        let others: Vec<(usize, bool, String, String)> = self
+            .panes
+            .iter()
+            .enumerate()
+            .filter(|&(j, _)| j != focused)
+            .map(|(j, pane)| {
+                let profile = &self.profiles[pane.profile.min(self.profiles.len() - 1)];
+                let tab = profile.tabs.iter().find(|t| t.id == pane.tab);
+                let host = tab
+                    .and_then(|t| t.entry())
+                    .map(|e| host_of(&e.url))
+                    .unwrap_or_default();
+                let title = tab.map_or("New tab", |t| t.title()).to_string();
+                (j, pane.painted, host, title)
+            })
+            .collect();
+        let other_headers: Vec<HeaderView> = others
+            .iter()
+            .map(|(j, _, host, _)| {
+                let pane = self.panes[*j];
+                let profile = &self.profiles[pane.profile.min(self.profiles.len() - 1)];
+                let tab = profile.tabs.iter().find(|t| t.id == pane.tab);
+                HeaderView {
+                    profile: &profile.name,
+                    hue: profile.hue,
+                    can_back: tab.is_some_and(|t| t.index > 0),
+                    can_forward: tab.is_some_and(|t| t.index + 1 < t.history.len()),
+                    loading: None,
+                    host,
+                    field: None,
+                    focused: None,
+                }
+            })
+            .collect();
 
         let profile = &self.profiles[self.profile];
-        let tab = &profile.tabs[profile.active];
-        let host = tab.entry().map(|e| host_of(&e.url)).unwrap_or_default();
-        let header = HeaderView {
-            profile: &profile.name,
-            hue: profile.hue,
-            can_back: tab.index > 0,
-            can_forward: tab.index + 1 < tab.history.len(),
-            loading: self.loading,
-            host: &host,
-            field: self.field.as_ref().map(|f| FieldView {
-                text: &f.text,
-                cursor: f.cursor,
-                all_selected: f.all_selected,
-            }),
-            focused: self.focus,
-        };
+        let host = header_host(profile);
+        let header = header_view(
+            profile,
+            &host,
+            self.field.as_ref(),
+            self.focus,
+            self.loading,
+        );
         let list = sidebar_rows(profile, self.list, self.bookmark_row);
         let drop_at = match self.drag {
             Some(Drag::Moving { drop, .. }) => Some(drop),
@@ -2642,7 +3416,7 @@ impl<S: Screen> Browser<S> {
             p.items
                 .iter()
                 .skip(p.first)
-                .take(chrome::palette_capacity(self.height))
+                .take(chrome::palette_capacity(self.pane_height()))
                 .map(|item| PaletteRow {
                     title: &item.title,
                     detail: &item.detail,
@@ -2678,6 +3452,7 @@ impl<S: Screen> Browser<S> {
                 })
                 .collect()
         });
+        let caret = self.caret(fonts.metrics());
         let view = self.page.as_ref().map(|p| engine::page_view(p, fonts));
         let viewport = Viewport {
             width: pane_px as f32 / scale,
@@ -2692,16 +3467,69 @@ impl<S: Screen> Browser<S> {
             items: &menu_items,
             selected: m.selected,
         });
-        let tooltip = self
-            .hover
-            .as_ref()
-            .filter(|h| h.shown)
-            .map(|h| (h.at, h.text.as_str()));
+        // Hover positions over the pane are relative to its top (see `route`).
+        let edge = self.sidebar_edge();
+        let top_pt = self.pane_top();
+        let tooltip = self.hover.as_ref().filter(|h| h.shown).map(|h| {
+            let (x, y) = h.at;
+            ((x, if x >= edge { y + top_pt } else { y }), h.text.as_str())
+        });
         let (painter, chrome) = (&mut self.painter, &mut self.chrome);
         let blank = chrome.theme().surface;
+        let line = chrome.theme().line;
         let shown = self
             .window
-            .render(width_px, height_px, &mut |pixels, stride| {
+            .render(width_px, height_px, &mut |pixels, stride, previous| {
+                // Hairlines between panes: the column right of the first pane, and with four
+                // panes the row under the top ones.
+                if rects_px.len() > 1 {
+                    let (x, _, w, h) = rects_px[0];
+                    let right = rects_px[1].0;
+                    chrome::fill(pixels, stride, x + w, right - (x + w), line);
+                    if rects_px.len() == 4 {
+                        let below = rects_px[2].1;
+                        let strip = &mut pixels[h * stride..below * stride];
+                        chrome::fill(strip, stride, sidebar_px, width_px - sidebar_px, line);
+                    }
+                }
+                for ((j, painted, _, title), header) in others.iter().zip(&other_headers) {
+                    let (x, y, w, h) = rects_px[*j];
+                    let rows = &mut pixels[y * stride..(y + h) * stride];
+                    let head = header_rows.min(h);
+                    match previous {
+                        Some(old) if *painted => {
+                            let old = &old[y * stride..(y + h) * stride];
+                            for (row, from) in rows.chunks_mut(stride).zip(old.chunks(stride)) {
+                                row[x * 4..(x + w) * 4].copy_from_slice(&from[x * 4..(x + w) * 4]);
+                            }
+                        }
+                        _ => {
+                            chrome::fill(rows, stride, x, w, blank);
+                            let frame = Frame {
+                                pixels: &mut rows[head * stride..],
+                                stride,
+                                left: x,
+                                width: w,
+                                scale,
+                            };
+                            chrome.draw_placeholder(
+                                painter,
+                                frame,
+                                fonts.set(),
+                                fonts.metrics(),
+                                title,
+                            );
+                        }
+                    }
+                    let frame = Frame {
+                        pixels: &mut rows[..head * stride],
+                        stride,
+                        left: x,
+                        width: w,
+                        scale,
+                    };
+                    chrome.draw(painter, frame, fonts.set(), fonts.metrics(), header);
+                }
                 if let Some(sidebar) = &sidebar {
                     let frame = Frame {
                         pixels: &mut *pixels,
@@ -2712,7 +3540,8 @@ impl<S: Screen> Browser<S> {
                     };
                     chrome.draw_sidebar(painter, frame, fonts.set(), fonts.metrics(), sidebar);
                 }
-                let (top, bottom) = pixels.split_at_mut(header_rows * stride);
+                let pane_rows = &mut pixels[pane_y * stride..(pane_y + pane_h) * stride];
+                let (top, bottom) = pane_rows.split_at_mut(header_rows * stride);
                 match &view {
                     Some(view) if page_rows > 0 => {
                         painter.paint_into(
@@ -2722,35 +3551,45 @@ impl<S: Screen> Browser<S> {
                                 pixels: bottom,
                                 stride,
                                 bgra: true,
-                                left: sidebar_px,
+                                left: pane_x,
                             },
                         );
                     }
-                    _ => chrome::fill(bottom, stride, sidebar_px, pane_px, blank),
+                    _ => chrome::fill(bottom, stride, pane_x, pane_px, blank),
                 }
                 if !ring.is_empty() && page_rows > 0 {
                     let frame = Frame {
                         pixels: &mut *bottom,
                         stride,
-                        left: sidebar_px,
+                        left: pane_x,
                         width: pane_px,
                         scale,
                     };
                     chrome.draw_focus_ring(painter, frame, &ring);
                 }
+                if let (Some(caret), true) = (caret, page_rows > 0) {
+                    let frame = Frame {
+                        pixels: &mut *bottom,
+                        stride,
+                        left: pane_x,
+                        width: pane_px,
+                        scale,
+                    };
+                    chrome.draw_caret(painter, frame, caret);
+                }
                 let frame = Frame {
                     pixels: top,
                     stride,
-                    left: sidebar_px,
+                    left: pane_x,
                     width: pane_px,
                     scale,
                 };
                 chrome.draw(painter, frame, fonts.set(), fonts.metrics(), &header);
                 if let Some(dialog) = &dialog_view {
                     let frame = Frame {
-                        pixels: &mut *pixels,
+                        pixels: &mut *pane_rows,
                         stride,
-                        left: sidebar_px,
+                        left: pane_x,
                         width: pane_px,
                         scale,
                     };
@@ -2758,9 +3597,9 @@ impl<S: Screen> Browser<S> {
                 }
                 if let Some(palette) = &palette_view {
                     let frame = Frame {
-                        pixels: &mut *pixels,
+                        pixels: &mut *pane_rows,
                         stride,
-                        left: sidebar_px,
+                        left: pane_x,
                         width: pane_px,
                         scale,
                     };
@@ -2768,9 +3607,9 @@ impl<S: Screen> Browser<S> {
                 }
                 if let Some(menu) = &menu_view {
                     let frame = Frame {
-                        pixels: &mut *pixels,
+                        pixels: &mut *pane_rows,
                         stride,
-                        left: sidebar_px,
+                        left: pane_x,
                         width: pane_px,
                         scale,
                     };
@@ -2790,6 +3629,36 @@ impl<S: Screen> Browser<S> {
         if let Err(e) = shown {
             self.window.set_title(&format!("Broxee: {e}"));
         }
+    }
+}
+
+/// The host the header shows for the visible tab of `profile`.
+fn header_host(profile: &Profile) -> String {
+    let tab = &profile.tabs[profile.active];
+    tab.entry().map(|e| host_of(&e.url)).unwrap_or_default()
+}
+
+fn header_view<'a>(
+    profile: &'a Profile,
+    host: &'a str,
+    field: Option<&'a Field>,
+    focus: Option<Button>,
+    loading: Option<f32>,
+) -> HeaderView<'a> {
+    let tab = &profile.tabs[profile.active];
+    HeaderView {
+        profile: &profile.name,
+        hue: profile.hue,
+        can_back: tab.index > 0,
+        can_forward: tab.index + 1 < tab.history.len(),
+        loading,
+        host,
+        field: field.map(|f| FieldView {
+            text: &f.text,
+            cursor: f.cursor,
+            all_selected: f.all_selected,
+        }),
+        focused: focus,
     }
 }
 
@@ -3197,10 +4066,13 @@ fn focusable_links(page: &Loaded) -> Vec<NodeId> {
     for b in &layout.boxes {
         shown[b.node as usize] = true;
     }
+    let control = |id: NodeId| match page.forms.controls.binary_search_by_key(&id, |c| c.node) {
+        Ok(i) => page.forms.focusable(dom, i),
+        Err(_) => false,
+    };
     dom.descendants(html::Dom::ROOT)
         .filter(|&id| {
-            dom.tag_name(id) == Some("a")
-                && dom.attr(id, "href").is_some()
+            (dom.tag_name(id) == Some("a") && dom.attr(id, "href").is_some() || control(id))
                 && {
                     let style = page.styles.style(id);
                     style.visible && !style.transparent
@@ -3341,6 +4213,9 @@ mod tests {
         title: RefCell<String>,
         frame: RefCell<(usize, usize, Vec<u8>)>,
         clipboard: RefCell<String>,
+        /// Full frames and header-only frames painted.
+        frames: std::cell::Cell<usize>,
+        headers: std::cell::Cell<usize>,
     }
 
     const PAD: usize = 16;
@@ -3366,17 +4241,40 @@ mod tests {
             *self.clipboard.borrow_mut() = text.to_string();
         }
 
-        fn render(
+        fn render(&self, width: usize, height: usize, draw: &mut DrawFrame) -> Result<(), String> {
+            let stride = width * 4 + PAD;
+            let mut pixels = vec![0u8; stride * height];
+            {
+                let old = self.frame.borrow();
+                let previous = ((old.0, old.1) == (width, height)).then_some(old.2.as_slice());
+                draw(&mut pixels, stride, previous);
+            }
+            *self.frame.borrow_mut() = (width, height, pixels);
+            self.frames.set(self.frames.get() + 1);
+            Ok(())
+        }
+
+        /// Paints the header into its own buffer, then copies it over the last frame, as
+        /// the window's header layer covers it.
+        fn render_header(
             &self,
+            (left, top): (usize, usize),
             width: usize,
             height: usize,
             draw: &mut dyn FnMut(&mut [u8], usize),
-        ) -> Result<(), String> {
+        ) -> Result<bool, String> {
             let stride = width * 4 + PAD;
-            let mut pixels = vec![0u8; stride * height];
-            draw(&mut pixels, stride);
-            *self.frame.borrow_mut() = (width, height, pixels);
-            Ok(())
+            let mut strip = vec![0u8; stride * height];
+            draw(&mut strip, stride);
+            let mut frame = self.frame.borrow_mut();
+            let frame_stride = frame.0 * 4 + PAD;
+            for y in 0..height {
+                let to = (top + y) * frame_stride + left * 4;
+                frame.2[to..to + width * 4]
+                    .copy_from_slice(&strip[y * stride..y * stride + width * 4]);
+            }
+            self.headers.set(self.headers.get() + 1);
+            Ok(true)
         }
     }
 
@@ -3430,6 +4328,7 @@ mod tests {
             height: 300.0,
             scale: 1.0,
             fetch_css: false,
+            panes: 1,
         };
         let mut b = Browser::new(opts, FakeScreen::default(), session, Some(store));
         b.start();
@@ -4132,6 +5031,379 @@ mod tests {
         assert_eq!(b.tab().history.len(), 2);
         assert_eq!(b.scroll, 0.0, "a new page starts at the top");
         assert!(b.loading.is_none());
+    }
+
+    #[test]
+    fn typing_in_the_address_field_repaints_only_the_header() {
+        let (a, _) = site("header-layer");
+        let mut b = browser(&a);
+        b.render();
+        assert_eq!(b.apply(command('l')), Repaint::Frame, "focusing the field");
+        b.repaint(Repaint::Frame);
+        let frames = b.window.frames.get();
+        for c in "example.org".chars() {
+            let r = b.apply(key(Key::Char(c)));
+            assert_eq!(r, Repaint::Header);
+            b.repaint(r);
+        }
+        for k in [Key::Left, Key::Backspace, Key::Home, Key::End] {
+            assert_eq!(b.apply(key(k)), Repaint::Header);
+            b.repaint(Repaint::Header);
+        }
+        assert_eq!(b.apply(Event::Paste("x".into())), Repaint::Header);
+        b.repaint(Repaint::Header);
+        assert_eq!(
+            b.window.frames.get(),
+            frames,
+            "the page surface is untouched"
+        );
+        assert_eq!(b.window.headers.get(), 16);
+        // What the header layer shows over the old frame equals a full repaint.
+        let layered = b.window.frame.borrow().2.clone();
+        b.render();
+        assert!(
+            layered == b.window.frame.borrow().2,
+            "header strip matches a full frame"
+        );
+        assert_eq!(
+            b.apply(key(Key::Escape)),
+            Repaint::Header,
+            "closing the field"
+        );
+
+        // Loading progress moves only the loading line.
+        b.loading = Some(0.5);
+        let frames = b.window.frames.get();
+        b.repaint(Repaint::Header);
+        assert_eq!(b.window.frames.get(), frames);
+        // With the menu open, the header is drawn as part of a full frame.
+        b.loading = None;
+        assert!(b.open_menu(false));
+        b.repaint(Repaint::Header);
+        assert_eq!(
+            b.window.frames.get(),
+            frames + 1,
+            "the menu overlaps the header"
+        );
+    }
+
+    /// A local server for form tests: `/` is a page with a GET form and a POST form; other
+    /// requests answer with their request line and body as the title.
+    fn form_server() -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = stream.read(&mut chunk).unwrap_or(0);
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    let done = text.find("\r\n\r\n").is_some_and(|end| {
+                        let len = text
+                            .lines()
+                            .find_map(|l| l.strip_prefix("Content-Length: "))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        buf.len() >= end + 4 + len
+                    });
+                    if done || n == 0 {
+                        break;
+                    }
+                }
+                let text = String::from_utf8_lossy(&buf).to_string();
+                let line = text.lines().next().unwrap_or("").to_string();
+                let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+                let page = if line.starts_with("GET / ") {
+                    "<!doctype html><style>body { margin: 0 }</style>\
+                     <form action=/s><input name=q><input type=checkbox name=c>\
+                     <input type=submit value=Go></form>\
+                     <form method=post action=/p><input type=password name=pw></form>"
+                        .to_string()
+                } else {
+                    let path = line.split(' ').nth(1).unwrap_or("");
+                    let method = line.split(' ').next().unwrap_or("");
+                    format!("<title>{method} {path} {body}</title>")
+                };
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{page}",
+                    page.len()
+                );
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        });
+        format!("http://{address}/")
+    }
+
+    /// Click the middle of control `i` of the page on screen.
+    fn click_control(b: &mut Browser<FakeScreen>, i: usize) -> bool {
+        let page = b.page.as_ref().expect("a page");
+        let node = page.forms.controls[i].node;
+        let r = page
+            .layout
+            .boxes
+            .iter()
+            .find(|x| x.node == node)
+            .expect("the control has a box")
+            .rect;
+        let (x, y) = (r.x + r.width / 2.0, r.y + r.height / 2.0);
+        let event = Event::Click {
+            x: f64::from(x + b.pane_left()),
+            y: f64::from(y + HEADER_HEIGHT - b.scroll),
+        };
+        act(b, event)
+    }
+
+    #[test]
+    fn fills_in_and_submits_forms() {
+        let url = form_server();
+        let mut b = browser(Path::new(&url));
+        let value = |b: &Browser<FakeScreen>, i: usize| {
+            b.page.as_ref().unwrap().forms.controls[i].value.clone()
+        };
+        assert!(click_control(&mut b, 0), "clicking the field focuses it");
+        assert_eq!(b.focused_control(), Some(0));
+        type_text(&mut b, "hello wörld");
+        act(&mut b, key(Key::Left));
+        act(&mut b, key(Key::Backspace));
+        assert_eq!(value(&b, 0), "hello wörd");
+        let shown = b.page.as_ref().unwrap();
+        assert_eq!(
+            shown.dom.text_content(shown.forms.controls[0].node),
+            "hello wörd"
+        );
+        b.render();
+        assert!(b.caret(b.fonts.metrics()).is_some(), "a caret is drawn");
+
+        assert!(click_control(&mut b, 1));
+        assert!(
+            b.page.as_ref().unwrap().forms.controls[1].checked,
+            "click checks the box"
+        );
+        assert_eq!(b.apply(key(Key::Char(' '))), Repaint::Frame);
+        assert!(
+            !b.page.as_ref().unwrap().forms.controls[1].checked,
+            "Space unchecks it"
+        );
+        b.apply(key(Key::Char(' ')));
+
+        // Back in the field, Enter submits with GET.
+        click_control(&mut b, 0);
+        act(&mut b, key(Key::Enter));
+        assert_eq!(
+            b.window.title.borrow().trim(),
+            "GET /s?q=hello+w%C3%B6rd&c=on"
+        );
+        assert_eq!(
+            b.tab().entry().unwrap().url.path,
+            "/s?q=hello+w%C3%B6rd&c=on"
+        );
+
+        // The POST form, reached with Tab from the address field.
+        act(&mut b, command('['));
+        let i = b.page.as_ref().unwrap().forms.controls.len() - 1;
+        click_control(&mut b, i);
+        type_text(&mut b, "s3cret pw");
+        act(&mut b, key(Key::Enter));
+        assert_eq!(b.window.title.borrow().trim(), "POST /p pw=s3cret+pw");
+        assert_eq!(
+            b.tab().entry().unwrap().url.path,
+            "/p",
+            "the body is not in the history"
+        );
+    }
+
+    impl Browser<FakeScreen> {
+        /// A point inside the first text run of the first `tag` element: x, y in page points.
+        fn link_rect_of(&self, tag: &str) -> (f32, f32) {
+            let p = self.page.as_ref().unwrap();
+            let node = p.dom.find_first(tag).unwrap();
+            let inside: Vec<NodeId> = p.dom.descendants(node).collect();
+            let t = p
+                .layout
+                .texts
+                .iter()
+                .find(|t| inside.contains(&t.node))
+                .unwrap();
+            (t.x + 2.0, t.baseline - 4.0)
+        }
+    }
+
+    /// The pixels of a pane's area in the last frame.
+    fn pane_pixels(b: &Browser<FakeScreen>, j: usize) -> Vec<u8> {
+        let frame = b.window.frame.borrow();
+        let (x, y, w, h) = b.pane_rects_px(frame.0, frame.1)[j];
+        let stride = frame.0 * 4 + PAD;
+        (y..y + h)
+            .flat_map(|row| frame.2[row * stride + x * 4..row * stride + (x + w) * 4].to_vec())
+            .collect()
+    }
+
+    #[test]
+    fn splits_into_panes_with_one_live_page() {
+        let (a, bpath) = site("split");
+        let mut b = browser(&a);
+        // A second tab with page B, then back to A.
+        act(&mut b, command('t'));
+        b.close_palette();
+        let url = engine::to_url(&bpath.display().to_string()).unwrap();
+        b.navigate(url, Destination::Push);
+        b.wait_for_load();
+        act(&mut b, command('1'));
+        assert_eq!(b.tab().title(), "Page A");
+
+        assert!(b.apply(command_shift('2')) == Repaint::Frame, "⌘⇧2");
+        b.render();
+        assert_eq!(b.panes.len(), 2);
+        let (_, _, w, _) = b.pane_rects()[0];
+        assert_eq!(
+            b.settings().width,
+            w,
+            "the page is laid out at the pane's width"
+        );
+        assert!(w < 200.0);
+        let left_before = pane_pixels(&b, 0);
+
+        // A click in the right pane gives it focus: B wakes there, A's pixels stay.
+        let (x1, _, _, _) = b.pane_rects()[1];
+        assert!(act(
+            &mut b,
+            Event::Click {
+                x: f64::from(x1) + 40.0,
+                y: 120.0
+            }
+        ));
+        assert_eq!(b.focused, 1);
+        assert_eq!(b.tab().title(), "Page B");
+        b.render();
+        assert!(
+            pane_pixels(&b, 0) == left_before,
+            "the left pane is copied, not rebuilt"
+        );
+        let (_, _, w1, _) = b.pane_rects()[1];
+        assert_eq!(b.settings().width, w1);
+
+        // The right pane switches profile; the left keeps its own.
+        act(&mut b, command_shift('p'));
+        assert_eq!(b.profile, 1);
+        let x0 = f64::from(b.pane_rects()[0].0);
+        act(
+            &mut b,
+            Event::Click {
+                x: x0 + 40.0,
+                y: 120.0,
+            },
+        );
+        assert_eq!((b.focused, b.profile), (0, 0));
+        assert_eq!(b.tab().title(), "Page A");
+        assert_eq!(
+            b.panes[1].profile, 1,
+            "the right pane remembers its profile"
+        );
+
+        // Four panes, then back to one: the focused pane's tab stays.
+        act(&mut b, command_shift('4'));
+        assert_eq!(b.panes.len(), 4);
+        b.render();
+        if let Ok(path) = std::env::var("SPLIT_PNG") {
+            let frame = b.window.frame.borrow();
+            let stride = frame.0 * 4 + PAD;
+            let rgba: Vec<u8> = (0..frame.1)
+                .flat_map(|y| {
+                    frame.2[y * stride..y * stride + frame.0 * 4]
+                        .chunks(4)
+                        .flat_map(|p| [p[2], p[1], p[0], 255])
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            std::fs::write(path, paint::png::encode(frame.0, frame.1, &rgba)).unwrap();
+        }
+        let rects = b.pane_rects();
+        assert!(rects[2].1 > 100.0, "a 2x2 grid");
+        act(&mut b, command_shift('1'));
+        assert_eq!(b.panes.len(), 1);
+        assert_eq!(b.tab().title(), "Page A");
+        assert_eq!(b.settings().width, 640.0 - b.sidebar_edge());
+    }
+
+    #[test]
+    fn runs_page_scripts_on_load_click_and_timer() {
+        let dir = std::env::temp_dir().join(format!("broxee-js-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let page = dir.join("js.html");
+        std::fs::write(
+            &page,
+            "<!doctype html><style>body { margin: 0 } .big { font-size: 40px }</style>\
+             <title>Before</title><button id=b>0</button><p><a href=other.html id=l>stay</a></p>\
+             <script>document.title = 'Counter'; let n = 0;\
+             const b = document.getElementById('b');\
+             b.addEventListener('click', () => { b.textContent = ++n; b.classList.add('big') });\
+             document.getElementById('l').addEventListener('click', e => e.preventDefault());\
+             setTimeout(() => document.querySelector('p').append(' and later'), 30);</script>",
+        )
+        .unwrap();
+        let mut b = browser(&page);
+        assert_eq!(
+            b.tab().title(),
+            "Counter",
+            "the script set the title before the tab took it"
+        );
+        let node_text = |b: &Browser<FakeScreen>, tag: &str| {
+            let p = b.page.as_ref().unwrap();
+            p.dom.text_content(p.dom.find_first(tag).unwrap())
+        };
+        let button = {
+            let p = b.page.as_ref().unwrap();
+            let node = p.dom.find_first("button").unwrap();
+            p.layout.boxes.iter().find(|x| x.node == node).unwrap().rect
+        };
+        let width_before = button.width;
+        let click = Event::Click {
+            x: f64::from(button.x + 3.0 + b.pane_left()),
+            y: f64::from(button.y + button.height / 2.0 + HEADER_HEIGHT),
+        };
+        assert!(act(&mut b, click));
+        assert_eq!(node_text(&b, "button"), "1");
+        let wider = {
+            let p = b.page.as_ref().unwrap();
+            let node = p.dom.find_first("button").unwrap();
+            p.layout
+                .boxes
+                .iter()
+                .find(|x| x.node == node)
+                .unwrap()
+                .rect
+                .width
+        };
+        assert!(
+            wider > width_before,
+            "the new class was styled and laid out"
+        );
+
+        // The link's listener prevents navigation.
+        let entries = b.tab().history.len();
+        let link = b.link_rect_of("a");
+        let at = Event::Click {
+            x: f64::from(link.0 + b.pane_left()),
+            y: f64::from(link.1 + HEADER_HEIGHT),
+        };
+        act(&mut b, at);
+        assert_eq!(
+            b.tab().history.len(),
+            entries,
+            "preventDefault kept the page"
+        );
+        assert!(b.load.is_none());
+
+        // The timer, as the run loop would fire it.
+        assert!(b.next_page_timer().is_some());
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(b.run_page_timers());
+        assert!(node_text(&b, "p").ends_with("and later"));
     }
 
     fn type_text(b: &mut Browser<FakeScreen>, text: &str) {

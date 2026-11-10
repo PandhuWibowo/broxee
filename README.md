@@ -55,6 +55,7 @@ In the window:
 | Palette: open tabs (every profile), this profile's history, commands, a typed address | ⌘K or "Search or go to" in the sidebar; type to filter, ↑ ↓ or Tab, Enter, Esc |
 | Scroll | trackpad or wheel, ↑ ↓, Space / Shift+Space, Page Up / Page Down, Home / End |
 | Follow a link | click it |
+| Fill in a form | click a field or Tab to it; type, paste, ← → Home End Backspace; Enter submits (in a text area it adds a line); Space checks a box, picks a radio button or presses a button; ↑ ↓ change a select; Esc leaves the field |
 | Back / forward / reload | the header buttons, or ⌘[ / ⌘] / ⌘R |
 | Stop loading | Esc, or the × that replaces reload while a page loads |
 | Page menu: copy the address, open in another profile, bookmark, reload, close | ⋯ at the right of the header, or Tab to it and Enter; ↑ ↓ Enter, Esc |
@@ -67,6 +68,7 @@ In the window:
 | Switch profile | ⌘⇧P (cycles), a click on the profile name at the top of the sidebar, or "Switch to …" in the palette |
 | Add, rename, recolor or remove a profile | palette: "New profile", "Rename this profile", "Change this profile's color", "Remove this profile" (asks for its name; its tabs, history, cookies and bookmarks are deleted) |
 | Show or hide the sidebar | ⌘\\ |
+| One pane, two side by side, four in a grid | ⌘⇧1 / ⌘⇧2 / ⌘⇧4, or `--panes 2` with several addresses; click a pane to give it focus. Each pane keeps its own profile |
 | Bookmark this page (or edit its bookmark) | ⌘D: name and folder, the last folder preselected; Tab between them, Enter saves, Esc cancels |
 | Bookmarks panel, in place of the tab list | ⌘⌥B: folders in name order; ↑ ↓ and Enter or a click opens, Esc goes back to tabs. Every bookmark is a ⌘K result too |
 | Address field | ⌘L or click the host; type or paste (⌘V), Enter to open, Esc to cancel |
@@ -125,9 +127,10 @@ refreshes it.
 | `font` | TrueType/OpenType reader: advances, vertical metrics, cmap formats 4 and 12, `.ttc`, glyph outlines (simple and composite) | ✅ |
 | `layout` | Block, inline, inline-block, flex and grid layout, positioning, line breaking, white-space, text-align, baselines | ✅ |
 | `paint` | Display list, anti-aliased glyph rasterizer, glyph cache, image cache with parallel decoding, parallel band compositing, streaming PNG writer | ✅ |
-| `image` | PNG (all color types and depths, `tRNS`, Adam7) and JPEG, baseline and progressive (any subsampling, restarts, Adobe RGB), decoded straight to the drawn size with a scaled inverse DCT; header sizes for PNG, JPEG, GIF, WebP | ✅ |
+| `image` | PNG (all color types and depths, `tRNS`, Adam7), JPEG baseline and progressive (any subsampling, restarts, Adobe RGB) with a scaled inverse DCT, GIF (first frame, interlaced, transparency), WebP lossy, lossless, alpha and the first animation frame, and an SVG subset rasterized at the drawn size; all decoded straight to the drawn size | ✅ |
 | `platform` | macOS window, menu, app delegate, main-thread hand-off, zero-copy frames through `IOSurface` | ✅ (macOS) |
-| `shell` | The `broxee` binary: CLI, the page pipeline (`engine.rs`), the browser (`browser.rs`: history, navigation, scrolling, links, address field) and its header (`chrome.rs`) | ✅ |
+| `js` | JavaScript interpreter: lexer, parser, tree-walking evaluation over a per-page arena heap with step and object limits; builtins (Object, Array, String, Number, Math, JSON, Map, Set, RegExp with its own engine, Date, timers, console, storage) and DOM bindings (querySelector, textContent, innerHTML, classList, style, attributes, tree changes, addEventListener, form values) | ✅ (first milestone) |
+| `shell` | The `broxee` binary: CLI, the page pipeline (`engine.rs`), the browser (`browser.rs`: history, navigation, scrolling, links, address field), form controls and submission (`forms.rs`) and its header (`chrome.rs`) | ✅ |
 
 How the stages run (sequential, parallel, which thread) is documented in [`docs/pipeline.md`](docs/pipeline.md).
 
@@ -192,9 +195,9 @@ time something reads it (most theme variables never are). A `var()` value is sub
 4. ✅ Layout: block, inline, text wrapping
 5. ✅ Painting to a window: the first visible page
 6. ✅ Scrolling, links, back/forward, address bar
-7. JavaScript (Boa) + a subset of the DOM API
-8. Product features: ✅ profiles, ✅ tabs that sleep to disk, ✅ session restore, ✅ ⌘K palette; next cookies,
-   split view, bookmarks, tab groups
+7. ✅ JavaScript, written here (not Boa: no engine crate, the owner's rule) + a subset of the DOM API
+8. Product features: ✅ profiles, ✅ tabs that sleep to disk, ✅ session restore, ✅ ⌘K palette, ✅ cookies,
+   ✅ bookmarks, ✅ tab groups, ✅ split view, ✅ forms
 
 ## Budget log
 
@@ -223,6 +226,11 @@ time something reads it (most theme variables never are). A `var()` value is sub
 | 2026-11-07 | Rules dropped from their selector text (#16) | 2.2 MB | 49.3 MB peak painted at 2x | GitHub's 30 sheets (3.4 MB): 15.0 → 11.7 ms, 155,109 → 34,167 allocations, same 820 rules |
 | 2026-11-08 | Display list skips runs of fragments out of view (#17) | 2.2 MB | 49.4 MB peak painted at 2x | Stress page: display list 0.65 → 0.01 ms a frame at any scroll; layout +0.8 ms once to index |
 | 2026-11-08 | Glyphs on quarter pixels (#18) | 2.2 MB | 49.5 MB peak painted at 2x | Repeated "i" at 13px, 1x: gaps 4/3/4/3 px (stdev 0.50) → 3.5 ± 0.15 px; GitHub glyph cache 46 → 88 KB |
+| 2026-11-10 | GIF, WebP and SVG drawn (#14) | 2.4 MB | 49.4 MB peak painted at 2x | 4000x4000 lossy WebP at 400 px: 17.9 MB peak (empty page 16.7), 296 ms; 4000x3000 lossless: 20.5 MB, 154 ms |
+| 2026-11-10 | Header in its own layer (#15) | 2.4 MB | 49.4 MB peak painted at 2x | Typing and the loading line paint a 36-point strip, not the 16 MB frame; GitHub load in a window: 37 MB idle, peak 48 to 54 MB, 0.3 s CPU (before: 37 MB, 51 to 53 MB, 0.3 s) |
+| 2026-11-10 | Forms: controls, editing, GET and POST (#13) | 2.4 MB | 49.4 MB peak painted at 2x | Wikipedia's search form submits from the keyboard; a keystroke lays the page out again (no incremental layout yet) |
+| 2026-11-10 | Split view, 1/2/4 panes (#7) | 2.4 MB | 49.4 MB peak painted at 2x | Window with GitHub, Wikipedia, HN, example.com: 1 pane 30 MB idle / 44 MB peak, 2 panes 33 / 47 MB, 4 panes 31 / 45 MB |
+| 2026-11-10 | JavaScript, written here (#12) | 2.9 MB | 49.6 MB peak painted at 2x | example.com 20 MB, HN 22 MB, Wikipedia 27 MB, GitHub 32 MB peak with their scripts run; scripts that use unsupported syntax are skipped and logged |
 
 Other pages after the layout milestone: GitHub home 22.7 MB peak (8,170 rules); Hacker News 11.5 MB.
 
@@ -273,7 +281,11 @@ scans need it), instead of 36 MB of coefficients; one decodes at a time.
 
 Images never exist at full size: a decoder hands rows to a box filter that shrinks them to the size they
 are drawn at, PNG data streams through a 32 KiB inflate window and JPEG is decoded one row of blocks at a
-time. Only images in view are decoded (in parallel); decoded pixels live in a 8 MB cache that evicts what
+time. GIF rows come straight out of LZW (interlaced frames are assembled at one byte per pixel first, as
+interlaced PNGs are), lossy WebP is decoded one macroblock row at a time with the loop filter one row
+behind, and lossless WebP keeps a ring of the last million pixels, the farthest a backward reference can
+reach, so a 4000x3000 file costs about 4 MB to decode instead of 48. SVG is rasterized at the drawn size with
+one row of coverage. Only images in view are decoded (in parallel); decoded pixels live in a 8 MB cache that evicts what
 has not been drawn recently, and the page keeps only compressed bytes (12 MB cap). The debugging PNG writer
 used to hold three copies of a frame (69 MB for a 1280x3000 render); it now writes rows straight into the
 file (48 MB).
@@ -313,12 +325,26 @@ Where data lives, and what compression does for it (measured 2026-11-07):
   They are saved per profile in `profiles/<profile>/bookmarks` (0600).
 - Sidebar rows have no keyboard focus of their own: tabs are reached with ⌘1 … ⌘9 and the palette, which
   also runs every sidebar action. Dragging needs the mouse.
-- Not built yet, so not shown: split view.
+- Split view: panes are not saved with the session yet, the tab list does not mark which tabs are in a pane,
+  and tabs cannot be dragged onto a pane. A pane that has not had focus since the layout changed shows its
+  tab's title until it is clicked.
 - A tooltip can stay on screen when the pointer leaves the window over it, until the next input: the
   window does not track the pointer leaving yet.
 - Profiles start as Personal and Work; up to 12, each with its own folder in `profiles/` (named by a fixed
   id, so renaming moves nothing). Four colors exist (emerald, amber, rose, violet), so profiles past four
   share them; their names always tell them apart.
-- GIF, WebP and SVG are sized from their headers but not drawn yet. Failed images draw nothing.
+- Forms: text fields, passwords, text areas, checkboxes, radio buttons, selects (↑ ↓ or a click steps
+  through the options; no dropdown list yet) and buttons; GET and POST as
+  `application/x-www-form-urlencoded` (multipart and file uploads are not sent). Long values are clipped at
+  the field's edge instead of scrolling. Typed values live with the page: a tab that sleeps forgets them, and
+  passwords are never written to disk.
+- JavaScript: classic scripts (inline and `src`) run; modules, classes, generators, getters and setters,
+  promises, `fetch` and `XMLHttpRequest` do not. A script using unsupported syntax is skipped as a whole and
+  the reason goes to stderr (`console:`), with what scripts log. Events: `click` (bubbling, `preventDefault`,
+  `onclick` attributes and properties), `DOMContentLoaded`, `load`; timers and `requestAnimationFrame`. Every
+  DOM change restyles and lays out the whole page.
+- GIF animations and animated WebP show their first frame. SVG draws shapes, strokes, `use`, simple `<style>`
+  rules and transforms; gradients are drawn as the average of their stops, and text, filters, masks and clip
+  paths are skipped. Failed images draw nothing.
 - Painting will add a window framebuffer (about 16 MB at 2x for 1280x800). The stress page sits at 37 MB, so
   paint must stay within roughly 20 MB including glyph caches.

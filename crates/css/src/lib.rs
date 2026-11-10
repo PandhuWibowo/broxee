@@ -16,7 +16,7 @@ mod vocabulary;
 
 use std::sync::OnceLock;
 
-pub use cascade::{cascade, Origin, StyleMap};
+pub use cascade::{cascade, matches_selector, select, Origin, StyleMap};
 pub use media::{Media, MediaList};
 pub use parser::{
     parse_declarations, parse_stylesheet, parse_stylesheet_for, parse_stylesheet_owned, Decl, Rule,

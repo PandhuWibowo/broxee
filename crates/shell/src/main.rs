@@ -1,8 +1,10 @@
 mod engine;
+mod forms;
 #[cfg(any(target_os = "macos", test))]
 mod hibernate;
 mod images;
 mod pool;
+mod script;
 
 #[cfg(any(target_os = "macos", test))]
 mod browser;
@@ -22,7 +24,7 @@ use engine::{FontStore, Settings};
 
 const USAGE: &str =
     "usage: broxee [<url-or-file>...] [--window | --png FILE | --paint] [--tree | --styles | --layout] \
-                     [--depth N] [--width PX] [--height PX] [--scale N] [--no-css-fetch]";
+                     [--depth N] [--width PX] [--height PX] [--scale N] [--no-css-fetch] [--panes 1|2|4]";
 
 #[derive(Clone)]
 struct Options {
@@ -40,6 +42,8 @@ struct Options {
     height: f32,
     scale: f32,
     fetch_css: bool,
+    /// Panes the window opens with (1, 2 or 4), showing the addresses given.
+    panes: usize,
 }
 
 fn main() -> ExitCode {
@@ -60,6 +64,7 @@ fn main() -> ExitCode {
         height: 800.0,
         scale: 1.0,
         fetch_css: true,
+        panes: 1,
     };
 
     let mut args = std::env::args().skip(1);
@@ -82,6 +87,12 @@ fn main() -> ExitCode {
             "--height" => opts.height = number(&mut args, 100.0, 8000.0, opts.height),
             "--scale" => opts.scale = number(&mut args, 0.5, 4.0, opts.scale),
             "--depth" => opts.depth = number(&mut args, 0.0, 1000.0, opts.depth as f32) as usize,
+            "--panes" => {
+                opts.panes = match number(&mut args, 1.0, 4.0, 1.0) as usize {
+                    n @ (1 | 2 | 4) => n,
+                    _ => 1,
+                }
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;

@@ -1,0 +1,8 @@
+[package]
+name = "js"
+version.workspace = true
+edition.workspace = true
+
+# Written here: a JavaScript interpreter for the scripts of a page. No dependencies; the
+# page's DOM is reached through the `Host` trait.
+[dependencies]

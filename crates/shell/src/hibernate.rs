@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::engine::{Snapshot, Sources};
 use crate::images::ImageStore;
 
-const MAGIC: &[u8] = b"broxee-tab 1\n";
+const MAGIC: &[u8] = b"broxee-tab 2\n";
 
 /// The files of one browser's sleeping tabs.
 pub struct TabStore {
@@ -133,6 +133,11 @@ fn encode(s: &Snapshot, out: &mut impl Write) -> io::Result<()> {
         put_bytes(out, url.as_bytes())?;
         put_wire(out, wire)?;
     }
+    put_u32(out, s.sources.scripts.len())?;
+    for (url, wire) in &s.sources.scripts {
+        put_bytes(out, url.as_bytes())?;
+        put_wire(out, wire)?;
+    }
     let (files, uses) = s.images.parts();
     put_u32(out, files.len())?;
     for file in files {
@@ -231,6 +236,11 @@ fn decode(input: impl Read, len: u64) -> Option<Snapshot> {
         let url = String::from_utf8(r.bytes()?).ok()?;
         stylesheets.push((url, r.wire()?));
     }
+    let mut scripts = Vec::new();
+    for _ in 0..r.count(9)? {
+        let url = String::from_utf8(r.bytes()?).ok()?;
+        scripts.push((url, r.wire()?));
+    }
     let mut files = Vec::new();
     for _ in 0..r.count(4)? {
         files.push(r.bytes()?);
@@ -242,7 +252,11 @@ fn decode(input: impl Read, len: u64) -> Option<Snapshot> {
     (r.left == 0).then_some(Snapshot {
         url,
         status,
-        sources: Sources { html, stylesheets },
+        sources: Sources {
+            html,
+            stylesheets,
+            scripts,
+        },
         images: ImageStore::from_parts(files, uses),
     })
 }
@@ -267,6 +281,13 @@ mod tests {
                         bytes: b"p{}".to_vec(),
                     },
                 )],
+                scripts: vec![(
+                    "https://example.com/app.js".into(),
+                    net::Wire {
+                        encoding: net::Encoding::Identity,
+                        bytes: b"var a = 1".to_vec(),
+                    },
+                )],
             },
             images: ImageStore::from_parts(vec![vec![9; 5], vec![]], vec![(7, 0), (3, 1), (4, 9)]),
         }
@@ -283,6 +304,7 @@ mod tests {
         assert_eq!(back.sources.html.bytes, [1, 2, 3]);
         assert_eq!(back.sources.html.encoding, net::Encoding::Brotli);
         assert_eq!(back.sources.stylesheets[0].1.bytes, b"p{}");
+        assert_eq!(back.sources.scripts[0].1.bytes, b"var a = 1");
         let (files, uses) = back.images.parts();
         assert_eq!(files.len(), 2);
         assert_eq!(uses, [(3, 1), (7, 0)], "the use past the files was dropped");

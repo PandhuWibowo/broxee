@@ -824,6 +824,37 @@ fn collect_candidates(
     // not matter: matches are sorted into cascade order afterwards.
 }
 
+/// The elements under `root` (not `root` itself) that match `selectors`, in document order,
+/// for scripts (`querySelectorAll`). Selectors Broxee cannot evaluate match nothing.
+pub fn select(dom: &Dom, root: NodeId, selectors: &str) -> Vec<NodeId> {
+    let list = crate::selector::parse_selector_list(selectors);
+    if list.is_empty() {
+        return Vec::new();
+    }
+    let names = Names {
+        id: dom.atom("id"),
+        class: dom.atom("class"),
+        style: dom.atom("style"),
+    };
+    dom.descendants(root)
+        .skip(1)
+        .filter(|&n| dom.element(n).is_some() && list.iter().any(|s| matches(dom, names, s, n)))
+        .collect()
+}
+
+/// Whether element `node` matches `selectors` (`Element.matches`, `closest`).
+pub fn matches_selector(dom: &Dom, node: NodeId, selectors: &str) -> bool {
+    let names = Names {
+        id: dom.atom("id"),
+        class: dom.atom("class"),
+        style: dom.atom("style"),
+    };
+    dom.element(node).is_some()
+        && crate::selector::parse_selector_list(selectors)
+            .iter()
+            .any(|s| matches(dom, names, s, node))
+}
+
 fn attr_value<'a>(element: &Element<'a>, name: Option<Atom>) -> Option<&'a str> {
     element.attr(name?)
 }

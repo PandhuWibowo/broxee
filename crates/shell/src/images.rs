@@ -35,12 +35,13 @@ pub enum Source {
 
 /// The `<img>` elements worth loading and their sources, in document order. Several elements
 /// can share one source.
-pub fn discover(dom: &Dom, base: &net::Url) -> (Vec<Source>, Vec<(NodeId, usize)>) {
+/// Only nodes below `limit` count: the ones the parser made.
+pub fn discover(dom: &Dom, base: &net::Url, limit: usize) -> (Vec<Source>, Vec<(NodeId, usize)>) {
     let mut sources: Vec<Source> = Vec::new();
     let mut seen: HashMap<String, usize> = HashMap::new();
     let mut uses = Vec::new();
     for id in dom.descendants(Dom::ROOT) {
-        if dom.tag_name(id) != Some("img") {
+        if dom.tag_name(id) != Some("img") || id as usize >= limit {
             continue;
         }
         let Some(src) = image_src(dom, id) else {
@@ -173,7 +174,7 @@ mod tests {
              <img src='data:image/gif;base64,R0lGODlh'><img>",
         );
         let base = net::Url::parse("https://e.com/dir/page").unwrap();
-        let (sources, uses) = discover(&dom, &base);
+        let (sources, uses) = discover(&dom, &base, usize::MAX);
         assert_eq!(sources.len(), 3);
         assert!(matches!(&sources[0], Source::Url(u) if u.path == "/dir/a.png"));
         assert!(matches!(&sources[1], Source::Url(u) if u.path == "/dir/b.jpg"));

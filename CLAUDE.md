@@ -39,12 +39,17 @@ crates/
            Approximate fallback used by tests
   layout/  block + inline layout into BoxFragment / TextFragment lists, one shared text buffer;
            flex.rs (flex containers, intrinsic widths), grid.rs (grid containers), table.rs (tables)
-  image/   PNG and baseline JPEG decoders that scale while decoding, header probes (GIF, WebP sizes)
+  image/   PNG, JPEG, GIF, WebP (vp8.rs lossy, vp8l.rs lossless, vp8_tables.rs from RFC 6386) decoders
+           that scale while decoding; svg.rs (XML subset, flattened paths, scanline rasterizer)
+  js/      JavaScript, written here: lexer.rs, parser.rs (syntax tree), interp.rs (arena heap, scopes,
+           evaluation, limits), builtins.rs (globals, DOM bindings, events), regex.rs; the DOM through `Host`
   paint/   display list, glyph rasterizer + cache, image cache + parallel decode, band compositing,
            streaming PNG writer
   platform/ macOS window via the Objective-C runtime, IOSurface frames (empty module on other OSes)
   shell/   the `broxee` binary: main.rs (CLI), engine.rs (page pipeline, FontStore, snapshot/restore),
            browser.rs (profiles, tabs, history, navigation, input, session file, Screen trait),
+           forms.rs (form controls: injected parts, state, submission),
+           script.rs (which scripts run, `js::Host` over the DOM, dispatch and timers),
            hibernate.rs (sleeping tabs on disk), palette.rs (⌘K results and ranking),
            chrome.rs (sidebar, header and palette drawing from DESIGN.md),
            pool.rs (fetch pool)
@@ -67,7 +72,7 @@ casts), not taken from binding crates. Ask before proposing any dependency.
   without locks.
 - **Images are never decoded at full size.** Decoders stream rows into `image::Scaler`, which outputs the
   drawn size; only visible images are decoded, and the pixel cache stays under `IMAGE_CACHE_BYTES`. A new
-  decoder (GIF, WebP) must keep that: memory proportional to the output, not the file. Progressive JPEG keeps
+  decoder must keep that: memory proportional to the output, not the file. Progressive JPEG keeps
   only the k x k coefficients the drawn size needs plus a non-zero mask per block, one decode at a time.
 - **Every `send!` states the method's exact C signature.** A wrong type is undefined behaviour, not an error.
 - **AppKit calls happen on the main thread only.** The engine thread hands work over with `dispatch_async_f`.
@@ -92,12 +97,19 @@ casts), not taken from binding crates. Ask before proposing any dependency.
   sleep); skipping it shows another page's pixels.
 - **Switching profile calls `net::forget_sessions`.** Nothing that could link profiles (connections, TLS
   tickets, and cookies once they exist) may be shared between them.
+- **Split view keeps one live page.** Only the focused pane has a `Loaded`; the others are pixels copied from
+  the previous frame surface (`Screen::render` hands it over), so they cost no memory. Giving a pane focus
+  sleeps the focused tab and wakes the pane's tab at the pane's size. Events over the focused pane get
+  pane-relative y (`Browser::route`); anything that draws in the pane uses its rows of the frame.
 - **One page load at a time.** `Browser::navigate` stops the running load before starting another, and every
   tab or profile change stops it too. A finished load always belongs to the visible tab, because nothing can
   change the visible tab without stopping it first. Keep both true when adding background work.
 - **Cookies belong to a profile.** Every fetch for a page passes that profile's jar (`engine::Jar`);
   subresources use `net::Context::subresource`, which blocks other sites' cookies. Never log or print cookie
   values, never write session cookies to disk, and keep cookie and session files 0600 (`write_private`).
+- **Form controls draw with nodes the browser adds** (`forms::Forms::prepare`, before anything reads the
+  DOM): they go after the page's own nodes so no id changes, and rebuilding from the sources gives the same
+  DOM. Typed values live in `Loaded::forms` only; passwords are never logged or written to disk.
 - **Session and tab files are data, never trusted**: every length and count is checked against what is left,
   and damage gives a reload, not a panic.
 
@@ -106,6 +118,20 @@ casts), not taken from binding crates. Ask before proposing any dependency.
 - **Never send synthetic input to the real desktop** (osascript keystrokes, clicks). The owner works on this
   machine; keystrokes can land in another app. Drive `Browser` through `FakeScreen` in `browser.rs` tests with
   local files, and render PNGs from it when a visual check is needed.
+
+### Script invariants
+
+- **JavaScript is written here** (`crates/js`), not taken from an engine crate: the owner's rule, and it keeps
+  memory in our hands. Decided for #12; recorded in README.
+- **A page's heap is an arena dropped with the page.** No collector: objects have a ceiling (`OBJECT_LIMIT`),
+  scopes of calls that made no closure are popped, every entry (script, handler, timer) has a step limit.
+  Past a limit the page's scripts stop for good; the page keeps working without them.
+- **Script work runs on a large-stack thread** (`script::on_script_stack`, `js::STACK_SIZE`): the interpreter
+  recurses. The runtime is `Send` (`Arc`, not `Rc`) so a `Loaded` can still cross from the loader thread.
+- **Scripts run before styles**, after form controls are prepared; later DOM changes (events, timers) restyle
+  and lay out the page again. Image ids come from parser nodes only, so a waking tab finds them again even if
+  its scripts behave differently the second time.
+- **Scripts see no cookies, cannot fetch or navigate, and store nothing on disk.** Widen this only on purpose.
 
 ### Compression invariants
 
@@ -139,8 +165,9 @@ casts), not taken from binding crates. Ask before proposing any dependency.
 ### CSS invariants
 
 - **Stylesheets are parsed against the document's vocabulary** (`css::Vocabulary`): rules needing a tag, id,
-  class, attribute or exact attribute value (`[data-theme=dark]`) the DOM lacks are dropped. Correct only while the DOM cannot gain names. When scripts arrive, keep the
-  source text and re-parse without a vocabulary (or add the new names and re-parse) before restyling.
+  class, attribute or exact attribute value (`[data-theme=dark]`) the DOM lacks are dropped. Correct only while
+  the DOM cannot gain names: a page with scripts parses its sheets with `Vocabulary::everything()`, since its
+  scripts can add names at any time.
 - **`Vocabulary::text_could_match` may only reject what `could_match` rejects.** It skips anything inside
   parentheses, brackets or strings and any escaped name. After changing either, run
   `CHECK=1 cargo run --release -p css --example parse_bench -- page.html sheets...` on real sites.
