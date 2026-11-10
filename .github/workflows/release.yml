@@ -1,0 +1,161 @@
+name: Release
+
+# Push a tag such as v0.1.0 to build the binaries and publish a GitHub release.
+# Or run it by hand (Actions > Release > Run workflow) with a tag name: an existing tag is rebuilt; a new one is
+# created on the latest commit of the default branch when the release is published.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build, e.g. v0.1.0 (created on the default branch if it does not exist)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  resolve:
+    name: Resolve commit
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Clean tag name
+        id: tag
+        run: |
+          # A tag typed in the Run workflow form can carry spaces ("  v0.1.1"); strip them.
+          tag=$(printf '%s' "$TAG" | tr -d '[:space:]')
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "Tag '$tag' is not a version tag such as v0.1.1."
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Commit for the tag
+        id: sha
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          # An existing tag builds that tag; a new one builds the head of the default branch.
+          if sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$TAG" --jq .sha 2>/dev/null); then
+            echo "Tag $TAG exists at $sha"
+          else
+            sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/heads/$DEFAULT_BRANCH" --jq .sha)
+            echo "Tag $TAG does not exist yet; building $DEFAULT_BRANCH at $sha"
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: resolve
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            name: macos-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            name: macos-x86_64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            name: linux-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+      - name: Tag matches Cargo.toml version
+        shell: bash
+        run: |
+          version=$(awk -F'"' '/^\[workspace.package\]/ { p = 1 } p && /^version/ { print $2; exit }' Cargo.toml)
+          if [ "$TAG" != "v$version" ]; then
+            echo "Tag $TAG does not match Cargo.toml version $version (expected v$version)."
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Clippy
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: cargo test
+      - name: 60 MB budget
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: ./scripts/budget.sh
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          dir="broxee-$TAG-${{ matrix.name }}"
+          mkdir "$dir"
+          cp "target/${{ matrix.target }}/release/broxee" README.md "$dir/"
+          tar -czf "$dir.tar.gz" "$dir"
+          shasum -a 256 "$dir.tar.gz" > "$dir.tar.gz.sha256"
+      - name: Package .dmg
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          # Same binary as the tar.gz, wrapped in Broxee.app.
+          dmg="broxee-$TAG-${{ matrix.name }}.dmg"
+          ./scripts/macos-dmg.sh "target/${{ matrix.target }}/release/broxee" "$dmg"
+          shasum -a 256 "$dmg" > "$dmg.sha256"
+      - uses: actions/upload-artifact@v4.6.2
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            broxee-*.tar.gz*
+            broxee-*.dmg*
+
+  release:
+    name: Publish
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          # --target creates the tag on that commit when it does not exist yet (ignored when it does).
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SHA" \
+            --title "Broxee $TAG" \
+            --prerelease \
+            --notes "Early preview build of Broxee, a browser with its own engine written in Rust.
+
+          - **macOS** (arm64, x86_64): open the \`.dmg\` and drag Broxee to Applications. The \`.tar.gz\` holds the
+            same binary for the terminal: \`./broxee\` or \`./broxee <url> --window\` opens the browser window.
+          - **Linux** (x86_64): CLI only for now (\`--png\`, \`--tree\`, \`--styles\`, \`--layout\`); no window yet.
+
+          The binaries are not signed with a Developer ID. On macOS, the first time:
+          - Broxee.app: right-click > Open, or System Settings > Privacy & Security > Open Anyway
+            (or \`xattr -dr com.apple.quarantine /Applications/Broxee.app\`).
+          - tar.gz: \`xattr -d com.apple.quarantine broxee\` after extracting.
+
+          Each archive has a \`.sha256\` checksum next to it."

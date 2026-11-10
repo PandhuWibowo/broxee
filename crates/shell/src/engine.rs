@@ -151,6 +151,7 @@ pub struct Sources {
 }
 
 /// A page put to sleep: its sources and compressed images, and nothing built from them.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
 pub struct Snapshot {
     pub url: net::Url,
     pub status: u16,
@@ -159,6 +160,7 @@ pub struct Snapshot {
 }
 
 /// Drop everything built from a page (DOM, styles, layout), keeping what rebuilds it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
 pub fn snapshot(page: Loaded) -> Snapshot {
     Snapshot {
         url: page.url,
@@ -169,6 +171,7 @@ pub fn snapshot(page: Loaded) -> Snapshot {
 }
 
 /// Rebuild a sleeping page from its snapshot, without the network.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
 pub fn restore(
     snapshot: Snapshot,
     settings: Settings,
@@ -227,6 +230,7 @@ enum From<'a> {
     /// Fetched, with the profile's cookies for subresources of the page's own site.
     Network(Option<&'a net::Cookies>),
     /// A sleeping page waking: stylesheets from their stored bytes, images as they were.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Snapshot(Sources, ImageStore),
     /// Pages Broxee writes itself.
     Nowhere,
@@ -297,6 +301,7 @@ pub fn load(
 }
 
 /// Build a page from HTML Broxee generated itself (error and message pages). No network.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
 pub fn page_from_html(
     url: net::Url,
     source: &str,
@@ -372,6 +377,7 @@ fn finish(
 
 /// Cascade and lay out again, for a new viewport size or color scheme. `@media` rules can
 /// change, so the cascade reruns as well.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
 pub fn relayout(page: &mut Loaded, settings: Settings, fonts: &FontStore) {
     let (styles, cascade_ms, layout, layout_ms) =
         style_and_layout(&page.dom, &page.css, &page.images, settings, fonts);

@@ -86,12 +86,22 @@ fn main() -> ExitCode {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;
             }
+            // Finder adds a process serial number (`-psn_0_12345`) when it launches an app on
+            // older macOS releases. It is not an address.
+            _ if arg.starts_with("-psn_") => {}
             _ if !arg.starts_with("--") => targets.push(arg),
             _ => {
                 eprintln!("unexpected argument: {arg}\n{USAGE}");
                 return ExitCode::from(2);
             }
         }
+    }
+    // Opened from Finder (double-clicked, or Broxee.app from the .dmg) there are no arguments:
+    // open the window instead of printing the usage and exiting at once. Anything that asks
+    // for CLI output keeps the CLI.
+    let cli_output = opts.png.is_some() || opts.paint || opts.tree || opts.styles || opts.layout;
+    if cfg!(target_os = "macos") && targets.is_empty() && !cli_output {
+        opts.window = true;
     }
     if opts.window {
         // Without an address the window brings back the last session; with several, each

@@ -91,11 +91,11 @@ pub fn crc32_update(crc: u32, data: &[u8]) -> u32 {
 unsafe fn crc32_arm(crc: u32, data: &[u8]) -> u32 {
     use std::arch::aarch64::{__crc32b, __crc32d};
     let mut c = !crc;
-    let mut chunks = data.chunks_exact(8);
-    for chunk in &mut chunks {
-        c = __crc32d(c, u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8])));
+    let (chunks, rest) = data.as_chunks::<8>();
+    for chunk in chunks {
+        c = __crc32d(c, u64::from_le_bytes(*chunk));
     }
-    for &b in chunks.remainder() {
+    for &b in rest {
         c = __crc32b(c, b);
     }
     !c
@@ -104,8 +104,8 @@ unsafe fn crc32_arm(crc: u32, data: &[u8]) -> u32 {
 fn crc32_tables(crc: u32, data: &[u8]) -> u32 {
     let t = &CRC_TABLES;
     let mut c = !crc;
-    let mut chunks = data.chunks_exact(8);
-    for chunk in &mut chunks {
+    let (chunks, rest) = data.as_chunks::<8>();
+    for chunk in chunks {
         let lo = c ^ u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         let hi = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
         c = t[7][(lo & 0xff) as usize]
@@ -117,7 +117,7 @@ fn crc32_tables(crc: u32, data: &[u8]) -> u32 {
             ^ t[1][((hi >> 16) & 0xff) as usize]
             ^ t[0][(hi >> 24) as usize];
     }
-    for &b in chunks.remainder() {
+    for &b in rest {
         c = t[0][((c ^ u32::from(b)) & 0xff) as usize] ^ (c >> 8);
     }
     !c
