@@ -70,6 +70,18 @@ pub trait Screen {
         height: usize,
         draw: &mut dyn FnMut(&mut [u8], usize),
     ) -> Result<(), String>;
+    /// Paint only the header strip: `width` x `height` device pixels, `left` pixels from the
+    /// window's left edge, shown over the last frame. `Ok(false)` when the screen cannot, and
+    /// a full frame is needed instead.
+    fn render_header(
+        &self,
+        _left: usize,
+        _width: usize,
+        _height: usize,
+        _draw: &mut dyn FnMut(&mut [u8], usize),
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
     /// Nothing has happened for a while: free what only drawing needs.
     fn idle(&self) {}
     /// Put text on the clipboard.
@@ -110,6 +122,29 @@ impl Screen for platform::Window {
     ) -> Result<(), String> {
         platform::Window::render(self, width, height, |pixels, stride| draw(pixels, stride))
     }
+
+    fn render_header(
+        &self,
+        left: usize,
+        width: usize,
+        height: usize,
+        draw: &mut dyn FnMut(&mut [u8], usize),
+    ) -> Result<bool, String> {
+        platform::Window::render_header(self, left, width, height, |pixels, stride| {
+            draw(pixels, stride)
+        })?;
+        Ok(true)
+    }
+}
+
+/// How much of the window a change needs repainted. Ordered: combining changes keeps the
+/// larger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Repaint {
+    Nothing,
+    /// Only the pane header (the address field, the loading line).
+    Header,
+    Frame,
 }
 
 #[cfg(target_os = "macos")]
@@ -495,6 +530,11 @@ struct Browser<S: Screen> {
     /// Progress of `load`, for the header's loading line.
     loading: Option<f32>,
     load: Option<Load>,
+    /// Set by an event handler whose change shows only in the header.
+    header_change: bool,
+    /// Window size, scale and pane edge of the last full frame: a header alone can be drawn
+    /// over it only while these hold.
+    frame_geometry: Option<(usize, usize, usize, usize)>,
 }
 
 impl<S: Screen> Browser<S> {
@@ -562,6 +602,8 @@ impl<S: Screen> Browser<S> {
             link_focus: None,
             loading: None,
             load: None,
+            header_change: false,
+            frame_geometry: None,
         }
     }
 
@@ -619,22 +661,27 @@ impl<S: Screen> Browser<S> {
             if let Some(h) = self.hover.as_ref().filter(|h| !h.shown) {
                 wait = wait.min(TOOLTIP_DELAY.saturating_sub(h.since.elapsed()));
             }
-            let mut dirty = false;
+            let mut repaint = Repaint::Nothing;
             let mut quiet = false;
             match events.recv_timeout(wait) {
                 Ok(event) => {
-                    dirty |= self.handle(event);
+                    repaint = repaint.max(self.apply(event));
                     for event in events.try_iter() {
-                        dirty |= self.handle(event);
+                        repaint = repaint.max(self.apply(event));
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => quiet = true,
                 Err(RecvTimeoutError::Disconnected) => break,
             }
-            dirty |= self.poll_load();
-            dirty |= self.tick();
-            if dirty {
-                self.render();
+            if self.poll_load() {
+                // Progress moves the loading line; a finished load painted its page already.
+                repaint = repaint.max(Repaint::Header);
+            }
+            if self.tick() {
+                repaint = Repaint::Frame;
+            }
+            if repaint != Repaint::Nothing {
+                self.repaint(repaint);
                 trimmed = false;
             } else if quiet && self.load.is_none() && !trimmed {
                 self.window.idle();
@@ -715,13 +762,31 @@ impl<S: Screen> Browser<S> {
     }
 
     /// Apply one event; returns whether the frame needs repainting.
+    /// Handle `event` and say what needs repainting.
+    fn apply(&mut self, event: Event) -> Repaint {
+        self.header_change = false;
+        match (self.handle(event), self.header_change) {
+            (false, _) => Repaint::Nothing,
+            (true, true) => Repaint::Header,
+            (true, false) => Repaint::Frame,
+        }
+    }
+
+    fn repaint(&mut self, repaint: Repaint) {
+        match repaint {
+            Repaint::Nothing => {}
+            Repaint::Header => self.render_header(),
+            Repaint::Frame => self.render(),
+        }
+    }
+
     fn handle(&mut self, event: Event) -> bool {
         if let Event::Hover { x, y } = event {
             return self.hover_at(x as f32, y as f32);
         }
-        // Anything else hides a tooltip.
+        // Anything else hides a tooltip, which needs a full frame.
         let hid = self.hover.take().is_some_and(|h| h.shown);
-        hid | match event {
+        let dirty = match event {
             Event::Scroll { dy, x, .. } if (x as f32) < self.pane_left() => {
                 let rows = self.sidebar_rows();
                 let max =
@@ -762,12 +827,17 @@ impl<S: Screen> Browser<S> {
                 match self.field.as_mut() {
                     Some(field) => {
                         field.insert(line);
+                        self.header_change = true;
                         true
                     }
                     None => false,
                 }
             }
+        };
+        if hid {
+            self.header_change = false;
         }
+        hid | dirty
     }
 
     /// Lay the page out again for a new pane size.
@@ -961,6 +1031,7 @@ impl<S: Screen> Browser<S> {
                 Key::Char('a') => match self.field.as_mut() {
                     Some(field) => {
                         field.all_selected = true;
+                        self.header_change = true;
                         true
                     }
                     None => false,
@@ -986,12 +1057,15 @@ impl<S: Screen> Browser<S> {
                     let input = std::mem::take(&mut field.text);
                     self.field = None;
                     self.open_input(&input);
+                    return true;
                 }
                 Key::Escape => self.field = None,
                 // `move_focus` closes the field, after reading where focus was.
                 Key::Tab => return self.move_focus(k.shift),
                 _ => return false,
             }
+            // Editing the field changes nothing but the header.
+            self.header_change = true;
             return true;
         }
         if let Some(button) = self.focus {
@@ -2546,32 +2620,77 @@ impl<S: Screen> Browser<S> {
         self.render_with(&fonts);
     }
 
-    fn render_with(&mut self, fonts: &FontStore) {
+    /// The frame in device pixels: width, height, header rows, and the pane's left edge.
+    fn geometry(&self) -> (usize, usize, usize, usize) {
         let scale = self.scale;
         let width_px = (self.width * scale).round().max(1.0) as usize;
         let height_px = (self.height * scale).round().max(1.0) as usize;
         let header_rows = ((HEADER_HEIGHT * scale).round() as usize).min(height_px);
-        let page_rows = height_px - header_rows;
         let sidebar_px = ((self.pane_left() * scale).round() as usize).min(width_px - 1);
+        (width_px, height_px, header_rows, sidebar_px)
+    }
+
+    /// Repaint only the header, over the last frame. Falls back to a full frame when
+    /// something drawn over the header (a tooltip, the menu, a dialog) or a new window size
+    /// would be lost.
+    fn render_header(&mut self) {
+        let geometry = self.geometry();
+        let (width_px, _, header_rows, sidebar_px) = geometry;
+        let pane_px = width_px - sidebar_px;
+        let covered = self.menu.is_some()
+            || self.dialog.is_some()
+            || self.hover.as_ref().is_some_and(|h| h.shown);
+        if covered || header_rows == 0 || self.frame_geometry != Some(geometry) {
+            return self.render();
+        }
+        let fonts = Arc::clone(&self.fonts);
+        let scale = self.scale;
+        let profile = &self.profiles[self.profile];
+        let host = header_host(profile);
+        let header = header_view(
+            profile,
+            &host,
+            self.field.as_ref(),
+            self.focus,
+            self.loading,
+        );
+        let (painter, chrome) = (&mut self.painter, &mut self.chrome);
+        let shown =
+            self.window
+                .render_header(sidebar_px, pane_px, header_rows, &mut |pixels, stride| {
+                    let frame = Frame {
+                        pixels,
+                        stride,
+                        left: 0,
+                        width: pane_px,
+                        scale,
+                    };
+                    chrome.draw(painter, frame, fonts.set(), fonts.metrics(), &header);
+                });
+        match shown {
+            Ok(true) => {}
+            Ok(false) => self.render(),
+            Err(e) => self.window.set_title(&format!("Broxee: {e}")),
+        }
+    }
+
+    fn render_with(&mut self, fonts: &FontStore) {
+        let scale = self.scale;
+        let geometry = self.geometry();
+        let (width_px, height_px, header_rows, sidebar_px) = geometry;
+        self.frame_geometry = Some(geometry);
+        let page_rows = height_px - header_rows;
         let pane_px = width_px - sidebar_px;
 
         let profile = &self.profiles[self.profile];
-        let tab = &profile.tabs[profile.active];
-        let host = tab.entry().map(|e| host_of(&e.url)).unwrap_or_default();
-        let header = HeaderView {
-            profile: &profile.name,
-            hue: profile.hue,
-            can_back: tab.index > 0,
-            can_forward: tab.index + 1 < tab.history.len(),
-            loading: self.loading,
-            host: &host,
-            field: self.field.as_ref().map(|f| FieldView {
-                text: &f.text,
-                cursor: f.cursor,
-                all_selected: f.all_selected,
-            }),
-            focused: self.focus,
-        };
+        let host = header_host(profile);
+        let header = header_view(
+            profile,
+            &host,
+            self.field.as_ref(),
+            self.focus,
+            self.loading,
+        );
         let list = sidebar_rows(profile, self.list, self.bookmark_row);
         let drop_at = match self.drag {
             Some(Drag::Moving { drop, .. }) => Some(drop),
@@ -2790,6 +2909,36 @@ impl<S: Screen> Browser<S> {
         if let Err(e) = shown {
             self.window.set_title(&format!("Broxee: {e}"));
         }
+    }
+}
+
+/// The host the header shows for the visible tab of `profile`.
+fn header_host(profile: &Profile) -> String {
+    let tab = &profile.tabs[profile.active];
+    tab.entry().map(|e| host_of(&e.url)).unwrap_or_default()
+}
+
+fn header_view<'a>(
+    profile: &'a Profile,
+    host: &'a str,
+    field: Option<&'a Field>,
+    focus: Option<Button>,
+    loading: Option<f32>,
+) -> HeaderView<'a> {
+    let tab = &profile.tabs[profile.active];
+    HeaderView {
+        profile: &profile.name,
+        hue: profile.hue,
+        can_back: tab.index > 0,
+        can_forward: tab.index + 1 < tab.history.len(),
+        loading,
+        host,
+        field: field.map(|f| FieldView {
+            text: &f.text,
+            cursor: f.cursor,
+            all_selected: f.all_selected,
+        }),
+        focused: focus,
     }
 }
 
@@ -3341,6 +3490,9 @@ mod tests {
         title: RefCell<String>,
         frame: RefCell<(usize, usize, Vec<u8>)>,
         clipboard: RefCell<String>,
+        /// Full frames and header-only frames painted.
+        frames: std::cell::Cell<usize>,
+        headers: std::cell::Cell<usize>,
     }
 
     const PAD: usize = 16;
@@ -3376,7 +3528,31 @@ mod tests {
             let mut pixels = vec![0u8; stride * height];
             draw(&mut pixels, stride);
             *self.frame.borrow_mut() = (width, height, pixels);
+            self.frames.set(self.frames.get() + 1);
             Ok(())
+        }
+
+        /// Paints the header into its own buffer, then copies it over the last frame, as
+        /// the window's header layer covers it.
+        fn render_header(
+            &self,
+            left: usize,
+            width: usize,
+            height: usize,
+            draw: &mut dyn FnMut(&mut [u8], usize),
+        ) -> Result<bool, String> {
+            let stride = width * 4 + PAD;
+            let mut strip = vec![0u8; stride * height];
+            draw(&mut strip, stride);
+            let mut frame = self.frame.borrow_mut();
+            let frame_stride = frame.0 * 4 + PAD;
+            for y in 0..height {
+                let to = y * frame_stride + left * 4;
+                frame.2[to..to + width * 4]
+                    .copy_from_slice(&strip[y * stride..y * stride + width * 4]);
+            }
+            self.headers.set(self.headers.get() + 1);
+            Ok(true)
         }
     }
 
@@ -4132,6 +4308,60 @@ mod tests {
         assert_eq!(b.tab().history.len(), 2);
         assert_eq!(b.scroll, 0.0, "a new page starts at the top");
         assert!(b.loading.is_none());
+    }
+
+    #[test]
+    fn typing_in_the_address_field_repaints_only_the_header() {
+        let (a, _) = site("header-layer");
+        let mut b = browser(&a);
+        b.render();
+        assert_eq!(b.apply(command('l')), Repaint::Frame, "focusing the field");
+        b.repaint(Repaint::Frame);
+        let frames = b.window.frames.get();
+        for c in "example.org".chars() {
+            let r = b.apply(key(Key::Char(c)));
+            assert_eq!(r, Repaint::Header);
+            b.repaint(r);
+        }
+        for k in [Key::Left, Key::Backspace, Key::Home, Key::End] {
+            assert_eq!(b.apply(key(k)), Repaint::Header);
+            b.repaint(Repaint::Header);
+        }
+        assert_eq!(b.apply(Event::Paste("x".into())), Repaint::Header);
+        b.repaint(Repaint::Header);
+        assert_eq!(
+            b.window.frames.get(),
+            frames,
+            "the page surface is untouched"
+        );
+        assert_eq!(b.window.headers.get(), 16);
+        // What the header layer shows over the old frame equals a full repaint.
+        let layered = b.window.frame.borrow().2.clone();
+        b.render();
+        assert!(
+            layered == b.window.frame.borrow().2,
+            "header strip matches a full frame"
+        );
+        assert_eq!(
+            b.apply(key(Key::Escape)),
+            Repaint::Header,
+            "closing the field"
+        );
+
+        // Loading progress moves only the loading line.
+        b.loading = Some(0.5);
+        let frames = b.window.frames.get();
+        b.repaint(Repaint::Header);
+        assert_eq!(b.window.frames.get(), frames);
+        // With the menu open, the header is drawn as part of a full frame.
+        b.loading = None;
+        assert!(b.open_menu(false));
+        b.repaint(Repaint::Header);
+        assert_eq!(
+            b.window.frames.get(),
+            frames + 1,
+            "the menu overlaps the header"
+        );
     }
 
     fn type_text(b: &mut Browser<FakeScreen>, text: &str) {

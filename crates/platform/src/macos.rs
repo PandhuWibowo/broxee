@@ -12,6 +12,10 @@
 //! Frames are painted straight into `IOSurface`s, which Core Animation shows as textures
 //! without copying. Two surfaces alternate (double buffering), so the engine never paints into
 //! the frame that is on screen.
+//!
+//! The pane header has a layer of its own above the frame, with its own small surfaces. A
+//! change to the header alone (typing in the address field, the loading line) paints only
+//! that strip; a full frame includes the header and hides the layer again.
 
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr};
@@ -192,6 +196,7 @@ unsafe fn rect_of(object: Id, selector: &CStr) -> CGRect {
 static WINDOW: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static VIEW: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static LAYER: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+static HEADER_LAYER: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static EVENTS: OnceLock<Sender<Event>> = OnceLock::new();
 
 fn emit(event: Event) {
@@ -209,6 +214,17 @@ struct Pool {
     last: *mut c_void,
 }
 
+impl Default for Pool {
+    fn default() -> Pool {
+        Pool {
+            width: 0,
+            height: 0,
+            surfaces: Vec::new(),
+            last: std::ptr::null_mut(),
+        }
+    }
+}
+
 /// The engine thread's handle to the window. It holds no AppKit objects; every effect is
 /// scheduled onto the main thread. Not `Sync`: it lives on the engine thread only.
 pub struct Window {
@@ -217,6 +233,18 @@ pub struct Window {
     height: f64,
     dark: bool,
     pool: RefCell<Pool>,
+    /// Surfaces of the header layer: as wide as the pane and as tall as the header.
+    header_pool: RefCell<Pool>,
+}
+
+/// A header surface on its way to the main thread, with where to show it (device pixels
+/// from the content area's top left).
+struct HeaderFrame {
+    surface: *mut c_void,
+    left: usize,
+    width: usize,
+    height: usize,
+    scale: f64,
 }
 
 // SAFETY: the surfaces in the pool are IOSurfaceRefs, which are thread-safe reference-counted
@@ -259,43 +287,86 @@ impl Window {
     }
 
     /// Paint a frame of `width` x `height` device pixels and show it. `draw` receives surface
-    /// memory (BGRA, rows of `stride` bytes) and must fill every pixel.
+    /// memory (BGRA, rows of `stride` bytes) and must fill every pixel. The frame includes the
+    /// header, so the header layer is hidden when it appears.
     pub fn render(
         &self,
         width: usize,
         height: usize,
         draw: impl FnOnce(&mut [u8], usize),
     ) -> Result<(), String> {
-        let mut pool = self.pool.borrow_mut();
-        // SAFETY: IOSurface calls are thread-safe. The memory is touched only between lock and
-        // unlock, and never while the surface is on screen (see `pick`).
-        unsafe {
-            if (pool.width, pool.height) != (width, height) {
-                for s in pool.surfaces.drain(..) {
-                    CFRelease(s);
-                }
-                pool.width = width;
-                pool.height = height;
-                pool.last = std::ptr::null_mut();
-            }
-            let surface = pick(&mut pool)?;
-            if IOSurfaceLock(surface, 0, std::ptr::null_mut()) != 0 {
-                return Err("could not lock the frame surface".into());
-            }
-            let stride = IOSurfaceGetBytesPerRow(surface);
-            let rows = IOSurfaceGetHeight(surface);
-            let memory = std::slice::from_raw_parts_mut(
-                IOSurfaceGetBaseAddress(surface).cast::<u8>(),
-                stride * rows,
-            );
-            draw(memory, stride);
-            IOSurfaceUnlock(surface, 0, std::ptr::null_mut());
-            pool.last = surface;
-            // The main thread gets its own reference and releases it after handing the surface to the layer.
-            CFRetain(surface);
-            dispatch_async_f(&_dispatch_main_q, surface, surface_on_main);
-        }
+        let surface = paint(&mut self.pool.borrow_mut(), width, height, draw)?;
+        // SAFETY: the main queue outlives the process; `surface_on_main` releases the
+        // reference `paint` took for it.
+        unsafe { dispatch_async_f(&_dispatch_main_q, surface, surface_on_main) };
         Ok(())
+    }
+
+    /// Paint only the header: `width` x `height` device pixels whose left edge is `left`
+    /// pixels from the window's, shown in the header layer above the last frame.
+    pub fn render_header(
+        &self,
+        left: usize,
+        width: usize,
+        height: usize,
+        draw: impl FnOnce(&mut [u8], usize),
+    ) -> Result<(), String> {
+        let surface = paint(&mut self.header_pool.borrow_mut(), width, height, draw)?;
+        let frame = Box::new(HeaderFrame {
+            surface,
+            left,
+            width,
+            height,
+            scale: self.scale,
+        });
+        // SAFETY: as in `render`; `header_on_main` reclaims the box and the reference.
+        unsafe {
+            dispatch_async_f(
+                &_dispatch_main_q,
+                Box::into_raw(frame).cast(),
+                header_on_main,
+            )
+        };
+        Ok(())
+    }
+}
+
+/// Paint into a surface of `pool` that is not on screen. Returns it with an extra reference
+/// for the main thread.
+fn paint(
+    pool: &mut Pool,
+    width: usize,
+    height: usize,
+    draw: impl FnOnce(&mut [u8], usize),
+) -> Result<*mut c_void, String> {
+    // SAFETY: IOSurface calls are thread-safe. The memory is touched only between lock and
+    // unlock, and never while the surface is on screen (see `pick`).
+    unsafe {
+        if (pool.width, pool.height) != (width, height) {
+            for s in pool.surfaces.drain(..) {
+                CFRelease(s);
+            }
+            pool.width = width;
+            pool.height = height;
+            pool.last = std::ptr::null_mut();
+        }
+        let surface = pick(pool)?;
+        if IOSurfaceLock(surface, 0, std::ptr::null_mut()) != 0 {
+            return Err("could not lock the frame surface".into());
+        }
+        let stride = IOSurfaceGetBytesPerRow(surface);
+        let rows = IOSurfaceGetHeight(surface);
+        let memory = std::slice::from_raw_parts_mut(
+            IOSurfaceGetBaseAddress(surface).cast::<u8>(),
+            stride * rows,
+        );
+        draw(memory, stride);
+        IOSurfaceUnlock(surface, 0, std::ptr::null_mut());
+        pool.last = surface;
+        // The main thread gets its own reference and releases it after handing the surface
+        // to the layer.
+        CFRetain(surface);
+        Ok(surface)
     }
 }
 
@@ -305,24 +376,28 @@ impl Window {
     /// frame creates it again.
     pub fn release_spare(&self) {
         release_free_memory();
-        let mut pool = self.pool.borrow_mut();
-        let last = pool.last;
-        pool.surfaces.retain(|&s| {
-            if s == last {
-                return true;
-            }
-            // SAFETY: the pool owns one reference to each surface; the layer keeps its own.
-            unsafe { CFRelease(s) };
-            false
-        });
+        for pool in [&self.pool, &self.header_pool] {
+            let mut pool = pool.borrow_mut();
+            let last = pool.last;
+            pool.surfaces.retain(|&s| {
+                if s == last {
+                    return true;
+                }
+                // SAFETY: the pool owns one reference to each surface; the layer keeps its own.
+                unsafe { CFRelease(s) };
+                false
+            });
+        }
     }
 }
 
 impl Drop for Window {
     fn drop(&mut self) {
-        for s in self.pool.get_mut().surfaces.drain(..) {
-            // SAFETY: the pool owns one reference to each surface.
-            unsafe { CFRelease(s) };
+        for pool in [self.pool.get_mut(), self.header_pool.get_mut()] {
+            for s in pool.surfaces.drain(..) {
+                // SAFETY: the pool owns one reference to each surface.
+                unsafe { CFRelease(s) };
+            }
         }
     }
 }
@@ -386,14 +461,63 @@ unsafe fn create_surface(width: usize, height: usize) -> Result<*mut c_void, Str
     Ok(surface)
 }
 
+/// Run `change` inside a Core Animation transaction without implicit animations: layers
+/// that do not back a view would otherwise fade new contents and slide to new frames.
+unsafe fn without_animation(change: impl FnOnce()) {
+    let transaction = class(c"CATransaction");
+    send!((); transaction, c"begin");
+    send!((); transaction, c"setDisableActions:", true => bool);
+    change();
+    send!((); transaction, c"commit");
+}
+
 extern "C" fn surface_on_main(surface: *mut c_void) {
     let layer = LAYER.load(Ordering::Acquire);
-    // SAFETY: main thread. The layer retains the surface; the reference sent by `render` is released here.
+    let header = HEADER_LAYER.load(Ordering::Acquire);
+    // SAFETY: main thread. The layer retains the surface; the reference sent by `render` is
+    // released here. -setHidden: takes a BOOL.
     unsafe {
-        if !layer.is_null() {
-            send!((); layer, c"setContents:", surface => Id);
-        }
+        without_animation(|| {
+            if !layer.is_null() {
+                send!((); layer, c"setContents:", surface => Id);
+            }
+            // The full frame has the current header in it.
+            if !header.is_null() {
+                send!((); header, c"setHidden:", true => bool);
+            }
+        });
         CFRelease(surface);
+    }
+}
+
+extern "C" fn header_on_main(context: *mut c_void) {
+    // SAFETY: `context` came from Box::into_raw in render_header and is used exactly once.
+    let frame = unsafe { Box::from_raw(context.cast::<HeaderFrame>()) };
+    let (header, view) = (
+        HEADER_LAYER.load(Ordering::Acquire),
+        VIEW.load(Ordering::Acquire),
+    );
+    // SAFETY: main thread; header is a live CALayer and view our content view. -setFrame:
+    // takes a CGRect, -setContentsScale: a CGFloat, -setHidden: a BOOL.
+    unsafe {
+        if !header.is_null() && !view.is_null() {
+            let s = frame.scale.max(1.0);
+            let height = frame.height as f64 / s;
+            // The view's layer has its origin at the bottom left: the header sits at the top.
+            let rect = CGRect {
+                x: frame.left as f64 / s,
+                y: bounds(view).height - height,
+                width: frame.width as f64 / s,
+                height,
+            };
+            without_animation(|| {
+                send!((); header, c"setContentsScale:", s => f64);
+                send!((); header, c"setFrame:", rect => CGRect);
+                send!((); header, c"setContents:", frame.surface => Id);
+                send!((); header, c"setHidden:", false => bool);
+            });
+        }
+        CFRelease(frame.surface);
     }
 }
 
@@ -700,6 +824,12 @@ pub fn run_app(
         let scale = send!(f64; window, c"backingScaleFactor");
         send!((); layer, c"setContentsScale:", scale => f64);
         send!((); layer, c"setContentsGravity:", kCAGravityTopLeft => Id);
+        // The header's own layer, hidden until the header changes on its own.
+        let header = send!(Id; send!(Id; class(c"CALayer"), c"alloc"), c"init");
+        send!((); header, c"setContentsScale:", scale => f64);
+        send!((); header, c"setContentsGravity:", kCAGravityTopLeft => Id);
+        send!((); header, c"setHidden:", true => bool);
+        send!((); layer, c"addSublayer:", header => Id);
 
         let appearance = send!(Id; app, c"effectiveAppearance");
         let dark =
@@ -708,6 +838,7 @@ pub fn run_app(
         WINDOW.store(window, Ordering::Release);
         VIEW.store(view, Ordering::Release);
         LAYER.store(layer, Ordering::Release);
+        HEADER_LAYER.store(header, Ordering::Release);
 
         send!((); window, c"makeKeyAndOrderFront:", std::ptr::null_mut::<c_void>() => Id);
         send!(bool; window, c"makeFirstResponder:", view => Id);
@@ -722,12 +853,8 @@ pub fn run_app(
             width: shown.width,
             height: shown.height,
             dark,
-            pool: RefCell::new(Pool {
-                width: 0,
-                height: 0,
-                surfaces: Vec::new(),
-                last: std::ptr::null_mut(),
-            }),
+            pool: RefCell::new(Pool::default()),
+            header_pool: RefCell::new(Pool::default()),
         };
         std::thread::Builder::new()
             .name("engine".into())
