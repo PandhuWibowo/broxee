@@ -125,7 +125,7 @@ refreshes it.
 | `font` | TrueType/OpenType reader: advances, vertical metrics, cmap formats 4 and 12, `.ttc`, glyph outlines (simple and composite) | ✅ |
 | `layout` | Block, inline, inline-block, flex and grid layout, positioning, line breaking, white-space, text-align, baselines | ✅ |
 | `paint` | Display list, anti-aliased glyph rasterizer, glyph cache, image cache with parallel decoding, parallel band compositing, streaming PNG writer | ✅ |
-| `image` | PNG (all color types and depths, `tRNS`, Adam7) and JPEG, baseline and progressive (any subsampling, restarts, Adobe RGB), decoded straight to the drawn size with a scaled inverse DCT; header sizes for PNG, JPEG, GIF, WebP | ✅ |
+| `image` | PNG (all color types and depths, `tRNS`, Adam7), JPEG baseline and progressive (any subsampling, restarts, Adobe RGB) with a scaled inverse DCT, GIF (first frame, interlaced, transparency), WebP lossy, lossless, alpha and the first animation frame, and an SVG subset rasterized at the drawn size; all decoded straight to the drawn size | ✅ |
 | `platform` | macOS window, menu, app delegate, main-thread hand-off, zero-copy frames through `IOSurface` | ✅ (macOS) |
 | `shell` | The `broxee` binary: CLI, the page pipeline (`engine.rs`), the browser (`browser.rs`: history, navigation, scrolling, links, address field) and its header (`chrome.rs`) | ✅ |
 
@@ -223,6 +223,7 @@ time something reads it (most theme variables never are). A `var()` value is sub
 | 2026-11-07 | Rules dropped from their selector text (#16) | 2.2 MB | 49.3 MB peak painted at 2x | GitHub's 30 sheets (3.4 MB): 15.0 → 11.7 ms, 155,109 → 34,167 allocations, same 820 rules |
 | 2026-11-08 | Display list skips runs of fragments out of view (#17) | 2.2 MB | 49.4 MB peak painted at 2x | Stress page: display list 0.65 → 0.01 ms a frame at any scroll; layout +0.8 ms once to index |
 | 2026-11-08 | Glyphs on quarter pixels (#18) | 2.2 MB | 49.5 MB peak painted at 2x | Repeated "i" at 13px, 1x: gaps 4/3/4/3 px (stdev 0.50) → 3.5 ± 0.15 px; GitHub glyph cache 46 → 88 KB |
+| 2026-11-10 | GIF, WebP and SVG drawn (#14) | 2.4 MB | 49.4 MB peak painted at 2x | 4000x4000 lossy WebP at 400 px: 17.9 MB peak (empty page 16.7), 296 ms; 4000x3000 lossless: 20.5 MB, 154 ms |
 
 Other pages after the layout milestone: GitHub home 22.7 MB peak (8,170 rules); Hacker News 11.5 MB.
 
@@ -273,7 +274,11 @@ scans need it), instead of 36 MB of coefficients; one decodes at a time.
 
 Images never exist at full size: a decoder hands rows to a box filter that shrinks them to the size they
 are drawn at, PNG data streams through a 32 KiB inflate window and JPEG is decoded one row of blocks at a
-time. Only images in view are decoded (in parallel); decoded pixels live in a 8 MB cache that evicts what
+time. GIF rows come straight out of LZW (interlaced frames are assembled at one byte per pixel first, as
+interlaced PNGs are), lossy WebP is decoded one macroblock row at a time with the loop filter one row
+behind, and lossless WebP keeps a ring of the last million pixels, the farthest a backward reference can
+reach, so a 4000x3000 file costs about 4 MB to decode instead of 48. SVG is rasterized at the drawn size with
+one row of coverage. Only images in view are decoded (in parallel); decoded pixels live in a 8 MB cache that evicts what
 has not been drawn recently, and the page keeps only compressed bytes (12 MB cap). The debugging PNG writer
 used to hold three copies of a frame (69 MB for a 1280x3000 render); it now writes rows straight into the
 file (48 MB).
@@ -319,6 +324,8 @@ Where data lives, and what compression does for it (measured 2026-11-07):
 - Profiles start as Personal and Work; up to 12, each with its own folder in `profiles/` (named by a fixed
   id, so renaming moves nothing). Four colors exist (emerald, amber, rose, violet), so profiles past four
   share them; their names always tell them apart.
-- GIF, WebP and SVG are sized from their headers but not drawn yet. Failed images draw nothing.
+- GIF animations and animated WebP show their first frame. SVG draws shapes, strokes, `use`, simple `<style>`
+  rules and transforms; gradients are drawn as the average of their stops, and text, filters, masks and clip
+  paths are skipped. Failed images draw nothing.
 - Painting will add a window framebuffer (about 16 MB at 2x for 1280x800). The stress page sits at 37 MB, so
   paint must stay within roughly 20 MB including glyph caches.

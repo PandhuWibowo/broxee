@@ -39,7 +39,8 @@ crates/
            Approximate fallback used by tests
   layout/  block + inline layout into BoxFragment / TextFragment lists, one shared text buffer;
            flex.rs (flex containers, intrinsic widths), grid.rs (grid containers), table.rs (tables)
-  image/   PNG and baseline JPEG decoders that scale while decoding, header probes (GIF, WebP sizes)
+  image/   PNG, JPEG, GIF, WebP (vp8.rs lossy, vp8l.rs lossless, vp8_tables.rs from RFC 6386) decoders
+           that scale while decoding; svg.rs (XML subset, flattened paths, scanline rasterizer)
   paint/   display list, glyph rasterizer + cache, image cache + parallel decode, band compositing,
            streaming PNG writer
   platform/ macOS window via the Objective-C runtime, IOSurface frames (empty module on other OSes)
@@ -67,7 +68,7 @@ casts), not taken from binding crates. Ask before proposing any dependency.
   without locks.
 - **Images are never decoded at full size.** Decoders stream rows into `image::Scaler`, which outputs the
   drawn size; only visible images are decoded, and the pixel cache stays under `IMAGE_CACHE_BYTES`. A new
-  decoder (GIF, WebP) must keep that: memory proportional to the output, not the file. Progressive JPEG keeps
+  decoder must keep that: memory proportional to the output, not the file. Progressive JPEG keeps
   only the k x k coefficients the drawn size needs plus a non-zero mask per block, one decode at a time.
 - **Every `send!` states the method's exact C signature.** A wrong type is undefined behaviour, not an error.
 - **AppKit calls happen on the main thread only.** The engine thread hands work over with `dispatch_async_f`.

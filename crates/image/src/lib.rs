@@ -1,16 +1,24 @@
-//! Image decoding for Broxee: PNG and baseline JPEG, written here.
+//! Image decoding for Broxee: PNG, JPEG, GIF, WebP and SVG, written here.
 //!
 //! Images are decoded straight to the size they are shown at. Decoders hand rows to a
 //! `Scaler`, which box-filters them down as they arrive, so a 4000x3000 photo shown at 400x300
 //! never exists at full size in memory (PNG data streams through `flate`, JPEG is decoded one
 //! row of blocks at a time). Output is premultiplied RGBA, ready to composite.
 //!
-//! `probe` reads only the header, so layout can size images before anything is decoded. It
-//! also recognises GIF and WebP, which are sized but not decoded yet.
+//! GIF rows come straight out of LZW, WebP lossy one macroblock row at a time, WebP lossless
+//! from a ring of recent pixels; SVG is rasterized at the drawn size.
+//!
+//! `probe` reads only the header, so layout can size images before anything is decoded.
 
+mod gif;
 mod jpeg;
 mod png;
 mod progressive;
+mod svg;
+mod vp8;
+mod vp8_tables;
+mod vp8l;
+mod webp;
 
 use std::fmt;
 
@@ -20,6 +28,7 @@ pub enum Format {
     Jpeg,
     Gif,
     Webp,
+    Svg,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,6 +99,13 @@ pub fn probe(data: &[u8]) -> Option<Info> {
         }
     } else if data.len() >= 30 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP" {
         probe_webp(data)?
+    } else if svg::sniff(data) {
+        let (width, height) = svg::probe(data)?;
+        Info {
+            width,
+            height,
+            format: Format::Svg,
+        }
     } else {
         return None;
     };
@@ -126,6 +142,10 @@ fn probe_webp(d: &[u8]) -> Option<Info> {
 /// image is drawn at.
 pub fn decode(data: &[u8], max_width: u32, max_height: u32) -> Result<Bitmap, Error> {
     let info = probe(data).ok_or(Error::Unsupported("unknown format"))?;
+    if info.format == Format::Svg {
+        // Vector images are drawn at the requested size, larger than natural too.
+        return svg::decode(data, (max_width, max_height));
+    }
     let target = (
         max_width.clamp(1, info.width),
         max_height.clamp(1, info.height),
@@ -133,8 +153,9 @@ pub fn decode(data: &[u8], max_width: u32, max_height: u32) -> Result<Bitmap, Er
     match info.format {
         Format::Png => png::decode(data, target),
         Format::Jpeg => jpeg::decode(data, target),
-        Format::Gif => Err(Error::Unsupported("GIF")),
-        Format::Webp => Err(Error::Unsupported("WebP")),
+        Format::Gif => gif::decode(data, target),
+        Format::Webp => webp::decode(data, target),
+        Format::Svg => svg::decode(data, target),
     }
 }
 
@@ -260,7 +281,7 @@ mod tests {
             probe(&gif).map(|i| (i.width, i.height, i.format)),
             Some((288, 16, Format::Gif))
         );
-        assert_eq!(probe(b"<svg/>"), None);
+        assert_eq!(probe(b"<svg/>").map(|i| i.format), Some(Format::Svg));
         assert_eq!(probe(&[]), None);
     }
 

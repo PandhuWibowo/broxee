@@ -3,6 +3,8 @@ name = "image"
 version.workspace = true
 edition.workspace = true
 
-# Written here: PNG and baseline JPEG decoders that scale while decoding.
+# Written here: PNG, JPEG, GIF and WebP decoders that scale while decoding, and an SVG
+# rasterizer. `css` is used for its color syntax.
 [dependencies]
+css = { path = "../css" }
 flate = { path = "../flate" }
