@@ -170,7 +170,7 @@ impl Engine<'_> {
         let mut items = Vec::new();
         // (first, count, has visible text)
         let mut run: Option<(NodeId, usize, bool)> = None;
-        for child in dom.children(container) {
+        for child in crate::kids(dom, container) {
             match dom.kind(child) {
                 NodeKind::Text(text) => {
                     let visible = !text.trim_ascii().is_empty();
@@ -575,7 +575,7 @@ impl Engine<'_> {
                 _ => 0.0,
             };
             let (mut min, mut max, mut count) = (0.0f32, 0.0f32, 0);
-            for child in dom.children(id) {
+            for child in crate::kids(dom, id) {
                 let (a, b) = match dom.kind(child) {
                     NodeKind::Text(t) if t.trim_ascii().is_empty() => continue,
                     NodeKind::Text(_) => self.measure_inline(child, 1),
@@ -613,7 +613,7 @@ impl Engine<'_> {
             min = min.max(a);
             max = max.max(b);
         };
-        for child in dom.children(id) {
+        for child in crate::kids(dom, id) {
             match self.level(child) {
                 // A float sits beside the text of its run, so it is measured with it.
                 Level::Inline | Level::Float => match &mut run {
@@ -658,7 +658,7 @@ impl Engine<'_> {
         let saved_words = std::mem::take(&mut self.words);
         let was_measuring = std::mem::replace(&mut self.measuring, true);
         let dom = self.dom;
-        for node in dom.siblings_from(first).take(count) {
+        for node in crate::kids_from(dom, first).take(count) {
             self.collect(node);
         }
         let (mut min, mut max, mut line, mut piece) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);

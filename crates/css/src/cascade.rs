@@ -9,7 +9,9 @@ use crate::grid::{
 };
 use crate::media::Media;
 use crate::parser::{expand_declaration, parse_declarations, Declaration, Stylesheet};
-use crate::selector::{Combinator, Compound, Selector};
+use crate::selector::{
+    Combinator, Compound, Pseudo, Selector, ACTIVE, FOCUS, FOCUS_VISIBLE, FOCUS_WITHIN, HOVER,
+};
 use crate::values::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -24,6 +26,11 @@ pub struct StyleMap {
     styles: Vec<ComputedStyle>,
     node_style: Vec<u32>,
     grids: GridTables,
+    /// Boxes `::before` and `::after` generate, in document order of their elements.
+    generated: Vec<Generated>,
+    /// Every compound that looks at a state, with its states and `:not()` taken out, and
+    /// the states it looks at: what decides whether a state change can restyle anything.
+    state_compounds: Vec<(Compound, u8)>,
 }
 
 impl StyleMap {
@@ -43,6 +50,86 @@ impl StyleMap {
     pub fn unique_styles(&self) -> usize {
         self.styles.len()
     }
+
+    pub fn generated(&self) -> &[Generated] {
+        &self.generated
+    }
+
+    /// Give the generated boxes their nodes in `dom` (`Dom::show_generated`), styled.
+    pub fn attach_generated(&mut self, dom: &mut Dom) {
+        dom.hide_generated();
+        for g in &self.generated {
+            let (element, text) = dom.show_generated(g.owner, g.after, &g.text);
+            if self.node_style.len() < dom.len() {
+                self.node_style.resize(dom.len(), 0);
+            }
+            self.node_style[element as usize] = g.style;
+            self.node_style[text as usize] = g.style;
+        }
+    }
+
+    /// The states (`selector::HOVER` and so on) some rule looks at; 0 when none does, and
+    /// then the page never needs to know where the pointer is.
+    pub fn states_used(&self) -> u8 {
+        self.state_compounds.iter().fold(0, |a, (_, s)| a | s)
+    }
+
+    /// Whether going from state `old` to `new` can change any style: some rule looks at a
+    /// state that changed, on an element whose state changed, ignoring everything but the
+    /// compound that names the state. False means the styles stay as they are.
+    pub fn state_change_matters(&self, dom: &Dom, old: &States, new: &States) -> bool {
+        if old == new || self.state_compounds.is_empty() {
+            return false;
+        }
+        let names = Names {
+            id: dom.atom("id"),
+            class: dom.atom("class"),
+            style: dom.atom("style"),
+        };
+        let focus_moved = old.focus != new.focus || old.focus_visible != new.focus_visible;
+        let focused: Vec<NodeId> = if focus_moved {
+            [old.focus, new.focus].into_iter().flatten().collect()
+        } else {
+            Vec::new()
+        };
+        let changed = [
+            (HOVER, chain_difference(dom, old.hover, new.hover)),
+            (ACTIVE, chain_difference(dom, old.active, new.active)),
+            (FOCUS | FOCUS_VISIBLE, focused),
+            (FOCUS_WITHIN, chain_difference(dom, old.focus, new.focus)),
+        ];
+        let none = States::default();
+        self.state_compounds.iter().any(|(compound, uses)| {
+            changed.iter().any(|(bits, nodes)| {
+                uses & bits != 0
+                    && nodes
+                        .iter()
+                        .any(|&n| compound_matches(dom, names, &none, compound, n))
+            })
+        })
+    }
+}
+
+/// The nodes in exactly one of the two chains (a node and its ancestors).
+fn chain_difference(dom: &Dom, a: Option<NodeId>, b: Option<NodeId>) -> Vec<NodeId> {
+    let chain = |n: Option<NodeId>| {
+        let mut out = Vec::new();
+        let mut at = n.filter(|&n| (n as usize) < dom.len());
+        while let Some(n) = at {
+            out.push(n);
+            at = dom.parent(n);
+        }
+        out
+    };
+    if a == b {
+        return Vec::new();
+    }
+    let (a, b) = (chain(a), chain(b));
+    a.iter()
+        .filter(|n| !b.contains(n))
+        .chain(b.iter().filter(|n| !a.contains(n)))
+        .copied()
+        .collect()
 }
 
 struct Entry<'a> {
@@ -50,6 +137,9 @@ struct Entry<'a> {
     decls: &'a [Declaration],
     /// Declares at least one custom property.
     has_custom: bool,
+    /// Declares `content` (directly or through `var()`): only such a rule can make a
+    /// `::before` or `::after` box exist, since `content` is not inherited.
+    has_content: bool,
     origin: Origin,
     order: u32,
     /// Bloom keys for the selector's ancestor compounds. If any is missing from the ancestor
@@ -72,6 +162,14 @@ struct RuleIndex<'a> {
     /// Some rule matches siblings with identical attributes differently (`:first-child`,
     /// `h1 + p`), so siblings cannot simply share a style.
     sibling_dependent: bool,
+    /// Some rule styles `::before` or `::after`.
+    has_pseudo: bool,
+    /// `::before` / `::after` rules without `content`, kept out of the buckets: they style a
+    /// box only once a rule with `content` made one, so they are matched only then.
+    /// (`::before, ::after { box-sizing: inherit }` would otherwise be tried on every element.)
+    pseudo_styling: Vec<u32>,
+    /// See `StyleMap::state_compounds`.
+    state_compounds: Vec<(Compound, u8)>,
 }
 
 impl<'a> RuleIndex<'a> {
@@ -85,6 +183,9 @@ impl<'a> RuleIndex<'a> {
             universal: Vec::new(),
             root: Vec::new(),
             sibling_dependent: false,
+            has_pseudo: false,
+            pseudo_styling: Vec::new(),
+            state_compounds: Vec::new(),
         };
         for &(origin, sheet) in sheets {
             for rule in sheet
@@ -102,6 +203,18 @@ impl<'a> RuleIndex<'a> {
                         .flat_map(|i| compound_keys(&selector.parts[i].0))
                         .collect();
                     index.sibling_dependent |= selector.depends_on_siblings();
+                    index.has_pseudo |= selector.pseudo != Pseudo::None;
+                    for (compound, _) in &selector.parts {
+                        let uses = compound.all_states();
+                        if uses != 0 {
+                            let bare = Compound {
+                                states: 0,
+                                not: Vec::new(),
+                                ..compound.clone()
+                            };
+                            index.state_compounds.push((bare, uses));
+                        }
+                    }
                     index.entries.push(Entry {
                         selector,
                         decls: &rule.decls,
@@ -109,11 +222,20 @@ impl<'a> RuleIndex<'a> {
                             .decls
                             .iter()
                             .any(|d| matches!(d, Declaration::Custom { .. })),
+                        has_content: rule.decls.iter().any(|d| match d {
+                            Declaration::Content { .. } => true,
+                            Declaration::Pending { name, .. } => &**name == "content",
+                            _ => false,
+                        }),
                         origin,
                         order: n,
                         ancestor_keys,
                     });
                     let subject = &selector.parts[0].0;
+                    if selector.pseudo != Pseudo::None && !index.entries[n as usize].has_content {
+                        index.pseudo_styling.push(n);
+                        continue;
+                    }
                     if let Some(id) = &subject.id {
                         index.by_id.entry(id).or_default().push(n);
                     } else if let Some(class) = subject.classes.first() {
@@ -519,38 +641,286 @@ struct Recent {
     parent: NodeId,
     element: NodeId,
     style: u32,
+    /// Its generated boxes: a range of `StyleMap::generated`.
+    generated: (u32, u32),
 }
 
 const SHARE_SLOTS: usize = 8;
 
+/// The interactive state of a page: what `:hover`, `:active`, `:focus`, `:focus-visible` and
+/// `:focus-within` look at.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct States {
+    /// The node under the pointer; it and its ancestors are hovered.
+    pub hover: Option<NodeId>,
+    /// The node the primary button went down on, while it is down.
+    pub active: Option<NodeId>,
+    /// The element with keyboard focus.
+    pub focus: Option<NodeId>,
+    /// The focus came from the keyboard, or is in a text field: `:focus-visible` holds.
+    pub focus_visible: bool,
+}
+
+/// A box generated by `::before` or `::after`, with its style and text.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Generated {
+    pub owner: NodeId,
+    pub after: bool,
+    pub style: u32,
+    pub text: Box<str>,
+}
+
+/// A generated box's element style and its matched rules.
+type PseudoKey = (u32, Vec<u32>);
+
+/// Elements that never get generated boxes: replaced elements and form controls.
+fn can_generate(tag: &str) -> bool {
+    !matches!(
+        tag,
+        "img"
+            | "input"
+            | "select"
+            | "textarea"
+            | "br"
+            | "hr"
+            | "iframe"
+            | "video"
+            | "audio"
+            | "canvas"
+            | "svg"
+            | "object"
+            | "embed"
+    )
+}
+
+/// The caches the cascade keeps while computing styles, and the tables it fills.
+struct Styler<'s, 'a> {
+    index: &'s RuleIndex<'a>,
+    media: &'s Media,
+    table: StyleTable,
+    customs: CustomSets<'a>,
+    grids: GridTables,
+    custom_rules: Vec<u32>,
+    var_cache: HashMap<(usize, u32), Vec<Declaration>, FastBuildHasher>,
+    root_font_size: Px,
+}
+
+impl<'a> Styler<'_, 'a> {
+    /// Compute and intern the style from `matched` rules (in cascade order, user-agent first),
+    /// presentational `hints` and `inline` declarations, under `parent_style`. Also returns
+    /// the winning `content`, for generated boxes.
+    fn compute_style(
+        &mut self,
+        matched: &[u32],
+        hints: &[Declaration],
+        inline: &[Declaration],
+        parent_style: u32,
+        is_root: bool,
+    ) -> (u32, Option<Content>) {
+        let index = self.index;
+        let author_start =
+            matched.partition_point(|&n| index.entries[n as usize].origin == Origin::UserAgent);
+        let declarations = || {
+            let entry = |&n: &u32| index.entries[n as usize].decls;
+            matched[..author_start]
+                .iter()
+                .flat_map(entry)
+                .chain(hints)
+                .chain(matched[author_start..].iter().flat_map(entry))
+                .chain(inline)
+        };
+        // Pass 1: custom properties, which `var()` in pass 2 reads. The set depends only on
+        // which rules matched, so elements matching the same rules reuse it.
+        let parent_custom = self.table.list[parent_style as usize].custom;
+        self.custom_rules.clear();
+        self.custom_rules.extend(
+            matched
+                .iter()
+                .copied()
+                .filter(|&n| index.entries[n as usize].has_custom),
+        );
+        let mut custom = parent_custom;
+        if !self.custom_rules.is_empty() {
+            let key = (parent_custom, std::mem::take(&mut self.custom_rules));
+            custom = match self.customs.known.get(&key) {
+                Some(&id) => id,
+                None => {
+                    let rules = key.1.iter().map(|&n| index.entries[n as usize].decls);
+                    let own = winning_customs(rules)
+                        .into_iter()
+                        .map(|(n, v)| (Cow::Borrowed(n), Cow::Borrowed(v)))
+                        .collect();
+                    let id = self.customs.declare(parent_custom, own);
+                    self.customs.known.insert(key.clone(), id);
+                    id
+                }
+            };
+            self.custom_rules = key.1;
+        }
+        // Inline variables go in a small set of their own on top, so the rule set stays
+        // shared. Only the inline ones that win the cascade go there: a rule's `!important`
+        // still beats a normal inline declaration.
+        let inline_values: Vec<*const u8> = inline
+            .iter()
+            .filter_map(|d| match d {
+                Declaration::Custom { value, .. } => Some(value.as_ptr()),
+                _ => None,
+            })
+            .collect();
+        if !inline_values.is_empty() {
+            let rules = self
+                .custom_rules
+                .iter()
+                .map(|&n| index.entries[n as usize].decls);
+            // Inline declarations are freed with the element, so these are copied.
+            let own = winning_customs(rules.chain(std::iter::once(inline)))
+                .into_iter()
+                .filter(|(_, v)| inline_values.contains(&v.as_ptr()))
+                .map(|(n, v)| (Cow::Owned(n.to_owned()), Cow::Owned(v.to_owned())))
+                .collect::<Vec<_>>();
+            if !own.is_empty() {
+                custom = self.customs.declare(custom, own);
+            }
+        }
+        // Pass 2: everything else, in cascade order; `var()` is substituted here.
+        let mut specified: [Option<Value>; PROP_COUNT] = [None; PROP_COUNT];
+        let mut grid: [Option<&GridValue>; GRID_SLOTS] = [None; GRID_SLOTS];
+        let mut content: Option<Content> = None;
+        // Grid values that came out of `var()` substitution, kept alive for `grid`.
+        let mut substituted: Vec<Declaration> = Vec::new();
+        for important in [false, true] {
+            for decl in declarations().filter(|d| d.important() == important) {
+                match decl {
+                    Declaration::Typed(d) => specified[d.prop as usize] = Some(d.value),
+                    Declaration::Grid { slot, value, .. } => grid[*slot as usize] = Some(value),
+                    Declaration::Content { value, .. } => content = Some((**value).clone()),
+                    Declaration::Pending { name, value, .. } => {
+                        // The result depends only on the declaration and the variable set,
+                        // so siblings and cousins reuse it. Inline declarations are not cached
+                        // (their addresses are reused once freed).
+                        let key = (value.as_ptr() as usize, custom);
+                        let is_inline = inline
+                            .as_ptr_range()
+                            .contains(&(decl as *const Declaration));
+                        let cached = if is_inline {
+                            None
+                        } else {
+                            self.var_cache.get(&key)
+                        };
+                        let decls = match cached {
+                            Some(d) => d.clone(),
+                            None => {
+                                // A value whose variables do not resolve is dropped, as if unset.
+                                let d = self
+                                    .customs
+                                    .substitute(value, custom)
+                                    .map(|r| expand_declaration(name, &r, false))
+                                    .unwrap_or_default();
+                                if !is_inline {
+                                    self.var_cache.insert(key, d.clone());
+                                }
+                                d
+                            }
+                        };
+                        for d in decls {
+                            match d {
+                                Declaration::Typed(d) => specified[d.prop as usize] = Some(d.value),
+                                Declaration::Content { value, .. } => content = Some(*value),
+                                grid_decl @ Declaration::Grid { .. } => substituted.push(grid_decl),
+                                _ => {}
+                            }
+                        }
+                    }
+                    Declaration::Custom { .. } => {}
+                }
+            }
+        }
+        let mut style = compute(
+            &specified,
+            &self.table.list[parent_style as usize],
+            self.root_font_size,
+            self.media,
+        );
+        style.custom = custom;
+        for decl in &substituted {
+            if let Declaration::Grid { slot, value, .. } = decl {
+                grid[*slot as usize] = Some(value);
+            }
+        }
+        if grid.iter().any(Option::is_some) {
+            let (root_font_size, media) = (self.root_font_size, self.media);
+            let length = |l| resolve(l, style.font_size, root_font_size, media);
+            let (template, placement) = build_grid(&grid, length);
+            style.grid = self.grids.template(template);
+            style.grid_item = self.grids.placement(placement);
+        }
+        if is_root {
+            self.root_font_size = style.font_size;
+        }
+        (self.table.intern(style), content)
+    }
+}
+
 /// Compute styles for every node, sheets in cascade order (user agent first, then author
 /// sheets in document order). `@media` rules apply when they match `media`.
 pub fn cascade(dom: &Dom, sheets: &[(Origin, &Stylesheet)], media: &Media) -> StyleMap {
+    cascade_with(dom, sheets, media, &States::default())
+}
+
+/// `cascade` for a page in the given interactive state (hover, focus, pressed).
+pub fn cascade_with(
+    dom: &Dom,
+    sheets: &[(Origin, &Stylesheet)],
+    media: &Media,
+    states: &States,
+) -> StyleMap {
     let index = RuleIndex::new(sheets, media);
     let names = Names {
         id: dom.atom("id"),
         class: dom.atom("class"),
         style: dom.atom("style"),
     };
-    let mut table = StyleTable::default();
-    let document_style = table.intern(ComputedStyle {
+    let mut styler = Styler {
+        index: &index,
+        media,
+        table: StyleTable::default(),
+        customs: CustomSets::new(),
+        grids: GridTables::default(),
+        custom_rules: Vec::new(),
+        var_cache: HashMap::default(),
+        root_font_size: ComputedStyle::initial().font_size,
+    };
+    let document_style = styler.table.intern(ComputedStyle {
         display: Display::Block,
         ..ComputedStyle::initial()
     });
     let mut node_style = vec![document_style; dom.len()];
 
     let mut filter = AncestorFilter::new();
-    let mut customs = CustomSets::new();
-    let mut grids = GridTables::default();
     let mut rule_cache = RuleCache::default();
-    let mut custom_rules: Vec<u32> = Vec::new();
-    let mut var_cache: HashMap<(usize, u32), Vec<Declaration>, FastBuildHasher> =
+    // Generated boxes' styles and `content` by (element style, matched rules): the same
+    // `.reference::before` under the same style is computed once.
+    let mut pseudo_cache: HashMap<PseudoKey, (u32, Option<Content>), FastBuildHasher> =
         HashMap::default();
     let mut recent: [Option<Recent>; SHARE_SLOTS] = [None; SHARE_SLOTS];
     let mut next_slot = 0;
-    let mut root_font_size = ComputedStyle::initial().font_size;
     let mut candidates: Vec<u32> = Vec::new();
     let mut matched: Vec<u32> = Vec::new();
+    let mut pseudo_matched: Vec<u32> = Vec::new();
+    let mut generated: Vec<Generated> = Vec::new();
+    // Elements in a state (and their ancestors, for `:hover` and `:focus-within`) can match
+    // differently from a sibling with the same attributes: they never share a style.
+    let mut in_state: Vec<NodeId> = Vec::new();
+    for node in [states.hover, states.active, states.focus]
+        .into_iter()
+        .flatten()
+    {
+        let mut at = Some(node);
+        while let Some(n) = at.filter(|&n| (n as usize) < dom.len()) {
+            in_state.push(n);
+            at = dom.parent(n);
+        }
+    }
 
     for id in dom.descendants(Dom::ROOT).skip(1) {
         let parent = dom
@@ -564,20 +934,29 @@ pub fn cascade(dom: &Dom, sheets: &[(Origin, &Stylesheet)], media: &Media) -> St
         };
         filter.pop_to(parent);
 
-        let hidden_parent =
-            parent != Dom::ROOT && table.list[parent_style as usize].display == Display::None;
+        let hidden_parent = parent != Dom::ROOT
+            && styler.table.list[parent_style as usize].display == Display::None;
+        let stateful = !in_state.is_empty() && in_state.contains(&id);
         let shared = recent
             .iter()
             .flatten()
-            .filter(|_| !index.sibling_dependent)
+            .filter(|_| !index.sibling_dependent && !stateful)
             .find(|r| r.parent == parent && same_element(dom, r.element, &element))
-            .map(|r| r.style);
+            .copied();
 
         let style_id = if hidden_parent {
             // Nothing under display:none is rendered, so skip matching for it entirely.
             parent_style
-        } else if let Some(style) = shared {
-            style
+        } else if let Some(r) = shared {
+            // Same attributes: the same generated boxes, with the same text.
+            for k in r.generated.0..r.generated.1 {
+                let g = Generated {
+                    owner: id,
+                    ..generated[k as usize].clone()
+                };
+                generated.push(g);
+            }
+            r.style
         } else {
             collect_candidates(
                 &index,
@@ -591,12 +970,24 @@ pub fn cascade(dom: &Dom, sheets: &[(Origin, &Stylesheet)], media: &Media) -> St
             matched.extend(candidates.iter().copied().filter(|&n| {
                 let entry = &index.entries[n as usize];
                 entry.ancestor_keys.iter().all(|&k| filter.might_contain(k))
-                    && matches(dom, names, entry.selector, id)
+                    && matches(dom, names, states, entry.selector, id)
             }));
-            matched.sort_unstable_by_key(|&n| {
+            // Rules for `::before` and `::after` style the boxes generated in the element.
+            pseudo_matched.clear();
+            if index.has_pseudo {
+                matched.retain(|&n| {
+                    let generates = index.entries[n as usize].selector.pseudo != Pseudo::None;
+                    if generates {
+                        pseudo_matched.push(n);
+                    }
+                    !generates
+                });
+            }
+            let order = |&n: &u32| {
                 let e = &index.entries[n as usize];
                 (e.origin, e.selector.specificity, e.order)
-            });
+            };
+            matched.sort_unstable_by_key(order);
             // The computed style is a function of the parent's style, the matched rules and the
             // `style` attribute. Without the attribute, elements that match the same rules under
             // the same parent style get the same result: skip computing and interning it.
@@ -606,8 +997,6 @@ pub fn cascade(dom: &Dom, sheets: &[(Origin, &Stylesheet)], media: &Media) -> St
             let hints = crate::hints::hints(dom, id)
                 .map(|css| parse_declarations(&css))
                 .unwrap_or_default();
-            let author_start =
-                matched.partition_point(|&n| index.entries[n as usize].origin == Origin::UserAgent);
             let cache_key = (attr_value(&element, names.style).is_none()
                 && hints.is_empty()
                 && parent != Dom::ROOT)
@@ -619,161 +1008,93 @@ pub fn cascade(dom: &Dom, sheets: &[(Origin, &Stylesheet)], media: &Media) -> St
                     let inline = attr_value(&element, names.style)
                         .map(parse_declarations)
                         .unwrap_or_default();
-                    let declarations = || {
-                        let entry = |&n: &u32| index.entries[n as usize].decls;
-                        matched[..author_start]
-                            .iter()
-                            .flat_map(entry)
-                            .chain(&hints)
-                            .chain(matched[author_start..].iter().flat_map(entry))
-                            .chain(&inline)
-                    };
-                    // Pass 1: custom properties, which `var()` in pass 2 reads. The set depends only on
-                    // which rules matched, so elements matching the same rules reuse it.
-                    let parent_custom = table.list[parent_style as usize].custom;
-                    custom_rules.clear();
-                    custom_rules.extend(
-                        matched
-                            .iter()
-                            .copied()
-                            .filter(|&n| index.entries[n as usize].has_custom),
+                    let (style_id, _) = styler.compute_style(
+                        &matched,
+                        &hints,
+                        &inline,
+                        parent_style,
+                        parent == Dom::ROOT,
                     );
-                    let mut custom = parent_custom;
-                    if !custom_rules.is_empty() {
-                        let key = (parent_custom, std::mem::take(&mut custom_rules));
-                        custom = match customs.known.get(&key) {
-                            Some(&id) => id,
-                            None => {
-                                let rules = key.1.iter().map(|&n| index.entries[n as usize].decls);
-                                let own = winning_customs(rules)
-                                    .into_iter()
-                                    .map(|(n, v)| (Cow::Borrowed(n), Cow::Borrowed(v)))
-                                    .collect();
-                                let id = customs.declare(parent_custom, own);
-                                customs.known.insert(key.clone(), id);
-                                id
-                            }
-                        };
-                        custom_rules = key.1;
-                    }
-                    // Inline variables go in a small set of their own on top, so the rule set stays
-                    // shared. Only the inline ones that win the cascade go there: a rule's `!important`
-                    // still beats a normal inline declaration.
-                    let inline_values: Vec<*const u8> = inline
-                        .iter()
-                        .filter_map(|d| match d {
-                            Declaration::Custom { value, .. } => Some(value.as_ptr()),
-                            _ => None,
-                        })
-                        .collect();
-                    if !inline_values.is_empty() {
-                        let rules = custom_rules
-                            .iter()
-                            .map(|&n| index.entries[n as usize].decls);
-                        // Inline declarations are freed with the element, so these are copied.
-                        let own = winning_customs(rules.chain(std::iter::once(&inline[..])))
-                            .into_iter()
-                            .filter(|(_, v)| inline_values.contains(&v.as_ptr()))
-                            .map(|(n, v)| (Cow::Owned(n.to_owned()), Cow::Owned(v.to_owned())))
-                            .collect::<Vec<_>>();
-                        if !own.is_empty() {
-                            custom = customs.declare(custom, own);
-                        }
-                    }
-                    // Pass 2: everything else, in cascade order; `var()` is substituted here.
-                    let mut specified: [Option<Value>; PROP_COUNT] = [None; PROP_COUNT];
-                    let mut grid: [Option<&GridValue>; GRID_SLOTS] = [None; GRID_SLOTS];
-                    // Grid values that came out of `var()` substitution, kept alive for `grid`.
-                    let mut substituted: Vec<Declaration> = Vec::new();
-                    for important in [false, true] {
-                        for decl in declarations().filter(|d| d.important() == important) {
-                            match decl {
-                                Declaration::Typed(d) => specified[d.prop as usize] = Some(d.value),
-                                Declaration::Grid { slot, value, .. } => {
-                                    grid[*slot as usize] = Some(value)
-                                }
-                                Declaration::Pending { name, value, .. } => {
-                                    // The result depends only on the declaration and the variable set,
-                                    // so siblings and cousins reuse it. Inline declarations are not cached
-                                    // (their addresses are reused once freed).
-                                    let key = (value.as_ptr() as usize, custom);
-                                    let is_inline = inline
-                                        .as_ptr_range()
-                                        .contains(&(decl as *const Declaration));
-                                    let cached = if is_inline { None } else { var_cache.get(&key) };
-                                    let decls = match cached {
-                                        Some(d) => d.clone(),
-                                        None => {
-                                            // A value whose variables do not resolve is dropped, as if unset.
-                                            let d = customs
-                                                .substitute(value, custom)
-                                                .map(|r| expand_declaration(name, &r, false))
-                                                .unwrap_or_default();
-                                            if !is_inline {
-                                                var_cache.insert(key, d.clone());
-                                            }
-                                            d
-                                        }
-                                    };
-                                    for d in decls {
-                                        match d {
-                                            Declaration::Typed(d) => {
-                                                specified[d.prop as usize] = Some(d.value)
-                                            }
-                                            grid_decl @ Declaration::Grid { .. } => {
-                                                substituted.push(grid_decl)
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                                Declaration::Custom { .. } => {}
-                            }
-                        }
-                    }
-                    let mut style = compute(
-                        &specified,
-                        &table.list[parent_style as usize],
-                        root_font_size,
-                        media,
-                    );
-                    style.custom = custom;
-                    for decl in &substituted {
-                        if let Declaration::Grid { slot, value, .. } = decl {
-                            grid[*slot as usize] = Some(value);
-                        }
-                    }
-                    if grid.iter().any(Option::is_some) {
-                        let length = |l| resolve(l, style.font_size, root_font_size, media);
-                        let (template, placement) = build_grid(&grid, length);
-                        style.grid = grids.template(template);
-                        style.grid_item = grids.placement(placement);
-                    }
-                    if parent == Dom::ROOT {
-                        root_font_size = style.font_size;
-                    }
-                    let style_id = table.intern(style);
                     if let Some(key) = cache_key {
                         rule_cache.insert(key, &matched, style_id);
                     }
                     style_id
                 }
             };
-            recent[next_slot] = Some(Recent {
-                parent,
-                element: id,
-                style: style_id,
-            });
-            next_slot = (next_slot + 1) % SHARE_SLOTS;
+            let first_generated = generated.len() as u32;
+            let generates = !pseudo_matched.is_empty()
+                && styler.table.list[style_id as usize].display != Display::None
+                && can_generate(dom.atom_name(element.tag));
+            if generates {
+                for (pseudo, after) in [(Pseudo::Before, false), (Pseudo::After, true)] {
+                    let mut rules: Vec<u32> = pseudo_matched
+                        .iter()
+                        .copied()
+                        .filter(|&n| index.entries[n as usize].selector.pseudo == pseudo)
+                        .collect();
+                    if rules.is_empty() {
+                        continue;
+                    }
+                    // A box will exist: the rules that only style it apply too.
+                    rules.extend(index.pseudo_styling.iter().copied().filter(|&n| {
+                        let entry = &index.entries[n as usize];
+                        entry.selector.pseudo == pseudo
+                            && entry.ancestor_keys.iter().all(|&k| filter.might_contain(k))
+                            && matches(dom, names, states, entry.selector, id)
+                    }));
+                    rules.sort_unstable_by_key(order);
+                    let key = (style_id, rules);
+                    let (style, content) = match pseudo_cache.get(&key) {
+                        Some(hit) => hit.clone(),
+                        None => {
+                            let computed = styler.compute_style(&key.1, &[], &[], style_id, false);
+                            pseudo_cache.insert(key, computed.clone());
+                            computed
+                        }
+                    };
+                    let Some(Content::Parts(parts)) = content else {
+                        continue;
+                    };
+                    if styler.table.list[style as usize].display == Display::None {
+                        continue;
+                    }
+                    let mut text = String::new();
+                    for part in &parts {
+                        match part {
+                            ContentPart::Text(t) => text.push_str(t),
+                            ContentPart::Attr(name) => {
+                                text.push_str(dom.attr(id, name).unwrap_or_default())
+                            }
+                        }
+                    }
+                    generated.push(Generated {
+                        owner: id,
+                        after,
+                        style,
+                        text: text.into(),
+                    });
+                }
+            }
+            if !stateful {
+                recent[next_slot] = Some(Recent {
+                    parent,
+                    element: id,
+                    style: style_id,
+                    generated: (first_generated, generated.len() as u32),
+                });
+                next_slot = (next_slot + 1) % SHARE_SLOTS;
+            }
             style_id
         };
         node_style[id as usize] = style_id;
         filter.push(id, dom, &element, names);
     }
     StyleMap {
-        styles: table.list,
+        styles: styler.table.list,
         node_style,
-        grids,
+        grids: styler.grids,
+        generated,
+        state_compounds: index.state_compounds,
     }
 }
 
@@ -836,9 +1157,15 @@ pub fn select(dom: &Dom, root: NodeId, selectors: &str) -> Vec<NodeId> {
         class: dom.atom("class"),
         style: dom.atom("style"),
     };
+    let none = States::default();
     dom.descendants(root)
         .skip(1)
-        .filter(|&n| dom.element(n).is_some() && list.iter().any(|s| matches(dom, names, s, n)))
+        .filter(|&n| {
+            dom.element(n).is_some()
+                && list
+                    .iter()
+                    .any(|s| s.pseudo == Pseudo::None && matches(dom, names, &none, s, n))
+        })
         .collect()
 }
 
@@ -852,29 +1179,36 @@ pub fn matches_selector(dom: &Dom, node: NodeId, selectors: &str) -> bool {
     dom.element(node).is_some()
         && crate::selector::parse_selector_list(selectors)
             .iter()
-            .any(|s| matches(dom, names, s, node))
+            .any(|s| s.pseudo == Pseudo::None && matches(dom, names, &States::default(), s, node))
 }
 
 fn attr_value<'a>(element: &Element<'a>, name: Option<Atom>) -> Option<&'a str> {
     element.attr(name?)
 }
 
-fn matches(dom: &Dom, names: Names, selector: &Selector, element: NodeId) -> bool {
-    compound_matches(dom, names, &selector.parts[0].0, element)
-        && match_rest(dom, names, selector, 1, element)
+fn matches(dom: &Dom, names: Names, states: &States, selector: &Selector, element: NodeId) -> bool {
+    compound_matches(dom, names, states, &selector.parts[0].0, element)
+        && match_rest(dom, names, states, selector, 1, element)
 }
 
 /// `parts[i - 1]` matched at `element`; try to match `parts[i..]` against its ancestors,
 /// backtracking across descendant combinators.
-fn match_rest(dom: &Dom, names: Names, selector: &Selector, i: usize, element: NodeId) -> bool {
+fn match_rest(
+    dom: &Dom,
+    names: Names,
+    states: &States,
+    selector: &Selector,
+    i: usize,
+    element: NodeId,
+) -> bool {
     if i == selector.parts.len() {
         return true;
     }
     let combinator = selector.parts[i - 1].1;
     let next = &selector.parts[i].0;
     let try_at = |candidate: NodeId| {
-        compound_matches(dom, names, next, candidate)
-            && match_rest(dom, names, selector, i + 1, candidate)
+        compound_matches(dom, names, states, next, candidate)
+            && match_rest(dom, names, states, selector, i + 1, candidate)
     };
     match combinator {
         Combinator::Child => parent_element(dom, element).is_some_and(try_at),
@@ -938,10 +1272,39 @@ fn parent_element(dom: &Dom, id: NodeId) -> Option<NodeId> {
     dom.element(parent).map(|_| parent)
 }
 
-fn compound_matches(dom: &Dom, names: Names, compound: &Compound, id: NodeId) -> bool {
+/// Whether `node` is `id` or one of its descendants.
+fn within(dom: &Dom, id: NodeId, node: Option<NodeId>) -> bool {
+    let mut at = node.filter(|&n| (n as usize) < dom.len());
+    while let Some(n) = at {
+        if n == id {
+            return true;
+        }
+        at = dom.parent(n);
+    }
+    false
+}
+
+fn states_hold(dom: &Dom, wanted: u8, id: NodeId, states: &States) -> bool {
+    (wanted & HOVER == 0 || within(dom, id, states.hover))
+        && (wanted & ACTIVE == 0 || within(dom, id, states.active))
+        && (wanted & FOCUS == 0 || states.focus == Some(id))
+        && (wanted & FOCUS_VISIBLE == 0 || (states.focus == Some(id) && states.focus_visible))
+        && (wanted & FOCUS_WITHIN == 0 || within(dom, id, states.focus))
+}
+
+fn compound_matches(
+    dom: &Dom,
+    names: Names,
+    states: &States,
+    compound: &Compound,
+    id: NodeId,
+) -> bool {
     let Some(element) = dom.element(id) else {
         return false;
     };
+    if compound.states != 0 && !states_hold(dom, compound.states, id, states) {
+        return false;
+    }
     if compound
         .tag
         .as_deref()
@@ -1016,7 +1379,7 @@ fn compound_matches(dom: &Dom, names: Names, compound: &Compound, id: NodeId) ->
     !compound
         .not
         .iter()
-        .any(|inner| compound_matches(dom, names, inner, id))
+        .any(|inner| compound_matches(dom, names, states, inner, id))
 }
 
 /// The block-level display of a floated box (CSS 2.1 9.7).
@@ -1318,6 +1681,35 @@ fn compute(
         };
         s.border_width[side] = if visible { width } else { Px::ZERO };
     }
+    s.outline_color = match get(Prop::OutlineColor) {
+        Some(Value::Color(c)) => c,
+        Some(Value::Inherit) => parent.outline_color,
+        _ => s.color,
+    };
+    let outlined = match get(Prop::OutlineStyle) {
+        Some(Value::BorderStyle(v)) => v,
+        Some(Value::Inherit) => parent.outline_width > Px::ZERO,
+        _ => false,
+    };
+    if outlined {
+        s.outline_width = match get(Prop::OutlineWidth) {
+            Some(Value::Length(l)) => match length(l) {
+                Length::Px(px) => px,
+                _ => Px::new(3.0),
+            },
+            Some(Value::Inherit) => parent.outline_width,
+            _ => Px::new(3.0),
+        };
+    }
+    match get(Prop::OutlineOffset) {
+        Some(Value::Length(l)) => {
+            if let Length::Px(px) = length(l) {
+                s.outline_offset = px;
+            }
+        }
+        Some(Value::Inherit) => s.outline_offset = parent.outline_offset,
+        _ => {}
+    }
     s
 }
 
@@ -1606,6 +1998,181 @@ mod tests {
             ".a + .b span { color: red }",
         );
         assert_eq!(first(&dom, &map, "span").color, RED);
+    }
+
+    fn styled_in(html_src: &str, css: &str, states: &States) -> (Dom, StyleMap) {
+        let dom = html::parse(html_src);
+        let author = parse_stylesheet(css);
+        let map = cascade_with(
+            &dom,
+            &[
+                (Origin::UserAgent, user_agent_stylesheet()),
+                (Origin::Author, &author),
+            ],
+            &Media::default(),
+            states,
+        );
+        (dom, map)
+    }
+
+    fn by_id(dom: &Dom, id: &str) -> NodeId {
+        dom.descendants(Dom::ROOT)
+            .find(|&n| dom.attr(n, "id") == Some(id))
+            .unwrap_or_else(|| panic!("no #{id}"))
+    }
+
+    #[test]
+    fn matches_hover_focus_and_active_states() {
+        let src = "<nav id=nav><a id=a href=x>a</a><a id=b href=y>b</a></nav><form id=f><input id=i></form>";
+        let css = "a { color: blue } a:hover { color: red } nav:hover { background: red }
+                   input:focus { margin: 1px } input:focus-visible { outline: 2px solid red }
+                   form:focus-within { padding: 3px } a:active { font-weight: bold }
+                   a:not(:hover) { margin-left: 4px }";
+        let dom = html::parse(src);
+        let (a, b, i) = (by_id(&dom, "a"), by_id(&dom, "b"), by_id(&dom, "i"));
+        // The text inside #a is under the pointer: #a and its ancestors are hovered.
+        let text = dom.children(a).next().unwrap();
+        let states = States {
+            hover: Some(text),
+            active: Some(text),
+            focus: Some(i),
+            focus_visible: false,
+        };
+        let (dom, map) = styled_in(src, css, &states);
+        assert_eq!(map.style(a).color, RED);
+        assert_eq!(map.style(a).font_weight, 700);
+        assert_eq!(map.style(a).margin[3], Length::ZERO, ":not(:hover) fails");
+        assert_eq!(
+            map.style(b).color,
+            BLUE,
+            "a sibling with the same attributes is not hovered"
+        );
+        assert_eq!(map.style(b).margin[3], Length::Px(Px::new(4.0)));
+        assert_eq!(map.style(by_id(&dom, "nav")).background_color, RED);
+        assert_eq!(map.style(i).margin[0], Length::Px(Px::new(1.0)));
+        assert_eq!(
+            map.style(i).outline_width,
+            Px::ZERO,
+            "focus from the pointer is not visible"
+        );
+        assert_eq!(
+            map.style(by_id(&dom, "f")).padding[0],
+            Length::Px(Px::new(3.0))
+        );
+
+        let visible = States {
+            focus_visible: true,
+            ..states
+        };
+        let (_, map) = styled_in(src, css, &visible);
+        assert_eq!(map.style(i).outline_width, Px::new(2.0));
+        assert_eq!(map.style(i).outline_color, RED);
+        let (_, map) = styled_in(src, css, &States::default());
+        assert_eq!(map.style(a).color, BLUE);
+        assert_eq!(map.style(by_id(&dom, "f")).padding[0], Length::ZERO);
+    }
+
+    #[test]
+    fn generates_before_and_after_boxes() {
+        let (dom, map) = styled(
+            "<p id=p title=Hi>x</p><p id=q>y</p><img id=i><div id=d>z</div><span id=s>w</span>",
+            r#"p::before { content: "\201C" attr(title) " "; color: red }
+               p:after { content: '!'; display: block }
+               img::before { content: "no" }
+               #d::before { content: none } #d::after { content: "x"; display: none }
+               #s::before { content: "" }"#,
+        );
+        let g = map.generated();
+        let (p, q) = (by_id(&dom, "p"), by_id(&dom, "q"));
+        let of = |owner: NodeId| -> Vec<(bool, &str)> {
+            g.iter()
+                .filter(|g| g.owner == owner)
+                .map(|g| (g.after, &*g.text))
+                .collect()
+        };
+        assert_eq!(of(p), [(false, "\u{201c}Hi "), (true, "!")]);
+        assert_eq!(
+            of(q),
+            [(false, "\u{201c} "), (true, "!")],
+            "attr() of a missing attribute"
+        );
+        assert!(
+            of(by_id(&dom, "i")).is_empty(),
+            "images get no generated boxes"
+        );
+        assert!(
+            of(by_id(&dom, "d")).is_empty(),
+            "content: none and display: none"
+        );
+        assert_eq!(
+            of(by_id(&dom, "s")),
+            [(false, "")],
+            "an empty string still makes a box"
+        );
+        let before = &g[0];
+        assert_eq!(map.styles[before.style as usize].color, RED);
+        assert_eq!(map.styles[g[1].style as usize].display, Display::Block);
+        assert_ne!(
+            map.style(p).color,
+            RED,
+            "the element itself is not styled by ::before"
+        );
+    }
+
+    #[test]
+    fn shared_siblings_keep_their_generated_boxes() {
+        let (dom, map) = styled(
+            "<ul><li>a</li><li>b</li><li>c</li></ul>",
+            r#"li::before { content: "- " }"#,
+        );
+        let items = all(&dom, "li");
+        let owners: Vec<NodeId> = map.generated().iter().map(|g| g.owner).collect();
+        assert_eq!(owners, items);
+    }
+
+    #[test]
+    fn a_state_change_matters_only_where_a_rule_can_see_it() {
+        let src = "<p id=p>text</p><a id=a href=x>link</a><div id=d><input id=i></div>";
+        let dom = html::parse(src);
+        let (p, a, i, d) = (
+            by_id(&dom, "p"),
+            by_id(&dom, "a"),
+            by_id(&dom, "i"),
+            by_id(&dom, "d"),
+        );
+        let hover = |n| States {
+            hover: Some(n),
+            ..States::default()
+        };
+        let (dom, plain) = styled_in(src, "p { color: red }", &States::default());
+        assert_eq!(plain.states_used(), 0);
+        assert!(!plain.state_change_matters(&dom, &hover(p), &hover(a)));
+
+        let (dom, links) = styled_in(src, "a:hover { color: red }", &States::default());
+        assert_eq!(links.states_used(), HOVER);
+        let text = dom.children(a).next().unwrap();
+        assert!(links.state_change_matters(&dom, &States::default(), &hover(text)));
+        assert!(
+            links.state_change_matters(&dom, &hover(a), &hover(p)),
+            "leaving the link"
+        );
+        assert!(
+            !links.state_change_matters(&dom, &hover(p), &hover(d)),
+            "no link involved"
+        );
+        assert!(
+            !links.state_change_matters(&dom, &hover(a), &hover(text)),
+            "still on the link"
+        );
+
+        let (dom, within) = styled_in(src, "div:focus-within { color: red }", &States::default());
+        let focus = |n| States {
+            focus: Some(n),
+            ..States::default()
+        };
+        assert!(within.state_change_matters(&dom, &States::default(), &focus(i)));
+        assert!(!within.state_change_matters(&dom, &States::default(), &focus(a)));
+        assert!(!within.state_change_matters(&dom, &States::default(), &hover(i)));
     }
 
     #[test]

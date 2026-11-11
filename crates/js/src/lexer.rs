@@ -157,7 +157,7 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, String> {
             if j == i {
                 return Err(format!(
                     "line {line}: unexpected character {:?}",
-                    &src[i..].chars().next()
+                    src[i..].chars().next()
                 ));
             }
             let name = src[i..j].to_string();

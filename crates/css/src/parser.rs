@@ -28,6 +28,11 @@ pub enum Declaration {
         value: Box<GridValue>,
         important: bool,
     },
+    /// `content`, kept as written (strings keep their case).
+    Content {
+        value: Box<Content>,
+        important: bool,
+    },
     /// A value that uses `var()`. Substituted and parsed per element during the cascade.
     Pending {
         name: Box<str>,
@@ -42,6 +47,7 @@ impl Declaration {
             Declaration::Typed(d) => d.important,
             Declaration::Custom { important, .. }
             | Declaration::Pending { important, .. }
+            | Declaration::Content { important, .. }
             | Declaration::Grid { important, .. } => *important,
         }
     }
@@ -236,6 +242,15 @@ pub fn parse_declarations(src: &str) -> Vec<Declaration> {
 
 /// Expand one declaration whose value no longer contains `var()` into longhand declarations.
 pub fn expand_declaration(name: &str, value: &str, important: bool) -> Vec<Declaration> {
+    if name == "content" {
+        return parse_content(value)
+            .map(|c| Declaration::Content {
+                value: Box::new(c),
+                important,
+            })
+            .into_iter()
+            .collect();
+    }
     let mut sink = Sink {
         out: Vec::new(),
         important,
@@ -310,6 +325,7 @@ fn expand(name: &str, v: &str, sink: &mut Sink) {
         "border-style" => box4(v, BORDER_STYLE, sink),
         "border-color" => box4(v, BORDER_COLOR, sink),
         "border" => border(v, &[0, 1, 2, 3], sink),
+        "outline" => outline(v, sink),
         "background" => background(v, sink),
         "font" => font(v, sink),
         "text-decoration-line" => expand("text-decoration", v, sink),
@@ -372,6 +388,7 @@ fn longhands(name: &str) -> Vec<Prop> {
         "border-style" => BORDER_STYLE.to_vec(),
         "border-color" => BORDER_COLOR.to_vec(),
         "border" => [BORDER_WIDTH, BORDER_STYLE, BORDER_COLOR].concat(),
+        "outline" => vec![Prop::OutlineWidth, Prop::OutlineStyle, Prop::OutlineColor],
         "background" => vec![Prop::BackgroundColor],
         "font" => vec![
             Prop::FontSize,
@@ -434,6 +451,10 @@ fn single_prop(name: &str) -> Option<Prop> {
         "caption-side" => Prop::CaptionSide,
         "float" => Prop::Float,
         "clear" => Prop::Clear,
+        "outline-width" => Prop::OutlineWidth,
+        "outline-style" => Prop::OutlineStyle,
+        "outline-color" => Prop::OutlineColor,
+        "outline-offset" => Prop::OutlineOffset,
         _ => {
             if let Some(side) = name.strip_prefix("margin-").and_then(side_index) {
                 return Some(MARGIN[side]);
@@ -581,6 +602,15 @@ fn parse_for(prop: Prop, v: &str) -> Option<Value> {
             "none" => crate::values::Clear::None,
             _ => return None,
         })),
+        OutlineWidth => parse_border_width(v).map(Value::Length),
+        // `auto` is the browser's own ring; it is drawn as a solid line.
+        OutlineStyle if v == "auto" => Some(Value::BorderStyle(true)),
+        OutlineStyle => parse_border_style(v).map(Value::BorderStyle),
+        OutlineColor if v == "invert" => Some(Value::CurrentColor),
+        OutlineColor => parse_color_value(v),
+        OutlineOffset => parse_length(v)
+            .filter(|l| !matches!(l, SpecLength::Auto | SpecLength::Percent(_)))
+            .map(Value::Length),
         CaptionSide => match v {
             "bottom" => Some(Value::CaptionBottom(true)),
             "top" => Some(Value::CaptionBottom(false)),
@@ -658,6 +688,110 @@ fn border(v: &str, sides: &[usize], sink: &mut Sink) {
         sink.set(BORDER_STYLE[side], style);
         sink.set(BORDER_COLOR[side], color);
     }
+}
+
+/// `outline: 2px solid blue`, `outline: none`, `outline: auto`.
+fn outline(v: &str, sink: &mut Sink) {
+    let mut width = Value::Length(SpecLength::Px(3.0));
+    let mut style = Value::BorderStyle(false);
+    let mut color = Value::CurrentColor;
+    for token in split_values(v) {
+        if token == "auto" {
+            style = Value::BorderStyle(true);
+            width = Value::Length(SpecLength::Px(2.0));
+        } else if let Some(s) = parse_border_style(token) {
+            style = Value::BorderStyle(s);
+        } else if let Some(w) = parse_border_width(token) {
+            width = Value::Length(w);
+        } else if let Some(c) = parse_color_value(token) {
+            color = c;
+        } else if token != "invert" {
+            return;
+        }
+    }
+    sink.set(Prop::OutlineWidth, width);
+    sink.set(Prop::OutlineStyle, style);
+    sink.set(Prop::OutlineColor, color);
+}
+
+/// `content`: strings and `attr()`, or `none` / `normal`. Anything else (counters, quotes,
+/// images) drops the declaration rather than showing part of it.
+pub(crate) fn parse_content(v: &str) -> Option<Content> {
+    // `content: "x" / "alt text"`: the part after the slash is for screen readers.
+    let v = split_top_level(v, b'/').into_iter().next()?.trim();
+    if v.eq_ignore_ascii_case("none") || v.eq_ignore_ascii_case("normal") {
+        return Some(Content::None);
+    }
+    let mut parts = Vec::new();
+    let mut rest = v;
+    while !rest.is_empty() {
+        if let Some(q @ ('"' | '\'')) = rest.chars().next() {
+            let (text, after) = css_string(&rest[1..], q)?;
+            parts.push(ContentPart::Text(text.into()));
+            rest = after;
+        } else if rest.len() >= 5 && rest[..5].eq_ignore_ascii_case("attr(") {
+            let close = rest.find(')')?;
+            let name = rest[5..close].trim();
+            if name.is_empty()
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            {
+                return None;
+            }
+            parts.push(ContentPart::Attr(name.to_ascii_lowercase().into()));
+            rest = &rest[close + 1..];
+        } else {
+            return None;
+        }
+        rest = rest.trim_start();
+    }
+    Some(Content::Parts(parts))
+}
+
+/// The text of a CSS string after its opening quote `q`, with escapes decoded (`\f101`, `\"`),
+/// and what follows the closing quote.
+fn css_string(s: &str, q: char) -> Option<(String, &str)> {
+    let mut out = String::new();
+    let mut chars = s.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            _ if c == q => return Some((out, &s[i + 1..])),
+            '\\' => {
+                let &(_, next) = chars.peek()?;
+                if next.is_ascii_hexdigit() {
+                    let mut code = 0u32;
+                    for _ in 0..6 {
+                        match chars.peek() {
+                            Some(&(_, h)) if h.is_ascii_hexdigit() => {
+                                code = code * 16 + h.to_digit(16)?;
+                                chars.next();
+                            }
+                            _ => break,
+                        }
+                    }
+                    // One white space character after a hex escape belongs to it.
+                    if chars.peek().is_some_and(|&(_, w)| w.is_ascii_whitespace()) {
+                        chars.next();
+                    }
+                    out.push(
+                        char::from_u32(code)
+                            .filter(|&c| c != '\0')
+                            .unwrap_or('\u{fffd}'),
+                    );
+                } else {
+                    chars.next();
+                    // An escaped newline continues the string.
+                    if next != '\n' {
+                        out.push(next);
+                    }
+                }
+            }
+            '\n' => return None,
+            _ => out.push(c),
+        }
+    }
+    None
 }
 
 /// Only the color part of `background` is used; images and positions come later.
@@ -1027,6 +1161,71 @@ fn block_end(s: &str, open: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_content_with_escapes_and_attr() {
+        let content = |v: &str| parse_content(v);
+        let text = |s: &str| ContentPart::Text(s.into());
+        assert_eq!(
+            content(r#""Hello""#),
+            Some(Content::Parts(vec![text("Hello")]))
+        );
+        assert_eq!(
+            content(r#""\f101""#),
+            Some(Content::Parts(vec![text("\u{f101}")]))
+        );
+        assert_eq!(
+            content(r#""\201C x""#),
+            Some(Content::Parts(vec![text("\u{201c}x")])),
+            "one space ends the escape"
+        );
+        assert_eq!(
+            content(r#"'it\'s'"#),
+            Some(Content::Parts(vec![text("it's")]))
+        );
+        assert_eq!(
+            content(r#""(" attr(data-Count) ")""#),
+            Some(Content::Parts(vec![
+                text("("),
+                ContentPart::Attr("data-count".into()),
+                text(")")
+            ]))
+        );
+        assert_eq!(
+            content(r#""x" / "alt""#),
+            Some(Content::Parts(vec![text("x")]))
+        );
+        assert_eq!(content("none"), Some(Content::None));
+        assert_eq!(content("normal"), Some(Content::None));
+        for dropped in [
+            "counter(item)",
+            "open-quote",
+            r#""a" counter(x)"#,
+            r#""unclosed"#,
+            "url(x.png)",
+        ] {
+            assert_eq!(content(dropped), None, "{dropped}");
+        }
+        // Strings keep their case even though other values are lowercased.
+        let decls = parse_declarations(r#"content: "MiXeD""#);
+        assert!(matches!(&decls[..], [Declaration::Content { value, .. }]
+            if **value == Content::Parts(vec![text("MiXeD")])));
+    }
+
+    #[test]
+    fn parses_outline() {
+        let d = typed("outline: 2px dashed red");
+        assert_eq!(d.len(), 3);
+        assert_eq!(d[0].value, Value::Length(SpecLength::Px(2.0)));
+        assert_eq!(d[1].value, Value::BorderStyle(true));
+        assert_eq!(typed("outline: none")[1].value, Value::BorderStyle(false));
+        assert_eq!(typed("outline: auto")[1].value, Value::BorderStyle(true));
+        assert_eq!(
+            typed("outline-offset: -2px")[0].value,
+            Value::Length(SpecLength::Px(-2.0))
+        );
+        assert!(typed("outline: 2px wobbly").is_empty());
+    }
 
     fn typed(s: &str) -> Vec<Decl> {
         parse_declarations(s)

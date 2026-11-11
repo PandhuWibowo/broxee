@@ -622,6 +622,29 @@ impl Painter {
                         });
                     }
                 }
+                if style.outline_width > css::Px::ZERO && style.outline_color.a > 0 {
+                    // Outside the border box (moved out by the offset), taking no space.
+                    let w = ((style.outline_width.to_f32() * s).round() as i32).max(1);
+                    let off = (style.outline_offset.to_f32() * s).round() as i32;
+                    let (ox0, oy0, ox1, oy1) =
+                        (x0 - off - w, y0 - off - w, x1 + off + w, y1 + off + w);
+                    let color = style.outline_color;
+                    for (fx0, fy0, fx1, fy1) in [
+                        (ox0, oy0, ox1, oy0 + w),
+                        (ox0, oy1 - w, ox1, oy1),
+                        (ox0, oy0 + w, ox0 + w, oy1 - w),
+                        (ox1 - w, oy0 + w, ox1, oy1 - w),
+                    ] {
+                        items.push(Item::Fill {
+                            x0: fx0,
+                            y0: fy0,
+                            x1: fx1,
+                            y1: fy1,
+                            color,
+                            clip,
+                        });
+                    }
+                }
                 if let Some((id, data)) = page.images.and_then(|images| images.image(b.node)) {
                     // The content box: inside the border and any fixed padding.
                     let pad = style.padding.map(|p| match p {

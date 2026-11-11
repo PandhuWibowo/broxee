@@ -127,8 +127,8 @@ pub(crate) fn decode(data: &[u8], target: (u32, u32)) -> Result<Bitmap, Error> {
         let mut d = vp8l::Decoder::new(lossless, None)?;
         let mut rgba = vec![0u8; d.width * 4];
         for _ in 0..d.height {
-            for (px, &p) in rgba.chunks_exact_mut(4).zip(d.next_row()?) {
-                px.copy_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, p as u8, (p >> 24) as u8]);
+            for (px, &p) in rgba.as_chunks_mut::<4>().0.iter_mut().zip(d.next_row()?) {
+                *px = [(p >> 16) as u8, (p >> 8) as u8, p as u8, (p >> 24) as u8];
             }
             out.frame_row(&rgba);
         }
