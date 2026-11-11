@@ -249,7 +249,7 @@ impl Engine<'_> {
         };
         let mut items = Vec::new();
         let mut run: Option<(NodeId, usize, bool)> = None;
-        for child in dom.children(container) {
+        for child in crate::kids(dom, container) {
             match dom.kind(child) {
                 NodeKind::Text(text) => {
                     let visible = !text.trim_ascii().is_empty();

@@ -117,6 +117,13 @@ pub struct Dom {
     values: String,
     atoms: Vec<Box<str>>,
     atom_index: HashMap<Box<str>, Atom, FastBuildHasher>,
+    /// Boxes CSS generates (`::before`, `::after`) per element: an element whose parent is
+    /// that element but which is not among its children, so the tree as selectors and
+    /// scripts see it never changes. Layout adds them around the children. Each element's
+    /// pair is kept and reused from one restyle to the next; `bool` says it is shown now.
+    generated: HashMap<NodeId, [(NodeId, bool); 2], FastBuildHasher>,
+    /// How many generated boxes are shown: zero lets `generated()` skip the lookup.
+    shown_generated: usize,
 }
 
 /// Hasher for engine tables keyed by page data (tags, classes, computed styles, glyph keys).
@@ -206,6 +213,8 @@ impl Dom {
             values: String::new(),
             atoms: Vec::new(),
             atom_index: HashMap::default(),
+            generated: HashMap::default(),
+            shown_generated: 0,
         }
     }
 
@@ -247,6 +256,14 @@ impl Dom {
         Children {
             dom: self,
             next: self.nodes[id as usize].first_child,
+        }
+    }
+
+    /// An iterator over no nodes.
+    pub fn no_children(&self) -> Children<'_> {
+        Children {
+            dom: self,
+            next: NONE,
         }
     }
 
@@ -379,6 +396,59 @@ impl Dom {
         let n = &mut self.nodes[id as usize];
         n.a = start;
         n.b = len;
+    }
+
+    /// The boxes generated before and after the children of `owner`, when shown.
+    #[inline]
+    pub fn generated(&self, owner: NodeId) -> [Option<NodeId>; 2] {
+        if self.shown_generated == 0 {
+            return [None, None];
+        }
+        match self.generated.get(&owner) {
+            Some(pair) => pair.map(|(node, shown)| (shown && node != NONE).then_some(node)),
+            None => [None, None],
+        }
+    }
+
+    /// Hide every generated box, before the cascade's new set is shown.
+    pub fn hide_generated(&mut self) {
+        for pair in self.generated.values_mut() {
+            pair[0].1 = false;
+            pair[1].1 = false;
+        }
+        self.shown_generated = 0;
+    }
+
+    /// Show the box generated before (or `after`) the children of `owner`, holding `text`.
+    /// Returns the generated element and its text node, made once per element and reused.
+    pub fn show_generated(&mut self, owner: NodeId, after: bool, text: &str) -> (NodeId, NodeId) {
+        let slot = usize::from(after);
+        let existing = self.generated.get(&owner).map(|pair| pair[slot].0);
+        let element = match existing {
+            Some(node) if node != NONE => node,
+            _ => {
+                let node = self.create_element(if after { "::after" } else { "::before" });
+                // The parent link without a place among the children.
+                self.nodes[node as usize].parent = owner;
+                self.append_text(node, "");
+                node
+            }
+        };
+        let text_node = self.nodes[element as usize].first_child;
+        if !matches!(self.kind(text_node), NodeKind::Text(t) if t == text) {
+            self.set_text(text_node, text);
+        }
+        let pair = self.generated.entry(owner).or_insert([(NONE, false); 2]);
+        if !pair[slot].1 {
+            self.shown_generated += 1;
+        }
+        pair[slot] = (element, true);
+        (element, text_node)
+    }
+
+    /// Whether `id` is a box CSS generated (whose parent is the element it belongs to).
+    pub fn is_generated(&self, id: NodeId) -> bool {
+        matches!(self.tag_name(id), Some("::before" | "::after"))
     }
 
     /// A new element with no parent, for a script to insert later (`createElement`).
@@ -960,5 +1030,37 @@ mod tests {
         assert_eq!(dom.attr(a, "hidden"), Some(""));
         assert_eq!(dom.attr(a, "target"), Some("_blank"));
         assert_eq!(dom.attr(a, "missing"), None);
+    }
+
+    #[test]
+    fn generated_boxes_stay_outside_the_tree_and_are_reused() {
+        let mut dom = parse("<p>a</p>");
+        let p = dom.find_first("p").unwrap();
+        let count = dom.descendants(Dom::ROOT).count();
+        assert_eq!(dom.generated(p), [None, None]);
+        let (before, text) = dom.show_generated(p, false, "x");
+        assert_eq!(dom.generated(p), [Some(before), None]);
+        assert_eq!(
+            (dom.parent(before), dom.tag_name(before)),
+            (Some(p), Some("::before"))
+        );
+        assert!(dom.is_generated(before));
+        assert!(matches!(dom.kind(text), NodeKind::Text("x")));
+        assert_eq!(
+            dom.descendants(Dom::ROOT).count(),
+            count,
+            "not among the descendants"
+        );
+        assert_eq!(dom.children(p).count(), 1);
+
+        let len = dom.len();
+        dom.hide_generated();
+        assert_eq!(dom.generated(p), [None, None]);
+        let (again, text) = dom.show_generated(p, false, "y");
+        assert_eq!(again, before, "the same node comes back");
+        assert!(matches!(dom.kind(text), NodeKind::Text("y")));
+        assert_eq!(dom.len(), len, "no new nodes");
+        let (after, _) = dom.show_generated(p, true, "");
+        assert_eq!(dom.generated(p), [Some(before), Some(after)]);
     }
 }

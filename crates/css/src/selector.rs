@@ -65,6 +65,22 @@ impl AttrSel {
     }
 }
 
+/// Element states a compound can require (`Compound::states`), and that `crate::States` holds.
+pub const HOVER: u8 = 1;
+pub const ACTIVE: u8 = 2;
+pub const FOCUS: u8 = 4;
+pub const FOCUS_VISIBLE: u8 = 8;
+pub const FOCUS_WITHIN: u8 = 16;
+
+/// The box a selector styles: the element, or one generated before or after its content.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Pseudo {
+    #[default]
+    None,
+    Before,
+    After,
+}
+
 /// `:nth-child(an+b)` and friends: the element's 1-based position `i` among its element
 /// siblings (counted from the end when `from_end`) must equal `a*n + b` for some n >= 0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,8 +123,12 @@ pub struct Compound {
     pub nth: Vec<Nth>,
     /// `:not(...)` arguments: none of them may match.
     pub not: Vec<Compound>,
-    /// A state that never holds on a freshly loaded page (`:hover`, `:focus`, `:visited`), or
-    /// a pseudo-element Broxee does not generate (`::before`). A compound with this never matches.
+    /// `:hover`, `:active`, `:focus`, `:focus-visible`, `:focus-within` (`HOVER` and so on).
+    pub states: u8,
+    /// `::before` / `::after`; only the subject may have one, and it moves to `Selector::pseudo`.
+    pub pseudo: Pseudo,
+    /// A state Broxee never sets (`:visited`, `:target`), or a pseudo-element it does not
+    /// generate (`::marker`). A compound with this never matches.
     pub never: bool,
 }
 
@@ -117,6 +137,11 @@ impl Compound {
     /// which style sharing between siblings must take into account.
     pub fn is_structural(&self) -> bool {
         !self.nth.is_empty() || self.empty || self.not.iter().any(Compound::is_structural)
+    }
+
+    /// The states this compound or its `:not()` arguments look at.
+    pub fn all_states(&self) -> u8 {
+        self.not.iter().fold(self.states, |s, c| s | c.all_states())
     }
 
     /// (ids, classes and attributes and pseudo-classes, types)
@@ -132,11 +157,12 @@ impl Compound {
         .iter()
         .filter(|&&p| p)
         .count()
-            + self.nth.len();
+            + self.nth.len()
+            + self.states.count_ones() as usize;
         let mut s = (
             u32::from(self.id.is_some()),
             (self.classes.len() + self.attrs.len() + pseudo) as u32,
-            u32::from(self.tag.is_some()),
+            u32::from(self.tag.is_some()) + u32::from(self.pseudo != Pseudo::None),
         );
         // `:not()` counts as its most specific argument.
         if let Some(arg) = self.not.iter().map(Compound::specificity).max() {
@@ -151,6 +177,8 @@ impl Compound {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Selector {
     pub parts: Vec<(Compound, Combinator)>,
+    /// `::before` or `::after`: the rule styles a box generated in the subject, not the subject.
+    pub pseudo: Pseudo,
     /// (ids, classes + attributes + pseudo-classes, types) packed so a plain integer comparison
     /// orders them correctly: ids in bits 20..30, classes in 10..20, types in 0..10.
     pub specificity: u32,
@@ -222,7 +250,12 @@ fn parse_selector(input: &str) -> Option<Selector> {
     let mut i = 0;
     loop {
         let (compound, next) = parse_compound(s, i)?;
-        if compound.never {
+        // A pseudo-element ends the selector: `p::before span` means nothing.
+        if compound.never
+            || compounds
+                .last()
+                .is_some_and(|c: &Compound| c.pseudo != Pseudo::None)
+        {
             return None;
         }
         compounds.push(compound);
@@ -257,6 +290,7 @@ fn parse_selector(input: &str) -> Option<Selector> {
         .fold((0, 0, 0), |a, c| (a.0 + c.0, a.1 + c.1, a.2 + c.2));
     let specificity = (ids.min(1023) << 20) + (classes.min(1023) << 10) + types.min(1023);
 
+    let pseudo = std::mem::take(&mut compounds.last_mut()?.pseudo);
     let parts = compounds
         .into_iter()
         .enumerate()
@@ -270,7 +304,11 @@ fn parse_selector(input: &str) -> Option<Selector> {
             (compound, relation)
         })
         .collect();
-    Some(Selector { parts, specificity })
+    Some(Selector {
+        parts,
+        pseudo,
+        specificity,
+    })
 }
 
 /// Parse one compound starting at byte `start`. Returns `None` if there is nothing there or it
@@ -282,6 +320,7 @@ fn parse_compound(s: &str, start: usize) -> Option<(Compound, usize)> {
     let mut any = false;
     while i < b.len() {
         match b[i] {
+            b'*' | b'#' | b'.' | b'[' if c.pseudo != Pseudo::None => return None,
             b'*' => i += 1,
             b'#' => {
                 let (name, next) = ident(s, i + 1)?;
@@ -299,10 +338,18 @@ fn parse_compound(s: &str, start: usize) -> Option<(Compound, usize)> {
                 i = end + 1;
             }
             b':' => {
+                if c.pseudo != Pseudo::None {
+                    // Nothing may follow a pseudo-element (`::before:hover` is not supported).
+                    return None;
+                }
                 if b.get(i + 1) == Some(&b':') {
-                    // Pseudo-elements (::before, ::marker...) are not generated.
-                    let (_, next) = ident(s, i + 2)?;
-                    c.never = true;
+                    let (name, next) = ident(s, i + 2)?;
+                    match name.to_ascii_lowercase().as_str() {
+                        "before" => c.pseudo = Pseudo::Before,
+                        "after" => c.pseudo = Pseudo::After,
+                        // Other pseudo-elements (::marker, ::placeholder...) are not generated.
+                        _ => c.never = true,
+                    }
                     i = next;
                     any = true;
                     continue;
@@ -321,6 +368,7 @@ fn parse_compound(s: &str, start: usize) -> Option<(Compound, usize)> {
             }
             b'>' | b'+' | b'~' | b',' => break,
             c0 if c0.is_ascii_whitespace() => break,
+            _ if c.pseudo != Pseudo::None => return None,
             _ => {
                 if any {
                     return None;
@@ -372,24 +420,31 @@ fn pseudo_class(c: &mut Compound, name: &str, arg: Option<&str>) -> Option<()> {
             for part in split_list(arg) {
                 let part = part.trim();
                 let (inner, end) = parse_compound(part, 0)?;
-                if end != part.len() {
+                if end != part.len() || inner.pseudo != Pseudo::None {
                     // Complex selectors inside :not() are not supported.
                     return None;
                 }
-                // `:not(:hover)` always holds: drop an argument that can never match.
+                // `:not(:visited)` always holds: drop an argument that can never match.
                 if !inner.never {
                     c.not.push(inner);
                 }
             }
         }
-        // States that never hold on a page nobody has interacted with yet.
+        ("hover", None) => c.states |= HOVER,
+        ("active", None) => c.states |= ACTIVE,
+        ("focus", None) => c.states |= FOCUS,
+        ("focus-visible", None) => c.states |= FOCUS_VISIBLE,
+        ("focus-within", None) => c.states |= FOCUS_WITHIN,
+        // States Broxee never sets: there is no history, no fragment target, no validation.
         (
-            "hover" | "active" | "focus" | "focus-visible" | "focus-within" | "visited" | "target"
-            | "placeholder-shown" | "autofill" | "indeterminate" | "invalid" | "user-invalid",
+            "visited" | "target" | "placeholder-shown" | "autofill" | "indeterminate" | "invalid"
+            | "user-invalid",
             None,
         ) => c.never = true,
         // CSS 2 single-colon pseudo-elements.
-        ("before" | "after" | "first-line" | "first-letter", None) => c.never = true,
+        ("before", None) => c.pseudo = Pseudo::Before,
+        ("after", None) => c.pseudo = Pseudo::After,
+        ("first-line" | "first-letter", None) => c.never = true,
         _ => return None,
     }
     Some(())
@@ -612,12 +667,15 @@ mod tests {
     fn handles_not_and_never_matching_states() {
         let sel = one("a:not(.x, [hidden])");
         assert_eq!(sel.parts[0].0.not.len(), 2);
-        // :not(:hover) always holds, so the argument disappears.
-        assert!(one("a:not(:hover)").parts[0].0.not.is_empty());
+        // :not(:visited) always holds, so the argument disappears.
+        assert!(one("a:not(:visited)").parts[0].0.not.is_empty());
+        assert_eq!(one("a:not(:hover)").parts[0].0.not[0].states, HOVER);
         for dropped in [
-            "a:hover",
-            "p::before",
-            "p:after",
+            "p::marker",
+            "p::before span",
+            "p::before:hover",
+            "p::before.x",
+            "a:not(::before)",
             "a:visited",
             "li:is(.x)",
             "a:not(p a)",
@@ -630,7 +688,30 @@ mod tests {
                 "{dropped} should be dropped"
             );
         }
-        assert_eq!(parse_selector_list("a:hover, b").len(), 1);
+        assert_eq!(parse_selector_list("a:visited, b").len(), 1);
+    }
+
+    #[test]
+    fn parses_states_and_generated_boxes() {
+        let sel = one(".menu:hover > a:focus-visible:active");
+        assert_eq!(sel.parts[0].0.states, FOCUS_VISIBLE | ACTIVE);
+        assert_eq!(sel.parts[1].0.states, HOVER);
+        assert_eq!(one("form:focus-within").parts[0].0.states, FOCUS_WITHIN);
+        assert_eq!(one("a:focus").parts[0].0.all_states(), FOCUS);
+        assert_eq!(one("a:not(:hover)").parts[0].0.all_states(), HOVER);
+        assert_eq!(one("a:hover").specificity, one("a.x").specificity);
+
+        let before = one("p.note::before");
+        assert_eq!(before.pseudo, Pseudo::Before);
+        assert_eq!(
+            before.parts[0].0.pseudo,
+            Pseudo::None,
+            "moved to the selector"
+        );
+        assert_eq!(one("a:hover:after").pseudo, Pseudo::After);
+        assert_eq!(one("::after").pseudo, Pseudo::After);
+        assert_eq!(one("p::before").specificity, one("div p").specificity);
+        assert_eq!(one("p").pseudo, Pseudo::None);
     }
 
     #[test]

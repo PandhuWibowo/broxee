@@ -372,6 +372,65 @@ enum Item {
 
 const NO_FRAGMENTS: u32 = u32::MAX;
 
+/// The children of a node as layout sees them: the box CSS generated before them
+/// (`::before`), the DOM children, then the one generated after. Generated boxes are not
+/// among the DOM children (`Dom::generated`), so selectors and scripts never see them.
+pub(crate) struct Kids<'a> {
+    before: Option<NodeId>,
+    rest: html::Children<'a>,
+    after: Option<NodeId>,
+}
+
+impl Iterator for Kids<'_> {
+    type Item = NodeId;
+
+    #[inline]
+    fn next(&mut self) -> Option<NodeId> {
+        if self.before.is_some() {
+            return self.before.take();
+        }
+        match self.rest.next() {
+            Some(n) => Some(n),
+            None => self.after.take(),
+        }
+    }
+}
+
+/// `node`'s children, with its generated boxes.
+pub(crate) fn kids(dom: &Dom, node: NodeId) -> Kids<'_> {
+    let [before, after] = dom.generated(node);
+    Kids {
+        before,
+        rest: dom.children(node),
+        after,
+    }
+}
+
+/// `first` and what follows it among its parent's children as `kids` lists them.
+pub(crate) fn kids_from(dom: &Dom, first: NodeId) -> Kids<'_> {
+    let [before, after] = dom.parent(first).map_or([None, None], |p| dom.generated(p));
+    if before == Some(first) {
+        let parent = dom.parent(first).unwrap_or(Dom::ROOT);
+        Kids {
+            before,
+            rest: dom.children(parent),
+            after,
+        }
+    } else if after == Some(first) {
+        Kids {
+            before: None,
+            rest: dom.no_children(),
+            after,
+        }
+    } else {
+        Kids {
+            before: None,
+            rest: dom.siblings_from(first),
+            after,
+        }
+    }
+}
+
 /// Vertical extent of an inline box around the baseline, after half-leading.
 #[derive(Clone, Copy, Default)]
 struct Extent {
@@ -412,7 +471,13 @@ impl<'a> Engine<'a> {
                     // An inline element that directly holds a block (an <a> around a <div>) is
                     // laid out as a block so its block child gets a proper box.
                     Display::Inline
-                        if self.dom.children(id).any(|c| self.level(c) == Level::Block) =>
+                        if self.dom.children(id).any(|c| self.level(c) == Level::Block)
+                            || self
+                                .dom
+                                .generated(id)
+                                .into_iter()
+                                .flatten()
+                                .any(|c| self.level(c) == Level::Block) =>
                     {
                         Level::Block
                     }
@@ -433,6 +498,24 @@ impl<'a> Engine<'a> {
         width: f32,
         definite_height: Option<f32>,
     ) -> f32 {
+        // The plain DOM walk unless the element has generated boxes: it is the hot path.
+        let dom = self.dom;
+        if dom.generated(node) == [None, None] {
+            self.layout_children_of(dom.children(node), node, x, y, width, definite_height)
+        } else {
+            self.layout_children_of(kids(dom, node), node, x, y, width, definite_height)
+        }
+    }
+
+    fn layout_children_of(
+        &mut self,
+        children: impl Iterator<Item = NodeId>,
+        node: NodeId,
+        x: f32,
+        y: f32,
+        width: f32,
+        definite_height: Option<f32>,
+    ) -> f32 {
         let centering = self.dom.element(node).is_some()
             && self.style(node).text_align == TextAlign::WebkitCenter;
         let outer_centering = std::mem::replace(&mut self.centering, centering);
@@ -441,8 +524,7 @@ impl<'a> Engine<'a> {
         // The open inline run as a sibling range (first, count): no allocation per box.
         // Hidden and out-of-flow siblings inside it are handled by `collect`.
         let mut run: Option<(NodeId, usize)> = None;
-        let dom = self.dom;
-        for child in dom.children(node) {
+        for child in children {
             match self.level(child) {
                 Level::Inline => match &mut run {
                     Some((_, count)) => *count += 1,
@@ -946,8 +1028,15 @@ impl<'a> Engine<'a> {
         self.line_width = width;
         let atomics_start = self.atomics.len();
         let dom = self.dom;
-        for node in dom.siblings_from(first).take(count) {
-            self.collect(node);
+        let generated = dom.parent(first).map_or([None, None], |p| dom.generated(p));
+        if generated == [None, None] {
+            for node in dom.siblings_from(first).take(count) {
+                self.collect(node);
+            }
+        } else {
+            for node in kids_from(dom, first).take(count) {
+                self.collect(node);
+            }
         }
         if self.items.is_empty() {
             return 0.0;
@@ -1131,6 +1220,7 @@ impl<'a> Engine<'a> {
 
     fn inline_needs_box(&self, s: &ComputedStyle) -> bool {
         s.background_color.a > 0
+            || s.outline_width != css::Px::ZERO
             || s.border_width.iter().any(|w| *w != css::Px::ZERO)
             || s.padding.iter().any(|p| *p != Length::ZERO)
     }
@@ -1296,8 +1386,15 @@ impl<'a> Engine<'a> {
                             });
                         }
                         let dom = self.dom;
+                        let [before, after] = dom.generated(id);
+                        if let Some(b) = before {
+                            self.collect(b);
+                        }
                         for child in dom.children(id) {
                             self.collect(child);
+                        }
+                        if let Some(a) = after {
+                            self.collect(a);
                         }
                         if decorated {
                             let (margin, edge) = self.inline_sides(s, 1);
@@ -1540,14 +1637,14 @@ mod tests {
 
     /// Approximate metrics: every character 0.5em, space 0.25em, ascent 0.8, descent 0.2.
     fn run(html_src: &str, css_src: &str, width: f32) -> (Dom, Layout) {
-        let dom = html::parse(html_src);
+        let mut dom = html::parse(html_src);
         let author = parse_stylesheet(css_src);
         let media = Media {
             width,
             height: 600.0,
             ..Media::default()
         };
-        let styles = cascade(
+        let mut styles = cascade(
             &dom,
             &[
                 (Origin::UserAgent, user_agent_stylesheet()),
@@ -1555,6 +1652,7 @@ mod tests {
             ],
             &media,
         );
+        styles.attach_generated(&mut dom);
         let layout = layout(&dom, &styles, &Approximate, &no_images, width, 600.0);
         (dom, layout)
     }
@@ -2447,5 +2545,31 @@ mod tests {
         let (_, l) = run("<p>x</p>", "", 300.0);
         assert_eq!(l.height, 600.0);
         assert_eq!(l.width, 300.0);
+    }
+
+    #[test]
+    fn lays_out_generated_boxes_around_the_content() {
+        let (dom, l) = run(
+            "<p>one <b>two</b></p><ul><li>x</li></ul><div id=c>c</div>",
+            r#"body { margin: 0 } p, ul { margin: 0; padding: 0 }
+               p::before { content: "> " } p::after { content: "!"; display: block }
+               li::before { content: "- " } #c::after { content: "z"; float: none }"#,
+            400.0,
+        );
+        assert_eq!(
+            lines(&l).into_iter().map(|(_, t)| t).collect::<Vec<_>>(),
+            [">|one|two", "!", "-|x", "c|z"]
+        );
+        // The generated text is in a node outside the tree, whose parent is the paragraph.
+        let p = dom.find_first("p").unwrap();
+        let gt = l.texts.iter().find(|t| l.text(t) == ">").unwrap().node;
+        let generated = dom.parent(gt).unwrap();
+        assert_eq!(dom.parent(generated), Some(p));
+        assert!(dom.children(p).all(|c| c != generated));
+        // The block after the paragraph's text has a box of its own.
+        assert!(l
+            .boxes
+            .iter()
+            .any(|b| dom.tag_name(b.node) == Some("::after")));
     }
 }

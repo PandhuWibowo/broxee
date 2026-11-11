@@ -139,6 +139,12 @@ pub struct Loaded {
     pub sources: Sources,
     pub styles: StyleMap,
     pub layout: Layout,
+    /// What the pointer is over, what is pressed and what has focus, for `:hover` and the
+    /// other state selectors.
+    pub states: css::States,
+    /// How many times the page was styled and laid out again after loading.
+    #[cfg_attr(not(test), allow(dead_code))] // read by tests
+    pub restyles: u32,
     pub fetch_ms: f64,
     pub parse_ms: f64,
     pub cascade_ms: f64,
@@ -386,8 +392,9 @@ fn finish(
     }
     // Join stage 1 before layout, the first stage that measures text.
     let fonts_wait_ms = fonts.ready();
+    let states = css::States::default();
     let (styles, cascade_ms, layout, layout_ms) =
-        style_and_layout(&dom, &css, &images, settings, fonts);
+        style_and_layout(&mut dom, &css, &images, &states, settings, fonts);
     progress(0.95);
     Some(Loaded {
         url: source.url,
@@ -405,6 +412,8 @@ fn finish(
         },
         styles,
         layout,
+        states,
+        restyles: 0,
         fetch_ms: source.fetch_ms,
         parse_ms: source.parse_ms,
         cascade_ms,
@@ -417,8 +426,15 @@ fn finish(
 /// change, so the cascade reruns as well.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
 pub fn relayout(page: &mut Loaded, settings: Settings, fonts: &FontStore) {
-    let (styles, cascade_ms, layout, layout_ms) =
-        style_and_layout(&page.dom, &page.css, &page.images, settings, fonts);
+    let (styles, cascade_ms, layout, layout_ms) = style_and_layout(
+        &mut page.dom,
+        &page.css,
+        &page.images,
+        &page.states,
+        settings,
+        fonts,
+    );
+    page.restyles += 1;
     page.styles = styles;
     page.cascade_ms = cascade_ms;
     page.layout = layout;
@@ -426,9 +442,10 @@ pub fn relayout(page: &mut Loaded, settings: Settings, fonts: &FontStore) {
 }
 
 fn style_and_layout(
-    dom: &Dom,
+    dom: &mut Dom,
     css: &LoadedCss,
     images: &ImageStore,
+    states: &css::States,
     settings: Settings,
     fonts: &FontStore,
 ) -> (StyleMap, f64, Layout, f64) {
@@ -443,7 +460,9 @@ fn style_and_layout(
     }
     sheets.extend(css.sheets.iter().map(|s| (Origin::Author, s)));
     let started = Instant::now();
-    let styles = css::cascade(dom, &sheets, &media);
+    let mut styles = css::cascade_with(dom, &sheets, &media, states);
+    // Boxes `::before` and `::after` generate become nodes outside the tree.
+    styles.attach_generated(dom);
     let cascade_ms = millis(started);
     let started = Instant::now();
     let natural = |node: NodeId| images.natural_size(node);

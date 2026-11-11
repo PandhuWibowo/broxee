@@ -315,6 +315,10 @@ pub struct ComputedStyle {
     /// Zero when the side's border style is `none`.
     pub border_width: [Px; 4],
     pub border_color: [Color; 4],
+    /// Zero when `outline-style` is `none`. Drawn outside the border box, taking no space.
+    pub outline_width: Px,
+    pub outline_color: Color,
+    pub outline_offset: Px,
 }
 
 impl ComputedStyle {
@@ -363,6 +367,9 @@ impl ComputedStyle {
             padding: [Length::ZERO; 4],
             border_width: [Px::ZERO; 4],
             border_color: [Color::BLACK; 4],
+            outline_width: Px::ZERO,
+            outline_color: Color::BLACK,
+            outline_offset: Px::ZERO,
         }
     }
 }
@@ -371,6 +378,21 @@ impl Default for ComputedStyle {
     fn default() -> Self {
         ComputedStyle::initial()
     }
+}
+
+/// `content` on `::before` / `::after`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Content {
+    /// `none` or `normal`: no box is generated.
+    None,
+    Parts(Vec<ContentPart>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ContentPart {
+    Text(Box<str>),
+    /// `attr(name)`: the element's attribute, or nothing.
+    Attr(Box<str>),
 }
 
 /// A length as written, before font sizes are known.
@@ -467,6 +489,10 @@ pub enum Prop {
     BorderSpacingV,
     BorderCollapse,
     CaptionSide,
+    OutlineWidth,
+    OutlineStyle,
+    OutlineColor,
+    OutlineOffset,
     MarginTop,
     MarginRight,
     MarginBottom,
@@ -644,6 +670,7 @@ mod tests {
         // Styles are deduplicated (a page has hundreds, nodes hold a 4-byte index), so size is
         // not a per-node cost; it is still hashed once per style computed. Grow it deliberately.
         let size = std::mem::size_of::<ComputedStyle>();
-        assert!(size <= 272, "ComputedStyle grew to {size} bytes");
+        // 280 since `outline` (width, color, offset).
+        assert!(size <= 280, "ComputedStyle grew to {size} bytes");
     }
 }

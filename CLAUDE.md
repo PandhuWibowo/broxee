@@ -181,6 +181,13 @@ casts), not taken from binding crates. Ask before proposing any dependency.
   Inline `style` declarations are freed per element: never cache by their address.
 - **The ancestor bloom filter must stay in step with the traversal**: every visited element is pushed, and
   `pop_to(parent)` runs before matching. Breaking that gives false "no match" results.
+- **Generated boxes (`::before`/`::after`) are nodes outside the tree** (`Dom::show_generated`): their parent is
+  the element, but they are not among its children, so selectors, scripts and `childNodes` never see them.
+  Layout adds them around the children (`layout::kids`, plain DOM walks when an element has none). Script events
+  that land on one go to its element. `content` rules alone are bucketed; rules that only style a generated
+  box are matched once a box exists (`RuleIndex::pseudo_styling`).
+- **A state change restyles only when a rule can see it** (`StyleMap::state_change_matters`). Pages without
+  state rules never hit-test the pointer for styles. Elements in a state never share a sibling's style.
 - **Computed values are integers** (`Px` is 1/64 px) so `ComputedStyle` can be hashed and deduplicated.
   Values that are lists or names (grid templates, placements) live in interned tables in `StyleMap`; the style
   holds their index.

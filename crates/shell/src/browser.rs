@@ -887,6 +887,8 @@ impl<S: Screen> Browser<S> {
         if let Event::Hover { x, y } = event {
             return self.hover_at(x as f32, y as f32);
         }
+        let from_key = matches!(event, Event::Key(_));
+        let focus_before = self.link_focus.as_ref().map(|l| l.node);
         // Anything else hides a tooltip, which needs a full frame.
         let hid = self.hover.take().is_some_and(|h| h.shown);
         let dirty = match event {
@@ -950,7 +952,62 @@ impl<S: Screen> Browser<S> {
         if hid {
             self.header_change = false;
         }
-        hid | dirty
+        let restyled = self.sync_focus(focus_before, from_key);
+        hid | dirty | restyled
+    }
+
+    /// Change the page's interactive states and style it again when a rule can see the
+    /// change (`StyleMap::state_change_matters`). Returns whether it was styled again.
+    fn set_states(&mut self, change: impl FnOnce(&mut css::States)) -> bool {
+        let Some(page) = self.page.as_mut() else {
+            return false;
+        };
+        let mut new = page.states;
+        change(&mut new);
+        if new == page.states {
+            return false;
+        }
+        let matters = page
+            .styles
+            .state_change_matters(&page.dom, &page.states, &new);
+        page.states = new;
+        if matters {
+            self.relayout_page();
+        }
+        matters
+    }
+
+    /// After an event: `:focus` follows the focused link or control. Focus is visible
+    /// (`:focus-visible`) when the keyboard moved it, or when it is in a text field.
+    fn sync_focus(&mut self, before: Option<NodeId>, from_key: bool) -> bool {
+        let focus = self.link_focus.as_ref().map(|l| l.node);
+        let text_field = self
+            .focused_control()
+            .zip(self.page.as_ref())
+            .is_some_and(|(i, page)| page.forms.is_text(i));
+        let moved = focus != before;
+        self.set_states(|s| {
+            if moved || s.focus != focus {
+                s.focus_visible = focus.is_some() && (from_key || text_field);
+            }
+            s.focus = focus;
+        })
+    }
+
+    /// The page node under the pointer, for `:hover` and `:active`: only looked for when
+    /// some rule uses that state, since it means hit-testing every move.
+    fn state_target(&self, x: f32, y: f32, state: u8) -> Option<NodeId> {
+        let page = self.page.as_ref()?;
+        if page.styles.states_used() & state == 0 {
+            return None;
+        }
+        if (self.sidebar && x < self.sidebar_edge() + 1.0) || y < HEADER_HEIGHT {
+            return None;
+        }
+        if self.menu.is_some() || self.palette.is_some() || self.dialog.is_some() {
+            return None;
+        }
+        self.node_at(x - self.pane_left(), y - HEADER_HEIGHT)
     }
 
     /// Pointer events over the panes. In the focused pane, y becomes relative to its top, so
@@ -1228,6 +1285,8 @@ impl<S: Screen> Browser<S> {
         let was_editing = self.field.take().is_some() | self.focus.take().is_some();
         let was_editing = was_editing | self.link_focus.take().is_some();
         self.editing = None;
+        let pressed = self.state_target(x + left, y, css::ACTIVE);
+        let was_editing = was_editing | self.set_states(|s| s.active = pressed);
         // Scripts hear the click first; preventDefault() keeps links and buttons still.
         if let Some(node) = self.node_at(x, y - HEADER_HEIGHT) {
             let (changed, prevented) = self.dispatch_page(node, "click");
@@ -1328,6 +1387,17 @@ impl<S: Screen> Browser<S> {
         let Some(script) = page.script.as_mut() else {
             return (false, false);
         };
+        // Scripts never see generated boxes: the event goes to the element they belong to.
+        let dom = &page.dom;
+        let mut node = node;
+        if matches!(dom.kind(node), html::NodeKind::Text(_))
+            && dom.parent(node).is_some_and(|p| dom.is_generated(p))
+        {
+            node = dom.parent(node).unwrap_or(node);
+        }
+        if dom.is_generated(node) {
+            node = dom.parent(node).unwrap_or(node);
+        }
         let r = crate::script::dispatch(
             script,
             &mut page.dom,
@@ -2227,10 +2297,12 @@ impl<S: Screen> Browser<S> {
 
     /// The pointer moved: start waiting for a new tooltip, or hide the one shown.
     fn hover_at(&mut self, x: f32, y: f32) -> bool {
+        let hovered = self.state_target(x, y, css::HOVER);
+        let restyled = self.set_states(|s| s.hover = hovered);
         let text = self.tooltip_at(x, y);
         let same = self.hover.as_ref().map(|h| &h.text) == text.as_ref();
         if same {
-            return false;
+            return restyled;
         }
         let was_shown = self.hover.as_ref().is_some_and(|h| h.shown);
         self.hover = text.map(|text| Hover {
@@ -2239,7 +2311,7 @@ impl<S: Screen> Browser<S> {
             since: std::time::Instant::now(),
             shown: false,
         });
-        was_shown
+        was_shown | restyled
     }
 
     /// Timers: show a tooltip once the pointer has rested long enough.
@@ -2329,6 +2401,9 @@ impl<S: Screen> Browser<S> {
 
     /// The button came up: finish a resize or a move.
     fn release(&mut self, _x: f32, _y: f32) -> bool {
+        if self.set_states(|s| s.active = None) {
+            return true;
+        }
         match self.drag.take() {
             Some(Drag::Resizing) => {
                 // The page is laid out again once, for the final width.
@@ -4446,6 +4521,178 @@ mod tests {
         act(&mut b, command('['));
         assert_eq!(title(&b), "Page A");
         assert_eq!(b.scroll, saved);
+    }
+
+    /// A page in its own temporary folder.
+    fn page_file(name: &str, html: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("broxee-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("page.html");
+        std::fs::write(&path, html).unwrap();
+        path
+    }
+
+    /// The window point at the middle of the first box drawn for an element with `id`.
+    fn box_center(b: &Browser<FakeScreen>, id: &str) -> (f64, f64) {
+        let page = b.page.as_ref().unwrap();
+        let r = page
+            .layout
+            .boxes
+            .iter()
+            .find(|f| page.dom.attr(f.node, "id") == Some(id))
+            .expect("a box for the element")
+            .rect;
+        (
+            f64::from(SIDEBAR_WIDTH + r.x + r.width / 2.0),
+            f64::from(HEADER_HEIGHT + r.y + r.height / 2.0 - b.scroll),
+        )
+    }
+
+    fn red(p: [u8; 4]) -> bool {
+        // The frame is BGRA.
+        p[2] > 200 && p[1] < 60 && p[0] < 60
+    }
+
+    #[test]
+    fn hover_restyles_a_link_and_only_when_a_rule_can_see_it() {
+        let page = page_file(
+            "hover",
+            "<style>body { margin: 0 } p { margin: 0; line-height: 20px; width: 200px }
+             a { color: blue } a:hover { background: rgb(255, 0, 0) }
+             span { padding: 2px }</style>
+             <p id=plain>plain text</p><p id=other>more text</p>
+             <p><a id=link href=x.html><span id=inner>A link</span></a></p>",
+        );
+        let mut b = browser(&page);
+        let restyles = |b: &Browser<FakeScreen>| b.page.as_ref().unwrap().restyles;
+        let hover =
+            |b: &mut Browser<FakeScreen>, (x, y): (f64, f64)| b.handle(Event::Hover { x, y });
+
+        // Between two paragraphs no rule can see the change: nothing is styled again.
+        let plain = box_center(&b, "plain");
+        let other = box_center(&b, "other");
+        hover(&mut b, plain);
+        hover(&mut b, other);
+        assert_eq!(restyles(&b), 0);
+
+        let link = box_center(&b, "inner");
+        assert!(hover(&mut b, link), "entering the link repaints");
+        assert_eq!(restyles(&b), 1);
+        b.render();
+        let (x, y) = box_center(&b, "link");
+        assert!(
+            red(b.window.pixel(x as usize, y as usize)),
+            "a:hover draws its background"
+        );
+        assert!(
+            !hover(&mut b, link),
+            "moving within the link changes nothing"
+        );
+        assert_eq!(restyles(&b), 1);
+
+        hover(&mut b, plain);
+        assert_eq!(restyles(&b), 2);
+        b.render();
+        assert!(
+            !red(b.window.pixel(x as usize, y as usize)),
+            "and loses it on leaving"
+        );
+    }
+
+    #[test]
+    fn a_page_without_state_rules_never_restyles_for_the_pointer() {
+        let page = page_file(
+            "nohover",
+            "<style>body { margin: 0 } a { color: blue; padding: 1px }</style>
+             <p id=p>text</p><p><a id=a href=x.html>link</a></p><input id=i>",
+        );
+        let mut b = browser(&page);
+        assert_eq!(b.page.as_ref().unwrap().styles.states_used(), 0);
+        for id in ["p", "a", "i", "p"] {
+            let (x, y) = box_center(&b, id);
+            b.handle(Event::Hover { x, y });
+        }
+        let (x, y) = box_center(&b, "i");
+        act(&mut b, Event::Click { x, y });
+        act(&mut b, Event::Release { x, y });
+        let page = b.page.as_ref().unwrap();
+        assert_eq!(page.restyles, 0);
+        assert_eq!(page.states.hover, None, "the pointer is not even looked up");
+    }
+
+    #[test]
+    fn focus_visible_outlines_a_field_reached_with_the_keyboard() {
+        let page = page_file(
+            "focus",
+            "<style>body { margin: 0 } input, button { margin: 20px }
+             input:focus-visible { outline: 3px solid rgb(255, 0, 0) }
+             button:focus-visible { outline: 3px solid rgb(255, 0, 0) }
+             button:active { background: rgb(0, 0, 255) }
+             form:focus-within { padding-left: 7px }</style>
+             <form id=f><input id=i><button id=go type=button>Go</button></form>",
+        );
+        let mut b = browser(&page);
+        let outline_point = |b: &Browser<FakeScreen>, id: &str| {
+            let page = b.page.as_ref().unwrap();
+            let r = page
+                .layout
+                .boxes
+                .iter()
+                .find(|f| page.dom.attr(f.node, "id") == Some(id))
+                .unwrap()
+                .rect;
+            (
+                (SIDEBAR_WIDTH + r.x - 2.0) as usize,
+                (HEADER_HEIGHT + r.y + r.height / 2.0) as usize,
+            )
+        };
+        // Tab goes through the header first, then into the page.
+        for _ in 0..6 {
+            if b.link_focus.is_some() {
+                break;
+            }
+            act(&mut b, key(Key::Tab));
+        }
+        let node_of = |b: &Browser<FakeScreen>, id: &str| {
+            let dom = &b.page.as_ref().unwrap().dom;
+            dom.descendants(html::Dom::ROOT)
+                .find(|&n| dom.attr(n, "id") == Some(id))
+                .expect("an element with that id")
+        };
+        let field = node_of(&b, "i");
+        assert_eq!(b.link_focus.as_ref().map(|l| l.node), Some(field));
+        let states = b.page.as_ref().unwrap().states;
+        assert!(states.focus_visible);
+        b.render();
+        let (x, y) = outline_point(&b, "i");
+        assert!(
+            red(b.window.pixel(x, y)),
+            "the outline is drawn outside the field"
+        );
+        let page = b.page.as_ref().unwrap();
+        let field_box = page.layout.boxes.iter().find(|f| f.node == field).unwrap();
+        assert_eq!(
+            field_box.rect.x,
+            20.0 + 7.0,
+            "form:focus-within pads the form"
+        );
+
+        // A button pressed with the pointer: :active while down, and no visible focus.
+        let go = node_of(&b, "go");
+        let (bx, by) = box_center(&b, "go");
+        act(&mut b, Event::Click { x: bx, y: by });
+        let page = b.page.as_ref().unwrap();
+        assert_eq!(
+            page.styles.style(go).background_color,
+            css::Color::rgb(0, 0, 255)
+        );
+        act(&mut b, Event::Release { x: bx, y: by });
+        let page = b.page.as_ref().unwrap();
+        assert_ne!(
+            page.styles.style(go).background_color,
+            css::Color::rgb(0, 0, 255)
+        );
+        assert_eq!(page.styles.style(go).outline_width, css::Px::ZERO);
     }
 
     #[test]
