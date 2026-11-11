@@ -1421,7 +1421,7 @@ impl Renderer<'_> {
             "polyline" | "polygon" => {
                 let v = numbers(self.doc.attr(n, "points").unwrap_or(""));
                 let mut p = Path::default();
-                for (k, xy) in v.chunks_exact(2).enumerate() {
+                for (k, xy) in v.as_chunks::<2>().0.iter().enumerate() {
                     if k == 0 {
                         p.move_to((xy[0], xy[1]));
                     } else {
