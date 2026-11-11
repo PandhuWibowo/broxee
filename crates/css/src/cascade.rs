@@ -1382,6 +1382,17 @@ fn compound_matches(
         .any(|inner| compound_matches(dom, names, states, inner, id))
 }
 
+/// The block-level display of a floated box (CSS 2.1 9.7).
+fn blockify(d: Display) -> Display {
+    match d {
+        Display::InlineFlex => Display::Flex,
+        Display::InlineGrid => Display::Grid,
+        Display::InlineTable => Display::Table,
+        Display::None | Display::Flex | Display::Grid | Display::Table | Display::ListItem => d,
+        _ => Display::Block,
+    }
+}
+
 fn bolder(w: u16) -> u16 {
     match w {
         0..350 => 400,
@@ -1603,9 +1614,36 @@ fn compute(
         s.order = n.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
     }
     match get(Prop::Overflow) {
-        Some(Value::Clips(c)) => s.clips = c,
-        Some(Value::Inherit) => s.clips = parent.clips,
+        Some(Value::Overflow { clips, visible }) => {
+            s.clips = clips;
+            s.flow_root = !visible;
+        }
+        Some(Value::Inherit) => {
+            s.clips = parent.clips;
+            s.flow_root = parent.flow_root;
+        }
         _ => {}
+    }
+    match get(Prop::Float) {
+        Some(Value::Float(f)) => s.float = f,
+        Some(Value::Inherit) => s.float = parent.float,
+        _ => {}
+    }
+    match get(Prop::Clear) {
+        Some(Value::Clear(c)) => s.clear = c,
+        Some(Value::Inherit) => s.clear = parent.clear,
+        _ => {}
+    }
+    if s.display == Display::FlowRoot {
+        s.display = Display::Block;
+        s.flow_root = true;
+    }
+    // CSS 2.1 9.7: absolute positioning wins over float, and a float is block-level.
+    if s.position.is_out_of_flow() {
+        s.float = Float::None;
+    }
+    if s.float != Float::None {
+        s.display = blockify(s.display);
     }
     for side in 0..4 {
         match get(INSET[side]) {
@@ -2135,6 +2173,40 @@ mod tests {
         assert!(within.state_change_matters(&dom, &States::default(), &focus(i)));
         assert!(!within.state_change_matters(&dom, &States::default(), &focus(a)));
         assert!(!within.state_change_matters(&dom, &States::default(), &hover(i)));
+    }
+
+    #[test]
+    fn computes_float_clear_and_formatting_contexts() {
+        let (dom, map) = styled(
+            "<span id=f>a</span><i>b</i><em>c</em><p>d</p><b>e</b><img align=right><div></div>",
+            "#f { float: right; clear: both } i { float: left; display: inline-flex }
+             em { float: left; position: absolute } p { overflow: auto } b { display: flow-root }",
+        );
+        let f = first(&dom, &map, "span");
+        assert_eq!(
+            (f.float, f.clear, f.display),
+            (Float::Right, Clear::Both, Display::Block)
+        );
+        assert_eq!(
+            first(&dom, &map, "i").display,
+            Display::Flex,
+            "floats are block-level"
+        );
+        let em = first(&dom, &map, "em");
+        assert_eq!(
+            (em.float, em.display),
+            (Float::None, Display::Inline),
+            "absolute wins"
+        );
+        let p = first(&dom, &map, "p");
+        assert!(
+            p.flow_root && !p.clips,
+            "overflow: auto starts a context without clipping"
+        );
+        let b = first(&dom, &map, "b");
+        assert!(b.flow_root && b.display == Display::Block);
+        assert_eq!(first(&dom, &map, "img").float, Float::Right, "align=right");
+        assert!(!first(&dom, &map, "div").flow_root);
     }
 
     #[test]

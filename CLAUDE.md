@@ -159,6 +159,10 @@ casts), not taken from binding crates. Ask before proposing any dependency.
   grown with `stretch`. Do not add a measure-by-layout pass: nested containers would multiply it.
 - **Positions that must survive later moves are stored as box indices or offsets from a box**
   (`Engine::containing`, `Deferred::anchor`), never as absolute coordinates.
+- **Floats live in their block formatting context** (`Engine::floats`, page coordinates). A box that starts a
+  context (`starts_context`) sets the outer list aside while its content is laid out and drops its own after,
+  so moving the box later moves its floats with it. A float is laid out once, in place (`place_float`); the
+  check costs nothing on pages without floats, keep it that way.
 - **Inline layout reuses `Engine::items`/`words`.** Anything that lays out a box while a line is being collected
   (`collect_inline_block`) or measures one (`measure_inline`) must save and restore them.
 

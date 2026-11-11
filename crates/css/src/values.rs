@@ -108,6 +108,8 @@ pub enum Display {
     TableCaption,
     /// `table-column` and `table-column-group`: they carry widths in browsers, nothing here.
     TableColumn,
+    /// `flow-root`: only while parsing; it computes to `Block` with `flow_root` set.
+    FlowRoot,
     None,
 }
 
@@ -215,6 +217,35 @@ impl Position {
     }
 }
 
+/// `float`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Float {
+    None,
+    Left,
+    Right,
+}
+
+/// `clear`: which floats a box must sit below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Clear {
+    None,
+    Left,
+    Right,
+    Both,
+}
+
+impl Clear {
+    /// Whether floats on this side (left when `left`) must be cleared.
+    pub fn clears(self, left: bool) -> bool {
+        match self {
+            Clear::None => false,
+            Clear::Left => left,
+            Clear::Right => !left,
+            Clear::Both => true,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FontStyle {
     Normal,
@@ -276,6 +307,11 @@ pub struct ComputedStyle {
     pub visible: bool,
     /// `overflow: hidden` or `clip`: descendants are clipped to the padding box.
     pub clips: bool,
+    /// `display: flow-root` or `overflow` other than `visible`: the box starts a block
+    /// formatting context, so floats outside it do not enter and floats inside stay in.
+    pub flow_root: bool,
+    pub float: Float,
+    pub clear: Clear,
     /// `opacity: 0`: the element and everything in it are not drawn (still laid out).
     /// Partial opacity is drawn opaque for now.
     pub transparent: bool,
@@ -344,6 +380,9 @@ impl ComputedStyle {
             inset: [Length::Auto; 4],
             visible: true,
             clips: false,
+            flow_root: false,
+            float: Float::None,
+            clear: Clear::None,
             transparent: false,
             border_box: false,
             flex_direction: FlexDirection::Row,
@@ -434,7 +473,13 @@ pub enum Value {
     Underline(bool),
     Position(Position),
     Visible(bool),
-    Clips(bool),
+    /// `overflow`: whether it clips, and whether it is anything but `visible`.
+    Overflow {
+        clips: bool,
+        visible: bool,
+    },
+    Float(Float),
+    Clear(Clear),
     BorderBox(bool),
     FlexDirection(FlexDirection),
     Wrap(bool),
@@ -489,6 +534,8 @@ pub enum Prop {
     BorderSpacingV,
     BorderCollapse,
     CaptionSide,
+    Float,
+    Clear,
     OutlineWidth,
     OutlineStyle,
     OutlineColor,
@@ -670,7 +717,7 @@ mod tests {
         // Styles are deduplicated (a page has hundreds, nodes hold a 4-byte index), so size is
         // not a per-node cost; it is still hashed once per style computed. Grow it deliberately.
         let size = std::mem::size_of::<ComputedStyle>();
-        // 280 since `outline` (width, color, offset).
-        assert!(size <= 280, "ComputedStyle grew to {size} bytes");
+        // 284 since floats (`float`, `clear`, `flow_root`) and `outline` (width, color, offset).
+        assert!(size <= 284, "ComputedStyle grew to {size} bytes");
     }
 }

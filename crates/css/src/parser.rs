@@ -313,10 +313,11 @@ fn expand(name: &str, v: &str, sink: &mut Sink) {
         "overflow" => {
             // `overflow: hidden auto` clips if either axis clips.
             let clips = v.split_whitespace().any(|t| matches!(t, "hidden" | "clip"));
+            let visible = v.split_whitespace().all(|t| t == "visible");
             if v.split_whitespace()
                 .all(|t| matches!(t, "visible" | "hidden" | "clip" | "auto" | "scroll"))
             {
-                sink.set(Prop::Overflow, Value::Clips(clips));
+                sink.set(Prop::Overflow, Value::Overflow { clips, visible });
             }
         }
         "padding" => box4(v, PADDING, sink),
@@ -448,6 +449,8 @@ fn single_prop(name: &str) -> Option<Prop> {
         "vertical-align" => Prop::VerticalAlign,
         "border-collapse" => Prop::BorderCollapse,
         "caption-side" => Prop::CaptionSide,
+        "float" => Prop::Float,
+        "clear" => Prop::Clear,
         "outline-width" => Prop::OutlineWidth,
         "outline-style" => Prop::OutlineStyle,
         "outline-color" => Prop::OutlineColor,
@@ -586,6 +589,19 @@ fn parse_for(prop: Prop, v: &str) -> Option<Value> {
             "bottom" => VAlign::Bottom,
             _ => VAlign::Baseline,
         })),
+        Float => Some(Value::Float(match v {
+            "left" | "inline-start" => crate::values::Float::Left,
+            "right" | "inline-end" => crate::values::Float::Right,
+            "none" => crate::values::Float::None,
+            _ => return None,
+        })),
+        Clear => Some(Value::Clear(match v {
+            "left" | "inline-start" => crate::values::Clear::Left,
+            "right" | "inline-end" => crate::values::Clear::Right,
+            "both" => crate::values::Clear::Both,
+            "none" => crate::values::Clear::None,
+            _ => return None,
+        })),
         OutlineWidth => parse_border_width(v).map(Value::Length),
         // `auto` is the browser's own ring; it is drawn as a solid line.
         OutlineStyle if v == "auto" => Some(Value::BorderStyle(true)),
@@ -607,8 +623,18 @@ fn parse_for(prop: Prop, v: &str) -> Option<Value> {
         },
         // `auto` and `scroll` stay unclipped until boxes can scroll their own content.
         Overflow => match v {
-            "hidden" | "clip" => Some(Value::Clips(true)),
-            "visible" | "auto" | "scroll" => Some(Value::Clips(false)),
+            "hidden" | "clip" => Some(Value::Overflow {
+                clips: true,
+                visible: false,
+            }),
+            "auto" | "scroll" => Some(Value::Overflow {
+                clips: false,
+                visible: false,
+            }),
+            "visible" => Some(Value::Overflow {
+                clips: false,
+                visible: true,
+            }),
             _ => None,
         },
         p if PADDING.contains(&p) => parse_length(v)
@@ -942,7 +968,8 @@ fn flex(v: &str, sink: &mut Sink) {
 
 fn parse_display(v: &str) -> Option<Display> {
     Some(match v {
-        "block" | "flow-root" => Display::Block,
+        "block" => Display::Block,
+        "flow-root" => Display::FlowRoot,
         "table" => Display::Table,
         "inline-table" => Display::InlineTable,
         "table-row-group" => Display::TableRowGroup,

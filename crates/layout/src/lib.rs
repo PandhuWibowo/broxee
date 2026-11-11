@@ -10,7 +10,13 @@
 //! paint layers (`Layout::layers`) so they draw over normal flow; `fixed` layers do not scroll.
 //! `overflow: hidden` records a clip range (`Layout::clips`). Neither costs memory per fragment.
 //!
-//! Not yet: floats, z-index (positioned boxes paint in document order), flex and grid (laid out
+//! Floats: `float` boxes are placed against the floats already in their block formatting
+//! context (`Engine::floats`, page coordinates, dropped when the context ends), line boxes
+//! shorten beside them, `clear` moves a box below them, and boxes that start a formatting
+//! context sit beside them. Floats paint in document order, so a later block's background can
+//! cover one.
+//!
+//! Not yet: z-index (positioned boxes paint in document order), flex and grid (laid out
 //! as blocks), tables, inline-block shrink-to-fit (laid out as blocks), margin collapsing through
 //! parents, padding and borders on inline elements, justify (treated as left).
 
@@ -22,8 +28,8 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use css::{
-    Align, ComputedStyle, Display, Justify, Length, LineHeight, Position, StyleMap, TextAlign,
-    VAlign, WhiteSpace,
+    Align, Clear, ComputedStyle, Display, Float, Justify, Length, LineHeight, Position, StyleMap,
+    TextAlign, VAlign, WhiteSpace,
 };
 use font::TextMetrics;
 use html::{ChunkVec, Dom, FastBuildHasher, NodeId, NodeKind};
@@ -245,6 +251,8 @@ pub fn layout(
         },
         ifc_origin: (0.0, 0.0),
         in_fixed: false,
+        floats: Vec::new(),
+        float_floor: f32::MIN,
     };
     let content = engine.layout_children(Dom::ROOT, 0.0, 0.0, width, Some(height));
     // Out-of-flow boxes last, in document order; laying one out can defer more (nested ones).
@@ -300,6 +308,22 @@ struct Engine<'a> {
     ifc_origin: (f32, f32),
     /// Laying out a fixed box: it does not extend the scrollable height.
     in_fixed: bool,
+    /// Floats placed so far in the current block formatting context, in page coordinates.
+    /// A box that starts a new context sets the list aside while its content is laid out, so
+    /// moving that box later (inline blocks, flex items) moves its floats with it.
+    floats: Vec<Placed>,
+    /// The top of the last float placed: no later float may sit higher (CSS 2.1 9.5.1).
+    float_floor: f32,
+}
+
+/// A placed float's margin box.
+#[derive(Clone, Copy, Debug)]
+struct Placed {
+    left: bool,
+    x0: f32,
+    x1: f32,
+    top: f32,
+    bottom: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -322,6 +346,8 @@ enum Level {
     Inline,
     /// `position: absolute` or `fixed`: laid out after normal flow.
     OutOfFlow,
+    /// `float: left` or `right`.
+    Float,
 }
 
 /// One unbreakable piece of inline content.
@@ -367,7 +393,15 @@ enum Item {
         width: f32,
         space_after: f32,
     },
+    /// A float: placed on the line where it appears if it fits there, else below that line.
+    /// It takes no width on the line itself.
+    Float {
+        node: NodeId,
+        space_after: f32,
+    },
     Break,
+    /// `<br clear>`: the next line starts below these floats.
+    Clear(Clear),
 }
 
 const NO_FRAGMENTS: u32 = u32::MAX;
@@ -451,6 +485,7 @@ impl<'a> Engine<'a> {
                 match s.display {
                     Display::None => Level::Skip,
                     _ if s.position.is_out_of_flow() => Level::OutOfFlow,
+                    _ if s.float != Float::None => Level::Float,
                     Display::TableColumn => Level::Skip,
                     Display::Block
                     | Display::ListItem
@@ -463,7 +498,8 @@ impl<'a> Engine<'a> {
                     | Display::TableFooterGroup
                     | Display::TableRow
                     | Display::TableCell
-                    | Display::TableCaption => Level::Block,
+                    | Display::TableCaption
+                    | Display::FlowRoot => Level::Block,
                     Display::InlineBlock
                     | Display::InlineFlex
                     | Display::InlineGrid
@@ -530,13 +566,14 @@ impl<'a> Engine<'a> {
                     Some((_, count)) => *count += 1,
                     None => run = Some((child, 1)),
                 },
-                Level::Skip | Level::OutOfFlow if run.is_some() => {
+                Level::Skip | Level::OutOfFlow | Level::Float if run.is_some() => {
                     if let Some((_, count)) = &mut run {
                         *count += 1;
                     }
                 }
                 Level::Skip => {}
                 Level::OutOfFlow => self.defer(child, x, cursor + pending_margin),
+                Level::Float => self.place_float(child, x, width, cursor + pending_margin),
                 Level::Block => {
                     if let Some((first, count)) = run.take() {
                         let height = self.layout_inline(
@@ -620,16 +657,40 @@ impl<'a> Engine<'a> {
             (Some(m), _) => m,
         };
 
-        let top = cursor + collapse(prev_margin, margin_top);
-        let border_height = self.build_box(
-            id,
-            cb_x + margin_left,
-            top,
-            content_width,
-            cb_width,
-            cb_height,
-            None,
-        );
+        let mut top = cursor + collapse(prev_margin, margin_top);
+        let mut x = cb_x + margin_left;
+        let mut content_width = content_width;
+        if !self.floats.is_empty() {
+            if s.clear != Clear::None {
+                top = top.max(self.clear_y(s.clear));
+            }
+            // A box that starts a formatting context does not overlap floats: it narrows (an
+            // auto width) or moves down until it fits beside them.
+            if self.starts_context(id, s) {
+                let margins = margin_left + margin_right.unwrap_or(0.0);
+                let auto =
+                    s.width == Length::Auto && !self.is_replaced(id) && !s.display.is_table();
+                loop {
+                    let (left, avail) = self.band(top, 1.0, cb_x, cb_width);
+                    if avail >= cb_width {
+                        break;
+                    }
+                    if auto {
+                        content_width =
+                            clamp_width(s, (avail - margins - extra).max(0.0), cb_width, extra);
+                    }
+                    let fits = content_width + extra + margins <= avail + 0.01;
+                    match self.next_float_bottom(top, cb_x, cb_width) {
+                        Some(below) if !fits => top = below,
+                        _ => {
+                            x = left + margin_left;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let border_height = self.build_box(id, x, top, content_width, cb_width, cb_height, None);
         (top + border_height, margin_bottom)
     }
 
@@ -675,7 +736,16 @@ impl<'a> Engine<'a> {
             },
         });
         let outer_box = self.current_box.replace(index as u32);
-        let content_height = if s.display.is_flex() {
+        // Whether the box starts a formatting context is asked only when floats exist outside
+        // it (set them aside) or appear inside it (take them back out): most pages have none.
+        let outer_floats = (!self.floats.is_empty() && self.starts_context(id, s)).then(|| {
+            (
+                std::mem::take(&mut self.floats),
+                std::mem::replace(&mut self.float_floor, f32::MIN),
+            )
+        });
+        let had_floats = !self.floats.is_empty() || outer_floats.is_some();
+        let mut content_height = if s.display.is_flex() {
             self.layout_flex(id, content_x, content_y, content_width, own_height)
         } else if s.display.is_grid() {
             self.layout_grid(id, content_x, content_y, content_width, own_height)
@@ -685,6 +755,21 @@ impl<'a> Engine<'a> {
             self.layout_children(id, content_x, content_y, content_width, own_height)
         };
         self.current_box = outer_box;
+        let inner = match outer_floats {
+            Some((floats, floor)) => {
+                self.float_floor = floor;
+                Some(std::mem::replace(&mut self.floats, floats))
+            }
+            None if !had_floats && !self.floats.is_empty() && self.starts_context(id, s) => {
+                self.float_floor = f32::MIN;
+                Some(std::mem::take(&mut self.floats))
+            }
+            None => None,
+        };
+        // Floats grow the box that holds their formatting context, and no other.
+        if let Some(bottom) = inner.and_then(|f| f.iter().map(|f| f.bottom).reduce(f32::max)) {
+            content_height = content_height.max(bottom - content_y);
+        }
 
         let mut height = own_height.unwrap_or(content_height);
         if let Some(max) = content_size(s, s.max_height, cb_height, edges.y()) {
@@ -727,6 +812,174 @@ impl<'a> Engine<'a> {
             self.bottom = self.bottom.max(y + offset.1 + border_height);
         }
         border_height
+    }
+
+    /// Whether box `id` starts a block formatting context: floats outside it stay out, floats
+    /// inside it stay in (CSS 2.1 9.4.1).
+    fn starts_context(&self, id: NodeId, s: &ComputedStyle) -> bool {
+        s.flow_root
+            || s.float != Float::None
+            || s.position.is_out_of_flow()
+            || !matches!(
+                s.display,
+                Display::Block | Display::ListItem | Display::Inline
+            )
+            || self
+                .dom
+                .parent(id)
+                .filter(|&p| self.dom.element(p).is_some())
+                .is_some_and(|p| {
+                    let d = self.style(p).display;
+                    d.is_flex() || d.is_grid()
+                })
+    }
+
+    /// The left edge and width left between the floats that reach into the band from `top`
+    /// down by `height`, inside the container from `x` with `width`.
+    #[cold]
+    #[inline(never)]
+    fn band(&self, top: f32, height: f32, x: f32, width: f32) -> (f32, f32) {
+        let (mut l, mut r) = (x, x + width);
+        for f in &self.floats {
+            if f.top < top + height && f.bottom > top {
+                if f.left {
+                    l = l.max(f.x1);
+                } else {
+                    r = r.min(f.x0);
+                }
+            }
+        }
+        let l = l.min(x + width);
+        (l, (r - l).max(0.0))
+    }
+
+    /// The highest float bottom below `top` among the floats that narrow the container there:
+    /// where to try next when something does not fit beside them.
+    #[cold]
+    #[inline(never)]
+    fn next_float_bottom(&self, top: f32, x: f32, width: f32) -> Option<f32> {
+        self.floats
+            .iter()
+            .filter(|f| f.top <= top && f.bottom > top && f.x1 > x && f.x0 < x + width)
+            .map(|f| f.bottom)
+            .reduce(f32::min)
+    }
+
+    /// The lowest bottom of the floats `clear` asks to clear.
+    #[cold]
+    #[inline(never)]
+    fn clear_y(&self, clear: Clear) -> f32 {
+        self.floats
+            .iter()
+            .filter(|f| clear.clears(f.left))
+            .map(|f| f.bottom)
+            .fold(f32::MIN, f32::max)
+    }
+
+    /// Content width and margin-box width of a float in a container `cb_width` wide: its
+    /// `width`, or shrink-to-fit from its intrinsic widths.
+    #[cold]
+    #[inline(never)]
+    fn float_width(&mut self, id: NodeId, cb_width: f32) -> (f32, f32) {
+        let s = self.style(id);
+        let extra = Edges::of(s, cb_width).x();
+        let margins = resolve(s.margin[1], cb_width).unwrap_or(0.0)
+            + resolve(s.margin[3], cb_width).unwrap_or(0.0);
+        let content = if self.is_replaced(id) {
+            self.replaced_size(id, s, Some(cb_width), None).0
+        } else {
+            match content_size(s, s.width, Some(cb_width), extra) {
+                Some(w) => clamp_width(s, w, cb_width, extra),
+                None => {
+                    let (min, max) = self.intrinsic_width(id);
+                    let available = (cb_width - margins - extra).max(0.0);
+                    let w = (max - extra).min(available).max(min - extra).max(0.0);
+                    clamp_width(s, w, cb_width, extra)
+                }
+            }
+        };
+        (content, content + extra + margins)
+    }
+
+    /// Place float `id` in the container from `x` with `width`, no higher than `y`: as far left
+    /// or right as the floats already there allow, moving down until it fits (CSS 2.1 9.5.1).
+    /// It is laid out once, in place.
+    #[cold]
+    #[inline(never)]
+    fn place_float(&mut self, id: NodeId, x: f32, width: f32, y: f32) {
+        if self.measuring {
+            return;
+        }
+        let s = self.style(id);
+        let left = s.float == Float::Left;
+        let (content_width, outer) = self.float_width(id, width);
+        let margin = [0, 1, 2, 3].map(|i| resolve(s.margin[i], width).unwrap_or(0.0));
+        let mut top = y.max(self.float_floor);
+        if s.clear != Clear::None {
+            top = top.max(self.clear_y(s.clear));
+        }
+        let (band_left, room) = loop {
+            let (l, room) = self.band(top, 1.0, x, width);
+            if outer <= room + 0.01 {
+                break (l, room);
+            }
+            match self.next_float_bottom(top, x, width) {
+                Some(below) => top = below,
+                None => break (l, room),
+            }
+        };
+        let margin_x = if left {
+            band_left
+        } else {
+            band_left + room - outer
+        };
+        // Its content runs inline layout, which reuses the scratch buffers of an open line.
+        let items = std::mem::take(&mut self.items);
+        let words = std::mem::take(&mut self.words);
+        let origin = self.ifc_origin;
+        let line_width = self.line_width;
+        let height = self.build_box(
+            id,
+            margin_x + margin[3],
+            top + margin[0],
+            content_width,
+            width,
+            None,
+            None,
+        );
+        self.items = items;
+        self.words = words;
+        self.ifc_origin = origin;
+        self.line_width = line_width;
+        self.floats.push(Placed {
+            left,
+            x0: margin_x,
+            x1: margin_x + outer,
+            top,
+            bottom: top + margin[0] + height + margin[2],
+        });
+        self.float_floor = top;
+    }
+
+    /// A float met while filling a line: placed beside the line when it fits next to the
+    /// `line_width` the line holds so far (returning the line's new room), else kept for below.
+    #[cold]
+    #[inline(never)]
+    fn float_on_line(
+        &mut self,
+        node: NodeId,
+        line_width: f32,
+        room: f32,
+        later: &mut Vec<NodeId>,
+        (x, width): (f32, f32),
+        (line_top, line_height): (f32, f32),
+    ) -> Option<(f32, f32)> {
+        if !later.is_empty() || line_width + self.float_width(node, width).1 > room {
+            later.push(node);
+            return None;
+        }
+        self.place_float(node, x, width, line_top);
+        Some(self.band(line_top, line_height, x, width))
     }
 
     /// Images are replaced elements: sized by their file, not by children.
@@ -1055,7 +1308,39 @@ impl<'a> Engine<'a> {
         let mut start = 0;
         // Decorated inline elements open on this line: (node, its box on this line, start x).
         let mut open: Vec<(NodeId, usize, f32)> = Vec::new();
+        // Floats that did not fit on the line where they appear: placed below it.
+        let mut later: Vec<NodeId> = Vec::new();
+        let strut_height = strut.above + strut.below;
         while start < items.len() {
+            for node in later.drain(..) {
+                self.place_float(node, x, width, line_top);
+            }
+            // Floats and clears at the start of a line need no room on it.
+            while let Some(&item) = items.get(start) {
+                match item {
+                    Item::Float { node, .. } => self.place_float(node, x, width, line_top),
+                    Item::Clear(c) => line_top = line_top.max(self.clear_y(c)),
+                    _ => break,
+                }
+                start += 1;
+            }
+            if start == items.len() {
+                break;
+            }
+            // The line's room beside floats; move down while its first piece does not fit.
+            let (mut left, mut room) = (x, width);
+            if !self.floats.is_empty() {
+                loop {
+                    (left, room) = self.band(line_top, strut_height, x, width);
+                    if room >= item_width(&items[start]) || room >= width {
+                        break;
+                    }
+                    match self.next_float_bottom(line_top, x, width) {
+                        Some(below) => line_top = below,
+                        None => break,
+                    }
+                }
+            }
             // Greedy line breaking: take items until the next one would overflow.
             let mut end = start;
             let mut line_width = 0.0;
@@ -1066,12 +1351,26 @@ impl<'a> Engine<'a> {
                     forced_break = true;
                     break;
                 }
+                if let Item::Float { node, .. } = item {
+                    if let Some(band) = self.float_on_line(
+                        node,
+                        line_width,
+                        room,
+                        &mut later,
+                        (x, width),
+                        (line_top, strut_height),
+                    ) {
+                        (left, room) = band;
+                    }
+                    end += 1;
+                    continue;
+                }
                 let gap = if end > start {
                     space_after(&items[end - 1])
                 } else {
                     0.0
                 };
-                let fits = line_width + gap + item_width(&item) <= width;
+                let fits = line_width + gap + item_width(&item) <= room;
                 let before_close = matches!(item, Item::Close { .. });
                 if end > start && !fits && breakable(&items[end - 1]) && !before_close {
                     break;
@@ -1087,7 +1386,7 @@ impl<'a> Engine<'a> {
                 extent.below = extent.below.max(e.below);
             }
             let baseline = line_top + extent.above;
-            let mut pen = x + (width - line_width).max(0.0) * align;
+            let mut pen = left + (room - line_width).max(0.0) * align;
             let mut last_text: Option<usize> = None;
             // Elements continuing from the previous line get a new box here, before this
             // line's content, so their background paints underneath it.
@@ -1188,7 +1487,7 @@ impl<'a> Engine<'a> {
                         last_text = None;
                         pen += w;
                     }
-                    Item::Break => {}
+                    Item::Break | Item::Float { .. } | Item::Clear(_) => {}
                 }
             }
             for &(node, index, from) in &open {
@@ -1203,6 +1502,9 @@ impl<'a> Engine<'a> {
             if forced_break && start == items.len() {
                 break;
             }
+        }
+        for node in later {
+            self.place_float(node, x, width, line_top);
         }
         self.items = items;
         self.atomics.truncate(atomics_start);
@@ -1353,8 +1655,45 @@ impl<'a> Engine<'a> {
                     self.defer(id, x, y);
                     return;
                 }
+                if s.float != Float::None {
+                    if self.measuring {
+                        // A float sits on a line beside the text, so it counts like an inline block.
+                        let (min, max) = self.outer_intrinsic(id);
+                        self.items.push(Item::Atomic {
+                            node: id,
+                            width: max,
+                            height: 0.0,
+                            above: 0.0,
+                            min,
+                            laid: NO_FRAGMENTS,
+                            space_after: 0.0,
+                        });
+                    } else {
+                        // It takes over the space before it, so a line may still break there
+                        // and the words around it keep their gap.
+                        let space_after = match self.items.last_mut() {
+                            Some(
+                                Item::Word { space_after, .. }
+                                | Item::Atomic { space_after, .. }
+                                | Item::Close { space_after, .. }
+                                | Item::Float { space_after, .. },
+                            ) => std::mem::take(space_after),
+                            _ => 0.0,
+                        };
+                        self.items.push(Item::Float {
+                            node: id,
+                            space_after,
+                        });
+                    }
+                    return;
+                }
                 match self.dom.tag_name(id) {
-                    Some("br") => self.items.push(Item::Break),
+                    Some("br") => {
+                        self.items.push(Item::Break);
+                        if s.clear != Clear::None {
+                            self.items.push(Item::Clear(s.clear));
+                        }
+                    }
                     Some("img") => {
                         let (w, h) = self.replaced_size(id, s, Some(self.line_width), None);
                         let edges = Edges::of(s, self.line_width);
@@ -1479,7 +1818,8 @@ impl<'a> Engine<'a> {
             Item::Word { space_after, .. }
             | Item::Atomic { space_after, .. }
             | Item::Open { space_after, .. }
-            | Item::Close { space_after, .. },
+            | Item::Close { space_after, .. }
+            | Item::Float { space_after, .. },
         ) = self.items.last_mut()
         {
             *space_after = width;
@@ -1510,7 +1850,11 @@ impl<'a> Engine<'a> {
                 below: height - above,
             },
             // Inline padding and borders do not make the line taller.
-            Item::Open { .. } | Item::Close { .. } | Item::Break => Extent::default(),
+            Item::Open { .. }
+            | Item::Close { .. }
+            | Item::Float { .. }
+            | Item::Break
+            | Item::Clear(_) => Extent::default(),
         }
     }
 }
@@ -1521,7 +1865,7 @@ fn item_width(item: &Item) -> f32 {
         | Item::Atomic { width, .. }
         | Item::Open { width, .. }
         | Item::Close { width, .. } => width,
-        Item::Break => 0.0,
+        Item::Float { .. } | Item::Break | Item::Clear(_) => 0.0,
     }
 }
 
@@ -1530,8 +1874,9 @@ fn space_after(item: &Item) -> f32 {
         Item::Word { space_after, .. }
         | Item::Atomic { space_after, .. }
         | Item::Open { space_after, .. }
-        | Item::Close { space_after, .. } => space_after,
-        Item::Break => 0.0,
+        | Item::Close { space_after, .. }
+        | Item::Float { space_after, .. } => space_after,
+        Item::Break | Item::Clear(_) => 0.0,
     }
 }
 
@@ -1542,8 +1887,8 @@ fn breakable(item: &Item) -> bool {
         // Never between an element's start and its first content; after its end only where
         // white space follows (`foo</b>bar` is one word).
         Item::Open { .. } => false,
-        Item::Close { space_after, .. } => space_after > 0.0,
-        Item::Atomic { .. } | Item::Break => true,
+        Item::Close { space_after, .. } | Item::Float { space_after, .. } => space_after > 0.0,
+        Item::Atomic { .. } | Item::Break | Item::Clear(_) => true,
     }
 }
 
@@ -2571,5 +2916,197 @@ mod tests {
             .boxes
             .iter()
             .any(|b| dom.tag_name(b.node) == Some("::after")));
+    }
+
+    /// Text fragments as (x, line top, text), lines being 16px tall with `Approximate`.
+    fn placed(l: &Layout) -> Vec<(f32, f32, String)> {
+        (0..l.texts.len())
+            .map(|i| {
+                let t = &l.texts[i];
+                let round = |v: f32| (v * 100.0).round() / 100.0;
+                (round(t.x), round(t.baseline - 12.8), l.text(t).to_string())
+            })
+            .collect()
+    }
+
+    fn rect_of(dom: &Dom, l: &Layout, id: &str) -> Rect {
+        let node = (0..dom.len() as NodeId)
+            .find(|&n| dom.attr(n, "id") == Some(id))
+            .unwrap_or_else(|| panic!("no #{id}"));
+        l.boxes.iter().find(|b| b.node == node).unwrap().rect
+    }
+
+    #[test]
+    fn wraps_text_beside_a_left_float() {
+        // Each word is 32px; beside the 50px float a 100px line holds one word.
+        let (dom, l) = run(
+            "<div id=f></div><p>aaaa bbbb cccc dddd eeee ffff</p>",
+            "body { margin: 0 } p { margin: 0 } #f { float: left; width: 50px; height: 20px }",
+            100.0,
+        );
+        assert_eq!(
+            rect_of(&dom, &l, "f"),
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 50.0,
+                height: 20.0
+            }
+        );
+        let p = placed(&l);
+        assert_eq!(
+            p[0],
+            (50.0, 0.0, "aaaa".into()),
+            "first line beside the float"
+        );
+        assert_eq!(
+            p[1],
+            (50.0, 16.0, "bbbb".into()),
+            "second line still reaches into it"
+        );
+        assert_eq!(
+            p[2],
+            (0.0, 32.0, "cccc dddd".into()),
+            "below it the line is full width"
+        );
+        assert_eq!(
+            rect(&dom, &l, "p").y,
+            0.0,
+            "the paragraph itself does not move"
+        );
+    }
+
+    #[test]
+    fn right_floats_and_stacking() {
+        let (dom, l) = run(
+            "<div id=a></div><div id=b></div><div id=c></div><div id=r></div><p>xx</p>",
+            "body { margin: 0 } p { margin: 0 }
+             #a, #b, #c { float: left; width: 40px; height: 10px }
+             #c { height: 30px }
+             #r { float: right; width: 30px; height: 50px }",
+            100.0,
+        );
+        assert_eq!(rect_of(&dom, &l, "a").x, 0.0);
+        assert_eq!(rect_of(&dom, &l, "b").x, 40.0, "next to the first");
+        let c = rect_of(&dom, &l, "c");
+        assert_eq!((c.x, c.y), (0.0, 10.0), "no room left: below the first two");
+        let r = rect_of(&dom, &l, "r");
+        assert_eq!((r.x, r.y), (70.0, 10.0), "not higher than an earlier float");
+        // No room at the top; at 10px the gap between c and r holds it.
+        assert_eq!(placed(&l)[0], (40.0, 10.0, "xx".into()));
+    }
+
+    #[test]
+    fn clear_moves_a_block_below_floats() {
+        let (dom, l) = run(
+            "<div id=l></div><div id=r></div><p id=a>a</p><p id=b>b</p><p id=c>c</p>",
+            "body { margin: 0 } p { margin: 0 }
+             #l { float: left; width: 10px; height: 20px }
+             #r { float: right; width: 10px; height: 40px }
+             #a { clear: left } #b { clear: right } #c { clear: both }",
+            100.0,
+        );
+        assert_eq!(rect_of(&dom, &l, "a").y, 20.0);
+        assert_eq!(rect_of(&dom, &l, "b").y, 40.0);
+        assert_eq!(rect_of(&dom, &l, "c").y, 56.0, "already below both");
+    }
+
+    #[test]
+    fn a_formatting_context_sits_beside_floats() {
+        let (dom, l) = run(
+            "<div id=f></div><div id=o>x</div><div id=w></div>",
+            "body { margin: 0 }
+             #f { float: left; width: 30px; height: 40px }
+             #o { overflow: hidden }
+             #w { display: flow-root; width: 90px; height: 5px }",
+            100.0,
+        );
+        let o = rect_of(&dom, &l, "o");
+        assert_eq!(
+            (o.x, o.y, o.width),
+            (30.0, 0.0, 70.0),
+            "narrowed beside the float"
+        );
+        let w = rect_of(&dom, &l, "w");
+        assert_eq!(
+            (w.x, w.y),
+            (0.0, 40.0),
+            "too wide to fit beside it: moved below"
+        );
+    }
+
+    #[test]
+    fn floats_grow_only_a_formatting_context_root() {
+        let (dom, l) = run(
+            "<div id=plain><div class=f></div></div><div id=root><div class=f></div></div>",
+            "body { margin: 0 } .f { float: left; width: 10px; height: 25px }
+             #root { overflow: hidden }",
+            100.0,
+        );
+        assert_eq!(rect_of(&dom, &l, "plain").height, 0.0);
+        let root = rect_of(&dom, &l, "root");
+        assert_eq!(root.height, 25.0);
+        assert_eq!((root.x, root.y), (10.0, 0.0), "beside the first float");
+        assert_eq!(l.height, 600.0);
+    }
+
+    #[test]
+    fn a_float_in_a_line_and_one_that_does_not_fit() {
+        // "aaaa" is 32px; the 50px float fits beside it on a 100px line, the 80px one does not.
+        let (dom, l) = run(
+            "<p>aaaa <span id=a></span>bbbb <span id=b></span>cc</p>",
+            "body { margin: 0 } p { margin: 0 }
+             #a { float: right; width: 50px; height: 20px }
+             #b { float: left; width: 80px; height: 10px }",
+            100.0,
+        );
+        let a = rect_of(&dom, &l, "a");
+        assert_eq!((a.x, a.y), (50.0, 0.0));
+        let b = rect_of(&dom, &l, "b");
+        assert_eq!(
+            (b.x, b.y),
+            (0.0, 32.0),
+            "placed under the line it appears on"
+        );
+        let p = placed(&l);
+        assert_eq!(p[0], (0.0, 0.0, "aaaa".into()));
+        assert_eq!(
+            p[1],
+            (0.0, 16.0, "bbbb".into()),
+            "no longer fits beside the float"
+        );
+        assert_eq!(p[2], (80.0, 32.0, "cc".into()), "beside the second float");
+    }
+
+    #[test]
+    fn shrink_to_fit_floats_and_float_attributes() {
+        let (dom, l) = run(
+            "<div id=f>aa bb</div><img id=i align=right width=20 height=10><p>x<br clear=all>y</p>",
+            "body { margin: 0 } p { margin: 0 } #f { float: left; padding: 2px }",
+            200.0,
+        );
+        let f = rect_of(&dom, &l, "f");
+        assert_eq!(f.width, 36.0 + 4.0, "as wide as its text, plus padding");
+        let i = rect_of(&dom, &l, "i");
+        assert_eq!((i.x, i.y), (180.0, 0.0), "align=right floats the image");
+        let p = placed(&l);
+        assert_eq!(p[1].0, 40.0, "\"x\" is beside the float");
+        assert_eq!(
+            p[2],
+            (0.0, 20.0, "y".into()),
+            "<br clear=all> moves below both"
+        );
+    }
+
+    #[test]
+    fn positioned_boxes_do_not_float() {
+        let (dom, l) = run(
+            "<div id=a></div><p>x</p>",
+            "body { margin: 0 } p { margin: 0 }
+             #a { float: left; position: absolute; width: 50px; height: 20px }",
+            100.0,
+        );
+        assert_eq!(placed(&l)[0].0, 0.0);
+        assert_eq!(rect_of(&dom, &l, "a").width, 50.0);
     }
 }
