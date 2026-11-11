@@ -141,7 +141,8 @@ Text is measured and drawn with Arial (macOS) or DejaVu Sans (Linux) until Figtr
 
 | Supported | Not yet |
 |---|---|
-| Block boxes: width, height, min/max, `margin: auto`, percentages, padding, borders, `box-sizing`, `<center>` centering narrower blocks | floats |
+| Block boxes: width, height, min/max, `margin: auto`, percentages, padding, borders, `box-sizing`, `<center>` centering narrower blocks | margin collapsing through parents |
+| Floats: `float: left`/`right` (shrink-to-fit, stacking, moving down until they fit), `clear` and `<br clear>`, `align=left`/`right` on images and tables, lines shortened beside floats, `display: flow-root`, `overflow` other than `visible`, inline blocks, flex and grid items and table cells sitting beside floats and holding their own | floats painting under later blocks' backgrounds (they paint in document order), line height other than the container's when testing room beside a float |
 | Tables: automatic column widths from cell content, px and % cell widths, `colspan`/`rowspan`, `thead`/`tfoot` order, rows and cells without their wrappers, `border-spacing`, row backgrounds, `vertical-align` top/middle/bottom, `inline-table`, `caption-side`, non-table content in anonymous cells | `table-layout: fixed`, collapsed border drawing, `<col>` widths, bottom captions |
 | Grid: track lists (lengths, %, `fr`, `auto`, `min-content`, `max-content`, `minmax()`, `fit-content()`, `repeat()` with `auto-fill`/`auto-fit`), `grid-template-areas` and `grid-area`, line numbers and `span`, sparse auto-placement, implicit tracks, gaps, `align-self`, `order` | column auto-flow and `dense`, named lines, `justify-items`/`-self`, `align-content`/`justify-content`, subgrid, intrinsic size of a grid container |
 | Flex: rows and columns (and reverses), wrapping rows, grow/shrink/basis with min/max and automatic minimums, auto margins, `justify-content`, `align-items`/`align-self`, `gap`, `order`, text as anonymous items | `align-content`, wrapping columns, baseline alignment (as start), cross-axis auto margins |
@@ -231,6 +232,7 @@ time something reads it (most theme variables never are). A `var()` value is sub
 | 2026-11-10 | Forms: controls, editing, GET and POST (#13) | 2.4 MB | 49.4 MB peak painted at 2x | Wikipedia's search form submits from the keyboard; a keystroke lays the page out again (no incremental layout yet) |
 | 2026-11-10 | Split view, 1/2/4 panes (#7) | 2.4 MB | 49.4 MB peak painted at 2x | Window with GitHub, Wikipedia, HN, example.com: 1 pane 30 MB idle / 44 MB peak, 2 panes 33 / 47 MB, 4 panes 31 / 45 MB |
 | 2026-11-10 | JavaScript, written here (#12) | 2.9 MB | 49.6 MB peak painted at 2x | example.com 20 MB, HN 22 MB, Wikipedia 27 MB, GitHub 32 MB peak with their scripts run; scripts that use unsupported syntax are skipped and logged |
+| 2026-11-12 | Floats and clear (#23) | 2.9 MB (+16 KB) | 49.6 MB peak painted at 2x; layout 14.1 → 14.7 ms (+4%) | Rust article: infobox and thumbnails on the right with text beside them, 34.0 MB peak (unchanged) |
 
 Other pages after the layout milestone: GitHub home 22.7 MB peak (8,170 rules); Hacker News 11.5 MB.
 

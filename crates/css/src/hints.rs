@@ -28,6 +28,7 @@ pub(crate) fn hints(dom: &Dom, id: NodeId) -> Option<String> {
                 add("margin-left", Some("auto".into()));
                 add("margin-right", Some("auto".into()));
             }
+            add("float", attr("align").and_then(float));
             add("border-spacing", attr("cellspacing").and_then(pixels));
             if let Some(border) = attr("border")
                 .and_then(|b| b.parse::<u32>().ok())
@@ -76,6 +77,7 @@ pub(crate) fn hints(dom: &Dom, id: NodeId) -> Option<String> {
             add("text-align", attr("align").and_then(text_align));
         }
         "img" => {
+            add("float", attr("align").and_then(float));
             add(
                 "border",
                 attr("border")
@@ -84,9 +86,28 @@ pub(crate) fn hints(dom: &Dom, id: NodeId) -> Option<String> {
             );
         }
         "hr" => add("width", attr("width").and_then(length)),
+        "br" => add(
+            "clear",
+            attr("clear").and_then(|c| {
+                let c = c.to_ascii_lowercase();
+                match c.as_str() {
+                    "left" | "right" | "both" => Some(c),
+                    "all" => Some("both".into()),
+                    _ => None,
+                }
+            }),
+        ),
         _ => return None,
     }
     (!css.is_empty()).then_some(css)
+}
+
+/// `align=left` and `align=right` on images and tables float them.
+fn float(v: &str) -> Option<String> {
+    ["left", "right"]
+        .into_iter()
+        .find(|side| v.eq_ignore_ascii_case(side))
+        .map(String::from)
 }
 
 /// The table a cell belongs to: through its row and, if present, its row group.
