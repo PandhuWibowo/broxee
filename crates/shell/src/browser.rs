@@ -4579,7 +4579,19 @@ mod tests {
         assert!(hover(&mut b, link), "entering the link repaints");
         assert_eq!(restyles(&b), 1);
         b.render();
-        let (x, y) = box_center(&b, "link");
+        // Inside the span's left padding: background only, whatever fonts draw the text.
+        let (cx, y) = box_center(&b, "link");
+        let page = b.page.as_ref().unwrap();
+        let left = page
+            .layout
+            .boxes
+            .iter()
+            .find(|f| page.dom.attr(f.node, "id") == Some("link"))
+            .unwrap()
+            .rect
+            .x;
+        let x = f64::from(SIDEBAR_WIDTH + left + 1.0);
+        assert!(x < cx);
         assert!(
             red(b.window.pixel(x as usize, y as usize)),
             "a:hover draws its background"
