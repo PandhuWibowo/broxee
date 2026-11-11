@@ -44,6 +44,7 @@ impl PageScript {
     }
 
     /// How long until the next timer is due, if any.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
     pub fn next_timer(&self) -> Option<std::time::Duration> {
         let due = self.runtime.next_timer()?;
         let now = self.started.elapsed().as_secs_f64() * 1000.0;
@@ -363,6 +364,7 @@ pub fn run_page_scripts(
 
 /// Fire `kind` at `node` (a click). Returns (the page changed, a listener prevented the
 /// default action).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
 pub fn dispatch(
     script: &mut PageScript,
     dom: &mut Dom,
@@ -397,6 +399,7 @@ pub fn dispatch(
 }
 
 /// Run the timers that are due. Returns whether the page changed.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
 pub fn run_timers(
     script: &mut PageScript,
     dom: &mut Dom,

@@ -49,6 +49,7 @@ pub struct Forms {
 }
 
 /// What submitting a form asks for: a GET of `url`, or a POST of `body` to it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
 #[derive(Debug, PartialEq)]
 pub struct Submission {
     pub url: net::Url,
@@ -99,6 +100,7 @@ impl Control {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
 impl Forms {
     /// Find the controls of `dom` and give them the nodes they draw with.
     pub fn prepare(dom: &mut Dom) -> Forms {
@@ -466,6 +468,7 @@ fn same_group(dom: &Dom, a: &Control, b: &Control) -> bool {
 
 /// `application/x-www-form-urlencoded`: UTF-8, spaces as `+`, everything but letters,
 /// digits and `*-._` percent-encoded.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
 pub fn urlencode(pairs: &[(String, String)]) -> String {
     fn enc(out: &mut String, s: &str) {
         for b in s.bytes() {

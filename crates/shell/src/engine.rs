@@ -132,8 +132,10 @@ pub struct Loaded {
     pub css: LoadedCss,
     pub images: ImageStore,
     /// Form controls and what has been typed into them.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
     pub forms: Forms,
     /// The page's scripts, when it has any.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
     pub script: Option<Box<crate::script::PageScript>>,
     /// The HTML and stylesheets as they arrived, to rebuild the page without the network.
     pub sources: Sources,
