@@ -615,7 +615,8 @@ impl Engine<'_> {
         };
         for child in dom.children(id) {
             match self.level(child) {
-                Level::Inline => match &mut run {
+                // A float sits beside the text of its run, so it is measured with it.
+                Level::Inline | Level::Float => match &mut run {
                     Some((_, count)) => *count += 1,
                     None => run = Some((child, 1)),
                 },
@@ -663,6 +664,9 @@ impl Engine<'_> {
         let (mut min, mut max, mut line, mut piece) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
         let mut prev: Option<Item> = None;
         for &item in &self.items {
+            if let Item::Clear(_) = item {
+                continue;
+            }
             if let Item::Break = item {
                 max = max.max(line);
                 line = 0.0;
