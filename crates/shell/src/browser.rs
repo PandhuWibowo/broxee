@@ -5016,10 +5016,12 @@ mod tests {
             figtree.advance_em('a'),
             "interface text is measured with Figtree"
         );
-        // Figtree has no ⌘; the system's symbol font draws it where there is one.
+        // Figtree has no ⌘: the system's symbol font draws it where there is one (macOS), and
+        // the page font may (DejaVu Sans does on Linux). Where none does, the chrome draws an
+        // icon instead.
         let symbol_font = std::path::Path::new("/System/Library/Fonts/Keyboard.ttf").exists();
         let drawn = ui.glyph('⌘', FontKey::UI).is_some_and(|(_, g)| g != 0);
-        assert_eq!(drawn, symbol_font);
+        assert!(drawn || !symbol_font, "the symbol font draws ⌘");
         if let Ok(path) = std::env::var("FONTS_PNG") {
             let frame = b.window.frame.borrow();
             let stride = frame.0 * 4 + PAD;
