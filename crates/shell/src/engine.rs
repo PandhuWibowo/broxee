@@ -110,6 +110,7 @@ impl FontStore {
 
     /// Measurement and glyphs for Broxee's interface (`font::FontKey::UI`) and for pages
     /// without `@font-face`.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
     pub fn ui(&self) -> Fonts<'_> {
         Fonts::system(self.system())
     }
