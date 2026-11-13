@@ -433,12 +433,17 @@ fn position_or_keywords(v: &str) -> (SpecLength, SpecLength) {
     })
 }
 
-/// What `background` sets besides its color and images: position, size and repeat of the
-/// first layer, each back to its initial value when not given.
+/// What `background` sets besides its color and images: position, size and repeat, each back
+/// to its initial value when not given. Taken from the first layer with a `url()`: only image
+/// layers use them, and `linear-gradient(...), url(photo) center / cover` is the usual way to
+/// darken a photo.
 pub(crate) fn parse_background_rest(v: &str) -> ((SpecLength, SpecLength), SizeSpec, (bool, bool)) {
-    let first = split_top_level(v, b',')
-        .into_iter()
-        .next()
+    let layers = split_top_level(v, b',');
+    let first = layers
+        .iter()
+        .find(|l| l.to_ascii_lowercase().contains("url("))
+        .or(layers.first())
+        .copied()
         .unwrap_or("")
         .to_ascii_lowercase();
     let mut position_words = Vec::new();
@@ -717,6 +722,13 @@ mod tests {
         );
         assert_eq!(size, SizeSpec::Lengths(SpecLength::Auto, SpecLength::Auto));
         assert_eq!(repeat, (true, true));
+        let (_, size, repeat) =
+            parse_background_rest("linear-gradient(red, blue), url(p.jpg) right center / cover");
+        assert_eq!(
+            (size, repeat),
+            (SizeSpec::Cover, (true, true)),
+            "the image layer's size, not the gradient's"
+        );
         let (position, _, _) = parse_background_rest("url(a.png) right 10px top 20%/40px");
         assert_eq!(position.0, SpecLength::Percent(100.0));
     }
