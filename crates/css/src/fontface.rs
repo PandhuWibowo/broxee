@@ -123,7 +123,7 @@ fn parse_sources(v: &str) -> Vec<FontSource> {
 }
 
 /// The URL in `url(x)`, `url("x")` or `url('x')` at the start of `s`, case kept.
-fn url_function(s: &str) -> Option<String> {
+pub(crate) fn url_function(s: &str) -> Option<String> {
     if !s.get(..4)?.eq_ignore_ascii_case("url(") {
         return None;
     }

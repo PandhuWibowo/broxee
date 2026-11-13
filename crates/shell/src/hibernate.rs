@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::engine::{Snapshot, Sources};
 use crate::images::ImageStore;
 
-const MAGIC: &[u8] = b"broxee-tab 3\n";
+const MAGIC: &[u8] = b"broxee-tab 4\n";
 
 /// The files of one browser's sleeping tabs.
 pub struct TabStore {
@@ -140,7 +140,7 @@ fn encode(s: &Snapshot, out: &mut impl Write) -> io::Result<()> {
             put_wire(out, wire)?;
         }
     }
-    let (files, uses) = s.images.parts();
+    let (files, uses, urls) = s.images.parts();
     put_u32(out, files.len())?;
     for file in files {
         put_bytes(out, file)?;
@@ -148,6 +148,12 @@ fn encode(s: &Snapshot, out: &mut impl Write) -> io::Result<()> {
     put_u32(out, uses.len())?;
     for (node, index) in uses {
         out.write_all(&node.to_le_bytes())?;
+        out.write_all(&index.to_le_bytes())?;
+    }
+    // CSS background files by URL.
+    put_u32(out, urls.len())?;
+    for (url, index) in urls {
+        put_bytes(out, url.as_bytes())?;
         out.write_all(&index.to_le_bytes())?;
     }
     Ok(())
@@ -256,6 +262,10 @@ fn decode(input: impl Read, len: u64) -> Option<Snapshot> {
     for _ in 0..r.count(8)? {
         uses.push((r.u32()?, r.u32()?));
     }
+    let mut urls = Vec::new();
+    for _ in 0..r.count(8)? {
+        urls.push((String::from_utf8(r.bytes()?).ok()?, r.u32()?));
+    }
     (r.left == 0).then_some(Snapshot {
         url,
         status,
@@ -265,7 +275,7 @@ fn decode(input: impl Read, len: u64) -> Option<Snapshot> {
             scripts,
             fonts,
         },
-        images: ImageStore::from_parts(files, uses),
+        images: ImageStore::from_parts(files, uses, urls),
     })
 }
 
@@ -304,7 +314,11 @@ mod tests {
                     },
                 )],
             },
-            images: ImageStore::from_parts(vec![vec![9; 5], vec![]], vec![(7, 0), (3, 1), (4, 9)]),
+            images: ImageStore::from_parts(
+                vec![vec![9; 5], vec![]],
+                vec![(7, 0), (3, 1), (4, 9)],
+                vec![("https://example.com/bg.png".into(), 1), ("bad".into(), 7)],
+            ),
         }
     }
 
@@ -322,9 +336,10 @@ mod tests {
         assert_eq!(back.sources.html.encoding, net::Encoding::Brotli);
         assert_eq!(back.sources.stylesheets[0].1.bytes, b"p{}");
         assert_eq!(back.sources.scripts[0].1.bytes, b"var a = 1");
-        let (files, uses) = back.images.parts();
+        let (files, uses, urls) = back.images.parts();
         assert_eq!(files.len(), 2);
         assert_eq!(uses, [(3, 1), (7, 0)], "the use past the files was dropped");
+        assert_eq!(urls, [("https://example.com/bg.png", 1)], "backgrounds too");
         assert_eq!(
             std::fs::read_dir(&store.dir).unwrap().count(),
             0,

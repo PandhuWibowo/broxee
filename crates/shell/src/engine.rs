@@ -10,6 +10,7 @@ use font::{Font, Fonts, Role, SystemFace, SystemFaces};
 use html::{Dom, NodeId};
 use layout::Layout;
 
+use crate::backgrounds::{self, BackgroundFrom};
 use crate::forms::Forms;
 use crate::images::{self, ImageStore};
 use crate::pool;
@@ -109,6 +110,7 @@ impl FontStore {
 
     /// Measurement and glyphs for Broxee's interface (`font::FontKey::UI`) and for pages
     /// without `@font-face`.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
     pub fn ui(&self) -> Fonts<'_> {
         Fonts::system(self.system())
     }
@@ -408,6 +410,11 @@ fn finish(
         From::Snapshot(sources, _) => FontFrom::Stored(std::mem::take(&mut sources.fonts)),
         From::Nowhere => FontFrom::Nowhere,
     };
+    let background_from = match &from {
+        From::Network(cookies) => BackgroundFrom::Network(*cookies),
+        From::Snapshot(..) => BackgroundFrom::Stored,
+        From::Nowhere => BackgroundFrom::Inline,
+    };
     // Controls get the nodes they draw with before anything reads the DOM.
     let mut forms = Forms::prepare(&mut dom);
     // Images are found among the parser's nodes only: nodes scripts add are not rebuilt the
@@ -423,7 +430,7 @@ fn finish(
     };
     let (script, scripts) =
         crate::script::run_page_scripts(&mut dom, &mut forms, &source.url, script_from);
-    let (css, images, stylesheets) =
+    let (css, mut images, stylesheets) =
         load_subresources(&dom, &source.url, from, script.is_some(), parser_nodes);
     if !progress(0.75) {
         return None;
@@ -432,9 +439,15 @@ fn finish(
     let fonts_wait_ms = fonts.ready();
     let states = css::States::default();
     let (styles, cascade_ms) = cascade(&mut dom, &css, &states, settings);
-    // Fonts are found from the styled text, so they load between the cascade and layout.
-    let (mut webfonts, font_files) =
-        webfonts::load(&dom, &styles, &css.sheets, &source.url, font_from, fonts);
+    // Fonts and background images are found from the styles, so they load between the
+    // cascade and layout, at the same time.
+    let ((mut webfonts, font_files), backgrounds) = std::thread::scope(|scope| {
+        let backgrounds =
+            scope.spawn(|| backgrounds::load(&dom, &styles, &source.url, background_from, &images));
+        let fonts = webfonts::load(&dom, &styles, &css.sheets, &source.url, font_from, fonts);
+        (fonts, backgrounds.join().unwrap_or_default())
+    });
+    images.add_backgrounds(backgrounds);
     if !progress(0.85) {
         return None;
     }
@@ -732,8 +745,13 @@ fn load_css(
     };
     let parse_started = Instant::now();
     let mut sheet = css::parse_stylesheet_for(text, vocabulary);
-    // `@font-face` URLs are relative to the sheet they are in.
+    // `@font-face` and background URLs are relative to the sheet they are in.
     webfonts::resolve_sources(&mut sheet, &sheet_url);
+    sheet.resolve_urls(|url| {
+        (!url.starts_with("data:"))
+            .then(|| sheet_url.join(url).ok().map(|u| u.to_string()))
+            .flatten()
+    });
     CssResult {
         sheet: Some(sheet),
         fetched,
@@ -881,6 +899,62 @@ mod tests {
         let woken = restore(snapshot(page), settings, &fonts).expect("restores");
         assert_eq!(woken.webfonts.faces.len(), 1);
         assert_eq!(width(&woken, "\u{e001}\u{e002}"), 32.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loads_background_images_relative_to_their_sheet() {
+        let dir = std::env::temp_dir().join(format!("broxee-backgrounds-{}", std::process::id()));
+        for sub in ["css", "img"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        let png = include_bytes!("../../image/src/testdata/rgba8.png");
+        std::fs::write(dir.join("img/a.png"), png).unwrap();
+        std::fs::write(dir.join("img/b.png"), png).unwrap();
+        // The sheet's URL is relative to the sheet; the attribute's to the page; the hidden
+        // element's file is never asked for (it does not exist).
+        std::fs::write(
+            dir.join("css/site.css"),
+            ".a { background: url(../img/a.png) } .gone { background: url(missing.png) }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("page.html"),
+            r#"<!doctype html><link rel=stylesheet href="css/site.css">
+               <div class=a>a</div><div style="background-image: url(img/b.png)">b</div>
+               <div style="display: none"><p class=gone>x</p></div>"#,
+        )
+        .unwrap();
+        let url = to_url(&dir.join("page.html").display().to_string()).unwrap();
+        let settings = Settings {
+            width: 400.0,
+            height: 300.0,
+            dark: false,
+            fetch_css: true,
+        };
+        let fonts = FontStore::default();
+        let page = load(&url, settings, &fonts, None, &mut |_| true).unwrap();
+        let sheet_url = net::Url::parse(&format!("{}", url))
+            .unwrap()
+            .join("img/a.png")
+            .unwrap()
+            .to_string();
+        use paint::ImageSource;
+        assert!(page.images.background(&sheet_url).is_some(), "{sheet_url}");
+        assert!(
+            page.images.background("img/b.png").is_some(),
+            "kept by the URL as written"
+        );
+        assert_eq!(
+            page.images.len(),
+            2,
+            "the hidden element's file was not fetched"
+        );
+        // A sleeping tab wakes with its backgrounds, without the files.
+        std::fs::remove_dir_all(dir.join("img")).unwrap();
+        let woken = restore(snapshot(page), settings, &fonts).expect("restores");
+        assert!(woken.images.background(&sheet_url).is_some());
+        assert!(woken.images.background("img/b.png").is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
