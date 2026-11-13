@@ -404,6 +404,14 @@ impl DeviceGradient {
         self.lut[i.clamp(0.0, (LUT - 1) as f32) as usize]
     }
 
+    /// Move the gradient with its box.
+    pub fn translate(&mut self, dx: f32, dy: f32) {
+        match &mut self.line {
+            Line::Linear { sx, sy, .. } => (*sx, *sy) = (*sx + dx, *sy + dy),
+            Line::Radial { cx, cy, .. } => (*cx, *cy) = (*cx + dx, *cy + dy),
+        }
+    }
+
     /// For a linear gradient, the color table index at the pixel center (x, y) and its step per
     /// pixel to the right: along a row it changes by a constant, so rows are filled without
     /// working out each pixel's position. `None` for radial gradients.

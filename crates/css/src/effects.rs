@@ -62,15 +62,17 @@ pub enum EffectSpec {
     Shadows(Vec<ShadowSpec>),
     /// Background layers, first on top. Only gradients for now; others are dropped.
     Images(Vec<GradientSpec>),
+    Transform(Vec<crate::transform::TransformSpec>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EffectSlot {
     BoxShadow,
     BackgroundImage,
+    Transform,
 }
 
-pub const EFFECT_SLOTS: usize = 2;
+pub const EFFECT_SLOTS: usize = 3;
 
 /// A computed shadow: lengths in px, the color resolved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -226,7 +228,7 @@ fn parse_direction(v: &str) -> Option<Direction> {
     parse_angle(v).map(Direction::Angle)
 }
 
-fn parse_angle(v: &str) -> Option<f32> {
+pub(crate) fn parse_angle(v: &str) -> Option<f32> {
     let split = v
         .find(|c: char| !(c.is_ascii_digit() || matches!(c, '.' | '-' | '+')))
         .unwrap_or(v.len());

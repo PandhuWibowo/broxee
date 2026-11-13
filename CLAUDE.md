@@ -77,6 +77,11 @@ casts), not taken from binding crates. Ask before proposing any dependency.
   over an opaque backdrop, and the rounded clip. Backdrops are copied 32 rows at a time within the group's
   bounds; groups that need none are dropped while building (`fade`, rounded clips whose content stays off the
   corners). `emit_range` never reopens a group it is inside: a group cut by a layer recursed forever.
+- **Transforms are resolved before compositing** (`resolve_transforms`, after the glyph and image caches are
+  written): a move shifts the items (whole pixels, so glyph phases hold), anything else renders offscreen,
+  over black and over white for alpha, within `MAX_LAYER_PIXELS`. Inside a transformed element only the
+  clips it owns move with it (`ClipTracker::floor`); its ancestors' clips apply where it is drawn. Groups
+  on the same range: a rounded clip (the parent's) is outer to a child's transform or opacity.
 - **Every band walks every item, so `Item` stays small**: rounded shapes, gradients and shadows are one
   boxed `Item::Effect`. Plain boxes keep the `Fill` path; only boxes with radii, shadows or gradients
   pay for per-pixel work, and only at their corners and edges (`Edges`: interiors are filled or

@@ -34,6 +34,7 @@ pub struct StyleMap {
     shadows: ListTable<Shadow>,
     gradients: ListTable<Gradient>,
     radii: ListTable<[Length; 2]>,
+    transforms: ListTable<crate::TransformOp>,
     /// Boxes `::before` and `::after` generate, in document order of their elements.
     generated: Vec<Generated>,
     /// Every compound that looks at a state, with its states and `:not()` taken out, and
@@ -61,6 +62,11 @@ impl StyleMap {
     /// then vertical, px or a percentage of the border box), or `None` for square corners.
     pub fn radii(&self, style: &ComputedStyle) -> Option<[[Length; 2]; 4]> {
         self.radii.get(style.radii).try_into().ok()
+    }
+
+    /// A style's `transform`: its origin first, then its functions; empty when it has none.
+    pub fn transform(&self, style: &ComputedStyle) -> &[crate::TransformOp] {
+        self.transforms.get(style.transform)
     }
 
     /// A style's `box-shadow` list, outermost first; empty when it has none.
@@ -809,6 +815,7 @@ struct Styler<'s, 'a> {
     shadows: ListTable<Shadow>,
     gradients: ListTable<Gradient>,
     radii: ListTable<[Length; 2]>,
+    transforms: ListTable<crate::TransformOp>,
     custom_rules: Vec<u32>,
     var_cache: HashMap<(usize, u32), Vec<Declaration>, FastBuildHasher>,
     root_font_size: Px,
@@ -1005,6 +1012,15 @@ impl<'a> Styler<'_, 'a> {
                 let gradients = compute_gradients(g, current, &length);
                 style.background_image = self.gradients.intern(gradients);
             }
+            if let Some(EffectSpec::Transform(t)) = effects[EffectSlot::Transform as usize] {
+                let center = Length::Percent(5000);
+                let origin = match specified[Prop::TransformOrigin as usize] {
+                    Some(Value::Origin(x, y)) => (length(x), length(y)),
+                    _ => (center, center),
+                };
+                let ops = crate::transform::compute_transform(t, origin, &length);
+                style.transform = self.transforms.intern(ops);
+            }
         }
         if let Some(family) = family {
             style.font_family = self.families.intern(family);
@@ -1052,6 +1068,7 @@ pub fn cascade_with(
         shadows: ListTable::default(),
         gradients: ListTable::default(),
         radii: ListTable::default(),
+        transforms: ListTable::default(),
         custom_rules: Vec::new(),
         var_cache: HashMap::default(),
         root_font_size: ComputedStyle::initial().font_size,
@@ -1263,6 +1280,7 @@ pub fn cascade_with(
         shadows: styler.shadows,
         gradients: styler.gradients,
         radii: styler.radii,
+        transforms: styler.transforms,
         generated,
         state_compounds: index.state_compounds,
     }

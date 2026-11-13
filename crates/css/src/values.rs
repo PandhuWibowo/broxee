@@ -364,6 +364,8 @@ pub struct ComputedStyle {
     pub box_shadow: u16,
     /// Gradient layers of `background-image`, an index into `StyleMap::gradients` (0: none).
     pub background_image: u16,
+    /// `transform` with its origin, an index into `StyleMap::transforms` (0: none).
+    pub transform: u16,
     /// Zero when `outline-style` is `none`. Drawn outside the border box, taking no space.
     pub outline_width: Px,
     pub outline_color: Color,
@@ -425,6 +427,7 @@ impl ComputedStyle {
             radii: 0,
             box_shadow: 0,
             background_image: 0,
+            transform: 0,
             outline_width: Px::ZERO,
             outline_color: Color::BLACK,
             outline_offset: Px::ZERO,
@@ -509,6 +512,8 @@ pub enum Value {
     CaptionBottom(bool),
     /// A corner's radii: horizontal, vertical.
     Radius(SpecLength, SpecLength),
+    /// `transform-origin`: horizontal, vertical.
+    Origin(SpecLength, SpecLength),
 }
 
 /// Longhand properties Broxee understands. Shorthands expand into these while parsing.
@@ -562,6 +567,7 @@ pub enum Prop {
     OutlineColor,
     OutlineOffset,
     ZIndex,
+    TransformOrigin,
     BorderTopLeftRadius,
     BorderTopRightRadius,
     BorderBottomRightRadius,
