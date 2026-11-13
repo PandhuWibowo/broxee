@@ -47,7 +47,7 @@ crates/
   js/      JavaScript, written here: lexer.rs, parser.rs (syntax tree), interp.rs (arena heap, scopes,
            evaluation, limits), builtins.rs (globals, DOM bindings, events), regex.rs; the DOM through `Host`
   paint/   display list, glyph rasterizer + cache, image cache + parallel decode, band compositing,
-           streaming PNG writer
+           streaming PNG writer; shape.rs (rounded rectangles, gradients, shadows, evaluated per pixel)
   platform/ macOS window via the Objective-C runtime, IOSurface frames (empty module on other OSes)
   shell/   the `broxee` binary: main.rs (CLI), engine.rs (page pipeline, FontStore, snapshot/restore),
            browser.rs (profiles, tabs, history, navigation, input, session file, Screen trait),
@@ -73,6 +73,10 @@ casts), not taken from binding crates. Ask before proposing any dependency.
 
 - **The glyph and image caches are written only before compositing starts**; band threads read them
   without locks.
+- **Every band walks every item, so `Item` stays small**: rounded shapes, gradients and shadows are one
+  boxed `Item::Effect`. Plain boxes keep the `Fill` path; only boxes with radii, shadows or gradients
+  pay for per-pixel work, and only at their corners and edges (`Edges`: interiors are filled or
+  skipped, straight edges get one coverage per row). Measure GitHub at 2x after changing it.
 - **Images are never decoded at full size.** Decoders stream rows into `image::Scaler`, which outputs the
   drawn size; only visible images are decoded, and the pixel cache stays under `IMAGE_CACHE_BYTES`. A new
   decoder must keep that: memory proportional to the output, not the file. Progressive JPEG keeps

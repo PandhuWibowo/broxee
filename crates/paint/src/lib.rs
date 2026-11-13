@@ -6,6 +6,7 @@
 
 pub mod png;
 mod raster;
+mod shape;
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -14,6 +15,7 @@ use css::{Color, Length, StyleMap};
 use font::{FaceId, FontKey, TextMetrics, WEB_FACES};
 use html::{Dom, FastBuildHasher, NodeId};
 use layout::{Layout, Rect};
+use shape::{device_radii, shadow_coverage, DeviceGradient, RRect};
 
 pub use raster::{rasterize_glyph, rasterize_glyph_at, GlyphBitmap, Rasterizer};
 
@@ -156,15 +158,19 @@ enum Item<'a> {
         color: Color,
         clip: DeviceClip,
     },
-    /// A decoded image stretched over the device rectangle.
+    /// A decoded image stretched over the device rectangle, cut to `round` when the box has
+    /// rounded corners.
     Image {
         x0: i32,
         y0: i32,
         x1: i32,
         y1: i32,
         key: ImageKey,
+        round: Option<RRect>,
         clip: DeviceClip,
     },
+    /// Boxed: every band walks every item, so the list's common items must stay small.
+    Effect(Box<Effect>),
     /// A coverage mask drawn in one color, such as an icon. (x, y) is its top left.
     Mask {
         x: i32,
@@ -173,6 +179,38 @@ enum Item<'a> {
         color: Color,
         clip: DeviceClip,
     },
+}
+
+enum Effect {
+    /// A rounded background, or a gradient layer, inside `shape`.
+    Shape {
+        shape: RRect,
+        fill: ShapeFill,
+        clip: DeviceClip,
+    },
+    /// Borders of a box with rounded corners: between `outer` and `inner`, each side its color.
+    Border {
+        outer: RRect,
+        inner: RRect,
+        widths: [f32; 4],
+        colors: [Color; 4],
+        clip: DeviceClip,
+    },
+    /// A `box-shadow`: `shape` blurred by `sigma`, drawn only outside `bound` (the border box)
+    /// or, for `inset`, only inside it (the padding box), where the shape does not reach.
+    Shadow {
+        shape: RRect,
+        bound: RRect,
+        sigma: f32,
+        color: Color,
+        inset: bool,
+        clip: DeviceClip,
+    },
+}
+
+enum ShapeFill {
+    Solid(Color),
+    Gradient(Box<DeviceGradient>),
 }
 
 /// Walks clip ranges (which nest) alongside ascending fragment indices, keeping the
@@ -594,20 +632,103 @@ impl Painter {
                 let b = &layout.boxes[i];
                 let (x0, y0, x1, y1) = device(b.rect);
                 let style = page.styles.style(b.node);
-                if !visible(y0, y1) || !style.visible || style.transparent {
+                let shadows = page.styles.shadows(style);
+                // Outer shadows reach past the box.
+                let reach = shadows
+                    .iter()
+                    .filter(|sh| !sh.inset)
+                    .map(|sh| {
+                        let d = sh.x.0.abs().max(sh.y.0.abs()) + sh.spread.0.max(0);
+                        ((d as f32 / 64.0 + sh.blur.to_f32() * 1.5) * s).ceil() as i32
+                    })
+                    .max()
+                    .unwrap_or(0);
+                if !visible(y0 - reach, y1 + reach) || !style.visible || style.transparent {
                     continue;
                 }
-                if style.background_color.a > 0 {
-                    items.push(Item::Fill {
-                        x0,
-                        y0,
-                        x1,
-                        y1,
-                        color: style.background_color,
+                let bw = style.border_width.map(|w| (w.to_f32() * s).round() as i32);
+                let (w, h) = ((x1 - x0) as f32, (y1 - y0) as f32);
+                let border_box = RRect::new(
+                    x0 as f32,
+                    y0 as f32,
+                    x1 as f32,
+                    y1 as f32,
+                    page.styles
+                        .radii(style)
+                        .map_or([[0.0; 2]; 4], |r| device_radii(r, w, h, s)),
+                );
+                let inset = |d: [i32; 4]| d.map(|v| -(v as f32));
+                let padding_box = border_box.outset(inset(bw));
+                let rounded = border_box.is_rounded();
+                for sh in shadows.iter().rev().filter(|sh| !sh.inset) {
+                    let spread = sh.spread.to_f32() * s;
+                    items.push(Item::Effect(Box::new(Effect::Shadow {
+                        shape: border_box
+                            .outset([spread; 4])
+                            .translate(sh.x.to_f32() * s, sh.y.to_f32() * s),
+                        bound: border_box,
+                        sigma: sh.blur.to_f32() * s / 2.0,
+                        color: sh.color,
+                        inset: false,
                         clip,
+                    })));
+                }
+                if style.background_color.a > 0 {
+                    items.push(if rounded {
+                        Item::Effect(Box::new(Effect::Shape {
+                            shape: border_box,
+                            fill: ShapeFill::Solid(style.background_color),
+                            clip,
+                        }))
+                    } else {
+                        Item::Fill {
+                            x0,
+                            y0,
+                            x1,
+                            y1,
+                            color: style.background_color,
+                            clip,
+                        }
                     });
                 }
-                let bw = style.border_width.map(|w| (w.to_f32() * s).round() as i32);
+                // Gradients are sized to the padding box and painted to the border box.
+                let area = [
+                    padding_box.x0,
+                    padding_box.y0,
+                    padding_box.x1,
+                    padding_box.y1,
+                ];
+                for g in page.styles.gradients(style).iter().rev() {
+                    if let Some(gradient) = DeviceGradient::new(g, area, s) {
+                        items.push(Item::Effect(Box::new(Effect::Shape {
+                            shape: border_box,
+                            fill: ShapeFill::Gradient(Box::new(gradient)),
+                            clip,
+                        })));
+                    }
+                }
+                for sh in shadows.iter().rev().filter(|sh| sh.inset) {
+                    let spread = sh.spread.to_f32() * s;
+                    items.push(Item::Effect(Box::new(Effect::Shadow {
+                        shape: padding_box
+                            .outset([-spread; 4])
+                            .translate(sh.x.to_f32() * s, sh.y.to_f32() * s),
+                        bound: padding_box,
+                        sigma: sh.blur.to_f32() * s / 2.0,
+                        color: sh.color,
+                        inset: true,
+                        clip,
+                    })));
+                }
+                if rounded && bw.iter().any(|&w| w > 0) {
+                    items.push(Item::Effect(Box::new(Effect::Border {
+                        outer: border_box,
+                        inner: padding_box,
+                        widths: bw.map(|w| w as f32),
+                        colors: style.border_color,
+                        clip,
+                    })));
+                }
                 let sides = [
                     (x0, y0, x1, y0 + bw[0]),
                     (x1 - bw[1], y0, x1, y1),
@@ -616,7 +737,7 @@ impl Painter {
                 ];
                 for (side, (sx0, sy0, sx1, sy1)) in sides.into_iter().enumerate() {
                     let color = style.border_color[side];
-                    if bw[side] > 0 && color.a > 0 {
+                    if !rounded && bw[side] > 0 && color.a > 0 {
                         items.push(Item::Fill {
                             x0: sx0,
                             y0: sy0,
@@ -672,6 +793,7 @@ impl Painter {
                             x1: ix1,
                             y1: iy1,
                             key,
+                            round: rounded.then_some(padding_box),
                             clip,
                         });
                     }
@@ -855,6 +977,7 @@ fn composite_band(
                 x1,
                 y1,
                 key,
+                ref round,
                 clip,
             } => {
                 let Some(cached) = images.get(&key) else {
@@ -865,10 +988,365 @@ fn composite_band(
                     continue;
                 }
                 let rect = [clip[0].max(lo), clip[1], clip[2].min(hi), clip[3]];
-                draw_image(rows, band, y0, [x0, iy0, x1, y1], bitmap, rect);
+                draw_image(
+                    rows,
+                    band,
+                    y0,
+                    [x0, iy0, x1, y1],
+                    bitmap,
+                    round.as_ref(),
+                    rect,
+                );
+            }
+            Item::Effect(ref effect) => draw_effect(rows, band, y0, effect, (lo, hi)),
+        }
+    }
+}
+
+/// Draw a rounded shape, a gradient, a rounded border or a shadow into this band.
+fn draw_effect(rows: &mut [u8], band: Band, y0: i32, effect: &Effect, (lo, hi): (i32, i32)) {
+    let order = |c: Color| {
+        if band.bgra {
+            Color {
+                r: c.b,
+                g: c.g,
+                b: c.r,
+                a: c.a,
+            }
+        } else {
+            c
+        }
+    };
+    match *effect {
+        Effect::Shape {
+            ref shape,
+            ref fill,
+            clip,
+        } => {
+            let rect = [clip[0].max(lo), clip[1], clip[2].min(hi), clip[3]];
+            let interior = shape.interior(0.0);
+            match fill {
+                ShapeFill::Gradient(g) => fill_gradient(rows, band, y0, interior, rect, g),
+                ShapeFill::Solid(c) => fill_rect(rows, band, y0, interior, rect, order(*c)),
+            }
+            // The interior is filled above; the edges go through the shape.
+            let edges = Edges {
+                area: shape.bounds(0.0),
+                hole: interior,
+                straight: shape.interior(1.0),
+            };
+            each_pixel(
+                rows,
+                band,
+                y0,
+                edges,
+                rect,
+                |x, y| shape.coverage(x, y),
+                |x, y, dst, cover| {
+                    let cover = (cover * 255.0).round() as u32;
+                    match fill {
+                        ShapeFill::Solid(c) => blend(dst, order(*c), cover * u32::from(c.a) / 255),
+                        ShapeFill::Gradient(g) => {
+                            let mut c = g.sample(x, y);
+                            if band.bgra {
+                                c.swap(0, 2);
+                            }
+                            blend_premultiplied(dst, c, cover);
+                        }
+                    }
+                },
+            );
+        }
+        Effect::Border {
+            ref outer,
+            ref inner,
+            widths,
+            colors,
+            clip,
+        } => {
+            let rect = [clip[0].max(lo), clip[1], clip[2].min(hi), clip[3]];
+            let edges = Edges {
+                area: outer.bounds(0.0),
+                hole: inner.interior(0.0),
+                straight: narrower(outer.interior(1.0), inner.interior(1.0)),
+            };
+            each_pixel(
+                rows,
+                band,
+                y0,
+                edges,
+                rect,
+                |x, y| outer.coverage(x, y) - inner.coverage(x, y),
+                |x, y, dst, cover| {
+                    // The side whose band the pixel is deepest in, relative to its width:
+                    // corners split along the line from the outer to the inner corner.
+                    let depth = [y - outer.y0, outer.x1 - x, outer.y1 - y, x - outer.x0];
+                    let side = (0..4)
+                        .filter(|&i| widths[i] > 0.0)
+                        .min_by(|&a, &b| (depth[a] / widths[a]).total_cmp(&(depth[b] / widths[b])))
+                        .unwrap_or(0);
+                    let c = colors[side];
+                    blend(dst, order(c), (cover * f32::from(c.a)).round() as u32);
+                },
+            );
+        }
+        Effect::Shadow {
+            ref shape,
+            ref bound,
+            sigma,
+            color,
+            inset,
+            clip,
+        } => {
+            let rect = [clip[0].max(lo), clip[1], clip[2].min(hi), clip[3]];
+            // Outer shadows are hidden under the box, inset ones fade out 3 sigma inside
+            // the shape: neither needs computing there.
+            let reach = sigma * 3.0 + 1.0;
+            let straight = narrower(shape.interior(reach), bound.interior(1.0));
+            let edges = if inset {
+                Edges {
+                    area: bound.bounds(0.0),
+                    hole: shape.interior(reach),
+                    straight,
+                }
+            } else {
+                Edges {
+                    area: shape.bounds(reach),
+                    hole: bound.interior(0.0),
+                    straight,
+                }
+            };
+            let c = order(color);
+            each_pixel(
+                rows,
+                band,
+                y0,
+                edges,
+                rect,
+                |x, y| {
+                    let dark = shadow_coverage(shape, sigma, x, y);
+                    if inset {
+                        (1.0 - dark) * bound.coverage(x, y)
+                    } else {
+                        dark * (1.0 - bound.coverage(x, y))
+                    }
+                },
+                |_, _, dst, cover| blend(dst, c, (cover * f32::from(c.a)).round() as u32),
+            );
+        }
+    }
+}
+
+/// Where an effect draws: `area`, less `hole` (drawn already, or nothing to draw), with
+/// coverage that is the same along a row between `straight`'s left and right (the edges
+/// between the corners are straight).
+struct Edges {
+    area: [i32; 4],
+    hole: [i32; 4],
+    straight: [i32; 4],
+}
+
+/// The horizontal span both shapes are straight in.
+fn narrower(a: [i32; 4], b: [i32; 4]) -> [i32; 4] {
+    [a[0].max(b[0]), a[1], a[2].min(b[2]), a[3]]
+}
+
+/// Paint the edges of an effect: `paint` gets each pixel's center (frame coordinates), its
+/// bytes and its coverage from `cover`, for the pixels of `edges.area` outside `edges.hole`,
+/// inside `clip` and this band. Coverage is worked out once per row where the edge is straight,
+/// so a wide box costs per-pixel distance work only at its corners and sides.
+fn each_pixel(
+    rows: &mut [u8],
+    band: Band,
+    y0: i32,
+    edges: Edges,
+    clip: DeviceClip,
+    cover: impl Fn(f32, f32) -> f32,
+    mut paint: impl FnMut(f32, f32, &mut [u8], f32),
+) {
+    let Edges {
+        area,
+        hole: h,
+        straight,
+    } = edges;
+    let band_height = (rows.len() / band.stride) as i32;
+    let (cx0, cx1) = (
+        area[0].max(clip[0]).max(0),
+        area[2].min(clip[2]).min(band.width as i32),
+    );
+    let ry0 = (area[1].max(clip[1]) - y0).clamp(0, band_height);
+    let ry1 = (area[3].min(clip[3]) - y0).clamp(0, band_height);
+    for ry in ry0..ry1 {
+        let fy = ry + y0;
+        let y = fy as f32 + 0.5;
+        let row = ry as usize * band.stride + band.left * 4;
+        let mut put = |x: i32, c: f32| {
+            if c > 0.0 {
+                let at = row + x as usize * 4;
+                paint(x as f32 + 0.5, y, &mut rows[at..at + 4], c);
+            }
+        };
+        if (h[1]..h[3]).contains(&fy) && h[0] < h[2] {
+            // Beside the hole: the left and right edges.
+            let (hx0, hx1) = (h[0].clamp(cx0, cx1), h[2].clamp(cx0, cx1));
+            for x in (cx0..hx0).chain(hx1..cx1) {
+                put(x, cover(x as f32 + 0.5, y));
+            }
+            continue;
+        }
+        // Above or below it: corners, and the straight edge between them.
+        let (sx0, sx1) = if straight[0] < straight[2] {
+            (straight[0].clamp(cx0, cx1), straight[2].clamp(cx0, cx1))
+        } else {
+            (cx1, cx1)
+        };
+        for x in cx0..sx0 {
+            put(x, cover(x as f32 + 0.5, y));
+        }
+        if sx0 < sx1 {
+            let c = cover(sx0 as f32 + 0.5, y);
+            for x in sx0..sx1 {
+                put(x, c);
+            }
+        }
+        for x in sx1..cx1 {
+            put(x, cover(x as f32 + 0.5, y));
+        }
+    }
+}
+
+/// Fill `area`, inside `clip` and this band, with one color (byte order already applied).
+fn fill_rect(rows: &mut [u8], band: Band, y0: i32, area: [i32; 4], clip: DeviceClip, c: Color) {
+    let band_height = (rows.len() / band.stride) as i32;
+    let (cx0, cx1) = (
+        area[0].max(clip[0]).max(0),
+        area[2].min(clip[2]).min(band.width as i32),
+    );
+    let ry0 = (area[1].max(clip[1]) - y0).clamp(0, band_height);
+    let ry1 = (area[3].min(clip[3]) - y0).clamp(0, band_height);
+    if cx0 >= cx1 {
+        return;
+    }
+    for ry in ry0..ry1 {
+        let start = ry as usize * band.stride + (band.left + cx0 as usize) * 4;
+        let end = start + (cx1 - cx0) as usize * 4;
+        for px in rows[start..end].as_chunks_mut::<4>().0 {
+            blend(px, c, u32::from(c.a));
+        }
+    }
+}
+
+/// Fill `area` (fully inside its shape) with a gradient. Linear gradients step their color
+/// table index along each row instead of computing every pixel's position: GitHub's loading
+/// skeletons are a third of the frame.
+fn fill_gradient(
+    rows: &mut [u8],
+    band: Band,
+    y0: i32,
+    area: [i32; 4],
+    clip: DeviceClip,
+    g: &DeviceGradient,
+) {
+    let band_height = (rows.len() / band.stride) as i32;
+    let (cx0, cx1) = (
+        area[0].max(clip[0]).max(0),
+        area[2].min(clip[2]).min(band.width as i32),
+    );
+    let ry0 = (area[1].max(clip[1]) - y0).clamp(0, band_height);
+    let ry1 = (area[3].min(clip[3]) - y0).clamp(0, band_height);
+    if cx0 >= cx1 || ry0 >= ry1 {
+        return;
+    }
+    let ordered = |mut c: [u8; 4]| {
+        if band.bgra {
+            c.swap(0, 2);
+        }
+        c
+    };
+    let row_pixels = |ry: i32| {
+        let start = ry as usize * band.stride + (band.left + cx0 as usize) * 4;
+        start..start + (cx1 - cx0) as usize * 4
+    };
+    let opaque = g.opaque();
+    match g.axis() {
+        // Every row the same: work out one, then copy it.
+        shape::Axis::Horizontal => {
+            let (mut i, step) = g
+                .row_index(cx0 as f32 + 0.5, 0.5)
+                .expect("linear gradients have rows");
+            let line: Vec<[u8; 4]> = (cx0..cx1)
+                .map(|_| {
+                    let c = ordered(g.at_index(i));
+                    i += step;
+                    c
+                })
+                .collect();
+            let bytes = line.as_flattened();
+            for ry in ry0..ry1 {
+                let range = row_pixels(ry);
+                let dst = &mut rows[range];
+                if opaque {
+                    dst.copy_from_slice(bytes);
+                } else {
+                    for (d, c) in dst.as_chunks_mut::<4>().0.iter_mut().zip(&line) {
+                        blend_premultiplied(d, *c, 255);
+                    }
+                }
+            }
+        }
+        // One color per row.
+        shape::Axis::Vertical => {
+            for ry in ry0..ry1 {
+                let y = (ry + y0) as f32 + 0.5;
+                let (i, _) = g.row_index(cx0 as f32 + 0.5, y).expect("linear");
+                let c = ordered(g.at_index(i));
+                let range = row_pixels(ry);
+                for d in rows[range].as_chunks_mut::<4>().0 {
+                    blend_premultiplied(d, c, 255);
+                }
+            }
+        }
+        shape::Axis::Other => {
+            for ry in ry0..ry1 {
+                let y = (ry + y0) as f32 + 0.5;
+                let range = row_pixels(ry);
+                let pixels = rows[range].as_chunks_mut::<4>().0;
+                match g.row_index(cx0 as f32 + 0.5, y) {
+                    Some((mut i, step)) => {
+                        for d in pixels {
+                            blend_premultiplied(d, ordered(g.at_index(i)), 255);
+                            i += step;
+                        }
+                    }
+                    None => {
+                        for (k, d) in pixels.iter_mut().enumerate() {
+                            let c = g.sample((cx0 + k as i32) as f32 + 0.5, y);
+                            blend_premultiplied(d, ordered(c), 255);
+                        }
+                    }
+                }
             }
         }
     }
+}
+
+/// Source-over blend of a premultiplied color at `cover` (0 to 255) onto an opaque pixel.
+#[inline]
+fn blend_premultiplied(dst: &mut [u8], c: [u8; 4], cover: u32) {
+    if cover >= 255 && c[3] == 255 {
+        dst.copy_from_slice(&[c[0], c[1], c[2], 255]);
+        return;
+    }
+    let a = u32::from(c[3]) * cover / 255;
+    if a == 0 {
+        return;
+    }
+    let inv = 255 - a;
+    for k in 0..3 {
+        let v = (u32::from(c[k]) * cover + u32::from(dst[k]) * inv + 127) / 255;
+        dst[k] = v.min(255) as u8;
+    }
+    dst[3] = 255;
 }
 
 /// Draw premultiplied `bitmap` stretched over `dest` (frame pixels), inside `clip`. The bitmap
@@ -879,6 +1357,7 @@ fn draw_image(
     y0: i32,
     dest: [i32; 4],
     bitmap: &image::Bitmap,
+    round: Option<&RRect>,
     clip: DeviceClip,
 ) {
     let band_height = (rows.len() / band.stride) as i32;
@@ -894,15 +1373,24 @@ fn draw_image(
         for x in cx0..cx1 {
             let sx = ((i64::from(x - dx0) * bw as i64 / dw) as usize).min(bw - 1);
             let p = &src[sx * 4..sx * 4 + 4];
-            let a = u32::from(p[3]);
-            if a == 0 {
-                continue;
-            }
-            let (r, g, b) = if band.bgra {
+            let mut a = u32::from(p[3]);
+            let (mut r, mut g, mut b) = if band.bgra {
                 (p[2], p[1], p[0])
             } else {
                 (p[0], p[1], p[2])
             };
+            if let Some(shape) = round {
+                // Premultiplied: scale every channel by the corner's coverage.
+                let cover = shape.coverage(x as f32 + 0.5, (ry + y0) as f32 + 0.5);
+                if cover < 1.0 {
+                    let k = |v: u8| (f32::from(v) * cover).round() as u8;
+                    (r, g, b) = (k(r), k(g), k(b));
+                    a = (a as f32 * cover).round() as u32;
+                }
+            }
+            if a == 0 {
+                continue;
+            }
             let at = ry as usize * band.stride + (band.left + x as usize) * 4;
             let dst = &mut rows[at..at + 4];
             if a == 255 {
@@ -1051,6 +1539,91 @@ mod tests {
         assert_eq!(pixel(&f, 10, 10), [0, 0, 0], "border");
         assert_eq!(pixel(&f, 50, 20), [255, 255, 255], "box background");
         assert_eq!(pixel(&f, 50, 55), [3, 105, 161]);
+    }
+
+    #[test]
+    fn rounds_corners_of_backgrounds_and_borders() {
+        let f = render(
+            "<body><div></div><p></p></body>",
+            "body { margin: 0; background: #fff }
+             div { margin: 10px; width: 80px; height: 40px; background: #000; border-radius: 10px }
+             p { margin: 10px; width: 40px; height: 40px; border-radius: 50%;
+                 border: 4px solid #f00; border-right-color: #00f }",
+            120.0,
+            130.0,
+            1.0,
+        );
+        assert_eq!(pixel(&f, 10, 10), [255, 255, 255], "the corner is cut");
+        assert_eq!(pixel(&f, 11, 11), [255, 255, 255]);
+        assert_eq!(pixel(&f, 20, 12), [0, 0, 0], "past the curve");
+        assert_eq!(pixel(&f, 50, 30), [0, 0, 0]);
+        // (13.5, 12.5) is 9.92 px from the arc center (20, 20): on the curve.
+        let corner = pixel(&f, 13, 12);
+        assert!(corner[0] > 0 && corner[0] < 255, "anti-aliased: {corner:?}");
+        // The circle: border box 48x48 at (10, 60), the margins between the boxes collapsing.
+        // Left side red, right side blue, inside clear.
+        assert_eq!(pixel(&f, 11, 84), [255, 0, 0]);
+        assert_eq!(pixel(&f, 56, 84), [0, 0, 255]);
+        assert_eq!(pixel(&f, 34, 84), [255, 255, 255], "inside the ring");
+        assert_eq!(pixel(&f, 11, 61), [255, 255, 255], "outside the circle");
+    }
+
+    #[test]
+    fn draws_gradients_over_the_padding_box() {
+        let f = render(
+            "<body><div></div><p></p></body>",
+            "body { margin: 0; background: #fff }
+             div { width: 100px; height: 10px; background: linear-gradient(to right, #000, #fff) }
+             p { margin: 0; width: 40px; height: 40px;
+                 background: radial-gradient(circle closest-side, #f00, #f00 50%, #00f 50%) }",
+            100.0,
+            60.0,
+            1.0,
+        );
+        let left = pixel(&f, 0, 5)[0];
+        let mid = pixel(&f, 50, 5)[0];
+        let right = pixel(&f, 99, 5)[0];
+        assert!(
+            left < 5 && right > 250 && (120..136).contains(&mid),
+            "{left} {mid} {right}"
+        );
+        assert_eq!(pixel(&f, 20, 30), [255, 0, 0], "center of the circle");
+        assert_eq!(pixel(&f, 2, 30), [0, 0, 255], "outside half the radius");
+    }
+
+    #[test]
+    fn draws_outer_and_inset_shadows() {
+        let f = render(
+            "<body><div></div><p></p></body>",
+            "body { margin: 0; background: #fff }
+             div { margin: 20px; width: 40px; height: 20px; background: #fff;
+                   box-shadow: 10px 0 0 #000 }
+             p { margin: 20px; width: 40px; height: 40px; background: #fff;
+                 box-shadow: inset 0 0 0 5px #00f, 0 0 8px #000 }",
+            120.0,
+            140.0,
+            1.0,
+        );
+        assert_eq!(
+            pixel(&f, 30, 30),
+            [255, 255, 255],
+            "the box covers its own shadow"
+        );
+        assert_eq!(pixel(&f, 65, 30), [0, 0, 0], "a hard shadow 10px right");
+        assert_eq!(pixel(&f, 75, 30), [255, 255, 255]);
+        // The second box is at (20, 60) to (60, 100): its top margin collapses with the first's.
+        assert_eq!(
+            pixel(&f, 22, 80),
+            [0, 0, 255],
+            "inset spread inside the edge"
+        );
+        assert_eq!(pixel(&f, 40, 80), [255, 255, 255], "the middle stays clear");
+        let blur = pixel(&f, 15, 80)[0];
+        assert!(
+            blur > 60 && blur < 250,
+            "the blurred shadow fades out: {blur}"
+        );
+        assert!(pixel(&f, 18, 80)[0] < blur, "darker nearer the box");
     }
 
     #[test]

@@ -353,6 +353,13 @@ pub struct ComputedStyle {
     /// Zero when the side's border style is `none`.
     pub border_width: [Px; 4],
     pub border_color: [Color; 4],
+    /// Corner radii, an index into `StyleMap::radii` (0: square corners). Interned: most
+    /// elements have none, and four pairs of lengths would add 64 bytes to every style.
+    pub radii: u16,
+    /// `box-shadow`, an index into `StyleMap::shadows` (0: none).
+    pub box_shadow: u16,
+    /// Gradient layers of `background-image`, an index into `StyleMap::gradients` (0: none).
+    pub background_image: u16,
     /// Zero when `outline-style` is `none`. Drawn outside the border box, taking no space.
     pub outline_width: Px,
     pub outline_color: Color,
@@ -409,6 +416,9 @@ impl ComputedStyle {
             padding: [Length::ZERO; 4],
             border_width: [Px::ZERO; 4],
             border_color: [Color::BLACK; 4],
+            radii: 0,
+            box_shadow: 0,
+            background_image: 0,
             outline_width: Px::ZERO,
             outline_color: Color::BLACK,
             outline_offset: Px::ZERO,
@@ -491,6 +501,8 @@ pub enum Value {
     VAlign(VAlign),
     Collapse(bool),
     CaptionBottom(bool),
+    /// A corner's radii: horizontal, vertical.
+    Radius(SpecLength, SpecLength),
 }
 
 /// Longhand properties Broxee understands. Shorthands expand into these while parsing.
@@ -543,6 +555,10 @@ pub enum Prop {
     OutlineStyle,
     OutlineColor,
     OutlineOffset,
+    BorderTopLeftRadius,
+    BorderTopRightRadius,
+    BorderBottomRightRadius,
+    BorderBottomLeftRadius,
     MarginTop,
     MarginRight,
     MarginBottom,
@@ -720,7 +736,8 @@ mod tests {
         // Styles are deduplicated (a page has hundreds, nodes hold a 4-byte index), so size is
         // not a per-node cost; it is still hashed once per style computed. Grow it deliberately.
         let size = std::mem::size_of::<ComputedStyle>();
-        // 284 since floats (`float`, `clear`, `flow_root`) and `outline` (width, color, offset).
-        assert!(size <= 284, "ComputedStyle grew to {size} bytes");
+        // 284 since floats (`float`, `clear`, `flow_root`) and `outline` (width, color, offset);
+        // 292 with the indices of radii, shadows and gradients (2 bytes each, then alignment).
+        assert!(size <= 292, "ComputedStyle grew to {size} bytes");
     }
 }
