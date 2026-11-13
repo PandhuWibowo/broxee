@@ -362,7 +362,7 @@ pub struct ComputedStyle {
     pub radii: u16,
     /// `box-shadow`, an index into `StyleMap::shadows` (0: none).
     pub box_shadow: u16,
-    /// Gradient layers of `background-image`, an index into `StyleMap::gradients` (0: none).
+    /// The layers of `background-image`, an index into `StyleMap::backgrounds` (0: none).
     pub background_image: u16,
     /// `transform` with its origin, an index into `StyleMap::transforms` (0: none).
     pub transform: u16,
@@ -512,8 +512,11 @@ pub enum Value {
     CaptionBottom(bool),
     /// A corner's radii: horizontal, vertical.
     Radius(SpecLength, SpecLength),
-    /// `transform-origin`: horizontal, vertical.
+    /// `transform-origin` or `background-position`: horizontal, vertical.
     Origin(SpecLength, SpecLength),
+    BgSize(crate::effects::SizeSpec),
+    /// `background-repeat`: across, down.
+    Repeat(bool, bool),
 }
 
 /// Longhand properties Broxee understands. Shorthands expand into these while parsing.
@@ -568,6 +571,9 @@ pub enum Prop {
     OutlineOffset,
     ZIndex,
     TransformOrigin,
+    BackgroundSize,
+    BackgroundPosition,
+    BackgroundRepeat,
     BorderTopLeftRadius,
     BorderTopRightRadius,
     BorderBottomRightRadius,

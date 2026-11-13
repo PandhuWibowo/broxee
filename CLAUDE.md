@@ -107,6 +107,10 @@ casts), not taken from binding crates. Ask before proposing any dependency.
 
 - **Only the visible tab is a live page** (`Browser::page`). Every other tab is a file in `TabStore` or just
   its history. Never keep a second `Loaded` around: a heavy page is 10 to 20 MB live.
+- **CSS background images are kept by URL** in the page's `ImageStore` (beside `<img>` files by `NodeId`,
+  within the same budget), keyed by the URL as the computed style holds it: stylesheets' URLs are made absolute
+  after parsing (`Stylesheet::resolve_urls`), `style` attributes' stay relative and are fetched against the page.
+  They are found after the cascade, for displayed elements only, and stored with a sleeping tab.
 - **A snapshot holds only what the page was built from**, as it arrived (`net::Wire`): rebuilding must give the
   same DOM, so `NodeId`s in the stored `ImageStore` stay valid. Do not store anything derived (styles, layout).
 - **Image ids in the painter are per page.** `Painter::forget_images` runs whenever the page changes (show,

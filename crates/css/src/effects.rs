@@ -60,8 +60,8 @@ pub struct GradientSpec {
 #[derive(Clone, Debug, PartialEq)]
 pub enum EffectSpec {
     Shadows(Vec<ShadowSpec>),
-    /// Background layers, first on top. Only gradients for now; others are dropped.
-    Images(Vec<GradientSpec>),
+    /// Background layers, first on top.
+    Images(Vec<ImageSpec>),
     Transform(Vec<crate::transform::TransformSpec>),
 }
 
@@ -321,25 +321,188 @@ pub(crate) fn parse_position(v: &str) -> Option<(SpecLength, SpecLength)> {
     Some((x.unwrap_or(pct(50.0)), y.unwrap_or(pct(50.0))))
 }
 
-/// The layers of `background-image` (or the image part of `background`) Broxee can draw.
-/// `None` when nothing in `v` is an image: the declaration does not set the property.
-pub fn parse_images(v: &str) -> Option<Vec<GradientSpec>> {
-    if v.trim() == "none" {
+/// One `background-image` layer as written.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ImageSpec {
+    Gradient(GradientSpec),
+    /// As written, case kept: a stylesheet's are made absolute after parsing
+    /// (`Stylesheet::resolve_urls`), a `style` attribute's against the page.
+    Url(String),
+}
+
+/// The layers of `background-image` (or the image part of `background`), first on top.
+/// `None` when nothing in `v` is an image: the declaration does not set the property. `v`
+/// keeps its case, for URLs.
+pub fn parse_images(v: &str) -> Option<Vec<ImageSpec>> {
+    if v.trim().eq_ignore_ascii_case("none") {
         return Some(Vec::new());
     }
     let mut out = Vec::new();
     let mut any = false;
     for layer in split_top_level(v, b',') {
         for token in split_values(layer.trim()) {
-            if token.contains("gradient(") {
+            let lower = token.to_ascii_lowercase();
+            if lower.contains("gradient(") {
                 any = true;
-                out.extend(parse_gradient(token));
-            } else if token.starts_with("url(") || token == "none" {
+                out.extend(parse_gradient(&lower).map(ImageSpec::Gradient));
+            } else if lower.starts_with("url(") {
+                any = true;
+                out.extend(crate::fontface::url_function(token).map(ImageSpec::Url));
+            } else if lower == "none" {
                 any = true;
             }
         }
     }
     any.then_some(out)
+}
+
+/// `background-size` as written.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SizeSpec {
+    Cover,
+    Contain,
+    /// Width and height; `Auto` keeps the image's proportions.
+    Lengths(SpecLength, SpecLength),
+}
+
+pub(crate) fn parse_size(v: &str) -> Option<SizeSpec> {
+    let first = split_top_level(v, b',')
+        .into_iter()
+        .next()?
+        .trim()
+        .to_ascii_lowercase();
+    match first.as_str() {
+        "cover" => Some(SizeSpec::Cover),
+        "contain" => Some(SizeSpec::Contain),
+        _ => {
+            let parts: Vec<SpecLength> = first
+                .split_ascii_whitespace()
+                .map(parse_length)
+                .collect::<Option<_>>()?;
+            match parts.as_slice() {
+                [w] => Some(SizeSpec::Lengths(*w, SpecLength::Auto)),
+                [w, h] => Some(SizeSpec::Lengths(*w, *h)),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// `background-repeat`: whether it repeats across, and down. `space` and `round` repeat.
+pub(crate) fn parse_repeat(v: &str) -> Option<(bool, bool)> {
+    let first = split_top_level(v, b',')
+        .into_iter()
+        .next()?
+        .trim()
+        .to_ascii_lowercase();
+    let one = |t: &str| match t {
+        "repeat" | "space" | "round" => Some(true),
+        "no-repeat" => Some(false),
+        _ => None,
+    };
+    let parts: Vec<&str> = first.split_ascii_whitespace().collect();
+    match parts.as_slice() {
+        ["repeat-x"] => Some((true, false)),
+        ["repeat-y"] => Some((false, true)),
+        [t] => one(t).map(|r| (r, r)),
+        [x, y] => Some((one(x)?, one(y)?)),
+        _ => None,
+    }
+}
+
+/// `background-position` for the first layer.
+pub(crate) fn parse_bg_position(v: &str) -> Option<(SpecLength, SpecLength)> {
+    let first = split_top_level(v, b',')
+        .into_iter()
+        .next()?
+        .trim()
+        .to_ascii_lowercase();
+    Some(position_or_keywords(&first))
+}
+
+/// A position, or for the three and four value forms (`right 10px top 20%`), which offset
+/// from an edge, the edges alone: the offset would need `calc(100% - 10px)`.
+fn position_or_keywords(v: &str) -> (SpecLength, SpecLength) {
+    let zero = (SpecLength::Percent(0.0), SpecLength::Percent(0.0));
+    parse_position(v).unwrap_or_else(|| {
+        let keywords: Vec<&str> = v
+            .split_ascii_whitespace()
+            .filter(|w| matches!(*w, "left" | "right" | "top" | "bottom" | "center"))
+            .collect();
+        parse_position(&keywords.join(" ")).unwrap_or(zero)
+    })
+}
+
+/// What `background` sets besides its color and images: position, size and repeat of the
+/// first layer, each back to its initial value when not given.
+pub(crate) fn parse_background_rest(v: &str) -> ((SpecLength, SpecLength), SizeSpec, (bool, bool)) {
+    let first = split_top_level(v, b',')
+        .into_iter()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let mut position_words = Vec::new();
+    let mut size_words = Vec::new();
+    let mut repeat = (true, true);
+    let mut after_slash = false;
+    for token in split_values(first.trim()) {
+        if token.contains('(') || parse_color(token).is_some() {
+            continue;
+        }
+        for (k, piece) in token.split('/').enumerate() {
+            if k > 0 {
+                after_slash = true;
+            }
+            if piece.is_empty() {
+                continue;
+            }
+            if let Some(r) = parse_repeat(piece) {
+                repeat = r;
+            } else if after_slash {
+                size_words.push(piece.to_string());
+            } else if matches!(piece, "left" | "right" | "top" | "bottom" | "center")
+                || parse_length(piece).is_some()
+            {
+                position_words.push(piece.to_string());
+            }
+        }
+    }
+    let position = position_or_keywords(&position_words.join(" "));
+    let position = if position_words.is_empty() {
+        (SpecLength::Percent(0.0), SpecLength::Percent(0.0))
+    } else {
+        position
+    };
+    let size = parse_size(&size_words.join(" "))
+        .unwrap_or(SizeSpec::Lengths(SpecLength::Auto, SpecLength::Auto));
+    (position, size, repeat)
+}
+
+/// `background-size` computed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BackgroundSize {
+    Cover,
+    Contain,
+    /// Px, percentages of the positioning area, or `Auto`.
+    Lengths(Length, Length),
+}
+
+/// A `url()` background layer, computed.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BackgroundImage {
+    pub url: Box<str>,
+    pub size: BackgroundSize,
+    /// Px offsets or percentages, against the positioning area less the image.
+    pub position: (Length, Length),
+    /// Repeats across, and down.
+    pub repeat: (bool, bool),
+}
+
+/// One computed background layer.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum BackgroundLayer {
+    Gradient(Gradient),
+    Image(BackgroundImage),
 }
 
 /// Resolve a specified length against the font sizes; `None` for percentages and `auto`.
@@ -369,7 +532,7 @@ pub(crate) fn compute_shadows(
         .collect()
 }
 
-pub(crate) fn compute_gradients(
+pub(crate) fn compute_gradient_list(
     specs: &[GradientSpec],
     current: Color,
     resolve: &impl Fn(SpecLength) -> Length,
@@ -396,6 +559,36 @@ pub(crate) fn compute_gradients(
                 .iter()
                 .map(|(c, p)| (c.unwrap_or(current), p.map_or(Length::Auto, resolve)))
                 .collect(),
+        })
+        .collect()
+}
+
+/// The layers of a style's background, computed: gradients as they are, images with the
+/// size, position and repeat set for them.
+pub(crate) fn compute_backgrounds(
+    specs: &[ImageSpec],
+    current: Color,
+    resolve: &impl Fn(SpecLength) -> Length,
+    (size, position, repeat): (SizeSpec, (SpecLength, SpecLength), (bool, bool)),
+) -> Vec<BackgroundLayer> {
+    specs
+        .iter()
+        .map(|layer| match layer {
+            ImageSpec::Gradient(g) => BackgroundLayer::Gradient(
+                compute_gradient_list(std::slice::from_ref(g), current, resolve)
+                    .pop()
+                    .expect("one gradient in, one out"),
+            ),
+            ImageSpec::Url(url) => BackgroundLayer::Image(BackgroundImage {
+                url: url.as_str().into(),
+                size: match size {
+                    SizeSpec::Cover => BackgroundSize::Cover,
+                    SizeSpec::Contain => BackgroundSize::Contain,
+                    SizeSpec::Lengths(w, h) => BackgroundSize::Lengths(resolve(w), resolve(h)),
+                },
+                position: (resolve(position.0), resolve(position.1)),
+                repeat,
+            }),
         })
         .collect()
 }
@@ -479,9 +672,52 @@ mod tests {
 
     #[test]
     fn finds_gradient_layers_in_backgrounds() {
-        let layers = parse_images("url(a.png) no-repeat, linear-gradient(red, blue) #fff").unwrap();
-        assert_eq!(layers.len(), 1, "urls come later; the gradient is kept");
+        let layers =
+            parse_images("url(Img/A.PNG) no-repeat, linear-gradient(red, blue) #fff").unwrap();
+        assert_eq!(layers.len(), 2);
+        assert_eq!(
+            layers[0],
+            ImageSpec::Url("Img/A.PNG".into()),
+            "URLs keep their case"
+        );
+        assert!(matches!(layers[1], ImageSpec::Gradient(_)));
+        assert_eq!(
+            parse_images("url('x y.svg')").unwrap(),
+            [ImageSpec::Url("x y.svg".into())]
+        );
         assert!(parse_images("#fff").is_none(), "only a color: no image");
         assert_eq!(parse_images("none").unwrap(), []);
+    }
+
+    #[test]
+    fn parses_background_size_position_and_repeat() {
+        assert_eq!(parse_size("cover"), Some(SizeSpec::Cover));
+        assert_eq!(
+            parse_size("50% auto"),
+            Some(SizeSpec::Lengths(
+                SpecLength::Percent(50.0),
+                SpecLength::Auto
+            ))
+        );
+        assert_eq!(parse_repeat("repeat-x"), Some((true, false)));
+        assert_eq!(parse_repeat("no-repeat repeat"), Some((false, true)));
+        assert_eq!(parse_repeat("sideways"), None);
+        let (position, size, repeat) =
+            parse_background_rest("url(a.png) center / cover no-repeat #fff");
+        assert_eq!(
+            position,
+            (SpecLength::Percent(50.0), SpecLength::Percent(50.0))
+        );
+        assert_eq!(size, SizeSpec::Cover);
+        assert_eq!(repeat, (false, false));
+        let (position, size, repeat) = parse_background_rest("#fff");
+        assert_eq!(
+            position,
+            (SpecLength::Percent(0.0), SpecLength::Percent(0.0))
+        );
+        assert_eq!(size, SizeSpec::Lengths(SpecLength::Auto, SpecLength::Auto));
+        assert_eq!(repeat, (true, true));
+        let (position, _, _) = parse_background_rest("url(a.png) right 10px top 20%/40px");
+        assert_eq!(position.0, SpecLength::Percent(100.0));
     }
 }

@@ -5,7 +5,8 @@ use std::hash::Hasher;
 use html::{Atom, Dom, Element, FastBuildHasher, FastHasher, NodeId, NodeKind};
 
 use crate::effects::{
-    compute_gradients, compute_shadows, EffectSlot, EffectSpec, Gradient, Shadow, EFFECT_SLOTS,
+    compute_backgrounds, compute_shadows, BackgroundLayer, EffectSlot, EffectSpec, Shadow,
+    SizeSpec, EFFECT_SLOTS,
 };
 use crate::fontface::FamilyList;
 use crate::grid::{
@@ -32,7 +33,7 @@ pub struct StyleMap {
     grids: GridTables,
     families: FamilyTable,
     shadows: ListTable<Shadow>,
-    gradients: ListTable<Gradient>,
+    backgrounds: ListTable<BackgroundLayer>,
     radii: ListTable<[Length; 2]>,
     transforms: ListTable<crate::TransformOp>,
     /// Boxes `::before` and `::after` generate, in document order of their elements.
@@ -74,9 +75,10 @@ impl StyleMap {
         self.shadows.get(style.box_shadow)
     }
 
-    /// A style's gradient background layers, top layer first; empty when it has none.
-    pub fn gradients(&self, style: &ComputedStyle) -> &[Gradient] {
-        self.gradients.get(style.background_image)
+    /// A style's background layers (gradients and images), top layer first; empty when it
+    /// has none.
+    pub fn backgrounds(&self, style: &ComputedStyle) -> &[BackgroundLayer] {
+        self.backgrounds.get(style.background_image)
     }
 
     pub fn grid_placement(&self, style: &ComputedStyle) -> &GridPlacement {
@@ -813,7 +815,7 @@ struct Styler<'s, 'a> {
     grids: GridTables,
     families: FamilyTable,
     shadows: ListTable<Shadow>,
-    gradients: ListTable<Gradient>,
+    backgrounds: ListTable<BackgroundLayer>,
     radii: ListTable<[Length; 2]>,
     transforms: ListTable<crate::TransformOp>,
     custom_rules: Vec<u32>,
@@ -1008,9 +1010,25 @@ impl<'a> Styler<'_, 'a> {
             if let Some(EffectSpec::Shadows(s)) = effects[EffectSlot::BoxShadow as usize] {
                 style.box_shadow = self.shadows.intern(compute_shadows(s, current, &length));
             }
-            if let Some(EffectSpec::Images(g)) = effects[EffectSlot::BackgroundImage as usize] {
-                let gradients = compute_gradients(g, current, &length);
-                style.background_image = self.gradients.intern(gradients);
+            if let Some(EffectSpec::Images(layers)) = effects[EffectSlot::BackgroundImage as usize]
+            {
+                let get = |p: Prop| specified[p as usize];
+                let size = match get(Prop::BackgroundSize) {
+                    Some(Value::BgSize(size)) => size,
+                    _ => SizeSpec::Lengths(SpecLength::Auto, SpecLength::Auto),
+                };
+                let zero = SpecLength::Percent(0.0);
+                let position = match get(Prop::BackgroundPosition) {
+                    Some(Value::Origin(x, y)) => (x, y),
+                    _ => (zero, zero),
+                };
+                let repeat = match get(Prop::BackgroundRepeat) {
+                    Some(Value::Repeat(x, y)) => (x, y),
+                    _ => (true, true),
+                };
+                let computed =
+                    compute_backgrounds(layers, current, &length, (size, position, repeat));
+                style.background_image = self.backgrounds.intern(computed);
             }
             if let Some(EffectSpec::Transform(t)) = effects[EffectSlot::Transform as usize] {
                 let center = Length::Percent(5000);
@@ -1066,7 +1084,7 @@ pub fn cascade_with(
         grids: GridTables::default(),
         families: FamilyTable::default(),
         shadows: ListTable::default(),
-        gradients: ListTable::default(),
+        backgrounds: ListTable::default(),
         radii: ListTable::default(),
         transforms: ListTable::default(),
         custom_rules: Vec::new(),
@@ -1278,7 +1296,7 @@ pub fn cascade_with(
         grids: styler.grids,
         families: styler.families,
         shadows: styler.shadows,
-        gradients: styler.gradients,
+        backgrounds: styler.backgrounds,
         radii: styler.radii,
         transforms: styler.transforms,
         generated,
@@ -2100,7 +2118,10 @@ mod tests {
         assert!(shadows[1].inset);
         assert_eq!(div.background_color, Color::rgb(0xee, 0xee, 0xee));
         assert!(matches!(
-            map.gradients(div)[0].kind,
+            match &map.backgrounds(div)[0] {
+                BackgroundLayer::Gradient(g) => g.kind,
+                other => panic!("{other:?}"),
+            },
             crate::GradientKind::Linear(9000)
         ));
         let b = first(&dom, &map, "b");
@@ -2113,13 +2134,46 @@ mod tests {
         assert!(map.radii(first(&dom, &map, "p")).is_none());
         assert!(map.shadows(b).is_empty(), "nor are shadows");
         assert!(matches!(
-            map.gradients(b)[0].kind,
+            match &map.backgrounds(b)[0] {
+                BackgroundLayer::Gradient(g) => g.kind,
+                other => panic!("{other:?}"),
+            },
             crate::GradientKind::Radial { .. }
         ));
         assert!(
-            map.gradients(first(&dom, &map, "i")).is_empty(),
+            map.backgrounds(first(&dom, &map, "i")).is_empty(),
             "background resets it"
         );
+    }
+
+    #[test]
+    fn computes_background_image_layers() {
+        let (dom, map) = styled(
+            "<div></div><p></p>",
+            "div { background: url(Img/Hero.JPG) center / cover no-repeat, #eee;
+                   background-image: url(Img/Hero.JPG), linear-gradient(red, blue) }
+             p { background-image: url(a.png); background-size: 20px; background-repeat: repeat-x;
+                 background-position: right 10% }",
+        );
+        let div = map.backgrounds(first(&dom, &map, "div"));
+        assert_eq!(div.len(), 2);
+        let BackgroundLayer::Image(img) = &div[0] else {
+            panic!("{div:?}")
+        };
+        assert_eq!(&*img.url, "Img/Hero.JPG");
+        assert_eq!(img.size, crate::BackgroundSize::Cover);
+        assert_eq!(img.position, (Length::Percent(5000), Length::Percent(5000)));
+        assert_eq!(img.repeat, (false, false));
+        assert!(matches!(div[1], BackgroundLayer::Gradient(_)));
+        let BackgroundLayer::Image(p) = &map.backgrounds(first(&dom, &map, "p"))[0] else {
+            panic!()
+        };
+        assert_eq!(
+            p.size,
+            crate::BackgroundSize::Lengths(Length::Px(Px::new(20.0)), Length::Auto)
+        );
+        assert_eq!(p.repeat, (true, false));
+        assert_eq!(p.position, (Length::Percent(10000), Length::Percent(1000)));
     }
 
     #[test]

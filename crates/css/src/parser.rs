@@ -93,6 +93,27 @@ impl Stylesheet {
         self.rules.is_empty()
     }
 
+    /// Make the `url()`s of background layers absolute with `join` (the sheet's URL), right
+    /// after parsing: relative URLs mean the sheet's location, not the page's. `@font-face`
+    /// sources are resolved by the loader the same way.
+    pub fn resolve_urls(&mut self, join: impl Fn(&str) -> Option<String>) {
+        for rule in &mut self.rules {
+            for decl in &mut rule.decls {
+                if let Declaration::Effect { value, .. } = decl {
+                    if let EffectSpec::Images(layers) = &mut **value {
+                        for layer in layers {
+                            if let crate::effects::ImageSpec::Url(url) = layer {
+                                if let Some(absolute) = join(url) {
+                                    *url = absolute;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn condition_matches(&self, condition: Option<u32>, media: &Media) -> bool {
         condition.is_none_or(|c| {
             self.conditions[c as usize]
@@ -281,7 +302,8 @@ pub fn expand_declaration(name: &str, value: &str, important: bool) -> Vec<Decla
             "inherit" => None,
             v => match slot {
                 EffectSlot::BoxShadow => parse_shadows(v).map(EffectSpec::Shadows),
-                EffectSlot::BackgroundImage => parse_images(v).map(EffectSpec::Images),
+                // URLs keep their case.
+                EffectSlot::BackgroundImage => parse_images(value).map(EffectSpec::Images),
                 EffectSlot::Transform => {
                     crate::transform::parse_transform(v).map(EffectSpec::Transform)
                 }
@@ -297,15 +319,31 @@ pub fn expand_declaration(name: &str, value: &str, important: bool) -> Vec<Decla
             .collect();
     }
     if name == "background" {
-        // The shorthand sets the color and resets the image layers (to its gradients, if any).
+        // The shorthand sets the color, and resets the image layers and the first layer's
+        // position, size and repeat to what it gives.
         let v = value.trim().to_ascii_lowercase();
         let mut out = expand_declaration("background-color-shorthand", &v, important);
         if !matches!(v.as_str(), "inherit" | "initial" | "unset") {
             out.push(Declaration::Effect {
                 slot: EffectSlot::BackgroundImage,
-                value: Box::new(EffectSpec::Images(parse_images(&v).unwrap_or_default())),
+                value: Box::new(EffectSpec::Images(parse_images(value).unwrap_or_default())),
                 important,
             });
+            let (position, size, repeat) = crate::effects::parse_background_rest(value);
+            for (prop, value) in [
+                (
+                    Prop::BackgroundPosition,
+                    Value::Origin(position.0, position.1),
+                ),
+                (Prop::BackgroundSize, Value::BgSize(size)),
+                (Prop::BackgroundRepeat, Value::Repeat(repeat.0, repeat.1)),
+            ] {
+                out.push(Declaration::Typed(Decl {
+                    prop,
+                    value,
+                    important,
+                }));
+            }
         }
         return out;
     }
@@ -517,6 +555,9 @@ fn single_prop(name: &str) -> Option<Prop> {
         "order" => Prop::Order,
         "z-index" => Prop::ZIndex,
         "transform-origin" | "-webkit-transform-origin" => Prop::TransformOrigin,
+        "background-size" | "-webkit-background-size" => Prop::BackgroundSize,
+        "background-position" => Prop::BackgroundPosition,
+        "background-repeat" => Prop::BackgroundRepeat,
         "vertical-align" => Prop::VerticalAlign,
         "border-collapse" => Prop::BorderCollapse,
         "caption-side" => Prop::CaptionSide,
@@ -722,6 +763,11 @@ fn parse_for(prop: Prop, v: &str) -> Option<Value> {
                 .map(Value::Length),
         },
         Order => v.parse::<i32>().ok().map(|n| Value::Number(n as f32)),
+        BackgroundSize => crate::effects::parse_size(v).map(Value::BgSize),
+        BackgroundPosition => {
+            crate::effects::parse_bg_position(v).map(|(x, y)| Value::Origin(x, y))
+        }
+        BackgroundRepeat => crate::effects::parse_repeat(v).map(|(x, y)| Value::Repeat(x, y)),
         TransformOrigin => {
             // The z part, when given, has no 2D meaning.
             let xy: Vec<&str> = v.split_whitespace().take(2).collect();
@@ -1512,7 +1558,7 @@ mod tests {
             .decls
             .iter()
             .filter_map(|d| match d {
-                Declaration::Typed(d) => Some(d.value),
+                Declaration::Typed(d) if matches!(d.value, Value::Color(_)) => Some(d.value),
                 _ => None,
             })
             .collect();
@@ -1522,6 +1568,18 @@ mod tests {
                 Value::Color(Color::rgb(255, 255, 255)),
                 Value::Color(Color::rgb(255, 0, 0))
             ]
+        );
+        // And the data URL is one layer, its semicolon kept.
+        let layer = sheet.rules[0].decls.iter().find_map(|d| match d {
+            Declaration::Effect { value, .. } => match &**value {
+                EffectSpec::Images(layers) => layers.first().cloned(),
+                _ => None,
+            },
+            _ => None,
+        });
+        assert_eq!(
+            layer,
+            Some(crate::effects::ImageSpec::Url("data:x;y".into()))
         );
     }
 

@@ -85,6 +85,12 @@ pub struct Page<'a> {
 /// file (so several elements share decoded pixels) and its bytes.
 pub trait ImageSource {
     fn image(&self, node: NodeId) -> Option<(u64, &[u8])>;
+
+    /// A CSS background's file by URL: its id (shared with `image` for the same file), bytes
+    /// and natural size in px.
+    fn background(&self, _url: &str) -> Option<(u64, &[u8], (u32, u32))> {
+        None
+    }
 }
 
 /// Decoded images kept between frames. Images on screen are never evicted, so this bounds what
@@ -213,6 +219,16 @@ enum Effect {
         inner: RRect,
         widths: [f32; 4],
         colors: [Color; 4],
+        clip: DeviceClip,
+    },
+    /// A repeating CSS background image: the decoded tile `key`, one copy at `origin` (device
+    /// pixels) of `size`, repeated across and down as `repeat` says, inside `clip` and `round`.
+    Tiles {
+        key: ImageKey,
+        origin: (i32, i32),
+        size: (i32, i32),
+        repeat: (bool, bool),
+        round: Option<RRect>,
         clip: DeviceClip,
     },
     /// A `box-shadow`: `shape` blurred by `sigma`, drawn only outside `bound` (the border box)
@@ -863,13 +879,62 @@ impl Painter {
                     padding_box.x1,
                     padding_box.y1,
                 ];
-                for g in page.styles.gradients(style).iter().rev() {
-                    if let Some(gradient) = DeviceGradient::new(g, area, s) {
-                        items.push(Item::Effect(Box::new(Effect::Shape {
-                            shape: border_box,
-                            fill: ShapeFill::Gradient(Box::new(gradient)),
-                            clip,
-                        })));
+                // Images too, positioned in the padding box; bottom layer first.
+                for layer in page.styles.backgrounds(style).iter().rev() {
+                    match layer {
+                        css::BackgroundLayer::Gradient(g) => {
+                            if let Some(gradient) = DeviceGradient::new(g, area, s) {
+                                items.push(Item::Effect(Box::new(Effect::Shape {
+                                    shape: border_box,
+                                    fill: ShapeFill::Gradient(Box::new(gradient)),
+                                    clip,
+                                })));
+                            }
+                        }
+                        css::BackgroundLayer::Image(bg) => {
+                            let Some((id, data, natural)) =
+                                page.images.and_then(|images| images.background(&bg.url))
+                            else {
+                                continue;
+                            };
+                            let Some(tile) = background_tile(bg, natural, area, s) else {
+                                continue;
+                            };
+                            let key = ImageKey {
+                                id,
+                                width: tile.size.0 as u32,
+                                height: tile.size.1 as u32,
+                            };
+                            pictures.push((key, data));
+                            // The painting area: the border box, rounded with it.
+                            let bounds = border_box.bounds(0.0);
+                            let clip = [
+                                clip[0].max(bounds[0]),
+                                clip[1].max(bounds[1]),
+                                clip[2].min(bounds[2]),
+                                clip[3].min(bounds[3]),
+                            ];
+                            if bg.repeat == (false, false) {
+                                items.push(Item::Image {
+                                    x0: tile.origin.0,
+                                    y0: tile.origin.1,
+                                    x1: tile.origin.0 + tile.size.0,
+                                    y1: tile.origin.1 + tile.size.1,
+                                    key,
+                                    round: rounded.then_some(border_box),
+                                    clip,
+                                });
+                            } else {
+                                items.push(Item::Effect(Box::new(Effect::Tiles {
+                                    key,
+                                    origin: tile.origin,
+                                    size: tile.size,
+                                    repeat: bg.repeat,
+                                    round: rounded.then_some(border_box),
+                                    clip,
+                                })));
+                            }
+                        }
                     }
                 }
                 for sh in shadows.iter().rev().filter(|sh| sh.inset) {
@@ -1347,7 +1412,7 @@ fn draw_items(rows: &mut [u8], band: Band, y0: i32, items: &[Item<'_>], caches: 
                     rect,
                 );
             }
-            Item::Effect(ref effect) => draw_effect(rows, band, y0, effect, (lo, hi)),
+            Item::Effect(ref effect) => draw_effect(rows, band, y0, effect, caches, (lo, hi)),
         }
     }
 }
@@ -1377,7 +1442,7 @@ fn fade(item: &mut Item<'_>, opacity: u8) -> bool {
                 mul(color);
                 true
             }
-            Effect::Shape { .. } => false,
+            Effect::Shape { .. } | Effect::Tiles { .. } => false,
         },
         _ => false,
     }
@@ -1779,6 +1844,18 @@ fn translate_item(item: &mut Item<'_>, dx: i32, dy: i32) {
             shift_clip(clip, dx, dy);
         }
         Item::Effect(effect) => match &mut **effect {
+            Effect::Tiles {
+                origin,
+                round,
+                clip,
+                ..
+            } => {
+                *origin = (origin.0 + dx, origin.1 + dy);
+                if let Some(r) = round {
+                    *r = r.translate(fx, fy);
+                }
+                shift_clip(clip, dx, dy);
+            }
             Effect::Shape { shape, fill, clip } => {
                 *shape = shape.translate(fx, fy);
                 if let ShapeFill::Gradient(g) = fill {
@@ -1841,7 +1918,8 @@ fn clip_item(item: &mut Item<'_>, outer: DeviceClip) {
         Item::Effect(effect) => match &mut **effect {
             Effect::Shape { clip, .. }
             | Effect::Border { clip, .. }
-            | Effect::Shadow { clip, .. } => cut(clip),
+            | Effect::Shadow { clip, .. }
+            | Effect::Tiles { clip, .. } => cut(clip),
         },
         Item::GroupStart { bounds, .. } => cut(bounds),
         Item::Layer(layer) => cut(&mut layer.clip),
@@ -1885,6 +1963,8 @@ fn item_bounds(
             ..
         } => ([*x0, *y0, *x1, *y1], *clip),
         Item::Effect(effect) => match &**effect {
+            // A repeating background fills its clip, the border box.
+            Effect::Tiles { clip, .. } => (*clip, *clip),
             Effect::Shape { shape, clip, .. } => (shape.bounds(1.0), *clip),
             Effect::Border { outer, clip, .. } => (outer.bounds(1.0), *clip),
             Effect::Shadow {
@@ -1985,8 +2065,136 @@ fn draw_layer(
     }
 }
 
+/// Where a background image's tile goes, in device pixels (CSS Backgrounds 3.9, 3.6).
+struct Tile {
+    origin: (i32, i32),
+    size: (i32, i32),
+}
+
+/// Size a background image in its positioning area (`area`, the padding box, device pixels)
+/// and place its first tile. `natural` is the file's size in px. `None` when it has no size.
+fn background_tile(
+    bg: &css::BackgroundImage,
+    natural: (u32, u32),
+    area: [f32; 4],
+    s: f32,
+) -> Option<Tile> {
+    let (aw, ah) = (area[2] - area[0], area[3] - area[1]);
+    let (iw, ih) = (natural.0 as f32 * s, natural.1 as f32 * s);
+    if iw <= 0.0 || ih <= 0.0 || aw <= 0.0 || ah <= 0.0 {
+        return None;
+    }
+    let len = |l: Length, of: f32| match l {
+        Length::Px(px) => Some(px.to_f32() * s),
+        Length::Percent(p) => Some(p as f32 / 10000.0 * of),
+        Length::Auto => None,
+    };
+    let (tw, th) = match bg.size {
+        css::BackgroundSize::Cover => {
+            let k = (aw / iw).max(ah / ih);
+            (iw * k, ih * k)
+        }
+        css::BackgroundSize::Contain => {
+            let k = (aw / iw).min(ah / ih);
+            (iw * k, ih * k)
+        }
+        css::BackgroundSize::Lengths(w, h) => match (len(w, aw), len(h, ah)) {
+            (Some(w), Some(h)) => (w, h),
+            (Some(w), None) => (w, w * ih / iw),
+            (None, Some(h)) => (h * iw / ih, h),
+            (None, None) => (iw, ih),
+        },
+    };
+    // Decoded at this size, as `<img>` is: bounded like it.
+    let (tw, th) = (tw.round().clamp(1.0, 8192.0), th.round().clamp(1.0, 8192.0));
+    let place = |l: Length, free: f32| match l {
+        Length::Px(px) => px.to_f32() * s,
+        Length::Percent(p) => p as f32 / 10000.0 * free,
+        Length::Auto => 0.0,
+    };
+    Some(Tile {
+        origin: (
+            (area[0] + place(bg.position.0, aw - tw)).round() as i32,
+            (area[1] + place(bg.position.1, ah - th)).round() as i32,
+        ),
+        size: (tw as i32, th as i32),
+    })
+}
+
+/// Draw a decoded tile repeated from `origin` across and down (as `repeat` says), inside
+/// `clip` and the rounded `round`. One item covers any number of tiles: each pixel finds its
+/// place in the tile by remainder.
+fn draw_tiles(
+    rows: &mut [u8],
+    band: Band,
+    y0: i32,
+    bitmap: &image::Bitmap,
+    (origin, size, repeat): ((i32, i32), (i32, i32), (bool, bool)),
+    round: Option<&RRect>,
+    clip: DeviceClip,
+) {
+    let (bw, bh) = (bitmap.width as i32, bitmap.height as i32);
+    if bw == 0 || bh == 0 || size.0 <= 0 || size.1 <= 0 {
+        return;
+    }
+    let band_height = (rows.len() / band.stride) as i32;
+    // Without repeat, only the one tile's span.
+    let (mut x0, mut x1) = (clip[0].max(0), clip[2].min(band.width as i32));
+    let (mut fy0, mut fy1) = (clip[1], clip[3]);
+    if !repeat.0 {
+        (x0, x1) = (x0.max(origin.0), x1.min(origin.0 + size.0));
+    }
+    if !repeat.1 {
+        (fy0, fy1) = (fy0.max(origin.1), fy1.min(origin.1 + size.1));
+    }
+    let ry0 = (fy0 - y0).clamp(0, band_height);
+    let ry1 = (fy1 - y0).clamp(0, band_height);
+    if x0 >= x1 {
+        return;
+    }
+    for ry in ry0..ry1 {
+        let fy = ry + y0;
+        // The bitmap is the tile's size; scale anyway in case decoding rounded differently.
+        let v = (fy - origin.1).rem_euclid(size.1) * bh / size.1;
+        let src = &bitmap.pixels[(v.min(bh - 1) * bw * 4) as usize..];
+        let spans = round.map(|r| r.row_spans(fy as f32));
+        let row = ry as usize * band.stride + band.left * 4;
+        for x in x0..x1 {
+            let u = ((x - origin.0).rem_euclid(size.0) * bw / size.0).min(bw - 1) as usize;
+            let p = &src[u * 4..u * 4 + 4];
+            let mut px = if band.bgra {
+                [p[2], p[1], p[0], p[3]]
+            } else {
+                [p[0], p[1], p[2], p[3]]
+            };
+            if let (Some(r), Some(spans)) = (round, spans) {
+                let cover = match spans.known(x) {
+                    Some(c) => c,
+                    None => r.coverage(x as f32 + 0.5, fy as f32 + 0.5),
+                };
+                if cover < 1.0 {
+                    px = px.map(|c| (f32::from(c) * cover).round() as u8);
+                }
+            }
+            if px[3] == 0 {
+                continue;
+            }
+            let at = row + x as usize * 4;
+            let dst: &mut [u8; 4] = (&mut rows[at..at + 4]).try_into().expect("four bytes");
+            *dst = over(u32::from_le_bytes(px), u32::from_le_bytes(*dst)).to_le_bytes();
+        }
+    }
+}
+
 /// Draw a rounded shape, a gradient, a rounded border or a shadow into this band.
-fn draw_effect(rows: &mut [u8], band: Band, y0: i32, effect: &Effect, (lo, hi): (i32, i32)) {
+fn draw_effect(
+    rows: &mut [u8],
+    band: Band,
+    y0: i32,
+    effect: &Effect,
+    caches: &Caches,
+    (lo, hi): (i32, i32),
+) {
     let order = |c: Color| {
         if band.bgra {
             Color {
@@ -2000,6 +2208,28 @@ fn draw_effect(rows: &mut [u8], band: Band, y0: i32, effect: &Effect, (lo, hi): 
         }
     };
     match *effect {
+        Effect::Tiles {
+            key,
+            origin,
+            size,
+            repeat,
+            ref round,
+            clip,
+        } => {
+            let Some(cached) = caches.images.get(&key) else {
+                return;
+            };
+            let clip = [clip[0].max(lo), clip[1], clip[2].min(hi), clip[3]];
+            draw_tiles(
+                rows,
+                band,
+                y0,
+                &cached.bitmap,
+                (origin, size, repeat),
+                round.as_ref(),
+                clip,
+            );
+        }
         Effect::Shape {
             ref shape,
             ref fill,
@@ -3250,6 +3480,122 @@ mod tests {
         fn image(&self, _: NodeId) -> Option<(u64, &[u8])> {
             Some((7, include_bytes!("../../image/src/testdata/rgb8.png")))
         }
+    }
+
+    /// A 2x2 PNG: red, green on top; blue, white below. Drawn at any size, each quarter keeps
+    /// its color (the decoder's box filter averages only within a quarter for even sizes).
+    struct Quarters(Vec<u8>);
+
+    impl Quarters {
+        fn new() -> Quarters {
+            let px = [
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+            ];
+            Quarters(png::encode(2, 2, &px))
+        }
+    }
+
+    impl ImageSource for Quarters {
+        fn image(&self, _: NodeId) -> Option<(u64, &[u8])> {
+            None
+        }
+
+        fn background(&self, url: &str) -> Option<(u64, &[u8], (u32, u32))> {
+            (url == "q.png").then_some((1, self.0.as_slice(), (2, 2)))
+        }
+    }
+
+    fn render_with(html_src: &str, css_src: &str, images: &dyn ImageSource) -> Frame {
+        let dom = html::parse(html_src);
+        let author = parse_stylesheet(css_src);
+        let media = Media {
+            width: 100.0,
+            height: 100.0,
+            ..Media::default()
+        };
+        let styles = cascade(
+            &dom,
+            &[
+                (Origin::UserAgent, user_agent_stylesheet()),
+                (Origin::Author, &author),
+            ],
+            &media,
+        );
+        let laid_out = layout::layout(
+            &dom,
+            &styles,
+            &Approximate,
+            &layout::no_images,
+            100.0,
+            100.0,
+        );
+        let page = Page {
+            dom: &dom,
+            styles: &styles,
+            layout: &laid_out,
+            metrics: &Approximate,
+            images: Some(images),
+        };
+        let view = Viewport {
+            width: 100.0,
+            height: 100.0,
+            scale: 1.0,
+            scroll_y: 0.0,
+        };
+        Painter::new().paint(&page, view).0
+    }
+
+    #[test]
+    fn draws_background_images_sized_placed_and_repeated() {
+        let q = Quarters::new();
+        let (red, green, blue) = ([255, 0, 0], [0, 255, 0], [0, 0, 255]);
+        // Repeated 10px tiles over a 40x20 box.
+        let f = render_with(
+            "<body><div></div></body>",
+            "body { margin: 0; background: #888 } div { width: 40px; height: 20px;
+               background: url(q.png) 0 0 / 10px }",
+            &q,
+        );
+        assert_eq!(pixel(&f, 2, 2), red);
+        assert_eq!(pixel(&f, 7, 2), green);
+        assert_eq!(pixel(&f, 12, 2), red, "the next tile across");
+        assert_eq!(pixel(&f, 2, 17), blue, "and down");
+        assert_eq!(pixel(&f, 45, 5), [136, 136, 136], "nothing past the box");
+        // One tile, cover, centered, no repeat, over a wide box: scaled to its width.
+        let f = render_with(
+            "<body><div></div></body>",
+            "body { margin: 0; background: #888 } div { width: 60px; height: 20px;
+               background: url(q.png) center / cover no-repeat }",
+            &q,
+        );
+        // 60x60 tile centered in 20 rows: rows -20..40; the box shows rows 0..20 of the
+        // frame, which are tile rows 20..40: the top half's lower part, then the bottom's.
+        assert_eq!(pixel(&f, 10, 5), red);
+        assert_eq!(pixel(&f, 50, 5), green);
+        assert_eq!(pixel(&f, 10, 15), blue);
+        // No repeat: one tile, positioned at the right; the rest is the color.
+        let f = render_with(
+            "<body><div></div></body>",
+            "body { margin: 0; background: #888 } div { width: 40px; height: 10px;
+               background: #fff url(q.png) right top / 10px no-repeat }",
+            &q,
+        );
+        assert_eq!(pixel(&f, 32, 2), red);
+        assert_eq!(pixel(&f, 37, 2), green);
+        assert_eq!(
+            pixel(&f, 5, 2),
+            [255, 255, 255],
+            "the background color left of it"
+        );
+        // Rounded corners cut the tiles too.
+        let f = render_with(
+            "<body><div></div></body>",
+            "body { margin: 0; background: #888 } div { width: 40px; height: 40px;
+               border-radius: 20px; background: url(q.png) 0 0 / 10px }",
+            &q,
+        );
+        assert_eq!(pixel(&f, 1, 1), [136, 136, 136], "outside the circle");
+        assert_eq!(pixel(&f, 22, 22), red);
     }
 
     #[test]

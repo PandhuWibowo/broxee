@@ -1,4 +1,5 @@
-//! The images of one page: which `<img>` shows which file, and the compressed bytes.
+//! The images of one page: which `<img>` shows which file, which CSS background URL is which
+//! file, and the compressed bytes.
 //!
 //! Only compressed data is kept here, with the size read from its header for layout. Pixels
 //! are decoded by the painter at the size they are drawn, and only while they are visible.
@@ -24,6 +25,8 @@ pub struct Entry {
 pub struct ImageStore {
     entries: Vec<Entry>,
     by_node: HashMap<NodeId, u32, FastBuildHasher>,
+    /// CSS `background-image` files by absolute URL (or the `data:` URL as written).
+    by_url: HashMap<String, u32, FastBuildHasher>,
 }
 
 /// Where an `<img>` gets its pixels.
@@ -104,7 +107,37 @@ impl ImageStore {
             .into_iter()
             .filter_map(|(node, source)| Some((node, kept.get(source).copied().flatten()?)))
             .collect();
-        ImageStore { entries, by_node }
+        ImageStore {
+            entries,
+            by_node,
+            by_url: HashMap::default(),
+        }
+    }
+
+    /// Add CSS background files by URL (`None` for failures), within what is left of the
+    /// budgets the page's `<img>` files share.
+    pub fn add_backgrounds(&mut self, loaded: Vec<(String, Option<Vec<u8>>)>) {
+        let mut total = self.bytes();
+        for (url, data) in loaded {
+            if self.by_url.contains_key(&url) || self.entries.len() >= MAX_IMAGES {
+                continue;
+            }
+            let Some(mut data) =
+                data.filter(|d| d.len() <= MAX_IMAGE_BYTES && total + d.len() <= MAX_TOTAL_BYTES)
+            else {
+                continue;
+            };
+            total += data.len();
+            data.shrink_to_fit();
+            let info = image::probe(&data);
+            self.entries.push(Entry { data, info });
+            self.by_url.insert(url, (self.entries.len() - 1) as u32);
+        }
+    }
+
+    /// Whether a background URL is loaded already (a waking tab keeps its files).
+    pub fn has_background(&self, url: &str) -> bool {
+        self.by_url.contains_key(url)
     }
 
     fn entry(&self, node: NodeId) -> Option<(u32, &Entry)> {
@@ -126,20 +159,29 @@ impl ImageStore {
         self.entries.iter().map(|e| e.data.len()).sum()
     }
 
-    /// The compressed files and which element shows which, for storing a sleeping tab.
+    /// The compressed files, which element shows which, and which background URL is which,
+    /// for storing a sleeping tab.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
-    pub fn parts(&self) -> (Vec<&[u8]>, Vec<(NodeId, u32)>) {
+    pub fn parts(&self) -> Parts<'_> {
         let mut uses: Vec<(NodeId, u32)> = self.by_node.iter().map(|(&n, &i)| (n, i)).collect();
         uses.sort_unstable();
+        let mut urls: Vec<(&str, u32)> =
+            self.by_url.iter().map(|(u, &i)| (u.as_str(), i)).collect();
+        urls.sort_unstable();
         (
             self.entries.iter().map(|e| e.data.as_slice()).collect(),
             uses,
+            urls,
         )
     }
 
     /// Rebuild a store from `parts`. Uses that point past the files are dropped.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
-    pub fn from_parts(files: Vec<Vec<u8>>, uses: Vec<(NodeId, u32)>) -> ImageStore {
+    pub fn from_parts(
+        files: Vec<Vec<u8>>,
+        uses: Vec<(NodeId, u32)>,
+        urls: Vec<(String, u32)>,
+    ) -> ImageStore {
         let entries: Vec<Entry> = files
             .into_iter()
             .map(|data| Entry {
@@ -151,15 +193,33 @@ impl ImageStore {
             .into_iter()
             .filter(|&(_, i)| (i as usize) < entries.len())
             .collect();
-        ImageStore { entries, by_node }
+        let by_url = urls
+            .into_iter()
+            .filter(|&(_, i)| (i as usize) < entries.len())
+            .collect();
+        ImageStore {
+            entries,
+            by_node,
+            by_url,
+        }
     }
 }
+
+/// What a sleeping tab stores of a page's images: files, element uses, background URLs.
+pub type Parts<'a> = (Vec<&'a [u8]>, Vec<(NodeId, u32)>, Vec<(&'a str, u32)>);
 
 impl paint::ImageSource for ImageStore {
     fn image(&self, node: NodeId) -> Option<(u64, &[u8])> {
         let (i, entry) = self.entry(node)?;
         entry.info?;
         Some((u64::from(i), &entry.data))
+    }
+
+    fn background(&self, url: &str) -> Option<(u64, &[u8], (u32, u32))> {
+        let i = *self.by_url.get(url)?;
+        let entry = &self.entries[i as usize];
+        let info = entry.info?;
+        Some((u64::from(i), &entry.data, (info.width, info.height)))
     }
 }
 

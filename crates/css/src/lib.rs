@@ -23,7 +23,9 @@ use std::sync::OnceLock;
 pub use cascade::{
     cascade, cascade_with, matches_selector, select, Generated, Origin, States, StyleMap,
 };
-pub use effects::{Gradient, GradientKind, RadialSize, Shadow};
+pub use effects::{
+    BackgroundImage, BackgroundLayer, BackgroundSize, Gradient, GradientKind, RadialSize, Shadow,
+};
 pub use fontface::{parse_family_list, FamilyList, FontFace, FontSource};
 pub use media::{Media, MediaList};
 pub use parser::{
