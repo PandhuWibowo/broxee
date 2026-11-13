@@ -1388,8 +1388,10 @@ fn fade(item: &mut Item<'_>, opacity: u8) -> bool {
 fn group_bounds(page: &Page, group: &layout::Group, s: f32, scroll: f32) -> [i32; 4] {
     let layout = page.layout;
     let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-    for i in group.boxes.0 as usize..(group.boxes.1 as usize).min(layout.boxes.len()) {
-        let b = &layout.boxes[i];
+    let boxes = layout
+        .boxes
+        .get(group.boxes.0 as usize..group.boxes.1 as usize);
+    for b in boxes.unwrap_or_default() {
         let style = page.styles.style(b.node);
         let reach = page
             .styles
