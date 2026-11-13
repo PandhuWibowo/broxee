@@ -1364,7 +1364,7 @@ impl<S: Screen> Browser<S> {
         let layout = &page.layout;
         let metrics = page.metrics(&self.fonts);
         let doc_y = |fixed: bool| if fixed { y_view } else { y_view + self.scroll };
-        for i in (0..layout.texts.len()).rev() {
+        for i in layout.texts_top_down() {
             let t = &layout.texts[i];
             let style = page.styles.style(t.node);
             let (size, key) = (style.font_size.to_f32(), layout::font_key(style));
@@ -1375,7 +1375,7 @@ impl<S: Screen> Browser<S> {
                 return Some(t.node);
             }
         }
-        (0..layout.boxes.len()).rev().find_map(|i| {
+        layout.boxes_top_down().find_map(|i| {
             let r = layout.boxes[i].rect;
             let y = doc_y(layout.box_is_fixed(i));
             ((r.x..=r.x + r.width).contains(&x) && (r.y..=r.y + r.height).contains(&y))
@@ -1444,7 +1444,7 @@ impl<S: Screen> Browser<S> {
     fn control_at(&self, x: f32, y_view: f32) -> Option<usize> {
         let page = self.page.as_ref()?;
         let layout = &page.layout;
-        (0..layout.boxes.len()).rev().find_map(|i| {
+        layout.boxes_top_down().find_map(|i| {
             let b = layout.boxes[i];
             let y = if layout.box_is_fixed(i) {
                 y_view
@@ -3248,7 +3248,7 @@ impl<S: Screen> Browser<S> {
         let layout = &page.layout;
         let metrics = page.metrics(&self.fonts);
         let doc_y = |fixed: bool| if fixed { y_view } else { y_view + self.scroll };
-        for i in (0..layout.texts.len()).rev() {
+        for i in layout.texts_top_down() {
             let t = &layout.texts[i];
             let style = page.styles.style(t.node);
             let (size, key) = (style.font_size.to_f32(), layout::font_key(style));
@@ -3264,7 +3264,7 @@ impl<S: Screen> Browser<S> {
             }
         }
         // Innermost boxes come last in document order; an outer <a> can still wrap them.
-        (0..layout.boxes.len()).rev().find_map(|i| {
+        layout.boxes_top_down().find_map(|i| {
             let r = layout.boxes[i].rect;
             let y = doc_y(layout.box_is_fixed(i));
             let inside = (r.x..=r.x + r.width).contains(&x) && (r.y..=r.y + r.height).contains(&y);

@@ -73,6 +73,10 @@ casts), not taken from binding crates. Ask before proposing any dependency.
 
 - **The glyph and image caches are written only before compositing starts**; band threads read them
   without locks.
+- **A group draws its content over its backdrop, then blends back** (`draw_group`): exactly group opacity
+  over an opaque backdrop, and the rounded clip. Backdrops are copied 32 rows at a time within the group's
+  bounds; groups that need none are dropped while building (`fade`, rounded clips whose content stays off the
+  corners). `emit_range` never reopens a group it is inside: a group cut by a layer recursed forever.
 - **Every band walks every item, so `Item` stays small**: rounded shapes, gradients and shadows are one
   boxed `Item::Effect`. Plain boxes keep the `Fill` path; only boxes with radii, shadows or gradients
   pay for per-pixel work, and only at their corners and edges (`Edges`: interiors are filled or
@@ -169,8 +173,11 @@ casts), not taken from binding crates. Ask before proposing any dependency.
 - **Fragments stay small**: `TextFragment` is 24 bytes and keeps no vertical extent; derive it from the
   baseline and the node's style. The stress page has 160k of them.
 - **`Engine::bottom` must see every box and line** so the scrollable height includes overflow.
-- **Positioned boxes cost nothing per fragment.** Paint order is `Layout::layers` (index ranges) and clipping is
-  `Layout::clips` (nested ranges); a fragment's position in the lists decides both. Anything that reorders or
+- **Positioned boxes cost nothing per fragment.** Paint order is `Layout::layers` (index ranges, sorted by
+  `Layer::z` for painting; a relative box with a `z-index` splits the flow into its own layer), clipping is
+  `Layout::clips` and opacity / rounded clips are `Layout::groups` (nested ranges like clips); a fragment's
+  position in the lists decides all three. Hit testing walks `texts_top_down` / `boxes_top_down`, never
+  index order. Anything that reorders or
   inserts fragments after layout must keep those ranges valid. Fixed layers never add to the scroll height.
 - **`box_extents` / `text_extents` are computed at the end of `layout()`** (`Layout::index`). Anything that moves
   fragments after that must recompute them, or painting skips what is on screen.

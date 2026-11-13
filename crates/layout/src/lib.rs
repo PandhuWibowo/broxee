@@ -63,13 +63,29 @@ pub struct TextFragment {
 }
 
 /// A paint layer: where it starts in `boxes` and `texts`. Layer 0 is the normal flow; each
-/// absolutely or fixed positioned box starts a new layer, painted after all earlier ones.
+/// absolutely or fixed positioned box starts a new layer, and so does a relatively positioned
+/// box with a `z-index` (the flow after it resumes in another). Layers paint in `z` order,
+/// then in the order they were laid out.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Layer {
     pub boxes: u32,
     pub texts: u32,
     /// Fixed layers stay in place when the page scrolls.
     pub fixed: bool,
+    /// Paint order: the `z-index` of the outermost stacking context the box is in, then its
+    /// own within it. Two levels cover what pages nest; `auto` is 0.
+    pub z: [i16; 2],
+}
+
+/// Fragments in these index ranges are drawn as one group (`node`'s): blended at the node's
+/// opacity, or cut to its rounded padding box (`round`, `overflow` hidden with
+/// `border-radius`). Ranges nest, like clips.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Group {
+    pub boxes: (u32, u32),
+    pub texts: (u32, u32),
+    pub node: NodeId,
+    pub round: bool,
 }
 
 /// Fragments in these index ranges are clipped to `rect` (`overflow: hidden`). Ranges nest.
@@ -91,6 +107,7 @@ pub struct Layout {
     text: String,
     pub layers: Vec<Layer>,
     pub clips: Vec<Clip>,
+    pub groups: Vec<Group>,
     pub width: f32,
     pub height: f32,
     /// For each run of `CHUNK` boxes, the top of the highest and the bottom of the lowest, in
@@ -103,9 +120,13 @@ pub struct Layout {
 }
 
 impl Layout {
-    /// Each layer's box range, text range, and whether it is fixed, in paint order.
+    /// Each layer's box range, text range, and whether it is fixed, in paint order: by `z`,
+    /// then as laid out. Hit testing walks it backwards.
     pub fn layer_ranges(&self) -> Vec<(Range<usize>, Range<usize>, bool)> {
-        (0..self.layers.len())
+        let mut order: Vec<usize> = (0..self.layers.len()).collect();
+        order.sort_by_key(|&i| self.layers[i].z);
+        order
+            .into_iter()
             .map(|i| {
                 let l = self.layers[i];
                 let next = self.layers.get(i + 1);
@@ -118,6 +139,24 @@ impl Layout {
                 )
             })
             .collect()
+    }
+
+    /// Text fragment indices from the topmost painted to the bottom: what hit testing walks.
+    pub fn texts_top_down(&self) -> impl Iterator<Item = usize> {
+        let layers = self.layer_ranges();
+        layers
+            .into_iter()
+            .rev()
+            .flat_map(|(_, texts, _)| texts.rev())
+    }
+
+    /// Box indices from the topmost painted to the bottom.
+    pub fn boxes_top_down(&self) -> impl Iterator<Item = usize> {
+        let layers = self.layer_ranges();
+        layers
+            .into_iter()
+            .rev()
+            .flat_map(|(boxes, _, _)| boxes.rev())
     }
 
     /// Whether box `i` is in a fixed layer.
@@ -140,6 +179,7 @@ impl Layout {
             text: String::new(),
             layers: vec![FLOW_LAYER],
             clips: Vec::new(),
+            groups: Vec::new(),
             width: 0.0,
             height: 0.0,
             box_extents: Vec::new(),
@@ -195,6 +235,7 @@ const FLOW_LAYER: Layer = Layer {
     boxes: 0,
     texts: 0,
     fixed: false,
+    z: [0, 0],
 };
 
 /// Lay out the document for a viewport of `width` by `height` CSS px.
@@ -235,6 +276,7 @@ pub fn layout(
             text: String::new(),
             layers: vec![FLOW_LAYER],
             clips: Vec::new(),
+            groups: Vec::new(),
             width,
             height: 0.0,
             box_extents: Vec::new(),
@@ -260,6 +302,7 @@ pub fn layout(
         },
         ifc_origin: (0.0, 0.0),
         in_fixed: false,
+        layer_z: [0, 0],
         floats: Vec::new(),
         float_floor: f32::MIN,
     };
@@ -317,6 +360,8 @@ struct Engine<'a> {
     ifc_origin: (f32, f32),
     /// Laying out a fixed box: it does not extend the scrollable height.
     in_fixed: bool,
+    /// The paint order key of the layer being filled (`Layer::z`).
+    layer_z: [i16; 2],
     /// Floats placed so far in the current block formatting context, in page coordinates.
     /// A box that starts a new context sets the list aside while its content is laid out, so
     /// moving that box later (inline blocks, flex items) moves its floats with it.
@@ -734,6 +779,19 @@ impl<'a> Engine<'a> {
         let index = self.out.boxes.len();
         let first_text = self.out.texts.len();
         let first_clip = self.out.clips.len();
+        // A relatively positioned box with a z-index paints in its own layer; the flow after
+        // it resumes in the layer it interrupted.
+        let resume_z = (s.position == Position::Relative && s.z_index.is_some()).then(|| {
+            let outer = self.layer_z;
+            self.layer_z = self.stacking_key(id);
+            self.out.layers.push(Layer {
+                boxes: index as u32,
+                texts: first_text as u32,
+                fixed: self.in_fixed,
+                z: self.layer_z,
+            });
+            outer
+        });
         // The origin is known now; static positions of deferred descendants are relative to it.
         self.out.boxes.push(BoxFragment {
             node: id,
@@ -802,6 +860,22 @@ impl<'a> Engine<'a> {
                 texts: (first_text as u32, self.out.texts.len() as u32),
                 rect: padding_box,
             });
+            if self.styles.radii(s).is_some() {
+                self.out.groups.push(Group {
+                    boxes: (index as u32 + 1, self.out.boxes.len() as u32),
+                    texts: (first_text as u32, self.out.texts.len() as u32),
+                    node: id,
+                    round: true,
+                });
+            }
+        }
+        if s.opacity < 255 && !s.transparent {
+            self.out.groups.push(Group {
+                boxes: (index as u32, self.out.boxes.len() as u32),
+                texts: (first_text as u32, self.out.texts.len() as u32),
+                node: id,
+                round: false,
+            });
         }
         let mut offset = (0.0, 0.0);
         if s.position == Position::Relative {
@@ -820,7 +894,38 @@ impl<'a> Engine<'a> {
         if !self.in_fixed {
             self.bottom = self.bottom.max(y + offset.1 + border_height);
         }
+        if let Some(outer) = resume_z {
+            self.layer_z = outer;
+            self.out.layers.push(Layer {
+                boxes: self.out.boxes.len() as u32,
+                texts: self.out.texts.len() as u32,
+                fixed: self.in_fixed,
+                z: outer,
+            });
+        }
         border_height
+    }
+
+    /// The paint order key of a positioned box (`Layer::z`): the z-index of the outermost
+    /// positioned ancestor (or the box itself) that has one, then the box's own.
+    fn stacking_key(&self, id: NodeId) -> [i16; 2] {
+        let own = self.style(id).z_index;
+        let mut outermost = own;
+        let mut current = self.dom.parent(id);
+        while let Some(p) = current {
+            if self.dom.element(p).is_some() {
+                let s = self.style(p);
+                if s.position.is_positioned() && s.z_index.is_some() {
+                    outermost = s.z_index;
+                }
+            }
+            current = self.dom.parent(p);
+        }
+        match (outermost, own) {
+            (Some(o), _) if outermost == own => [o, 0],
+            (Some(o), own) => [o, own.unwrap_or(0)],
+            (None, _) => [0, 0],
+        }
     }
 
     /// Whether box `id` starts a block formatting context: floats outside it stay out, floats
@@ -1228,11 +1333,14 @@ impl<'a> Engine<'a> {
             (None, None) => static_y + margin[0],
         };
 
+        let z = self.stacking_key(d.node);
         self.out.layers.push(Layer {
             boxes: self.out.boxes.len() as u32,
             texts: self.out.texts.len() as u32,
             fixed: d.fixed,
+            z,
         });
+        let outer_z = std::mem::replace(&mut self.layer_z, z);
         let index = self.out.boxes.len();
         let first_text = self.out.texts.len();
         let first_clip = self.out.clips.len();
@@ -1270,6 +1378,7 @@ impl<'a> Engine<'a> {
         };
         self.shift(index, first_text, first_clip, dx, dy);
         self.in_fixed = was_fixed;
+        self.layer_z = outer_z;
     }
 
     /// Lay out `count` siblings starting at `first` (an inline-level run) as lines inside `container`'s content box.
@@ -2153,6 +2262,56 @@ mod tests {
             "baseline {}",
             f.baseline
         );
+    }
+
+    #[test]
+    fn layers_paint_in_z_order() {
+        let (dom, l) = run(
+            "<div id=a></div><div id=b></div><p id=r>rel</p><div id=c></div><p>after</p>",
+            "body { margin: 0 } div { position: absolute; width: 10px; height: 10px }
+             #a { z-index: 5 } #b { z-index: -1 } #r { position: relative; z-index: 2 }",
+            400.0,
+        );
+        let first_node = |boxes: &Range<usize>| boxes.clone().next().map(|i| l.boxes[i].node);
+        let id = |name: &str| (0..dom.len() as NodeId).find(|&n| dom.attr(n, "id") == Some(name));
+        let order: Vec<Option<NodeId>> = l
+            .layer_ranges()
+            .iter()
+            .filter(|(b, _, _)| !b.is_empty())
+            .map(|(b, _, _)| first_node(b))
+            .collect();
+        let pos = |name| order.iter().position(|&n| n == id(name)).expect(name);
+        assert!(pos("b") < pos("c"), "negative z below the rest");
+        assert!(
+            pos("c") < pos("r") && pos("r") < pos("a"),
+            "then auto, 2, 5: {order:?}"
+        );
+        // The flow after the relative box resumes at z 0, before it in paint order.
+        let after = l.texts.iter().position(|t| l.text(t) == "after").unwrap();
+        let resumed = l
+            .layer_ranges()
+            .iter()
+            .position(|(_, t, _)| t.contains(&after))
+            .unwrap();
+        assert!(resumed < pos("r") + 1);
+    }
+
+    #[test]
+    fn records_opacity_and_rounded_clip_groups() {
+        let (dom, l) = run(
+            "<div><p>x</p></div><section><span>y</span></section>",
+            "body { margin: 0 } div { opacity: 0.5 } section { overflow: hidden; border-radius: 8px }",
+            400.0,
+        );
+        assert_eq!(l.groups.len(), 2);
+        let div = dom.find_first("div").unwrap();
+        let g = l.groups.iter().find(|g| g.node == div).unwrap();
+        assert!(
+            !g.round && g.boxes.0 as usize == l.boxes.iter().position(|b| b.node == div).unwrap()
+        );
+        assert_eq!(g.texts, (0, 1), "its text is in the group");
+        let r = l.groups.iter().find(|g| g.round).unwrap();
+        assert_eq!(r.texts, (1, 2), "the rounded clip holds the section's text");
     }
 
     #[test]

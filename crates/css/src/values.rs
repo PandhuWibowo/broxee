@@ -313,8 +313,12 @@ pub struct ComputedStyle {
     pub float: Float,
     pub clear: Clear,
     /// `opacity: 0`: the element and everything in it are not drawn (still laid out).
-    /// Partial opacity is drawn opaque for now.
     pub transparent: bool,
+    /// `opacity` from 0 to 255: below 255 the element and its content are drawn as one
+    /// group, then blended at this opacity. Not inherited.
+    pub opacity: u8,
+    /// `z-index`, `None` for `auto`. Positioned boxes with one paint in its order.
+    pub z_index: Option<i16>,
     /// `box-sizing: border-box`: `width`, `height` and their min/max include padding and border.
     pub border_box: bool,
     pub flex_direction: FlexDirection,
@@ -393,6 +397,8 @@ impl ComputedStyle {
             float: Float::None,
             clear: Clear::None,
             transparent: false,
+            opacity: 255,
+            z_index: None,
             border_box: false,
             flex_direction: FlexDirection::Row,
             flex_wrap: false,
@@ -555,6 +561,7 @@ pub enum Prop {
     OutlineStyle,
     OutlineColor,
     OutlineOffset,
+    ZIndex,
     BorderTopLeftRadius,
     BorderTopRightRadius,
     BorderBottomRightRadius,
@@ -737,7 +744,8 @@ mod tests {
         // not a per-node cost; it is still hashed once per style computed. Grow it deliberately.
         let size = std::mem::size_of::<ComputedStyle>();
         // 284 since floats (`float`, `clear`, `flow_root`) and `outline` (width, color, offset);
-        // 292 with the indices of radii, shadows and gradients (2 bytes each, then alignment).
-        assert!(size <= 292, "ComputedStyle grew to {size} bytes");
+        // 292 with the indices of radii, shadows and gradients (2 bytes each, then alignment);
+        // 296 with `opacity` and `z-index`.
+        assert!(size <= 296, "ComputedStyle grew to {size} bytes");
     }
 }
