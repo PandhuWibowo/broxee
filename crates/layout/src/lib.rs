@@ -63,13 +63,172 @@ pub struct TextFragment {
 }
 
 /// A paint layer: where it starts in `boxes` and `texts`. Layer 0 is the normal flow; each
-/// absolutely or fixed positioned box starts a new layer, painted after all earlier ones.
+/// absolutely or fixed positioned box starts a new layer, and so does a relatively positioned
+/// box with a `z-index` (the flow after it resumes in another). Layers paint in `z` order,
+/// then in the order they were laid out.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Layer {
     pub boxes: u32,
     pub texts: u32,
     /// Fixed layers stay in place when the page scrolls.
     pub fixed: bool,
+    /// Paint order: the `z-index` of the outermost stacking context the box is in, then its
+    /// own within it. Two levels cover what pages nest; `auto` is 0.
+    pub z: [i16; 2],
+}
+
+/// Fragments in these index ranges are drawn as one group (`node`'s). Ranges nest, like clips.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Group {
+    pub boxes: (u32, u32),
+    pub texts: (u32, u32),
+    pub node: NodeId,
+    pub kind: GroupKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupKind {
+    /// Blended at the node's opacity.
+    Opacity,
+    /// Cut to the node's rounded padding box (`overflow` hidden with `border-radius`); the
+    /// node's own box is not in the range.
+    Round,
+    /// Drawn through the node's `transform` (`transform_of`); the node's own box is the first.
+    Transform,
+}
+
+/// A 2D affine map: x' = a x + c y + e, y' = b x + d y + f.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Affine {
+    pub a: f32,
+    pub b: f32,
+    pub c: f32,
+    pub d: f32,
+    pub e: f32,
+    pub f: f32,
+}
+
+impl Affine {
+    pub const IDENTITY: Affine = Affine {
+        a: 1.0,
+        b: 0.0,
+        c: 0.0,
+        d: 1.0,
+        e: 0.0,
+        f: 0.0,
+    };
+
+    pub fn translate(x: f32, y: f32) -> Affine {
+        Affine {
+            e: x,
+            f: y,
+            ..Affine::IDENTITY
+        }
+    }
+
+    pub fn scale(x: f32, y: f32) -> Affine {
+        Affine {
+            a: x,
+            d: y,
+            ..Affine::IDENTITY
+        }
+    }
+
+    /// `self` after `inner`: apply `inner` first.
+    pub fn then(&self, inner: &Affine) -> Affine {
+        Affine {
+            a: self.a * inner.a + self.c * inner.b,
+            b: self.b * inner.a + self.d * inner.b,
+            c: self.a * inner.c + self.c * inner.d,
+            d: self.b * inner.c + self.d * inner.d,
+            e: self.a * inner.e + self.c * inner.f + self.e,
+            f: self.b * inner.e + self.d * inner.f + self.f,
+        }
+    }
+
+    pub fn apply(&self, x: f32, y: f32) -> (f32, f32) {
+        (
+            self.a * x + self.c * y + self.e,
+            self.b * x + self.d * y + self.f,
+        )
+    }
+
+    /// `None` when the map flattens everything (a scale of 0): nothing is drawn or hit.
+    pub fn invert(&self) -> Option<Affine> {
+        let det = self.a * self.d - self.b * self.c;
+        if det.abs() < 1e-9 || !det.is_finite() {
+            return None;
+        }
+        let (a, b, c, d) = (self.d / det, -self.b / det, -self.c / det, self.a / det);
+        Some(Affine {
+            a,
+            b,
+            c,
+            d,
+            e: -(a * self.e + c * self.f),
+            f: -(b * self.e + d * self.f),
+        })
+    }
+
+    /// Only a move: drawn by shifting, without resampling.
+    pub fn is_translation(&self) -> bool {
+        (self.a - 1.0).abs() < 1e-6
+            && self.b.abs() < 1e-6
+            && self.c.abs() < 1e-6
+            && (self.d - 1.0).abs() < 1e-6
+    }
+}
+
+/// The map a box's `transform` makes, in page coordinates: the functions applied around the
+/// origin (CSS Transforms 1, 6). `rect` is the border box; percentages are against it.
+pub fn transform_of(rect: Rect, ops: &[css::TransformOp]) -> Affine {
+    use css::TransformOp as Op;
+    let len = |l: css::Length, of: f32| match l {
+        css::Length::Px(px) => px.to_f32(),
+        css::Length::Percent(p) => p as f32 / 10000.0 * of,
+        css::Length::Auto => 0.0,
+    };
+    let (mut ox, mut oy) = (rect.width / 2.0, rect.height / 2.0);
+    let mut m = Affine::IDENTITY;
+    for op in ops {
+        let step = match *op {
+            Op::Origin(x, y) => {
+                (ox, oy) = (len(x, rect.width), len(y, rect.height));
+                continue;
+            }
+            Op::Translate(x, y) => Affine::translate(len(x, rect.width), len(y, rect.height)),
+            Op::Scale(x, y) => Affine::scale(x as f32 / 10000.0, y as f32 / 10000.0),
+            Op::Rotate(a) => {
+                let (sin, cos) = (a as f32 / 100.0).to_radians().sin_cos();
+                Affine {
+                    a: cos,
+                    b: sin,
+                    c: -sin,
+                    d: cos,
+                    e: 0.0,
+                    f: 0.0,
+                }
+            }
+            Op::Skew(x, y) => Affine {
+                c: (x as f32 / 100.0).to_radians().tan(),
+                b: (y as f32 / 100.0).to_radians().tan(),
+                ..Affine::IDENTITY
+            },
+            Op::Matrix([a, b, c, d], e, f) => Affine {
+                a: a as f32 / 10000.0,
+                b: b as f32 / 10000.0,
+                c: c as f32 / 10000.0,
+                d: d as f32 / 10000.0,
+                e: len(e, 0.0),
+                f: len(f, 0.0),
+            },
+        };
+        m = m.then(&step);
+    }
+    let (cx, cy) = (rect.x + ox, rect.y + oy);
+    Affine::translate(cx, cy)
+        .then(&m)
+        .then(&Affine::translate(-cx, -cy))
 }
 
 /// Fragments in these index ranges are clipped to `rect` (`overflow: hidden`). Ranges nest.
@@ -91,6 +250,7 @@ pub struct Layout {
     text: String,
     pub layers: Vec<Layer>,
     pub clips: Vec<Clip>,
+    pub groups: Vec<Group>,
     pub width: f32,
     pub height: f32,
     /// For each run of `CHUNK` boxes, the top of the highest and the bottom of the lowest, in
@@ -103,9 +263,13 @@ pub struct Layout {
 }
 
 impl Layout {
-    /// Each layer's box range, text range, and whether it is fixed, in paint order.
+    /// Each layer's box range, text range, and whether it is fixed, in paint order: by `z`,
+    /// then as laid out. Hit testing walks it backwards.
     pub fn layer_ranges(&self) -> Vec<(Range<usize>, Range<usize>, bool)> {
-        (0..self.layers.len())
+        let mut order: Vec<usize> = (0..self.layers.len()).collect();
+        order.sort_by_key(|&i| self.layers[i].z);
+        order
+            .into_iter()
             .map(|i| {
                 let l = self.layers[i];
                 let next = self.layers.get(i + 1);
@@ -118,6 +282,56 @@ impl Layout {
                 )
             })
             .collect()
+    }
+
+    /// A point in page coordinates as fragment `index` (of `boxes` when `is_box`, else of
+    /// `texts`) sees it: through the inverse of every transform around it, outermost first.
+    /// `None` when a transform flattens it (nothing there can be hit).
+    pub fn untransform(
+        &self,
+        styles: &StyleMap,
+        index: usize,
+        is_box: bool,
+        (x, y): (f32, f32),
+    ) -> Option<(f32, f32)> {
+        let mut around: Vec<&Group> = self
+            .groups
+            .iter()
+            .filter(|g| g.kind == GroupKind::Transform)
+            .filter(|g| {
+                let (lo, hi) = if is_box { g.boxes } else { g.texts };
+                (lo as usize..hi as usize).contains(&index)
+            })
+            .collect();
+        if around.is_empty() {
+            return Some((x, y));
+        }
+        around.sort_by_key(|g| g.boxes.0);
+        let mut p = (x, y);
+        for g in around {
+            let b = self.boxes.get(g.boxes.0 as usize)?;
+            let m = transform_of(b.rect, styles.transform(styles.style(g.node)));
+            p = m.invert()?.apply(p.0, p.1);
+        }
+        Some(p)
+    }
+
+    /// Text fragment indices from the topmost painted to the bottom: what hit testing walks.
+    pub fn texts_top_down(&self) -> impl Iterator<Item = usize> {
+        let layers = self.layer_ranges();
+        layers
+            .into_iter()
+            .rev()
+            .flat_map(|(_, texts, _)| texts.rev())
+    }
+
+    /// Box indices from the topmost painted to the bottom.
+    pub fn boxes_top_down(&self) -> impl Iterator<Item = usize> {
+        let layers = self.layer_ranges();
+        layers
+            .into_iter()
+            .rev()
+            .flat_map(|(boxes, _, _)| boxes.rev())
     }
 
     /// Whether box `i` is in a fixed layer.
@@ -140,6 +354,7 @@ impl Layout {
             text: String::new(),
             layers: vec![FLOW_LAYER],
             clips: Vec::new(),
+            groups: Vec::new(),
             width: 0.0,
             height: 0.0,
             box_extents: Vec::new(),
@@ -195,6 +410,7 @@ const FLOW_LAYER: Layer = Layer {
     boxes: 0,
     texts: 0,
     fixed: false,
+    z: [0, 0],
 };
 
 /// Lay out the document for a viewport of `width` by `height` CSS px.
@@ -235,6 +451,7 @@ pub fn layout(
             text: String::new(),
             layers: vec![FLOW_LAYER],
             clips: Vec::new(),
+            groups: Vec::new(),
             width,
             height: 0.0,
             box_extents: Vec::new(),
@@ -260,6 +477,7 @@ pub fn layout(
         },
         ifc_origin: (0.0, 0.0),
         in_fixed: false,
+        layer_z: [0, 0],
         floats: Vec::new(),
         float_floor: f32::MIN,
     };
@@ -317,6 +535,8 @@ struct Engine<'a> {
     ifc_origin: (f32, f32),
     /// Laying out a fixed box: it does not extend the scrollable height.
     in_fixed: bool,
+    /// The paint order key of the layer being filled (`Layer::z`).
+    layer_z: [i16; 2],
     /// Floats placed so far in the current block formatting context, in page coordinates.
     /// A box that starts a new context sets the list aside while its content is laid out, so
     /// moving that box later (inline blocks, flex items) moves its floats with it.
@@ -734,6 +954,19 @@ impl<'a> Engine<'a> {
         let index = self.out.boxes.len();
         let first_text = self.out.texts.len();
         let first_clip = self.out.clips.len();
+        // A relatively positioned box with a z-index paints in its own layer; the flow after
+        // it resumes in the layer it interrupted.
+        let resume_z = (s.position == Position::Relative && s.z_index.is_some()).then(|| {
+            let outer = self.layer_z;
+            self.layer_z = self.stacking_key(id);
+            self.out.layers.push(Layer {
+                boxes: index as u32,
+                texts: first_text as u32,
+                fixed: self.in_fixed,
+                z: self.layer_z,
+            });
+            outer
+        });
         // The origin is known now; static positions of deferred descendants are relative to it.
         self.out.boxes.push(BoxFragment {
             node: id,
@@ -802,6 +1035,30 @@ impl<'a> Engine<'a> {
                 texts: (first_text as u32, self.out.texts.len() as u32),
                 rect: padding_box,
             });
+            if self.styles.radii(s).is_some() {
+                self.out.groups.push(Group {
+                    boxes: (index as u32 + 1, self.out.boxes.len() as u32),
+                    texts: (first_text as u32, self.out.texts.len() as u32),
+                    node: id,
+                    kind: GroupKind::Round,
+                });
+            }
+        }
+        if s.opacity < 255 && !s.transparent {
+            self.out.groups.push(Group {
+                boxes: (index as u32, self.out.boxes.len() as u32),
+                texts: (first_text as u32, self.out.texts.len() as u32),
+                node: id,
+                kind: GroupKind::Opacity,
+            });
+        }
+        if s.transform != 0 && !self.styles.transform(s).is_empty() {
+            self.out.groups.push(Group {
+                boxes: (index as u32, self.out.boxes.len() as u32),
+                texts: (first_text as u32, self.out.texts.len() as u32),
+                node: id,
+                kind: GroupKind::Transform,
+            });
         }
         let mut offset = (0.0, 0.0);
         if s.position == Position::Relative {
@@ -820,7 +1077,38 @@ impl<'a> Engine<'a> {
         if !self.in_fixed {
             self.bottom = self.bottom.max(y + offset.1 + border_height);
         }
+        if let Some(outer) = resume_z {
+            self.layer_z = outer;
+            self.out.layers.push(Layer {
+                boxes: self.out.boxes.len() as u32,
+                texts: self.out.texts.len() as u32,
+                fixed: self.in_fixed,
+                z: outer,
+            });
+        }
         border_height
+    }
+
+    /// The paint order key of a positioned box (`Layer::z`): the z-index of the outermost
+    /// positioned ancestor (or the box itself) that has one, then the box's own.
+    fn stacking_key(&self, id: NodeId) -> [i16; 2] {
+        let own = self.style(id).z_index;
+        let mut outermost = own;
+        let mut current = self.dom.parent(id);
+        while let Some(p) = current {
+            if self.dom.element(p).is_some() {
+                let s = self.style(p);
+                if s.position.is_positioned() && s.z_index.is_some() {
+                    outermost = s.z_index;
+                }
+            }
+            current = self.dom.parent(p);
+        }
+        match (outermost, own) {
+            (Some(o), _) if outermost == own => [o, 0],
+            (Some(o), own) => [o, own.unwrap_or(0)],
+            (None, _) => [0, 0],
+        }
     }
 
     /// Whether box `id` starts a block formatting context: floats outside it stay out, floats
@@ -1228,11 +1516,14 @@ impl<'a> Engine<'a> {
             (None, None) => static_y + margin[0],
         };
 
+        let z = self.stacking_key(d.node);
         self.out.layers.push(Layer {
             boxes: self.out.boxes.len() as u32,
             texts: self.out.texts.len() as u32,
             fixed: d.fixed,
+            z,
         });
+        let outer_z = std::mem::replace(&mut self.layer_z, z);
         let index = self.out.boxes.len();
         let first_text = self.out.texts.len();
         let first_clip = self.out.clips.len();
@@ -1270,6 +1561,7 @@ impl<'a> Engine<'a> {
         };
         self.shift(index, first_text, first_clip, dx, dy);
         self.in_fixed = was_fixed;
+        self.layer_z = outer_z;
     }
 
     /// Lay out `count` siblings starting at `first` (an inline-level run) as lines inside `container`'s content box.
@@ -1993,6 +2285,11 @@ mod tests {
 
     /// Approximate metrics: every character 0.5em, space 0.25em, ascent 0.8, descent 0.2.
     fn run(html_src: &str, css_src: &str, width: f32) -> (Dom, Layout) {
+        let (dom, _, layout) = run_styled(html_src, css_src, width);
+        (dom, layout)
+    }
+
+    fn run_styled(html_src: &str, css_src: &str, width: f32) -> (Dom, StyleMap, Layout) {
         let mut dom = html::parse(html_src);
         let author = parse_stylesheet(css_src);
         let media = Media {
@@ -2010,7 +2307,7 @@ mod tests {
         );
         styles.attach_generated(&mut dom);
         let layout = layout(&dom, &styles, &Approximate, &no_images, width, 600.0);
-        (dom, layout)
+        (dom, styles, layout)
     }
 
     fn rect(dom: &Dom, l: &Layout, tag: &str) -> Rect {
@@ -2153,6 +2450,98 @@ mod tests {
             "baseline {}",
             f.baseline
         );
+    }
+
+    #[test]
+    fn layers_paint_in_z_order() {
+        let (dom, l) = run(
+            "<div id=a></div><div id=b></div><p id=r>rel</p><div id=c></div><p>after</p>",
+            "body { margin: 0 } div { position: absolute; width: 10px; height: 10px }
+             #a { z-index: 5 } #b { z-index: -1 } #r { position: relative; z-index: 2 }",
+            400.0,
+        );
+        let first_node = |boxes: &Range<usize>| boxes.clone().next().map(|i| l.boxes[i].node);
+        let id = |name: &str| (0..dom.len() as NodeId).find(|&n| dom.attr(n, "id") == Some(name));
+        let order: Vec<Option<NodeId>> = l
+            .layer_ranges()
+            .iter()
+            .filter(|(b, _, _)| !b.is_empty())
+            .map(|(b, _, _)| first_node(b))
+            .collect();
+        let pos = |name| order.iter().position(|&n| n == id(name)).expect(name);
+        assert!(pos("b") < pos("c"), "negative z below the rest");
+        assert!(
+            pos("c") < pos("r") && pos("r") < pos("a"),
+            "then auto, 2, 5: {order:?}"
+        );
+        // The flow after the relative box resumes at z 0, before it in paint order.
+        let after = l.texts.iter().position(|t| l.text(t) == "after").unwrap();
+        let resumed = l
+            .layer_ranges()
+            .iter()
+            .position(|(_, t, _)| t.contains(&after))
+            .unwrap();
+        assert!(resumed < pos("r") + 1);
+    }
+
+    #[test]
+    fn maps_points_through_transforms() {
+        let (dom, styles, l) = run_styled(
+            "<div><p>x</p></div>",
+            "body { margin: 0 } p { margin: 0 }
+             div { width: 100px; height: 40px; transform: translate(10px, 5px) rotate(90deg) }",
+            400.0,
+        );
+        let styles = &styles;
+        let i = l
+            .boxes
+            .iter()
+            .position(|b| dom.tag_name(b.node) == Some("div"))
+            .unwrap();
+        // The center (50, 20) moves by (10, 5); rotating about it keeps it there.
+        let (x, y) = l.untransform(styles, i, true, (60.0, 25.0)).unwrap();
+        assert!(
+            (x - 50.0).abs() < 1e-3 && (y - 20.0).abs() < 1e-3,
+            "{x},{y}"
+        );
+        // A quarter turn clockwise (y points down): right of the center turns to below it, so
+        // 10px below the moved center is 10px right of the box's center.
+        let (x, y) = l.untransform(styles, i, true, (60.0, 35.0)).unwrap();
+        assert!(
+            (x - 60.0).abs() < 1e-3 && (y - 20.0).abs() < 1e-3,
+            "{x},{y}"
+        );
+        assert!(
+            l.untransform(styles, 0, false, (60.0, 25.0)).is_some(),
+            "its text maps the same way"
+        );
+        let m = Affine::translate(3.0, 4.0).then(&Affine::scale(2.0, 0.5));
+        let back = m.invert().unwrap().then(&m);
+        assert!(back.is_translation() && back.e.abs() < 1e-6);
+        assert!(Affine::scale(0.0, 1.0).invert().is_none());
+    }
+
+    #[test]
+    fn records_opacity_and_rounded_clip_groups() {
+        let (dom, l) = run(
+            "<div><p>x</p></div><section><span>y</span></section>",
+            "body { margin: 0 } div { opacity: 0.5 } section { overflow: hidden; border-radius: 8px }",
+            400.0,
+        );
+        assert_eq!(l.groups.len(), 2);
+        let div = dom.find_first("div").unwrap();
+        let g = l.groups.iter().find(|g| g.node == div).unwrap();
+        assert!(
+            g.kind == GroupKind::Opacity
+                && g.boxes.0 as usize == l.boxes.iter().position(|b| b.node == div).unwrap()
+        );
+        assert_eq!(g.texts, (0, 1), "its text is in the group");
+        let r = l
+            .groups
+            .iter()
+            .find(|g| g.kind == GroupKind::Round)
+            .unwrap();
+        assert_eq!(r.texts, (1, 2), "the rounded clip holds the section's text");
     }
 
     #[test]

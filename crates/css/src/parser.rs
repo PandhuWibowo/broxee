@@ -1,3 +1,4 @@
+use crate::effects::{parse_images, parse_shadows, EffectSlot, EffectSpec};
 use crate::fontface::{parse_family_list, parse_font_face, FamilyList, FontFace};
 use crate::grid::{expand_grid, is_grid_property, GridSlot, GridValue};
 use crate::media::{Media, MediaList};
@@ -31,6 +32,12 @@ pub enum Declaration {
     },
     /// `font-family`, as lowercase names.
     Family { value: FamilyList, important: bool },
+    /// `box-shadow` or gradient backgrounds: lists, resolved per element in the cascade.
+    Effect {
+        slot: EffectSlot,
+        value: Box<EffectSpec>,
+        important: bool,
+    },
     /// `content`, kept as written (strings keep their case).
     Content {
         value: Box<Content>,
@@ -52,6 +59,7 @@ impl Declaration {
             | Declaration::Pending { important, .. }
             | Declaration::Content { important, .. }
             | Declaration::Family { important, .. }
+            | Declaration::Effect { important, .. }
             | Declaration::Grid { important, .. } => *important,
         }
     }
@@ -261,6 +269,46 @@ pub fn expand_declaration(name: &str, value: &str, important: bool) -> Vec<Decla
             .into_iter()
             .collect();
     }
+    if let Some(slot) = effect_slot(name) {
+        let v = value.trim().to_ascii_lowercase();
+        let spec = match v.as_str() {
+            "initial" | "unset" | "revert" | "revert-layer" | "none" => Some(match slot {
+                EffectSlot::BoxShadow => EffectSpec::Shadows(Vec::new()),
+                EffectSlot::BackgroundImage => EffectSpec::Images(Vec::new()),
+                EffectSlot::Transform => EffectSpec::Transform(Vec::new()),
+            }),
+            // Not inherited: `inherit` is rare enough to treat as not set.
+            "inherit" => None,
+            v => match slot {
+                EffectSlot::BoxShadow => parse_shadows(v).map(EffectSpec::Shadows),
+                EffectSlot::BackgroundImage => parse_images(v).map(EffectSpec::Images),
+                EffectSlot::Transform => {
+                    crate::transform::parse_transform(v).map(EffectSpec::Transform)
+                }
+            },
+        };
+        return spec
+            .map(|value| Declaration::Effect {
+                slot,
+                value: Box::new(value),
+                important,
+            })
+            .into_iter()
+            .collect();
+    }
+    if name == "background" {
+        // The shorthand sets the color and resets the image layers (to its gradients, if any).
+        let v = value.trim().to_ascii_lowercase();
+        let mut out = expand_declaration("background-color-shorthand", &v, important);
+        if !matches!(v.as_str(), "inherit" | "initial" | "unset") {
+            out.push(Declaration::Effect {
+                slot: EffectSlot::BackgroundImage,
+                value: Box::new(EffectSpec::Images(parse_images(&v).unwrap_or_default())),
+                important,
+            });
+        }
+        return out;
+    }
     if name == "content" {
         return parse_content(value)
             .map(|c| Declaration::Content {
@@ -345,7 +393,8 @@ fn expand(name: &str, v: &str, sink: &mut Sink) {
         "border-color" => box4(v, BORDER_COLOR, sink),
         "border" => border(v, &[0, 1, 2, 3], sink),
         "outline" => outline(v, sink),
-        "background" => background(v, sink),
+        "background" | "background-color-shorthand" => background(v, sink),
+        "border-radius" => border_radius(v, sink),
         "font" => font(v, sink),
         "text-decoration-line" => expand("text-decoration", v, sink),
         "flex" => flex(v, sink),
@@ -408,7 +457,8 @@ fn longhands(name: &str) -> Vec<Prop> {
         "border-color" => BORDER_COLOR.to_vec(),
         "border" => [BORDER_WIDTH, BORDER_STYLE, BORDER_COLOR].concat(),
         "outline" => vec![Prop::OutlineWidth, Prop::OutlineStyle, Prop::OutlineColor],
-        "background" => vec![Prop::BackgroundColor],
+        "background" | "background-color-shorthand" => vec![Prop::BackgroundColor],
+        "border-radius" => RADIUS.to_vec(),
         "font" => vec![
             Prop::FontSize,
             Prop::FontWeight,
@@ -465,6 +515,8 @@ fn single_prop(name: &str) -> Option<Prop> {
         "row-gap" | "grid-row-gap" => Prop::RowGap,
         "column-gap" | "grid-column-gap" => Prop::ColumnGap,
         "order" => Prop::Order,
+        "z-index" => Prop::ZIndex,
+        "transform-origin" | "-webkit-transform-origin" => Prop::TransformOrigin,
         "vertical-align" => Prop::VerticalAlign,
         "border-collapse" => Prop::BorderCollapse,
         "caption-side" => Prop::CaptionSide,
@@ -474,6 +526,10 @@ fn single_prop(name: &str) -> Option<Prop> {
         "outline-style" => Prop::OutlineStyle,
         "outline-color" => Prop::OutlineColor,
         "outline-offset" => Prop::OutlineOffset,
+        "border-top-left-radius" => Prop::BorderTopLeftRadius,
+        "border-top-right-radius" => Prop::BorderTopRightRadius,
+        "border-bottom-right-radius" => Prop::BorderBottomRightRadius,
+        "border-bottom-left-radius" => Prop::BorderBottomLeftRadius,
         _ => {
             if let Some(side) = name.strip_prefix("margin-").and_then(side_index) {
                 return Some(MARGIN[side]);
@@ -493,6 +549,59 @@ fn single_prop(name: &str) -> Option<Prop> {
     })
 }
 
+const RADIUS: [Prop; 4] = [
+    Prop::BorderTopLeftRadius,
+    Prop::BorderTopRightRadius,
+    Prop::BorderBottomRightRadius,
+    Prop::BorderBottomLeftRadius,
+];
+
+fn effect_slot(name: &str) -> Option<EffectSlot> {
+    match name {
+        "box-shadow" => Some(EffectSlot::BoxShadow),
+        "background-image" => Some(EffectSlot::BackgroundImage),
+        "transform" | "-webkit-transform" => Some(EffectSlot::Transform),
+        _ => None,
+    }
+}
+
+fn radius_length(t: &str) -> Option<SpecLength> {
+    parse_length(t).filter(|l| non_negative(l) && *l != SpecLength::Auto)
+}
+
+/// `border-radius: 4px`, `10px 5%`, `1em 2em 3em 4em / 5px`: one to four horizontal radii,
+/// then optionally one to four vertical ones, for top left, top right, bottom right, bottom left.
+fn border_radius(v: &str, sink: &mut Sink) {
+    let (h, vert) = match v.split_once('/') {
+        Some((h, vert)) => (h, Some(vert)),
+        None => (v, None),
+    };
+    let four = |part: &str| -> Option<[SpecLength; 4]> {
+        let l: Vec<SpecLength> = part
+            .split_whitespace()
+            .map(radius_length)
+            .collect::<Option<_>>()?;
+        Some(match l.as_slice() {
+            [a] => [*a; 4],
+            [a, b] => [*a, *b, *a, *b],
+            [a, b, c] => [*a, *b, *c, *b],
+            [a, b, c, d] => [*a, *b, *c, *d],
+            _ => return None,
+        })
+    };
+    let Some(h) = four(h) else { return };
+    let vert = match vert {
+        Some(part) => match four(part) {
+            Some(v) => v,
+            None => return,
+        },
+        None => h,
+    };
+    for i in 0..4 {
+        sink.set(RADIUS[i], Value::Radius(h[i], vert[i]));
+    }
+}
+
 fn side_index(side: &str) -> Option<usize> {
     ["top", "right", "bottom", "left"]
         .iter()
@@ -504,6 +613,17 @@ fn parse_for(prop: Prop, v: &str) -> Option<Value> {
     use Prop::*;
     match prop {
         Display => parse_display(v).map(Value::Display),
+        p if RADIUS.contains(&p) => {
+            let parts: Vec<SpecLength> = v
+                .split_whitespace()
+                .map(radius_length)
+                .collect::<Option<_>>()?;
+            match parts.as_slice() {
+                [r] => Some(Value::Radius(*r, *r)),
+                [h, v] => Some(Value::Radius(*h, *v)),
+                _ => None,
+            }
+        }
         Color | BackgroundColor => parse_color_value(v),
         FontSize => parse_font_size(v).map(Value::Length),
         FontWeight => parse_font_weight(v),
@@ -602,6 +722,15 @@ fn parse_for(prop: Prop, v: &str) -> Option<Value> {
                 .map(Value::Length),
         },
         Order => v.parse::<i32>().ok().map(|n| Value::Number(n as f32)),
+        TransformOrigin => {
+            // The z part, when given, has no 2D meaning.
+            let xy: Vec<&str> = v.split_whitespace().take(2).collect();
+            crate::effects::parse_position(&xy.join(" ")).map(|(x, y)| Value::Origin(x, y))
+        }
+        ZIndex => match v {
+            "auto" => Some(Value::Normal),
+            n => n.parse::<i32>().ok().map(|n| Value::Number(n as f32)),
+        },
         VerticalAlign => Some(Value::VAlign(match v {
             "top" => VAlign::Top,
             "middle" => VAlign::Middle,
@@ -1078,7 +1207,7 @@ fn parse_color_value(v: &str) -> Option<Value> {
 }
 
 /// Split on whitespace that is not inside parentheses, so `rgb(0, 0, 0)` stays one token.
-fn split_values(v: &str) -> Vec<&str> {
+pub(crate) fn split_values(v: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut depth = 0i32;
     let mut start = None;

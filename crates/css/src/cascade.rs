@@ -4,6 +4,9 @@ use std::hash::Hasher;
 
 use html::{Atom, Dom, Element, FastBuildHasher, FastHasher, NodeId, NodeKind};
 
+use crate::effects::{
+    compute_gradients, compute_shadows, EffectSlot, EffectSpec, Gradient, Shadow, EFFECT_SLOTS,
+};
 use crate::fontface::FamilyList;
 use crate::grid::{
     resolve_tracks, GridPlacement, GridSlot, GridTables, GridTemplate, GridValue, GRID_SLOTS,
@@ -28,6 +31,10 @@ pub struct StyleMap {
     node_style: Vec<u32>,
     grids: GridTables,
     families: FamilyTable,
+    shadows: ListTable<Shadow>,
+    gradients: ListTable<Gradient>,
+    radii: ListTable<[Length; 2]>,
+    transforms: ListTable<crate::TransformOp>,
     /// Boxes `::before` and `::after` generate, in document order of their elements.
     generated: Vec<Generated>,
     /// Every compound that looks at a state, with its states and `:not()` taken out, and
@@ -49,6 +56,27 @@ impl StyleMap {
     /// index 0 is the empty list (the browser's default).
     pub fn families(&self) -> &[FamilyList] {
         &self.families.list
+    }
+
+    /// A style's corner radii (top left, top right, bottom right, bottom left; each horizontal
+    /// then vertical, px or a percentage of the border box), or `None` for square corners.
+    pub fn radii(&self, style: &ComputedStyle) -> Option<[[Length; 2]; 4]> {
+        self.radii.get(style.radii).try_into().ok()
+    }
+
+    /// A style's `transform`: its origin first, then its functions; empty when it has none.
+    pub fn transform(&self, style: &ComputedStyle) -> &[crate::TransformOp] {
+        self.transforms.get(style.transform)
+    }
+
+    /// A style's `box-shadow` list, outermost first; empty when it has none.
+    pub fn shadows(&self, style: &ComputedStyle) -> &[Shadow] {
+        self.shadows.get(style.box_shadow)
+    }
+
+    /// A style's gradient background layers, top layer first; empty when it has none.
+    pub fn gradients(&self, style: &ComputedStyle) -> &[Gradient] {
+        self.gradients.get(style.background_image)
     }
 
     pub fn grid_placement(&self, style: &ComputedStyle) -> &GridPlacement {
@@ -427,6 +455,45 @@ impl FamilyTable {
     }
 }
 
+/// Distinct lists of a computed value (shadows, gradients), index 0 the empty list. Past
+/// `u16::MAX` lists the rest compute to none.
+struct ListTable<T> {
+    list: Vec<Box<[T]>>,
+    index: HashMap<Box<[T]>, u16, FastBuildHasher>,
+}
+
+impl<T> Default for ListTable<T> {
+    fn default() -> Self {
+        ListTable {
+            list: vec![Box::default()],
+            index: HashMap::default(),
+        }
+    }
+}
+
+impl<T: Clone + Eq + std::hash::Hash> ListTable<T> {
+    fn intern(&mut self, items: Vec<T>) -> u16 {
+        if items.is_empty() {
+            return 0;
+        }
+        let items: Box<[T]> = items.into();
+        if let Some(&id) = self.index.get(&items) {
+            return id;
+        }
+        if self.list.len() > usize::from(u16::MAX) {
+            return 0;
+        }
+        let id = self.list.len() as u16;
+        self.list.push(items.clone());
+        self.index.insert(items, id);
+        id
+    }
+
+    fn get(&self, id: u16) -> &[T] {
+        self.list.get(usize::from(id)).map_or(&[], |l| l)
+    }
+}
+
 #[derive(Default)]
 struct StyleTable {
     list: Vec<ComputedStyle>,
@@ -745,6 +812,10 @@ struct Styler<'s, 'a> {
     customs: CustomSets<'a>,
     grids: GridTables,
     families: FamilyTable,
+    shadows: ListTable<Shadow>,
+    gradients: ListTable<Gradient>,
+    radii: ListTable<[Length; 2]>,
+    transforms: ListTable<crate::TransformOp>,
     custom_rules: Vec<u32>,
     var_cache: HashMap<(usize, u32), Vec<Declaration>, FastBuildHasher>,
     root_font_size: Px,
@@ -832,6 +903,7 @@ impl<'a> Styler<'_, 'a> {
         let mut grid: [Option<&GridValue>; GRID_SLOTS] = [None; GRID_SLOTS];
         let mut content: Option<Content> = None;
         let mut family: Option<&[Box<str>]> = None;
+        let mut effects: [Option<&EffectSpec>; EFFECT_SLOTS] = [None; EFFECT_SLOTS];
         // Grid values that came out of `var()` substitution, kept alive for `grid`.
         let mut substituted: Vec<Declaration> = Vec::new();
         for important in [false, true] {
@@ -841,6 +913,9 @@ impl<'a> Styler<'_, 'a> {
                     Declaration::Grid { slot, value, .. } => grid[*slot as usize] = Some(value),
                     Declaration::Content { value, .. } => content = Some((**value).clone()),
                     Declaration::Family { value, .. } => family = Some(value),
+                    Declaration::Effect { slot, value, .. } => {
+                        effects[*slot as usize] = Some(value)
+                    }
                     Declaration::Pending { name, value, .. } => {
                         // The result depends only on the declaration and the variable set,
                         // so siblings and cousins reuse it. Inline declarations are not cached
@@ -873,9 +948,9 @@ impl<'a> Styler<'_, 'a> {
                             match d {
                                 Declaration::Typed(d) => specified[d.prop as usize] = Some(d.value),
                                 Declaration::Content { value, .. } => content = Some(*value),
-                                d @ (Declaration::Grid { .. } | Declaration::Family { .. }) => {
-                                    substituted.push(d)
-                                }
+                                d @ (Declaration::Grid { .. }
+                                | Declaration::Family { .. }
+                                | Declaration::Effect { .. }) => substituted.push(d),
                                 _ => {}
                             }
                         }
@@ -895,7 +970,56 @@ impl<'a> Styler<'_, 'a> {
             match decl {
                 Declaration::Grid { slot, value, .. } => grid[*slot as usize] = Some(value),
                 Declaration::Family { value, .. } => family = Some(value),
+                Declaration::Effect { slot, value, .. } => effects[*slot as usize] = Some(value),
                 _ => {}
+            }
+        }
+        if RADIUS_PROPS
+            .iter()
+            .any(|&p| specified[p as usize].is_some())
+        {
+            let (root_font_size, media) = (self.root_font_size, self.media);
+            let length = |l| resolve(l, style.font_size, root_font_size, media);
+            let parent = self
+                .radii
+                .get(self.table.list[parent_style as usize].radii)
+                .to_vec();
+            let mut corners = [[Length::ZERO; 2]; 4];
+            for (i, prop) in RADIUS_PROPS.into_iter().enumerate() {
+                match specified[prop as usize] {
+                    Some(Value::Radius(h, v)) => corners[i] = [length(h), length(v)],
+                    Some(Value::Inherit) => {
+                        corners[i] = parent.get(i).copied().unwrap_or([Length::ZERO; 2])
+                    }
+                    _ => {}
+                }
+            }
+            let square = corners.iter().flatten().all(|l| *l == Length::ZERO);
+            style.radii = if square {
+                0
+            } else {
+                self.radii.intern(corners.to_vec())
+            };
+        }
+        if effects.iter().any(Option::is_some) {
+            let (root_font_size, media) = (self.root_font_size, self.media);
+            let length = |l| resolve(l, style.font_size, root_font_size, media);
+            let current = style.color;
+            if let Some(EffectSpec::Shadows(s)) = effects[EffectSlot::BoxShadow as usize] {
+                style.box_shadow = self.shadows.intern(compute_shadows(s, current, &length));
+            }
+            if let Some(EffectSpec::Images(g)) = effects[EffectSlot::BackgroundImage as usize] {
+                let gradients = compute_gradients(g, current, &length);
+                style.background_image = self.gradients.intern(gradients);
+            }
+            if let Some(EffectSpec::Transform(t)) = effects[EffectSlot::Transform as usize] {
+                let center = Length::Percent(5000);
+                let origin = match specified[Prop::TransformOrigin as usize] {
+                    Some(Value::Origin(x, y)) => (length(x), length(y)),
+                    _ => (center, center),
+                };
+                let ops = crate::transform::compute_transform(t, origin, &length);
+                style.transform = self.transforms.intern(ops);
             }
         }
         if let Some(family) = family {
@@ -941,6 +1065,10 @@ pub fn cascade_with(
         customs: CustomSets::new(),
         grids: GridTables::default(),
         families: FamilyTable::default(),
+        shadows: ListTable::default(),
+        gradients: ListTable::default(),
+        radii: ListTable::default(),
+        transforms: ListTable::default(),
         custom_rules: Vec::new(),
         var_cache: HashMap::default(),
         root_font_size: ComputedStyle::initial().font_size,
@@ -1149,6 +1277,10 @@ pub fn cascade_with(
         node_style,
         grids: styler.grids,
         families: styler.families,
+        shadows: styler.shadows,
+        gradients: styler.gradients,
+        radii: styler.radii,
+        transforms: styler.transforms,
         generated,
         state_compounds: index.state_compounds,
     }
@@ -1612,6 +1744,12 @@ fn compute(
     }
     if let Some(Value::Number(n)) = get(Prop::Opacity) {
         s.transparent |= n <= 0.01;
+        s.opacity = (n * 255.0).round().clamp(0.0, 255.0) as u8;
+    }
+    match get(Prop::ZIndex) {
+        Some(Value::Number(n)) => s.z_index = Some(n.clamp(-32768.0, 32767.0) as i16),
+        Some(Value::Inherit) => s.z_index = parent.z_index,
+        _ => {}
     }
     match get(Prop::VerticalAlign) {
         Some(Value::VAlign(v)) => s.vertical_align = v,
@@ -1769,6 +1907,13 @@ fn compute(
     }
     s
 }
+
+const RADIUS_PROPS: [Prop; 4] = [
+    Prop::BorderTopLeftRadius,
+    Prop::BorderTopRightRadius,
+    Prop::BorderBottomRightRadius,
+    Prop::BorderBottomLeftRadius,
+];
 
 #[cfg(test)]
 mod tests {
@@ -1929,6 +2074,51 @@ mod tests {
             map.families().len(),
             4,
             "default, inter, georgia, fira code"
+        );
+    }
+
+    #[test]
+    fn computes_radii_shadows_and_gradients() {
+        let (dom, map) = styled(
+            "<div><p>a</p><b>b</b><i>c</i></div>",
+            "div { border-radius: 10px 50% / 4px; color: red; font-size: 10px;
+                   box-shadow: 0 1em 2px currentcolor, inset 1px 1px blue;
+                   background: linear-gradient(to right, #fff, #000) #eee }
+             b { border-top-left-radius: 3px 6px; background-image: radial-gradient(red, blue) }
+             i { background: #fff }",
+        );
+        let div = first(&dom, &map, "div");
+        let radii = map.radii(div).unwrap();
+        assert_eq!(
+            radii[0],
+            [Length::Px(Px::new(10.0)), Length::Px(Px::new(4.0))]
+        );
+        assert_eq!(radii[1], [Length::Percent(5000), Length::Px(Px::new(4.0))]);
+        let shadows = map.shadows(div);
+        assert_eq!(shadows.len(), 2);
+        assert_eq!((shadows[0].y, shadows[0].color), (Px::new(10.0), RED));
+        assert!(shadows[1].inset);
+        assert_eq!(div.background_color, Color::rgb(0xee, 0xee, 0xee));
+        assert!(matches!(
+            map.gradients(div)[0].kind,
+            crate::GradientKind::Linear(9000)
+        ));
+        let b = first(&dom, &map, "b");
+        let radii = map.radii(b).unwrap();
+        assert_eq!(
+            radii[0],
+            [Length::Px(Px::new(3.0)), Length::Px(Px::new(6.0))]
+        );
+        assert_eq!(radii[1], [Length::ZERO; 2], "radius is not inherited");
+        assert!(map.radii(first(&dom, &map, "p")).is_none());
+        assert!(map.shadows(b).is_empty(), "nor are shadows");
+        assert!(matches!(
+            map.gradients(b)[0].kind,
+            crate::GradientKind::Radial { .. }
+        ));
+        assert!(
+            map.gradients(first(&dom, &map, "i")).is_empty(),
+            "background resets it"
         );
     }
 
