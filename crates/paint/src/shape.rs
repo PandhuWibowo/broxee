@@ -121,6 +121,48 @@ impl RRect {
         }
     }
 
+    /// The shape's left and right edge along the horizontal line at `y`, if it crosses it.
+    pub fn span(&self, y: f32) -> Option<(f32, f32)> {
+        if y < self.y0 || y > self.y1 {
+            return None;
+        }
+        // How far a corner's curve is inset at `y`, when `y` is in that corner's rows.
+        let inset = |[rx, ry]: [f32; 2], from_edge: f32| {
+            if rx <= 0.0 || from_edge >= ry {
+                return 0.0;
+            }
+            let t = (ry - from_edge) / ry;
+            rx * (1.0 - (1.0 - t * t).max(0.0).sqrt())
+        };
+        let (top, bottom) = (y - self.y0, self.y1 - y);
+        let left = inset(self.r[0], top).max(inset(self.r[3], bottom));
+        let right = inset(self.r[1], top).max(inset(self.r[2], bottom));
+        Some((self.x0 + left, self.x1 - right))
+    }
+
+    /// For the pixel row from `y` to `y + 1`: the columns every pixel left of which lies
+    /// outside (and right of `out.1`), and the columns between which pixels lie wholly inside.
+    /// The shape is convex, so a pixel square is inside when its four corners are.
+    pub fn row_spans(&self, y: f32) -> RowSpans {
+        let (top, mid, bottom) = (self.span(y), self.span(y + 0.5), self.span(y + 1.0));
+        let inside = match (top, bottom) {
+            (Some(t), Some(b)) => Some((t.0.max(b.0), t.1.min(b.1))),
+            _ => None,
+        };
+        let mut outside: Option<(f32, f32)> = None;
+        for (l, r) in [top, mid, bottom].into_iter().flatten() {
+            outside = Some(match outside {
+                Some((ol, or)) => (ol.min(l), or.max(r)),
+                None => (l, r),
+            });
+        }
+        RowSpans {
+            // One pixel of slack: the curve can bulge between the three samples.
+            outside: outside.map(|(l, r)| (l - 1.0, r + 1.0)),
+            inside,
+        }
+    }
+
     /// How much of the pixel whose center is (x, y) the shape covers, 0 to 1.
     pub fn coverage(&self, x: f32, y: f32) -> f32 {
         (0.5 - self.distance(x, y)).clamp(0.0, 1.0)
@@ -149,6 +191,33 @@ impl RRect {
             (self.x1 + margin).ceil() as i32,
             (self.y1 + margin).ceil() as i32,
         ]
+    }
+}
+
+/// Where a row of pixels is certainly outside or wholly inside a shape (`RRect::row_spans`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RowSpans {
+    /// Pixels ending at or before `.0`, or starting at or after `.1`, are outside; `None`: all.
+    pub outside: Option<(f32, f32)>,
+    /// Pixels starting at or after `.0` and ending by `.1` are wholly inside.
+    pub inside: Option<(f32, f32)>,
+}
+
+impl RowSpans {
+    /// 0 when the pixel at column `x` is outside, 1 when wholly inside, `None` when its
+    /// coverage needs working out.
+    #[inline]
+    pub fn known(&self, x: i32) -> Option<f32> {
+        let (x0, x1) = (x as f32, x as f32 + 1.0);
+        match self.outside {
+            None => return Some(0.0),
+            Some((l, r)) if x1 <= l || x0 >= r => return Some(0.0),
+            _ => {}
+        }
+        match self.inside {
+            Some((l, r)) if x0 >= l && x1 <= r => Some(1.0),
+            _ => None,
+        }
     }
 }
 
@@ -196,6 +265,8 @@ pub(crate) struct DeviceGradient {
     repeating: bool,
     /// Premultiplied colors from the first stop's position to the last's.
     lut: Box<[[u8; 4]]>,
+    /// The same colors as little-endian pixels, in RGBA and in BGRA order, for row fills.
+    pixels: [Box<[u32]>; 2],
     first: f32,
     span: f32,
 }
@@ -298,6 +369,7 @@ impl DeviceGradient {
             stops,
             repeating: g.repeating,
             lut: Box::default(),
+            pixels: [Box::default(), Box::default()],
             first,
             span: (last - first).max(1e-6),
         };
@@ -309,6 +381,15 @@ impl DeviceGradient {
                     .map(|v| (v * 255.0).round().clamp(0.0, 255.0) as u8)
             })
             .collect();
+        gradient.pixels = [false, true].map(|bgra| {
+            gradient
+                .lut
+                .iter()
+                .map(|&[r, g, b, a]| {
+                    u32::from_le_bytes(if bgra { [b, g, r, a] } else { [r, g, b, a] })
+                })
+                .collect()
+        });
         Some(gradient)
     }
 
@@ -348,6 +429,33 @@ impl DeviceGradient {
     /// Whether every color in the table is opaque, so pixels are copied rather than blended.
     pub fn opaque(&self) -> bool {
         self.lut.iter().all(|c| c[3] == 255)
+    }
+
+    /// For a radial gradient, along a row: the horizontal term at (x, y), its step per pixel,
+    /// and the row's vertical term, so the position is `sqrt(ax * ax + by)` with `ax` stepping.
+    pub fn radial_row(&self, x: f32, y: f32) -> (f32, f32, f32) {
+        match self.line {
+            Line::Radial { cx, cy, rx, ry } => ((x - cx) / rx, 1.0 / rx, ((y - cy) / ry).powi(2)),
+            Line::Linear { .. } => (0.0, 0.0, 0.0),
+        }
+    }
+
+    /// The color at position `t` along the line, from the table.
+    #[inline]
+    pub fn at_position(&self, t: f32) -> [u8; 4] {
+        self.at_index((t - self.first) * ((LUT - 1) as f32 / self.span))
+    }
+
+    /// The color at a whole table index as a pixel in the given byte order.
+    #[inline]
+    pub fn pixel_at(&self, i: i64, bgra: bool) -> u32 {
+        let last = (LUT - 1) as i64;
+        let i = if self.repeating {
+            i.rem_euclid(last)
+        } else {
+            i.clamp(0, last)
+        };
+        self.pixels[usize::from(bgra)][i as usize]
     }
 
     /// The color for a table index from `row_index`, wrapping when the gradient repeats.
@@ -465,7 +573,40 @@ pub(crate) fn shadow_coverage(shape: &RRect, sigma: f32, x: f32, y: f32) -> f32 
     if sigma < 0.5 {
         return shape.coverage(x, y);
     }
-    0.5 * (1.0 - erf(shape.distance(x, y) / (sigma * std::f32::consts::SQRT_2)))
+    half_erfc(shape.distance(x, y) / (sigma * std::f32::consts::SQRT_2))
+}
+
+/// How much of a Gaussian of standard deviation `sigma` centered at `c` falls between `lo` and
+/// `hi`: one axis of a blurred rectangle, which is the product of its two axes.
+pub(crate) fn blur_span(lo: f32, hi: f32, sigma: f32, c: f32) -> f32 {
+    let k = 1.0 / (sigma * std::f32::consts::SQRT_2);
+    (half_erfc((lo - c) * k) - half_erfc((hi - c) * k)).max(0.0)
+}
+
+/// `(1 - erf(x)) / 2` from a table, interpolated: `exp` per pixel made large blurred shadows
+/// the slowest thing on singapay.id.
+fn half_erfc(x: f32) -> f32 {
+    const RANGE: f32 = 3.5;
+    const N: usize = 512;
+    static TABLE: std::sync::OnceLock<[f32; N + 1]> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut t = [0.0; N + 1];
+        for (i, v) in t.iter_mut().enumerate() {
+            let x = -RANGE + 2.0 * RANGE * i as f32 / N as f32;
+            *v = 0.5 * (1.0 - erf(x));
+        }
+        t
+    });
+    if x <= -RANGE {
+        return 1.0;
+    }
+    if x >= RANGE {
+        return 0.0;
+    }
+    let f = (x + RANGE) / (2.0 * RANGE) * N as f32;
+    let i = (f as usize).min(N - 1);
+    let k = f - i as f32;
+    table[i] + (table[i + 1] - table[i]) * k
 }
 
 #[cfg(test)]
@@ -483,6 +624,63 @@ mod tests {
         assert!(r.distance(on_arc, on_arc).abs() < 1e-3);
         assert_eq!(r.distance(150.0, 25.0), 50.0);
         assert_eq!(r.distance(50.0, 10.0), -10.0);
+    }
+
+    #[test]
+    fn row_spans_agree_with_coverage() {
+        for r in [
+            RRect::new(3.0, 2.0, 61.0, 40.0, [[12.0, 12.0]; 4]),
+            RRect::new(0.0, 0.0, 300.0, 40.0, [[150.0, 20.0]; 4]),
+            RRect::new(
+                5.0,
+                5.0,
+                50.0,
+                90.0,
+                [[20.0, 30.0], [0.0, 0.0], [8.0, 8.0], [40.0, 10.0]],
+            ),
+        ] {
+            for y in -2..95 {
+                let spans = r.row_spans(y as f32);
+                for x in -3..310 {
+                    if let Some(known) = spans.known(x) {
+                        let exact = r.coverage(x as f32 + 0.5, y as f32 + 0.5);
+                        assert_eq!(known, exact, "{r:?} at {x},{y}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_blurred_rectangle_is_the_product_of_its_axes() {
+        let r = RRect::new(0.0, 0.0, 100.0, 60.0, [[0.0; 2]; 4]);
+        for (x, y) in [
+            (50.0, 30.0),
+            (100.0, 30.0),
+            (110.0, 30.0),
+            (100.0, 60.0),
+            (-8.0, 70.0),
+        ] {
+            let separable = blur_span(r.x0, r.x1, 6.0, x) * blur_span(r.y0, r.y1, 6.0, y);
+            let exact_edge = shadow_coverage(&r, 6.0, x, y);
+            // Along a straight edge, away from corners, both are the same 1D profile.
+            if (0.0..60.0).contains(&y) && (y - 30.0).abs() < 1.0 {
+                assert!((separable - exact_edge).abs() < 1e-3, "{x},{y}");
+            }
+            assert!((0.0..=1.0).contains(&separable));
+        }
+        assert!(
+            (blur_span(0.0, 100.0, 6.0, 0.0) - 0.5).abs() < 1e-3,
+            "half at an edge"
+        );
+    }
+
+    #[test]
+    fn the_erfc_table_is_close() {
+        for i in -50..50 {
+            let x = i as f32 / 10.0;
+            assert!((half_erfc(x) - 0.5 * (1.0 - erf(x))).abs() < 2e-4, "{x}");
+        }
     }
 
     #[test]

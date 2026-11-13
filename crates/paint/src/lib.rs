@@ -15,7 +15,7 @@ use css::{Color, Length, StyleMap};
 use font::{FaceId, FontKey, TextMetrics, WEB_FACES};
 use html::{Dom, FastBuildHasher, NodeId};
 use layout::{Layout, Rect};
-use shape::{device_radii, shadow_coverage, DeviceGradient, RRect};
+use shape::{blur_span, device_radii, shadow_coverage, DeviceGradient, RRect};
 
 pub use raster::{rasterize_glyph, rasterize_glyph_at, GlyphBitmap, Rasterizer};
 
@@ -927,7 +927,9 @@ fn composite_band(
             }
         }
     }
-    let (lo, hi) = (band.clip.0.max(0), band.clip.1.min(band.width as i32));
+    let lo = band.clip.0.max(0);
+    // Never below `lo`: the clamps against (lo, hi) panic on reversed bounds.
+    let hi = band.clip.1.min(band.width as i32).max(lo);
     let pixel = |x: i32, y: i32| y as usize * band.stride + (band.left + x as usize) * 4;
     for item in items {
         match *item {
@@ -1027,13 +1029,17 @@ fn draw_effect(rows: &mut [u8], band: Band, y0: i32, effect: &Effect, (lo, hi): 
             let interior = shape.interior(0.0);
             match fill {
                 ShapeFill::Gradient(g) => fill_gradient(rows, band, y0, interior, rect, g),
-                ShapeFill::Solid(c) => fill_rect(rows, band, y0, interior, rect, order(*c)),
+                ShapeFill::Solid(c) => {
+                    fill_shape(rows, band, y0, shape, rect, order(*c));
+                    return;
+                }
             }
             // The interior is filled above; the edges go through the shape.
             let edges = Edges {
                 area: shape.bounds(0.0),
                 hole: interior,
                 straight: shape.interior(1.0),
+                shape: Some((*shape, None)),
             };
             each_pixel(
                 rows,
@@ -1069,6 +1075,7 @@ fn draw_effect(rows: &mut [u8], band: Band, y0: i32, effect: &Effect, (lo, hi): 
                 area: outer.bounds(0.0),
                 hole: inner.interior(0.0),
                 straight: narrower(outer.interior(1.0), inner.interior(1.0)),
+                shape: Some((*outer, Some(*inner))),
             };
             each_pixel(
                 rows,
@@ -1108,15 +1115,32 @@ fn draw_effect(rows: &mut [u8], band: Band, y0: i32, effect: &Effect, (lo, hi): 
                     area: bound.bounds(0.0),
                     hole: shape.interior(reach),
                     straight,
+                    shape: None,
                 }
             } else {
                 Edges {
                     area: shape.bounds(reach),
                     hole: bound.interior(0.0),
                     straight,
+                    shape: None,
                 }
             };
             let c = order(color);
+            // When the blur is at least the corners' radius, the rounded corner makes no
+            // visible difference: the shadow is a blurred rectangle, the product of two
+            // one-dimensional blurs, one per column and one per row. Small cards with large
+            // blurs are all corner: per-pixel distances cost 9 ms a band on singapay.id.
+            let radius = shape.r.iter().flatten().fold(0.0f32, |m, &r| m.max(r));
+            if sigma >= 0.5 && radius <= sigma {
+                let shadow = BlurredRect {
+                    shape,
+                    bound,
+                    sigma,
+                    inset,
+                };
+                draw_blurred_rect(rows, band, y0, &shadow, edges, rect, c);
+                return;
+            }
             each_pixel(
                 rows,
                 band,
@@ -1137,24 +1161,34 @@ fn draw_effect(rows: &mut [u8], band: Band, y0: i32, effect: &Effect, (lo, hi): 
     }
 }
 
-/// Where an effect draws: `area`, less `hole` (drawn already, or nothing to draw), with
-/// coverage that is the same along a row between `straight`'s left and right (the edges
-/// between the corners are straight).
+/// Where an effect draws: `area`, less `hole` (drawn already, or nothing to draw). Between
+/// the corners the edges are straight: coverage is the same along a row between `straight`'s
+/// left and right, and the same down a column between its top and bottom.
 struct Edges {
     area: [i32; 4],
     hole: [i32; 4],
     straight: [i32; 4],
+    /// The shape whose coverage this is, and the hole cut from it (a border's inner edge):
+    /// pixels known to be outside, inside or in the hole skip working out their coverage.
+    shape: Option<(RRect, Option<RRect>)>,
 }
 
-/// The horizontal span both shapes are straight in.
+/// Where both shapes' edges are straight: the overlap of their straight spans.
 fn narrower(a: [i32; 4], b: [i32; 4]) -> [i32; 4] {
-    [a[0].max(b[0]), a[1], a[2].min(b[2]), a[3]]
+    [
+        a[0].max(b[0]),
+        a[1].max(b[1]),
+        a[2].min(b[2]),
+        a[3].min(b[3]),
+    ]
 }
 
 /// Paint the edges of an effect: `paint` gets each pixel's center (frame coordinates), its
 /// bytes and its coverage from `cover`, for the pixels of `edges.area` outside `edges.hole`,
 /// inside `clip` and this band. Coverage is worked out once per row where the edge is straight,
-/// so a wide box costs per-pixel distance work only at its corners and sides.
+/// and once per column where it is straight vertically, so a big box costs per-pixel distance
+/// work only at its corners: singapay.id's large blurred shadows took 22 ms a frame at 2x
+/// before columns were reused.
 fn each_pixel(
     rows: &mut [u8],
     band: Band,
@@ -1168,6 +1202,7 @@ fn each_pixel(
         area,
         hole: h,
         straight,
+        shape,
     } = edges;
     let band_height = (rows.len() / band.stride) as i32;
     let (cx0, cx1) = (
@@ -1176,6 +1211,13 @@ fn each_pixel(
     );
     let ry0 = (area[1].max(clip[1]) - y0).clamp(0, band_height);
     let ry1 = (area[3].min(clip[3]) - y0).clamp(0, band_height);
+    // Nothing of the area in this band's columns; the clamps below need cx0 <= cx1.
+    if cx0 >= cx1 {
+        return;
+    }
+    // Coverage per column for rows on the straight vertical stretch, worked out on first use.
+    let mut columns: Vec<f32> = Vec::new();
+    let straight_rows = straight[1]..straight[3];
     for ry in ry0..ry1 {
         let fy = ry + y0;
         let y = fy as f32 + 0.5;
@@ -1186,11 +1228,43 @@ fn each_pixel(
                 paint(x as f32 + 0.5, y, &mut rows[at..at + 4], c);
             }
         };
+        // Pixels whose coverage the row's spans already tell (most of a big corner).
+        let spans =
+            shape.map(|(s, hole)| (s.row_spans(fy as f32), hole.map(|h| h.row_spans(fy as f32))));
+        let known = |x: i32| -> Option<f32> {
+            let (outer, hole) = spans?;
+            match (outer.known(x)?, hole.map(|h| h.known(x))) {
+                (0.0, _) => Some(0.0),
+                (_, None) => Some(1.0),
+                (_, Some(Some(1.0))) => Some(0.0),
+                (_, Some(Some(_))) => Some(1.0),
+                (_, Some(None)) => None,
+            }
+        };
+        let cover = |x: i32| known(x).unwrap_or_else(|| cover(x as f32 + 0.5, y));
         if (h[1]..h[3]).contains(&fy) && h[0] < h[2] {
             // Beside the hole: the left and right edges.
             let (hx0, hx1) = (h[0].clamp(cx0, cx1), h[2].clamp(cx0, cx1));
-            for x in (cx0..hx0).chain(hx1..cx1) {
-                put(x, cover(x as f32 + 0.5, y));
+            if straight_rows.contains(&fy) {
+                if columns.is_empty() {
+                    columns = (cx0..cx1)
+                        .map(|x| {
+                            let inside = (hx0..hx1).contains(&x);
+                            if inside {
+                                0.0
+                            } else {
+                                cover(x)
+                            }
+                        })
+                        .collect();
+                }
+                for x in (cx0..hx0).chain(hx1..cx1) {
+                    put(x, columns[(x - cx0) as usize]);
+                }
+            } else {
+                for x in (cx0..hx0).chain(hx1..cx1) {
+                    put(x, cover(x));
+                }
             }
             continue;
         }
@@ -1201,23 +1275,102 @@ fn each_pixel(
             (cx1, cx1)
         };
         for x in cx0..sx0 {
-            put(x, cover(x as f32 + 0.5, y));
+            put(x, cover(x));
         }
         if sx0 < sx1 {
-            let c = cover(sx0 as f32 + 0.5, y);
+            let c = cover(sx0);
             for x in sx0..sx1 {
                 put(x, c);
             }
         }
         for x in sx1..cx1 {
-            put(x, cover(x as f32 + 0.5, y));
+            put(x, cover(x));
         }
     }
 }
 
-/// Fill `area`, inside `clip` and this band, with one color (byte order already applied).
-fn fill_rect(rows: &mut [u8], band: Band, y0: i32, area: [i32; 4], clip: DeviceClip, c: Color) {
+/// A shadow drawn as a blurred rectangle (see `Effect::Shadow`).
+struct BlurredRect<'s> {
+    shape: &'s RRect,
+    bound: &'s RRect,
+    sigma: f32,
+    inset: bool,
+}
+
+/// Draw a shadow whose blur hides its corners' rounding: darkness is a column's blur times
+/// the row's, and the box's own edge comes from the row's spans, so a pixel costs a multiply
+/// and, when it shows, a blend.
+fn draw_blurred_rect(
+    rows: &mut [u8],
+    band: Band,
+    y0: i32,
+    shadow: &BlurredRect,
+    edges: Edges,
+    clip: DeviceClip,
+    c: Color,
+) {
+    let BlurredRect {
+        shape,
+        bound,
+        sigma,
+        inset,
+    } = *shadow;
     let band_height = (rows.len() / band.stride) as i32;
+    let area = edges.area;
+    let (cx0, cx1) = (
+        area[0].max(clip[0]).max(0),
+        area[2].min(clip[2]).min(band.width as i32),
+    );
+    let ry0 = (area[1].max(clip[1]) - y0).clamp(0, band_height);
+    let ry1 = (area[3].min(clip[3]) - y0).clamp(0, band_height);
+    if cx0 >= cx1 || ry0 >= ry1 {
+        return;
+    }
+    let columns: Vec<f32> = (cx0..cx1)
+        .map(|x| blur_span(shape.x0, shape.x1, sigma, x as f32 + 0.5))
+        .collect();
+    let alpha = f32::from(c.a);
+    let h = edges.hole;
+    for ry in ry0..ry1 {
+        let fy = ry + y0;
+        let y = fy as f32 + 0.5;
+        let row_dark = blur_span(shape.y0, shape.y1, sigma, y);
+        if !inset && row_dark * alpha < 0.5 {
+            continue;
+        }
+        let spans = bound.row_spans(fy as f32);
+        let (hx0, hx1) = if (h[1]..h[3]).contains(&fy) && h[0] < h[2] {
+            (h[0].clamp(cx0, cx1), h[2].clamp(cx0, cx1))
+        } else {
+            (cx1, cx1)
+        };
+        let row = ry as usize * band.stride + band.left * 4;
+        for x in (cx0..hx0).chain(hx1..cx1) {
+            let dark = columns[(x - cx0) as usize] * row_dark;
+            let box_cover = match spans.known(x) {
+                Some(k) => k,
+                None => bound.coverage(x as f32 + 0.5, y),
+            };
+            let cover = if inset {
+                (1.0 - dark) * box_cover
+            } else {
+                dark * (1.0 - box_cover)
+            };
+            let a = cover * alpha;
+            if a >= 0.5 {
+                let at = row + x as usize * 4;
+                blend(&mut rows[at..at + 4], c, a.round() as u32);
+            }
+        }
+    }
+}
+
+/// Fill a rounded shape with one color (byte order already applied), row by row: the run each
+/// row's spans put wholly inside is filled directly, and only the few pixels on the curve work
+/// out their coverage. Big pills and circles cost a row, not a pixel, each.
+fn fill_shape(rows: &mut [u8], band: Band, y0: i32, shape: &RRect, clip: DeviceClip, c: Color) {
+    let band_height = (rows.len() / band.stride) as i32;
+    let area = shape.bounds(0.0);
     let (cx0, cx1) = (
         area[0].max(clip[0]).max(0),
         area[2].min(clip[2]).min(band.width as i32),
@@ -1227,11 +1380,39 @@ fn fill_rect(rows: &mut [u8], band: Band, y0: i32, area: [i32; 4], clip: DeviceC
     if cx0 >= cx1 {
         return;
     }
+    let alpha = u32::from(c.a);
     for ry in ry0..ry1 {
-        let start = ry as usize * band.stride + (band.left + cx0 as usize) * 4;
-        let end = start + (cx1 - cx0) as usize * 4;
-        for px in rows[start..end].as_chunks_mut::<4>().0 {
-            blend(px, c, u32::from(c.a));
+        let fy = ry + y0;
+        let spans = shape.row_spans(fy as f32);
+        let row = ry as usize * band.stride + band.left * 4;
+        let (in0, in1) = match spans.inside {
+            Some((l, r)) => (
+                (l.ceil() as i32).clamp(cx0, cx1),
+                (r.floor() as i32).clamp(cx0, cx1),
+            ),
+            None => (cx1, cx1),
+        };
+        let (in0, in1) = if in0 < in1 { (in0, in1) } else { (cx1, cx1) };
+        for px in rows[row + in0 as usize * 4..row + in1 as usize * 4]
+            .as_chunks_mut::<4>()
+            .0
+        {
+            blend(px, c, alpha);
+        }
+        let y = fy as f32 + 0.5;
+        for x in (cx0..in0.min(cx1)).chain(in1.max(cx0)..cx1) {
+            let cover = match spans.known(x) {
+                Some(k) => k,
+                None => shape.coverage(x as f32 + 0.5, y),
+            };
+            if cover > 0.0 {
+                let at = row + x as usize * 4;
+                blend(
+                    &mut rows[at..at + 4],
+                    c,
+                    (cover * alpha as f32).round() as u32,
+                );
+            }
         }
     }
 }
@@ -1289,7 +1470,7 @@ fn fill_gradient(
                     dst.copy_from_slice(bytes);
                 } else {
                     for (d, c) in dst.as_chunks_mut::<4>().0.iter_mut().zip(&line) {
-                        blend_premultiplied(d, *c, 255);
+                        *d = over(u32::from_le_bytes(*c), u32::from_le_bytes(*d)).to_le_bytes();
                     }
                 }
             }
@@ -1299,10 +1480,10 @@ fn fill_gradient(
             for ry in ry0..ry1 {
                 let y = (ry + y0) as f32 + 0.5;
                 let (i, _) = g.row_index(cx0 as f32 + 0.5, y).expect("linear");
-                let c = ordered(g.at_index(i));
+                let c = u32::from_le_bytes(ordered(g.at_index(i)));
                 let range = row_pixels(ry);
                 for d in rows[range].as_chunks_mut::<4>().0 {
-                    blend_premultiplied(d, c, 255);
+                    *d = over(c, u32::from_le_bytes(*d)).to_le_bytes();
                 }
             }
         }
@@ -1312,22 +1493,48 @@ fn fill_gradient(
                 let range = row_pixels(ry);
                 let pixels = rows[range].as_chunks_mut::<4>().0;
                 match g.row_index(cx0 as f32 + 0.5, y) {
-                    Some((mut i, step)) => {
+                    Some((i, step)) => {
+                        // Fixed point, 16 fraction bits: no float conversions per pixel.
+                        let mut fixed = (f64::from(i) * 65536.0) as i64;
+                        let step = (f64::from(step) * 65536.0) as i64;
                         for d in pixels {
-                            blend_premultiplied(d, ordered(g.at_index(i)), 255);
-                            i += step;
+                            let src = g.pixel_at((fixed + 32768) >> 16, band.bgra);
+                            *d = over(src, u32::from_le_bytes(*d)).to_le_bytes();
+                            fixed += step;
                         }
                     }
                     None => {
-                        for (k, d) in pixels.iter_mut().enumerate() {
-                            let c = g.sample((cx0 + k as i32) as f32 + 0.5, y);
+                        let (mut ax, step, by) = g.radial_row(cx0 as f32 + 0.5, y);
+                        for d in pixels {
+                            let c = g.at_position((ax * ax + by).sqrt());
                             blend_premultiplied(d, ordered(c), 255);
+                            ax += step;
                         }
                     }
                 }
             }
         }
     }
+}
+
+/// Source-over of a premultiplied pixel onto an opaque one, two channels per multiply: the
+/// translucent gradients of glass-style pages cover large areas, and this is their per-pixel
+/// cost.
+#[inline]
+fn over(src: u32, dst: u32) -> u32 {
+    let inv = 255 - (src >> 24);
+    if inv == 0 {
+        return src;
+    }
+    // dst * inv / 255 for the 0x00ff00ff lanes and the 0xff00ff00 lanes, rounded.
+    let scale = |lanes: u32| {
+        let x = lanes * inv + 0x0080_0080;
+        ((x + ((x >> 8) & 0x00ff_00ff)) >> 8) & 0x00ff_00ff
+    };
+    let rb = scale(dst & 0x00ff_00ff);
+    let ga = scale((dst >> 8) & 0x00ff_00ff) << 8;
+    // The color channels never pass 255 (premultiplied); alpha stays opaque.
+    (src + rb + ga) | 0xff00_0000
 }
 
 /// Source-over blend of a premultiplied color at `cover` (0 to 255) onto an opaque pixel.
@@ -1624,6 +1831,55 @@ mod tests {
             "the blurred shadow fades out: {blur}"
         );
         assert!(pixel(&f, 18, 80)[0] < blur, "darker nearer the box");
+    }
+
+    #[test]
+    fn effects_past_the_edges_draw_nothing_and_never_panic() {
+        // A window crashed on a rounded, shadowed box lying past the right edge: the span
+        // left after clipping was empty and `clamp` panicked on its reversed bounds.
+        for left in [-400, -90, -10, 0, 95, 120, 400] {
+            for top in [-300, -40, 0, 50, 300] {
+                let css = format!(
+                    "body {{ margin: 0 }} div {{ position: absolute; left: {left}px; top: {top}px;
+                       width: 60px; height: 30px; border: 3px solid red; border-radius: 12px;
+                       box-shadow: 0 0 10px #000, inset 2px 2px 6px blue;
+                       background: linear-gradient(red, blue) }}
+                     p {{ position: absolute; left: {left}px; top: {top}px; margin: 0; width: 40px;
+                       height: 40px; border-radius: 50%; background: radial-gradient(red, blue) }}"
+                );
+                for scale in [1.0, 2.0] {
+                    render("<body><div></div><p></p></body>", &css, 100.0, 60.0, scale);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn over_matches_the_channel_by_channel_blend() {
+        let dsts = [
+            [0u8, 0, 0, 255],
+            [255, 255, 255, 255],
+            [12, 200, 77, 255],
+            [3, 99, 254, 255],
+        ];
+        for dst in dsts {
+            for a in [0u32, 1, 26, 128, 153, 254, 255] {
+                for v in [0u32, 40, 255] {
+                    let c = (v * a / 255) as u8;
+                    let src = [c, (a / 2) as u8, 0, a as u8];
+                    let mut slow = dst;
+                    blend_premultiplied(&mut slow, src, 255);
+                    let fast = over(u32::from_le_bytes(src), u32::from_le_bytes(dst)).to_le_bytes();
+                    for k in 0..3 {
+                        assert!(
+                            slow[k].abs_diff(fast[k]) <= 1,
+                            "{src:?} over {dst:?}: {slow:?} {fast:?}"
+                        );
+                    }
+                    assert_eq!(fast[3], 255);
+                }
+            }
+        }
     }
 
     #[test]
