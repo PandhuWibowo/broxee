@@ -313,8 +313,12 @@ pub struct ComputedStyle {
     pub float: Float,
     pub clear: Clear,
     /// `opacity: 0`: the element and everything in it are not drawn (still laid out).
-    /// Partial opacity is drawn opaque for now.
     pub transparent: bool,
+    /// `opacity` from 0 to 255: below 255 the element and its content are drawn as one
+    /// group, then blended at this opacity. Not inherited.
+    pub opacity: u8,
+    /// `z-index`, `None` for `auto`. Positioned boxes with one paint in its order.
+    pub z_index: Option<i16>,
     /// `box-sizing: border-box`: `width`, `height` and their min/max include padding and border.
     pub border_box: bool,
     pub flex_direction: FlexDirection,
@@ -353,6 +357,15 @@ pub struct ComputedStyle {
     /// Zero when the side's border style is `none`.
     pub border_width: [Px; 4],
     pub border_color: [Color; 4],
+    /// Corner radii, an index into `StyleMap::radii` (0: square corners). Interned: most
+    /// elements have none, and four pairs of lengths would add 64 bytes to every style.
+    pub radii: u16,
+    /// `box-shadow`, an index into `StyleMap::shadows` (0: none).
+    pub box_shadow: u16,
+    /// Gradient layers of `background-image`, an index into `StyleMap::gradients` (0: none).
+    pub background_image: u16,
+    /// `transform` with its origin, an index into `StyleMap::transforms` (0: none).
+    pub transform: u16,
     /// Zero when `outline-style` is `none`. Drawn outside the border box, taking no space.
     pub outline_width: Px,
     pub outline_color: Color,
@@ -386,6 +399,8 @@ impl ComputedStyle {
             float: Float::None,
             clear: Clear::None,
             transparent: false,
+            opacity: 255,
+            z_index: None,
             border_box: false,
             flex_direction: FlexDirection::Row,
             flex_wrap: false,
@@ -409,6 +424,10 @@ impl ComputedStyle {
             padding: [Length::ZERO; 4],
             border_width: [Px::ZERO; 4],
             border_color: [Color::BLACK; 4],
+            radii: 0,
+            box_shadow: 0,
+            background_image: 0,
+            transform: 0,
             outline_width: Px::ZERO,
             outline_color: Color::BLACK,
             outline_offset: Px::ZERO,
@@ -491,6 +510,10 @@ pub enum Value {
     VAlign(VAlign),
     Collapse(bool),
     CaptionBottom(bool),
+    /// A corner's radii: horizontal, vertical.
+    Radius(SpecLength, SpecLength),
+    /// `transform-origin`: horizontal, vertical.
+    Origin(SpecLength, SpecLength),
 }
 
 /// Longhand properties Broxee understands. Shorthands expand into these while parsing.
@@ -543,6 +566,12 @@ pub enum Prop {
     OutlineStyle,
     OutlineColor,
     OutlineOffset,
+    ZIndex,
+    TransformOrigin,
+    BorderTopLeftRadius,
+    BorderTopRightRadius,
+    BorderBottomRightRadius,
+    BorderBottomLeftRadius,
     MarginTop,
     MarginRight,
     MarginBottom,
@@ -720,7 +749,9 @@ mod tests {
         // Styles are deduplicated (a page has hundreds, nodes hold a 4-byte index), so size is
         // not a per-node cost; it is still hashed once per style computed. Grow it deliberately.
         let size = std::mem::size_of::<ComputedStyle>();
-        // 284 since floats (`float`, `clear`, `flow_root`) and `outline` (width, color, offset).
-        assert!(size <= 284, "ComputedStyle grew to {size} bytes");
+        // 284 since floats (`float`, `clear`, `flow_root`) and `outline` (width, color, offset);
+        // 292 with the indices of radii, shadows and gradients (2 bytes each, then alignment);
+        // 296 with `opacity` and `z-index`.
+        assert!(size <= 296, "ComputedStyle grew to {size} bytes");
     }
 }
