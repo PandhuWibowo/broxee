@@ -14,6 +14,7 @@ mod hints;
 mod media;
 mod parser;
 mod selector;
+mod transform;
 mod values;
 mod vocabulary;
 
@@ -33,6 +34,7 @@ pub use selector::{
     parse_selector_list, Combinator, Compound, Pseudo, Selector, ACTIVE, FOCUS, FOCUS_VISIBLE,
     FOCUS_WITHIN, HOVER,
 };
+pub use transform::TransformOp;
 pub use values::*;
 pub use vocabulary::Vocabulary;
 

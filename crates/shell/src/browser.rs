@@ -1369,6 +1369,10 @@ impl<S: Screen> Browser<S> {
             let style = page.styles.style(t.node);
             let (size, key) = (style.font_size.to_f32(), layout::font_key(style));
             let y = doc_y(layout.text_is_fixed(i));
+            // Through the transforms around it, where the pointer falls on the fragment.
+            let Some((x, y)) = layout.untransform(&page.styles, i, false, (x, y)) else {
+                continue;
+            };
             let top = t.baseline - metrics.ascent_em(key) * size;
             let bottom = t.baseline + metrics.descent_em(key) * size;
             if (t.x..=t.x + t.width).contains(&x) && (top..=bottom).contains(&y) {
@@ -1378,6 +1382,7 @@ impl<S: Screen> Browser<S> {
         layout.boxes_top_down().find_map(|i| {
             let r = layout.boxes[i].rect;
             let y = doc_y(layout.box_is_fixed(i));
+            let (x, y) = layout.untransform(&page.styles, i, true, (x, y))?;
             ((r.x..=r.x + r.width).contains(&x) && (r.y..=r.y + r.height).contains(&y))
                 .then_some(layout.boxes[i].node)
         })
@@ -1451,6 +1456,7 @@ impl<S: Screen> Browser<S> {
             } else {
                 y_view + self.scroll
             };
+            let (x, y) = layout.untransform(&page.styles, i, true, (x, y))?;
             let r = b.rect;
             let inside = (r.x..=r.x + r.width).contains(&x) && (r.y..=r.y + r.height).contains(&y);
             let style = page.styles.style(b.node);
@@ -3253,6 +3259,10 @@ impl<S: Screen> Browser<S> {
             let style = page.styles.style(t.node);
             let (size, key) = (style.font_size.to_f32(), layout::font_key(style));
             let y = doc_y(layout.text_is_fixed(i));
+            // Through the transforms around it, where the pointer falls on the fragment.
+            let Some((x, y)) = layout.untransform(&page.styles, i, false, (x, y)) else {
+                continue;
+            };
             let top = t.baseline - metrics.ascent_em(key) * size;
             let bottom = t.baseline + metrics.descent_em(key) * size;
             if style.visible
@@ -3267,6 +3277,7 @@ impl<S: Screen> Browser<S> {
         layout.boxes_top_down().find_map(|i| {
             let r = layout.boxes[i].rect;
             let y = doc_y(layout.box_is_fixed(i));
+            let (x, y) = layout.untransform(&page.styles, i, true, (x, y))?;
             let inside = (r.x..=r.x + r.width).contains(&x) && (r.y..=r.y + r.height).contains(&y);
             (inside && {
                 let st = page.styles.style(layout.boxes[i].node);
@@ -4465,6 +4476,41 @@ mod tests {
                 y: f64::from(y),
             },
         )
+    }
+
+    #[test]
+    fn clicks_land_where_transformed_links_are_drawn() {
+        // A link moved 200px right: clicking where it was laid out does nothing, clicking
+        // where it is drawn follows it.
+        let (_, target) = site("transformed-links");
+        let page = page_file(
+            "moved-link.html",
+            &format!(
+                "<title>Moved</title><style>body {{ margin: 0 }} a {{ display: block; width: 80px;
+                 height: 20px; transform: translateX(200px) }}</style>
+                 <a href=\"{}\">Moved link</a>",
+                target.display()
+            ),
+        );
+        let mut b = browser(&page);
+        let run = {
+            let p = b.page.as_ref().expect("a page is loaded");
+            let t = p
+                .layout
+                .texts
+                .iter()
+                .find(|t| p.layout.text(t).contains("Moved"))
+                .unwrap();
+            (t.x + 10.0, t.baseline - 4.0)
+        };
+        let at = |dx: f32| Event::Click {
+            x: f64::from(SIDEBAR_WIDTH + run.0 + dx),
+            y: f64::from(run.1 + HEADER_HEIGHT),
+        };
+        act(&mut b, at(0.0));
+        assert_eq!(title(&b), "Moved", "nothing is drawn where it was laid out");
+        act(&mut b, at(200.0));
+        assert_eq!(title(&b), "Page B", "the link follows where it is drawn");
     }
 
     #[test]

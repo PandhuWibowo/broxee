@@ -15,7 +15,7 @@ use std::time::Instant;
 use css::{Color, Length, StyleMap};
 use font::{FaceId, FontKey, TextMetrics, WEB_FACES};
 use html::{Dom, FastBuildHasher, NodeId};
-use layout::{Layout, Rect};
+use layout::{Affine, Layout, Rect};
 use shape::{blur_span, device_radii, shadow_coverage, DeviceGradient, RRect};
 
 pub use raster::{rasterize_glyph, rasterize_glyph_at, GlyphBitmap, Rasterizer};
@@ -181,6 +181,15 @@ enum Item<'a> {
         bounds: [i32; 4],
     },
     GroupEnd,
+    /// The items up to the matching `GroupEnd` are drawn through `matrix` (device pixels, the
+    /// element's own clips included), then cut to `clip` (its ancestors'). Replaced before
+    /// compositing: shifted in place, or drawn into an offscreen `Layer`.
+    TransformStart {
+        matrix: Affine,
+        clip: DeviceClip,
+    },
+    /// A transformed element drawn offscreen (`Offscreen`), sampled through its matrix.
+    Layer(Box<LayerItem>),
     /// A coverage mask drawn in one color, such as an icon. (x, y) is its top left.
     Mask {
         x: i32,
@@ -226,14 +235,20 @@ enum ShapeFill {
 /// Walks clip ranges (which nest) alongside ascending fragment indices, keeping the
 /// intersection of every clip that covers the current index on a stack.
 struct ClipTracker {
-    ranges: Vec<(u32, u32, Rect)>,
+    /// Fragment range, rectangle, and the clip's key: the first box it clips, which orders
+    /// clips by the element that owns them.
+    ranges: Vec<(u32, u32, Rect, u32)>,
     next: usize,
-    stack: Vec<(u32, Rect)>,
+    /// Clips covering the current fragment, outermost first: (end, rectangle, key).
+    stack: Vec<(u32, Rect, u32)>,
     last: u32,
+    /// Inside a transformed element, only the clips it owns move with it: clips with a key at
+    /// or below the floor belong to its ancestors and are applied where it is drawn.
+    floor: Option<u32>,
 }
 
 impl ClipTracker {
-    fn new(mut ranges: Vec<(u32, u32, Rect)>) -> ClipTracker {
+    fn new(mut ranges: Vec<(u32, u32, Rect, u32)>) -> ClipTracker {
         // Outer clips first when several start at the same index.
         ranges.sort_by_key(|r| (r.0, std::cmp::Reverse(r.1)));
         ClipTracker {
@@ -241,32 +256,35 @@ impl ClipTracker {
             next: 0,
             stack: Vec::new(),
             last: 0,
+            floor: None,
         }
     }
 
-    /// The clip for fragment `i`. Calls are cheapest with non-decreasing `i`; going back
-    /// (another layer, a group's fragments) starts the walk over.
+    /// The clip for fragment `i`: every clip around it, or above the floor only. Calls are
+    /// cheapest with non-decreasing `i`; going back (another layer, a group's fragments)
+    /// starts the walk over.
     fn at(&mut self, i: u32) -> Option<Rect> {
         if i < self.last {
             self.next = 0;
             self.stack.clear();
         }
         self.last = i;
-        while self.stack.last().is_some_and(|&(end, _)| end <= i) {
+        while self.stack.last().is_some_and(|&(end, _, _)| end <= i) {
             self.stack.pop();
         }
         while self.next < self.ranges.len() && self.ranges[self.next].0 <= i {
-            let (_, end, rect) = self.ranges[self.next];
+            let (_, end, rect, key) = self.ranges[self.next];
             self.next += 1;
             if end > i {
-                let rect = match self.stack.last() {
-                    Some(&(_, outer)) => intersect(outer, rect),
-                    None => rect,
-                };
-                self.stack.push((end, rect));
+                self.stack.push((end, rect, key));
             }
         }
-        self.stack.last().map(|&(_, r)| r)
+        let floor = self.floor;
+        self.stack
+            .iter()
+            .filter(|&&(_, _, key)| floor.is_none_or(|f| key > f))
+            .map(|&(_, r, _)| r)
+            .reduce(intersect)
     }
 }
 
@@ -411,16 +429,23 @@ impl Painter {
             fill_canvas: true,
             clip: (0, width as i32),
         };
+        // Transformed elements: shifted in place, or drawn offscreen now, while the glyph and
+        // image caches are complete and nothing reads them yet.
+        let (items, layers) = resolve_transforms(items, &self.glyphs, &self.images, target.bgra);
+        let caches = Caches {
+            glyphs: &self.glyphs,
+            images: &self.images,
+            layers: &layers,
+        };
+        let caches = &caches;
         let items = &items;
-        let glyphs = &self.glyphs;
-        let images = &self.images;
         let pixels = &mut target.pixels[..target.stride * height];
         std::thread::scope(|scope| {
             for (index, rows) in pixels.chunks_mut(rows_per_band * target.stride).enumerate() {
                 stats.bands += 1;
                 scope.spawn(move || {
                     let y0 = (index * rows_per_band) as i32;
-                    composite_band(rows, band, y0, items, glyphs, images);
+                    composite_band(rows, band, y0, items, caches);
                 });
             }
         });
@@ -512,7 +537,12 @@ impl Painter {
             fill_canvas: false,
             clip,
         };
-        composite_band(target.pixels, band, 0, &items, &self.glyphs, &self.images);
+        let caches = Caches {
+            glyphs: &self.glyphs,
+            images: &self.images,
+            layers: &[],
+        };
+        composite_band(target.pixels, band, 0, &items, &caches);
     }
 
     /// Decode the images this frame draws that are not cached yet, in parallel, then evict
@@ -611,14 +641,14 @@ impl Painter {
             layout
                 .clips
                 .iter()
-                .map(|c| (c.boxes.0, c.boxes.1, c.rect))
+                .map(|c| (c.boxes.0, c.boxes.1, c.rect, c.boxes.0))
                 .collect(),
         );
         let mut text_clips = ClipTracker::new(
             layout
                 .clips
                 .iter()
-                .map(|c| (c.texts.0, c.texts.1, c.rect))
+                .map(|c| (c.texts.0, c.texts.1, c.rect, c.boxes.0))
                 .collect(),
         );
 
@@ -654,6 +684,8 @@ impl Painter {
             );
             // Groups open in the list: where each starts, which it is, its clip and opacity.
             let mut open: Vec<(usize, usize, Option<RRect>, u8)> = Vec::new();
+            // The clip floors of the transformed elements open around the current fragment.
+            let mut floors: Vec<Option<u32>> = Vec::new();
             for op in ops {
                 let i = match op {
                     Emit::Box(i) => i,
@@ -668,10 +700,34 @@ impl Painter {
                         );
                         continue;
                     }
+                    Emit::GroupStart(g)
+                        if layout.groups[g].kind == layout::GroupKind::Transform =>
+                    {
+                        let group = &layout.groups[g];
+                        let style = page.styles.style(group.node);
+                        let Some(b) = layout.boxes.get(group.boxes.0 as usize) else {
+                            continue;
+                        };
+                        // In device pixels: page to device, the transform, back.
+                        let m = layout::transform_of(b.rect, page.styles.transform(style));
+                        let to_device = Affine::scale(s, s).then(&Affine::translate(0.0, -scroll));
+                        let from_device =
+                            Affine::translate(0.0, scroll).then(&Affine::scale(1.0 / s, 1.0 / s));
+                        let matrix = to_device.then(&m).then(&from_device);
+                        // Its ancestors' clips stay where they are; its own move with it.
+                        let clip = to_clip(box_clips.at(group.boxes.0));
+                        floors.push(box_clips.floor);
+                        box_clips.floor = Some(group.boxes.0);
+                        text_clips.floor = Some(group.boxes.0);
+                        open.push((items.len(), g, None, 0));
+                        items.push(Item::TransformStart { matrix, clip });
+                        continue;
+                    }
                     Emit::GroupStart(g) => {
                         let group = &layout.groups[g];
                         let style = page.styles.style(group.node);
-                        let round = group.round.then(|| {
+                        let is_round = group.kind == layout::GroupKind::Round;
+                        let round = is_round.then(|| {
                             // A rounded clip holds its box's children: the box comes just before.
                             let b = (group.boxes.0 as usize)
                                 .checked_sub(1)
@@ -692,7 +748,7 @@ impl Painter {
                             Some(r) => r.bounds(1.0),
                             None => group_bounds(page, group, s, scroll),
                         };
-                        let opacity = if group.round { 255 } else { style.opacity };
+                        let opacity = if is_round { 255 } else { style.opacity };
                         open.push((items.len(), g, round, opacity));
                         items.push(Item::GroupStart {
                             opacity,
@@ -705,6 +761,17 @@ impl Painter {
                         let Some((start, g, round, opacity)) = open.pop() else {
                             continue;
                         };
+                        if layout.groups[g].kind == layout::GroupKind::Transform {
+                            let floor = floors.pop().flatten();
+                            box_clips.floor = floor;
+                            text_clips.floor = floor;
+                            if items.len() == start + 1 {
+                                items.truncate(start);
+                            } else {
+                                items.push(Item::GroupEnd);
+                            }
+                            continue;
+                        }
                         // Most groups need no backdrop: a rounded clip whose content stays off
                         // its corners changes nothing, and opacity over a single item is that
                         // item's alpha (exactly: nothing in the group overlaps it).
@@ -994,6 +1061,30 @@ enum Emit {
     GroupEnd,
 }
 
+/// What compositing reads, written before it starts: glyph bitmaps, decoded images and the
+/// offscreen layers of transformed elements.
+struct Caches<'c> {
+    glyphs: &'c HashMap<GlyphKey, GlyphBitmap, FastBuildHasher>,
+    images: &'c ImageCache,
+    layers: &'c [Offscreen],
+}
+
+/// Where an offscreen layer goes: `from_frame` maps a frame pixel into the layer, `dest` is
+/// what it can cover, `clip` its ancestors' clips.
+struct LayerItem {
+    layer: usize,
+    from_frame: Affine,
+    dest: [i32; 4],
+    clip: DeviceClip,
+}
+
+/// A transformed element's pixels, premultiplied, in the frame's byte order.
+struct Offscreen {
+    width: usize,
+    height: usize,
+    pixels: Vec<u8>,
+}
+
 /// The visible fragments of a layer (box and text index ranges) in paint order: boxes in
 /// order, each group's boxes and text together between its start and end (groups nest), then
 /// the text outside any group. Groups are cut to the layer: a part laid out in another layer
@@ -1026,15 +1117,24 @@ fn emit_range(
                 && (!b.is_empty() || !t.is_empty())
         })
         .collect();
-    // The outermost: not inside another candidate (on equal ranges, the lower index is outer).
+    // The outermost: not inside another candidate. On equal ranges a rounded clip is outer:
+    // it holds a box's children, so it belongs to their parent, while a child's own opacity or
+    // transform covers the same range (a carousel's track and its sliding row). Otherwise the
+    // lower index is outer.
     let inside = |o: usize, g: usize| {
         let (a, b) = (layout.groups[o], layout.groups[g]);
+        let round = |x: &layout::Group| x.kind == layout::GroupKind::Round;
+        let outer_first = match (round(&a), round(&b)) {
+            (true, false) => true,
+            (false, true) => false,
+            _ => o < g,
+        };
         o != g
             && a.boxes.0 <= b.boxes.0
             && b.boxes.1 <= a.boxes.1
             && a.texts.0 <= b.texts.0
             && b.texts.1 <= a.texts.1
-            && ((a.boxes, a.texts) != (b.boxes, b.texts) || o < g)
+            && ((a.boxes, a.texts) != (b.boxes, b.texts) || outer_first)
     };
     let mut outer: Vec<usize> = candidates
         .iter()
@@ -1112,14 +1212,7 @@ fn opaque(c: Color) -> Color {
 }
 
 /// Draw every item that touches this band. `y0` is the band's first row in frame coordinates.
-fn composite_band(
-    rows: &mut [u8],
-    band: Band,
-    y0: i32,
-    items: &[Item<'_>],
-    glyphs: &HashMap<GlyphKey, GlyphBitmap, FastBuildHasher>,
-    images: &ImageCache,
-) {
+fn composite_band(rows: &mut [u8], band: Band, y0: i32, items: &[Item<'_>], caches: &Caches) {
     let order = |c: Color| {
         if band.bgra {
             Color {
@@ -1143,18 +1236,11 @@ fn composite_band(
             }
         }
     }
-    draw_items(rows, band, y0, items, glyphs, images);
+    draw_items(rows, band, y0, items, caches);
 }
 
 /// Draw `items` into this band's rows (or a strip of them, starting at frame row `y0`).
-fn draw_items(
-    rows: &mut [u8],
-    band: Band,
-    y0: i32,
-    items: &[Item<'_>],
-    glyphs: &HashMap<GlyphKey, GlyphBitmap, FastBuildHasher>,
-    images: &ImageCache,
-) {
+fn draw_items(rows: &mut [u8], band: Band, y0: i32, items: &[Item<'_>], caches: &Caches) {
     let order = |c: Color| {
         if band.bgra {
             Color {
@@ -1185,10 +1271,13 @@ fn draw_items(
                 let end = group_end(items, k - 1);
                 let inner = &items[k..end];
                 let how = (opacity, round.as_ref(), bounds);
-                draw_group(rows, band, y0, inner, how, glyphs, images);
+                draw_group(rows, band, y0, inner, how, caches);
                 k = end + 1;
             }
             Item::GroupEnd => {}
+            // Unresolved (never, after `resolve_transforms`): drawn untransformed.
+            Item::TransformStart { .. } => {}
+            Item::Layer(ref layer) => draw_layer(rows, band, y0, layer, caches.layers, (lo, hi)),
             Item::Fill {
                 x0,
                 y0: fy0,
@@ -1215,7 +1304,9 @@ fn draw_items(
                 color,
                 clip,
             } => {
-                let Some(g) = glyphs.get(&key) else { continue };
+                let Some(g) = caches.glyphs.get(&key) else {
+                    continue;
+                };
                 let rect = [clip[0].max(lo), clip[1], clip[2].min(hi), clip[3]];
                 draw_mask(rows, band, y0, x + g.left, y + g.top, g, order(color), rect);
             }
@@ -1238,7 +1329,7 @@ fn draw_items(
                 ref round,
                 clip,
             } => {
-                let Some(cached) = images.get(&key) else {
+                let Some(cached) = caches.images.get(&key) else {
                     continue;
                 };
                 let bitmap = &cached.bitmap;
@@ -1341,7 +1432,7 @@ fn group_end(items: &[Item<'_>], start: usize) -> usize {
     let mut depth = 0;
     for (i, item) in items.iter().enumerate().skip(start) {
         match item {
-            Item::GroupStart { .. } => depth += 1,
+            Item::GroupStart { .. } | Item::TransformStart { .. } => depth += 1,
             Item::GroupEnd => {
                 depth -= 1;
                 if depth == 0 {
@@ -1367,8 +1458,7 @@ fn draw_group(
     y0: i32,
     inner: &[Item<'_>],
     (opacity, round, bounds): (u8, Option<&RRect>, [i32; 4]),
-    glyphs: &HashMap<GlyphKey, GlyphBitmap, FastBuildHasher>,
-    images: &ImageCache,
+    caches: &Caches,
 ) {
     let band_rows = rows.len() / band.stride;
     // Only the group's own columns and rows: a small button must not cost the band's width.
@@ -1398,7 +1488,7 @@ fn draw_group(
             clip: inner_clip,
             ..band
         };
-        draw_items(strip, inner_band, fy0, inner, glyphs, images);
+        draw_items(strip, inner_band, fy0, inner, caches);
         for (k, row) in strip.chunks_mut(band.stride).enumerate() {
             let before = &backdrop[k * (c1 - c0)..(k + 1) * (c1 - c0)];
             let y = (fy0 + k as i32) as f32 + 0.5;
@@ -1432,6 +1522,466 @@ fn draw_group(
             }
         }
         start = end;
+    }
+}
+
+/// A layer's offscreen pixels at most: larger transformed elements are drawn untransformed.
+/// Drawing one briefly holds it twice (over black and over white).
+const MAX_LAYER_PIXELS: usize = 512 * 1024;
+/// Offscreen pixels a frame keeps at most, across its layers.
+const MAX_FRAME_LAYER_PIXELS: usize = 1024 * 1024;
+
+/// Replace each transformed element's items: shifted in place when the transform only moves
+/// it, else drawn into an offscreen layer that compositing samples through the matrix.
+/// Innermost first, so a layer's items already hold the layers inside it.
+fn resolve_transforms<'a>(
+    items: Vec<Item<'a>>,
+    glyphs: &HashMap<GlyphKey, GlyphBitmap, FastBuildHasher>,
+    images: &ImageCache,
+    bgra: bool,
+) -> (Vec<Item<'a>>, Vec<Offscreen>) {
+    struct Frame<'a> {
+        items: Vec<Item<'a>>,
+        transform: Option<(Affine, DeviceClip)>,
+        /// Groups open in this frame: their `GroupEnd`s are not the transform's.
+        depth: usize,
+    }
+    let mut layers: Vec<Offscreen> = Vec::new();
+    if !items
+        .iter()
+        .any(|i| matches!(i, Item::TransformStart { .. }))
+    {
+        return (items, layers);
+    }
+    let mut stack = vec![Frame {
+        items: Vec::with_capacity(items.len()),
+        transform: None,
+        depth: 0,
+    }];
+    let finish = |frame: Frame<'a>, layers: &mut Vec<Offscreen>| -> Vec<Item<'a>> {
+        let Some((matrix, outer)) = frame.transform else {
+            return frame.items;
+        };
+        resolve_one(frame.items, matrix, outer, (glyphs, images, bgra), layers)
+    };
+    for item in items {
+        let nested = stack.len() > 1;
+        let top = stack.last_mut().expect("the base frame stays");
+        match item {
+            Item::TransformStart { matrix, clip } => stack.push(Frame {
+                items: Vec::new(),
+                transform: Some((matrix, clip)),
+                depth: 0,
+            }),
+            Item::GroupStart { .. } => {
+                top.depth += 1;
+                top.items.push(item);
+            }
+            Item::GroupEnd if top.depth > 0 => {
+                top.depth -= 1;
+                top.items.push(item);
+            }
+            Item::GroupEnd if nested => {
+                let frame = stack.pop().expect("more than the base frame");
+                let done = finish(frame, &mut layers);
+                stack.last_mut().expect("base").items.extend(done);
+            }
+            other => top.items.push(other),
+        }
+    }
+    while stack.len() > 1 {
+        let frame = stack.pop().expect("more than the base frame");
+        let done = finish(frame, &mut layers);
+        stack.last_mut().expect("base").items.extend(done);
+    }
+    let mut items = stack.pop().expect("base").items;
+    // A group's bounds came from where its content was laid out; transformed content inside
+    // it can now reach elsewhere. Rounded clips keep theirs: their content is cut to them.
+    for k in 0..items.len() {
+        if let Item::GroupStart { round: None, .. } = items[k] {
+            let end = group_end(&items, k);
+            let reach = items[k + 1..end]
+                .iter()
+                .filter_map(|i| item_bounds(i, glyphs))
+                .reduce(|a, b| {
+                    [
+                        a[0].min(b[0]),
+                        a[1].min(b[1]),
+                        a[2].max(b[2]),
+                        a[3].max(b[3]),
+                    ]
+                });
+            if let (Item::GroupStart { bounds, .. }, Some(reach)) = (&mut items[k], reach) {
+                *bounds = reach;
+            }
+        }
+    }
+    (items, layers)
+}
+
+/// One transformed element's items, its inner ones resolved already.
+fn resolve_one<'a>(
+    mut items: Vec<Item<'a>>,
+    matrix: Affine,
+    outer: DeviceClip,
+    (glyphs, images, bgra): (
+        &HashMap<GlyphKey, GlyphBitmap, FastBuildHasher>,
+        &ImageCache,
+        bool,
+    ),
+    layers: &mut Vec<Offscreen>,
+) -> Vec<Item<'a>> {
+    if matrix.is_translation() {
+        // Whole pixels, so glyphs keep the quarter-pixel phases they were rasterized with.
+        let (dx, dy) = (matrix.e.round() as i32, matrix.f.round() as i32);
+        for item in &mut items {
+            translate_item(item, dx, dy);
+            clip_item(item, outer);
+        }
+        return items;
+    }
+    let Some(_) = matrix.invert() else {
+        return Vec::new(); // Flattened (a scale of 0): nothing shows.
+    };
+    let bounds = items
+        .iter()
+        .filter_map(|i| item_bounds(i, glyphs))
+        .reduce(|a, b| {
+            [
+                a[0].min(b[0]),
+                a[1].min(b[1]),
+                a[2].max(b[2]),
+                a[3].max(b[3]),
+            ]
+        });
+    let Some([x0, y0, x1, y1]) = bounds else {
+        return Vec::new();
+    };
+    let (w, h) = ((x1 - x0).max(0) as usize, (y1 - y0).max(0) as usize);
+    let used: usize = layers.iter().map(|l| l.width * l.height).sum();
+    if w == 0 || h == 0 || w * h > MAX_LAYER_PIXELS || used + w * h > MAX_FRAME_LAYER_PIXELS {
+        // Too large to hold offscreen: drawn where it was laid out.
+        for item in &mut items {
+            clip_item(item, outer);
+        }
+        return items;
+    }
+    for item in &mut items {
+        translate_item(item, -x0, -y0);
+    }
+    let caches = Caches {
+        glyphs,
+        images,
+        layers,
+    };
+    let render = |canvas: Color| {
+        let mut pixels = vec![0u8; w * h * 4];
+        let band = Band {
+            width: w,
+            left: 0,
+            stride: w * 4,
+            canvas,
+            bgra,
+            fill_canvas: true,
+            clip: (0, w as i32),
+        };
+        composite_band(&mut pixels, band, 0, &items, &caches);
+        pixels
+    };
+    // Drawn over black and over white: the difference is how much shows through, which
+    // gives alpha without teaching every drawing path about transparent targets.
+    let mut pixels = render(Color::rgb(0, 0, 0));
+    let white = render(Color::rgb(255, 255, 255));
+    for (px, wh) in pixels
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(white.as_chunks::<4>().0)
+    {
+        let through: u32 = (0..3).map(|k| u32::from(wh[k].saturating_sub(px[k]))).sum();
+        let alpha = 255 - (through / 3).min(255);
+        for c in px.iter_mut().take(3) {
+            *c = (*c).min(alpha as u8);
+        }
+        px[3] = alpha as u8;
+    }
+    drop(white);
+    let to_frame = matrix.then(&Affine::translate(x0 as f32, y0 as f32));
+    let Some(from_frame) = to_frame.invert() else {
+        return Vec::new();
+    };
+    let corners = [
+        (0.0, 0.0),
+        (w as f32, 0.0),
+        (0.0, h as f32),
+        (w as f32, h as f32),
+    ]
+    .map(|(x, y)| to_frame.apply(x, y));
+    let dest = [
+        corners.iter().map(|c| c.0).fold(f32::MAX, f32::min).floor() as i32 - 1,
+        corners.iter().map(|c| c.1).fold(f32::MAX, f32::min).floor() as i32 - 1,
+        corners.iter().map(|c| c.0).fold(f32::MIN, f32::max).ceil() as i32 + 1,
+        corners.iter().map(|c| c.1).fold(f32::MIN, f32::max).ceil() as i32 + 1,
+    ];
+    layers.push(Offscreen {
+        width: w,
+        height: h,
+        pixels,
+    });
+    vec![Item::Layer(Box::new(LayerItem {
+        layer: layers.len() - 1,
+        from_frame,
+        dest,
+        clip: outer,
+    }))]
+}
+
+fn shift_clip(clip: &mut DeviceClip, dx: i32, dy: i32) {
+    clip[0] = clip[0].saturating_add(dx);
+    clip[1] = clip[1].saturating_add(dy);
+    clip[2] = clip[2].saturating_add(dx);
+    clip[3] = clip[3].saturating_add(dy);
+}
+
+/// Move an item by whole device pixels: what a transform that only translates does, and how
+/// an offscreen layer's items are brought to its origin.
+fn translate_item(item: &mut Item<'_>, dx: i32, dy: i32) {
+    let (fx, fy) = (dx as f32, dy as f32);
+    match item {
+        Item::Fill {
+            x0,
+            y0,
+            x1,
+            y1,
+            clip,
+            ..
+        } => {
+            (*x0, *x1, *y0, *y1) = (*x0 + dx, *x1 + dx, *y0 + dy, *y1 + dy);
+            shift_clip(clip, dx, dy);
+        }
+        Item::Glyph { x, y, clip, .. } | Item::Mask { x, y, clip, .. } => {
+            (*x, *y) = (*x + dx, *y + dy);
+            shift_clip(clip, dx, dy);
+        }
+        Item::Image {
+            x0,
+            y0,
+            x1,
+            y1,
+            round,
+            clip,
+            ..
+        } => {
+            (*x0, *x1, *y0, *y1) = (*x0 + dx, *x1 + dx, *y0 + dy, *y1 + dy);
+            if let Some(r) = round {
+                *r = r.translate(fx, fy);
+            }
+            shift_clip(clip, dx, dy);
+        }
+        Item::Effect(effect) => match &mut **effect {
+            Effect::Shape { shape, fill, clip } => {
+                *shape = shape.translate(fx, fy);
+                if let ShapeFill::Gradient(g) = fill {
+                    g.translate(fx, fy);
+                }
+                shift_clip(clip, dx, dy);
+            }
+            Effect::Border {
+                outer, inner, clip, ..
+            } => {
+                *outer = outer.translate(fx, fy);
+                *inner = inner.translate(fx, fy);
+                shift_clip(clip, dx, dy);
+            }
+            Effect::Shadow {
+                shape, bound, clip, ..
+            } => {
+                *shape = shape.translate(fx, fy);
+                *bound = bound.translate(fx, fy);
+                shift_clip(clip, dx, dy);
+            }
+        },
+        Item::GroupStart { round, bounds, .. } => {
+            if let Some(r) = round {
+                *r = r.translate(fx, fy);
+            }
+            shift_clip(bounds, dx, dy);
+        }
+        Item::GroupEnd => {}
+        Item::TransformStart { matrix, clip } => {
+            *matrix = Affine::translate(fx, fy)
+                .then(matrix)
+                .then(&Affine::translate(-fx, -fy));
+            shift_clip(clip, dx, dy);
+        }
+        Item::Layer(layer) => {
+            layer.from_frame = layer.from_frame.then(&Affine::translate(-fx, -fy));
+            shift_clip(&mut layer.dest, dx, dy);
+            shift_clip(&mut layer.clip, dx, dy);
+        }
+    }
+}
+
+/// Cut an item to `outer` too: a transformed element's ancestors' clips.
+fn clip_item(item: &mut Item<'_>, outer: DeviceClip) {
+    let cut = |c: &mut DeviceClip| {
+        *c = [
+            c[0].max(outer[0]),
+            c[1].max(outer[1]),
+            c[2].min(outer[2]),
+            c[3].min(outer[3]),
+        ]
+    };
+    match item {
+        Item::Fill { clip, .. }
+        | Item::Glyph { clip, .. }
+        | Item::Mask { clip, .. }
+        | Item::Image { clip, .. }
+        | Item::TransformStart { clip, .. } => cut(clip),
+        Item::Effect(effect) => match &mut **effect {
+            Effect::Shape { clip, .. }
+            | Effect::Border { clip, .. }
+            | Effect::Shadow { clip, .. } => cut(clip),
+        },
+        Item::GroupStart { bounds, .. } => cut(bounds),
+        Item::Layer(layer) => cut(&mut layer.clip),
+        Item::GroupEnd => {}
+    }
+}
+
+/// The device pixels an item can draw, inside its clip; `None` for markers.
+fn item_bounds(
+    item: &Item<'_>,
+    glyphs: &HashMap<GlyphKey, GlyphBitmap, FastBuildHasher>,
+) -> Option<[i32; 4]> {
+    let (rect, clip) = match item {
+        Item::Fill {
+            x0,
+            y0,
+            x1,
+            y1,
+            clip,
+            ..
+        } => ([*x0, *y0, *x1, *y1], *clip),
+        Item::Glyph {
+            x, y, key, clip, ..
+        } => {
+            let g = glyphs.get(key)?;
+            let (gx, gy) = (x + g.left, y + g.top);
+            ([gx, gy, gx + g.width as i32, gy + g.height as i32], *clip)
+        }
+        Item::Mask {
+            x, y, mask, clip, ..
+        } => (
+            [*x, *y, x + mask.width as i32, y + mask.height as i32],
+            *clip,
+        ),
+        Item::Image {
+            x0,
+            y0,
+            x1,
+            y1,
+            clip,
+            ..
+        } => ([*x0, *y0, *x1, *y1], *clip),
+        Item::Effect(effect) => match &**effect {
+            Effect::Shape { shape, clip, .. } => (shape.bounds(1.0), *clip),
+            Effect::Border { outer, clip, .. } => (outer.bounds(1.0), *clip),
+            Effect::Shadow {
+                shape,
+                bound,
+                sigma,
+                inset,
+                clip,
+                ..
+            } => {
+                let r = if *inset {
+                    bound.bounds(1.0)
+                } else {
+                    shape.bounds(sigma * 3.0 + 1.0)
+                };
+                (r, *clip)
+            }
+        },
+        Item::Layer(layer) => (layer.dest, layer.clip),
+        Item::GroupStart { .. } | Item::GroupEnd | Item::TransformStart { .. } => return None,
+    };
+    let b = [
+        rect[0].max(clip[0]),
+        rect[1].max(clip[1]),
+        rect[2].min(clip[2]),
+        rect[3].min(clip[3]),
+    ];
+    (b[0] < b[2] && b[1] < b[3]).then_some(b)
+}
+
+/// Draw an offscreen layer through its matrix: each frame pixel looks up where it falls in
+/// the layer and blends the bilinear sample of the four pixels around it.
+fn draw_layer(
+    rows: &mut [u8],
+    band: Band,
+    y0: i32,
+    layer: &LayerItem,
+    layers: &[Offscreen],
+    (lo, hi): (i32, i32),
+) {
+    let Some(src) = layers.get(layer.layer) else {
+        return;
+    };
+    let band_height = (rows.len() / band.stride) as i32;
+    let area = [
+        layer.dest[0].max(layer.clip[0]).max(lo),
+        layer.dest[1].max(layer.clip[1]),
+        layer.dest[2].min(layer.clip[2]).min(hi),
+        layer.dest[3].min(layer.clip[3]),
+    ];
+    let (cx0, cx1) = (area[0].max(0), area[2].min(band.width as i32));
+    let ry0 = (area[1] - y0).clamp(0, band_height);
+    let ry1 = (area[3] - y0).clamp(0, band_height);
+    if cx0 >= cx1 {
+        return;
+    }
+    let (w, h) = (src.width as i32, src.height as i32);
+    let texel = |x: i32, y: i32| -> [f32; 4] {
+        if x < 0 || y < 0 || x >= w || y >= h {
+            return [0.0; 4];
+        }
+        let at = (y as usize * src.width + x as usize) * 4;
+        let p = &src.pixels[at..at + 4];
+        [p[0], p[1], p[2], p[3]].map(f32::from)
+    };
+    let m = layer.from_frame;
+    for ry in ry0..ry1 {
+        let fy = (ry + y0) as f32 + 0.5;
+        let row = ry as usize * band.stride + band.left * 4;
+        for x in cx0..cx1 {
+            let (u, v) = m.apply(x as f32 + 0.5, fy);
+            let (u, v) = (u - 0.5, v - 0.5);
+            let (ux, vy) = (u.floor(), v.floor());
+            if ux < -1.0 || vy < -1.0 || ux >= w as f32 || vy >= h as f32 {
+                continue;
+            }
+            let (fx, fyy) = (u - ux, v - vy);
+            let (ix, iy) = (ux as i32, vy as i32);
+            let (a, b, c, d) = (
+                texel(ix, iy),
+                texel(ix + 1, iy),
+                texel(ix, iy + 1),
+                texel(ix + 1, iy + 1),
+            );
+            let mut out = [0u8; 4];
+            for k in 0..4 {
+                let top = a[k] + (b[k] - a[k]) * fx;
+                let bottom = c[k] + (d[k] - c[k]) * fx;
+                out[k] = (top + (bottom - top) * fyy).round().clamp(0.0, 255.0) as u8;
+            }
+            if out[3] == 0 {
+                continue;
+            }
+            let at = row + x as usize * 4;
+            let dst: &mut [u8; 4] = (&mut rows[at..at + 4]).try_into().expect("four bytes");
+            *dst = over(u32::from_le_bytes(out), u32::from_le_bytes(*dst)).to_le_bytes();
+        }
     }
 }
 
@@ -2327,6 +2877,70 @@ mod tests {
             100.0,
             1.0,
         );
+    }
+
+    #[test]
+    fn translates_without_moving_ancestor_clips() {
+        // A slide moved right inside a clipping track: it moves, the track's clip does not.
+        let f = render(
+            "<body><div class=track><p></p></div><section></section></body>",
+            "body { margin: 0; background: #fff } .track { width: 40px; height: 20px;
+               overflow: hidden } p { margin: 0; width: 40px; height: 20px; background: #f00;
+               transform: translateX(30px) } section { width: 20px; height: 20px;
+               background: #00f; transform: translate(50%, 50%) }",
+            80.0,
+            60.0,
+            1.0,
+        );
+        assert_eq!(
+            pixel(&f, 25, 10),
+            [255, 255, 255],
+            "the slide left its place"
+        );
+        assert_eq!(pixel(&f, 35, 10), [255, 0, 0], "and shows where it moved");
+        assert_eq!(
+            pixel(&f, 45, 10),
+            [255, 255, 255],
+            "cut by the track, which stayed"
+        );
+        assert_eq!(
+            pixel(&f, 25, 45),
+            [0, 0, 255],
+            "percentages are of the box: 10px"
+        );
+        assert_eq!(pixel(&f, 5, 25), [255, 255, 255]);
+    }
+
+    #[test]
+    fn rotates_and_scales_through_a_layer() {
+        // 40x20 box, left half red, right half blue, turned 90 degrees clockwise about its
+        // center (20, 10): the left half ends up on top, from y -10 to 10, x 10 to 30.
+        let f = render(
+            "<body><div><b></b><i></i></div><section></section></body>",
+            "body { margin: 0; background: #fff } div { margin: 20px 0 0 20px; width: 40px;
+               height: 20px; display: flex; transform: rotate(90deg) } b, i { width: 20px;
+               height: 20px } b { background: #f00 } i { background: #00f }
+             section { width: 10px; height: 10px; background: #0f0; transform: scale(2);
+               transform-origin: 0 0; opacity: 0.5 }",
+            100.0,
+            100.0,
+            1.0,
+        );
+        assert_eq!(pixel(&f, 40, 15), [255, 0, 0], "the red half is now on top");
+        assert_eq!(pixel(&f, 40, 35), [0, 0, 255], "the blue half below");
+        assert_eq!(
+            pixel(&f, 25, 30),
+            [255, 255, 255],
+            "the old left end is empty"
+        );
+        assert_eq!(pixel(&f, 55, 30), [255, 255, 255], "and the old right end");
+        // The green square, doubled from its top left at half opacity.
+        let g = pixel(&f, 15, 55);
+        assert!(
+            g[1] == 255 && g[0] > 100 && g[0] < 160,
+            "scaled to 20px: {g:?}"
+        );
+        assert_eq!(pixel(&f, 25, 45), [255, 255, 255], "but not past it");
     }
 
     #[test]

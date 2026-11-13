@@ -275,12 +275,16 @@ pub fn expand_declaration(name: &str, value: &str, important: bool) -> Vec<Decla
             "initial" | "unset" | "revert" | "revert-layer" | "none" => Some(match slot {
                 EffectSlot::BoxShadow => EffectSpec::Shadows(Vec::new()),
                 EffectSlot::BackgroundImage => EffectSpec::Images(Vec::new()),
+                EffectSlot::Transform => EffectSpec::Transform(Vec::new()),
             }),
             // Not inherited: `inherit` is rare enough to treat as not set.
             "inherit" => None,
             v => match slot {
                 EffectSlot::BoxShadow => parse_shadows(v).map(EffectSpec::Shadows),
                 EffectSlot::BackgroundImage => parse_images(v).map(EffectSpec::Images),
+                EffectSlot::Transform => {
+                    crate::transform::parse_transform(v).map(EffectSpec::Transform)
+                }
             },
         };
         return spec
@@ -512,6 +516,7 @@ fn single_prop(name: &str) -> Option<Prop> {
         "column-gap" | "grid-column-gap" => Prop::ColumnGap,
         "order" => Prop::Order,
         "z-index" => Prop::ZIndex,
+        "transform-origin" | "-webkit-transform-origin" => Prop::TransformOrigin,
         "vertical-align" => Prop::VerticalAlign,
         "border-collapse" => Prop::BorderCollapse,
         "caption-side" => Prop::CaptionSide,
@@ -555,6 +560,7 @@ fn effect_slot(name: &str) -> Option<EffectSlot> {
     match name {
         "box-shadow" => Some(EffectSlot::BoxShadow),
         "background-image" => Some(EffectSlot::BackgroundImage),
+        "transform" | "-webkit-transform" => Some(EffectSlot::Transform),
         _ => None,
     }
 }
@@ -716,6 +722,11 @@ fn parse_for(prop: Prop, v: &str) -> Option<Value> {
                 .map(Value::Length),
         },
         Order => v.parse::<i32>().ok().map(|n| Value::Number(n as f32)),
+        TransformOrigin => {
+            // The z part, when given, has no 2D meaning.
+            let xy: Vec<&str> = v.split_whitespace().take(2).collect();
+            crate::effects::parse_position(&xy.join(" ")).map(|(x, y)| Value::Origin(x, y))
+        }
         ZIndex => match v {
             "auto" => Some(Value::Normal),
             n => n.parse::<i32>().ok().map(|n| Value::Number(n as f32)),

@@ -77,15 +77,158 @@ pub struct Layer {
     pub z: [i16; 2],
 }
 
-/// Fragments in these index ranges are drawn as one group (`node`'s): blended at the node's
-/// opacity, or cut to its rounded padding box (`round`, `overflow` hidden with
-/// `border-radius`). Ranges nest, like clips.
+/// Fragments in these index ranges are drawn as one group (`node`'s). Ranges nest, like clips.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Group {
     pub boxes: (u32, u32),
     pub texts: (u32, u32),
     pub node: NodeId,
-    pub round: bool,
+    pub kind: GroupKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupKind {
+    /// Blended at the node's opacity.
+    Opacity,
+    /// Cut to the node's rounded padding box (`overflow` hidden with `border-radius`); the
+    /// node's own box is not in the range.
+    Round,
+    /// Drawn through the node's `transform` (`transform_of`); the node's own box is the first.
+    Transform,
+}
+
+/// A 2D affine map: x' = a x + c y + e, y' = b x + d y + f.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Affine {
+    pub a: f32,
+    pub b: f32,
+    pub c: f32,
+    pub d: f32,
+    pub e: f32,
+    pub f: f32,
+}
+
+impl Affine {
+    pub const IDENTITY: Affine = Affine {
+        a: 1.0,
+        b: 0.0,
+        c: 0.0,
+        d: 1.0,
+        e: 0.0,
+        f: 0.0,
+    };
+
+    pub fn translate(x: f32, y: f32) -> Affine {
+        Affine {
+            e: x,
+            f: y,
+            ..Affine::IDENTITY
+        }
+    }
+
+    pub fn scale(x: f32, y: f32) -> Affine {
+        Affine {
+            a: x,
+            d: y,
+            ..Affine::IDENTITY
+        }
+    }
+
+    /// `self` after `inner`: apply `inner` first.
+    pub fn then(&self, inner: &Affine) -> Affine {
+        Affine {
+            a: self.a * inner.a + self.c * inner.b,
+            b: self.b * inner.a + self.d * inner.b,
+            c: self.a * inner.c + self.c * inner.d,
+            d: self.b * inner.c + self.d * inner.d,
+            e: self.a * inner.e + self.c * inner.f + self.e,
+            f: self.b * inner.e + self.d * inner.f + self.f,
+        }
+    }
+
+    pub fn apply(&self, x: f32, y: f32) -> (f32, f32) {
+        (
+            self.a * x + self.c * y + self.e,
+            self.b * x + self.d * y + self.f,
+        )
+    }
+
+    /// `None` when the map flattens everything (a scale of 0): nothing is drawn or hit.
+    pub fn invert(&self) -> Option<Affine> {
+        let det = self.a * self.d - self.b * self.c;
+        if det.abs() < 1e-9 || !det.is_finite() {
+            return None;
+        }
+        let (a, b, c, d) = (self.d / det, -self.b / det, -self.c / det, self.a / det);
+        Some(Affine {
+            a,
+            b,
+            c,
+            d,
+            e: -(a * self.e + c * self.f),
+            f: -(b * self.e + d * self.f),
+        })
+    }
+
+    /// Only a move: drawn by shifting, without resampling.
+    pub fn is_translation(&self) -> bool {
+        (self.a - 1.0).abs() < 1e-6
+            && self.b.abs() < 1e-6
+            && self.c.abs() < 1e-6
+            && (self.d - 1.0).abs() < 1e-6
+    }
+}
+
+/// The map a box's `transform` makes, in page coordinates: the functions applied around the
+/// origin (CSS Transforms 1, 6). `rect` is the border box; percentages are against it.
+pub fn transform_of(rect: Rect, ops: &[css::TransformOp]) -> Affine {
+    use css::TransformOp as Op;
+    let len = |l: css::Length, of: f32| match l {
+        css::Length::Px(px) => px.to_f32(),
+        css::Length::Percent(p) => p as f32 / 10000.0 * of,
+        css::Length::Auto => 0.0,
+    };
+    let (mut ox, mut oy) = (rect.width / 2.0, rect.height / 2.0);
+    let mut m = Affine::IDENTITY;
+    for op in ops {
+        let step = match *op {
+            Op::Origin(x, y) => {
+                (ox, oy) = (len(x, rect.width), len(y, rect.height));
+                continue;
+            }
+            Op::Translate(x, y) => Affine::translate(len(x, rect.width), len(y, rect.height)),
+            Op::Scale(x, y) => Affine::scale(x as f32 / 10000.0, y as f32 / 10000.0),
+            Op::Rotate(a) => {
+                let (sin, cos) = (a as f32 / 100.0).to_radians().sin_cos();
+                Affine {
+                    a: cos,
+                    b: sin,
+                    c: -sin,
+                    d: cos,
+                    e: 0.0,
+                    f: 0.0,
+                }
+            }
+            Op::Skew(x, y) => Affine {
+                c: (x as f32 / 100.0).to_radians().tan(),
+                b: (y as f32 / 100.0).to_radians().tan(),
+                ..Affine::IDENTITY
+            },
+            Op::Matrix([a, b, c, d], e, f) => Affine {
+                a: a as f32 / 10000.0,
+                b: b as f32 / 10000.0,
+                c: c as f32 / 10000.0,
+                d: d as f32 / 10000.0,
+                e: len(e, 0.0),
+                f: len(f, 0.0),
+            },
+        };
+        m = m.then(&step);
+    }
+    let (cx, cy) = (rect.x + ox, rect.y + oy);
+    Affine::translate(cx, cy)
+        .then(&m)
+        .then(&Affine::translate(-cx, -cy))
 }
 
 /// Fragments in these index ranges are clipped to `rect` (`overflow: hidden`). Ranges nest.
@@ -139,6 +282,38 @@ impl Layout {
                 )
             })
             .collect()
+    }
+
+    /// A point in page coordinates as fragment `index` (of `boxes` when `is_box`, else of
+    /// `texts`) sees it: through the inverse of every transform around it, outermost first.
+    /// `None` when a transform flattens it (nothing there can be hit).
+    pub fn untransform(
+        &self,
+        styles: &StyleMap,
+        index: usize,
+        is_box: bool,
+        (x, y): (f32, f32),
+    ) -> Option<(f32, f32)> {
+        let mut around: Vec<&Group> = self
+            .groups
+            .iter()
+            .filter(|g| g.kind == GroupKind::Transform)
+            .filter(|g| {
+                let (lo, hi) = if is_box { g.boxes } else { g.texts };
+                (lo as usize..hi as usize).contains(&index)
+            })
+            .collect();
+        if around.is_empty() {
+            return Some((x, y));
+        }
+        around.sort_by_key(|g| g.boxes.0);
+        let mut p = (x, y);
+        for g in around {
+            let b = self.boxes.get(g.boxes.0 as usize)?;
+            let m = transform_of(b.rect, styles.transform(styles.style(g.node)));
+            p = m.invert()?.apply(p.0, p.1);
+        }
+        Some(p)
     }
 
     /// Text fragment indices from the topmost painted to the bottom: what hit testing walks.
@@ -865,7 +1040,7 @@ impl<'a> Engine<'a> {
                     boxes: (index as u32 + 1, self.out.boxes.len() as u32),
                     texts: (first_text as u32, self.out.texts.len() as u32),
                     node: id,
-                    round: true,
+                    kind: GroupKind::Round,
                 });
             }
         }
@@ -874,7 +1049,15 @@ impl<'a> Engine<'a> {
                 boxes: (index as u32, self.out.boxes.len() as u32),
                 texts: (first_text as u32, self.out.texts.len() as u32),
                 node: id,
-                round: false,
+                kind: GroupKind::Opacity,
+            });
+        }
+        if s.transform != 0 && !self.styles.transform(s).is_empty() {
+            self.out.groups.push(Group {
+                boxes: (index as u32, self.out.boxes.len() as u32),
+                texts: (first_text as u32, self.out.texts.len() as u32),
+                node: id,
+                kind: GroupKind::Transform,
             });
         }
         let mut offset = (0.0, 0.0);
@@ -2102,6 +2285,11 @@ mod tests {
 
     /// Approximate metrics: every character 0.5em, space 0.25em, ascent 0.8, descent 0.2.
     fn run(html_src: &str, css_src: &str, width: f32) -> (Dom, Layout) {
+        let (dom, _, layout) = run_styled(html_src, css_src, width);
+        (dom, layout)
+    }
+
+    fn run_styled(html_src: &str, css_src: &str, width: f32) -> (Dom, StyleMap, Layout) {
         let mut dom = html::parse(html_src);
         let author = parse_stylesheet(css_src);
         let media = Media {
@@ -2119,7 +2307,7 @@ mod tests {
         );
         styles.attach_generated(&mut dom);
         let layout = layout(&dom, &styles, &Approximate, &no_images, width, 600.0);
-        (dom, layout)
+        (dom, styles, layout)
     }
 
     fn rect(dom: &Dom, l: &Layout, tag: &str) -> Rect {
@@ -2297,6 +2485,43 @@ mod tests {
     }
 
     #[test]
+    fn maps_points_through_transforms() {
+        let (dom, styles, l) = run_styled(
+            "<div><p>x</p></div>",
+            "body { margin: 0 } p { margin: 0 }
+             div { width: 100px; height: 40px; transform: translate(10px, 5px) rotate(90deg) }",
+            400.0,
+        );
+        let styles = &styles;
+        let i = l
+            .boxes
+            .iter()
+            .position(|b| dom.tag_name(b.node) == Some("div"))
+            .unwrap();
+        // The center (50, 20) moves by (10, 5); rotating about it keeps it there.
+        let (x, y) = l.untransform(styles, i, true, (60.0, 25.0)).unwrap();
+        assert!(
+            (x - 50.0).abs() < 1e-3 && (y - 20.0).abs() < 1e-3,
+            "{x},{y}"
+        );
+        // A quarter turn clockwise (y points down): right of the center turns to below it, so
+        // 10px below the moved center is 10px right of the box's center.
+        let (x, y) = l.untransform(styles, i, true, (60.0, 35.0)).unwrap();
+        assert!(
+            (x - 60.0).abs() < 1e-3 && (y - 20.0).abs() < 1e-3,
+            "{x},{y}"
+        );
+        assert!(
+            l.untransform(styles, 0, false, (60.0, 25.0)).is_some(),
+            "its text maps the same way"
+        );
+        let m = Affine::translate(3.0, 4.0).then(&Affine::scale(2.0, 0.5));
+        let back = m.invert().unwrap().then(&m);
+        assert!(back.is_translation() && back.e.abs() < 1e-6);
+        assert!(Affine::scale(0.0, 1.0).invert().is_none());
+    }
+
+    #[test]
     fn records_opacity_and_rounded_clip_groups() {
         let (dom, l) = run(
             "<div><p>x</p></div><section><span>y</span></section>",
@@ -2307,10 +2532,15 @@ mod tests {
         let div = dom.find_first("div").unwrap();
         let g = l.groups.iter().find(|g| g.node == div).unwrap();
         assert!(
-            !g.round && g.boxes.0 as usize == l.boxes.iter().position(|b| b.node == div).unwrap()
+            g.kind == GroupKind::Opacity
+                && g.boxes.0 as usize == l.boxes.iter().position(|b| b.node == div).unwrap()
         );
         assert_eq!(g.texts, (0, 1), "its text is in the group");
-        let r = l.groups.iter().find(|g| g.round).unwrap();
+        let r = l
+            .groups
+            .iter()
+            .find(|g| g.kind == GroupKind::Round)
+            .unwrap();
         assert_eq!(r.texts, (1, 2), "the rounded clip holds the section's text");
     }
 
