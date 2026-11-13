@@ -1726,6 +1726,12 @@ fn compute(
     }
     if let Some(Value::Number(n)) = get(Prop::Opacity) {
         s.transparent |= n <= 0.01;
+        s.opacity = (n * 255.0).round().clamp(0.0, 255.0) as u8;
+    }
+    match get(Prop::ZIndex) {
+        Some(Value::Number(n)) => s.z_index = Some(n.clamp(-32768.0, 32767.0) as i16),
+        Some(Value::Inherit) => s.z_index = parent.z_index,
+        _ => {}
     }
     match get(Prop::VerticalAlign) {
         Some(Value::VAlign(v)) => s.vertical_align = v,

@@ -511,6 +511,7 @@ fn single_prop(name: &str) -> Option<Prop> {
         "row-gap" | "grid-row-gap" => Prop::RowGap,
         "column-gap" | "grid-column-gap" => Prop::ColumnGap,
         "order" => Prop::Order,
+        "z-index" => Prop::ZIndex,
         "vertical-align" => Prop::VerticalAlign,
         "border-collapse" => Prop::BorderCollapse,
         "caption-side" => Prop::CaptionSide,
@@ -715,6 +716,10 @@ fn parse_for(prop: Prop, v: &str) -> Option<Value> {
                 .map(Value::Length),
         },
         Order => v.parse::<i32>().ok().map(|n| Value::Number(n as f32)),
+        ZIndex => match v {
+            "auto" => Some(Value::Normal),
+            n => n.parse::<i32>().ok().map(|n| Value::Number(n as f32)),
+        },
         VerticalAlign => Some(Value::VAlign(match v {
             "top" => VAlign::Top,
             "middle" => VAlign::Middle,
