@@ -6,19 +6,21 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use css::{Origin, StyleMap};
-use font::{Approximate, Font, FontSet, TextMetrics};
+use font::{Font, Fonts, Role, SystemFace, SystemFaces};
 use html::{Dom, NodeId};
 use layout::Layout;
 
 use crate::forms::Forms;
 use crate::images::{self, ImageStore};
 use crate::pool;
+use crate::webfonts::{self, FontFrom, WebFonts};
 
 /// External stylesheets fetched per page. Keeps a page with hundreds of `<link>`s from stalling.
 const MAX_STYLESHEETS: usize = 32;
 /// Concurrent subresource requests per page, the per-host limit browsers use.
 const FETCH_WORKERS: usize = 6;
-/// Until Figtree is bundled (see DESIGN.md), text uses a common system font.
+/// The default face of pages: a common system font. Broxee's own interface uses Figtree, which
+/// is bundled (DESIGN.md).
 const FONT_CANDIDATES: [(&str, &str); 3] = [
     (
         "/System/Library/Fonts/Supplemental/Arial.ttf",
@@ -33,6 +35,8 @@ const FONT_CANDIDATES: [(&str, &str); 3] = [
         "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
     ),
 ];
+/// Fallback for characters the other faces lack: the modifier key symbols ⌘ ⇧ ⌥ (macOS).
+const SYMBOL_FONTS: [&str; 1] = ["/System/Library/Fonts/Keyboard.ttf"];
 
 /// What the page is laid out for.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -54,16 +58,19 @@ impl Settings {
     }
 }
 
-/// The loaded fonts and the name of the regular face.
-type Fonts = Option<(FontSet, String)>;
+/// The process's own faces and the name of the default page face.
+type ProcessFonts = (SystemFaces, String);
 
 /// Fonts load once per process on their own thread (stage 1) and are shared by every page.
 /// Only shared references are needed, so a page can load while the window renders with them.
 #[derive(Default)]
 pub struct FontStore {
-    pending: Mutex<Option<JoinHandle<Fonts>>>,
-    loaded: OnceLock<Fonts>,
+    pending: Mutex<Option<JoinHandle<ProcessFonts>>>,
+    loaded: OnceLock<ProcessFonts>,
 }
+
+/// Before the fonts load (and in tests), text is measured as `font::Approximate` does.
+static NO_FACES: OnceLock<SystemFaces> = OnceLock::new();
 
 impl FontStore {
     pub fn start() -> FontStore {
@@ -80,47 +87,67 @@ impl FontStore {
         }
         let started = Instant::now();
         let handle = self.pending.lock().map(|mut p| p.take()).unwrap_or(None);
-        let fonts = handle.and_then(|h| h.join().ok()).flatten();
-        let _ = self.loaded.set(fonts);
+        if let Some(fonts) = handle.and_then(|h| h.join().ok()) {
+            let _ = self.loaded.set(fonts);
+        }
         millis(started)
     }
 
-    pub fn set(&self) -> Option<&FontSet> {
-        self.loaded.get()?.as_ref().map(|(set, _)| set)
+    pub fn system(&self) -> &SystemFaces {
+        match self.loaded.get() {
+            Some((faces, _)) => faces,
+            None => NO_FACES.get_or_init(SystemFaces::default),
+        }
     }
 
     pub fn name(&self) -> &str {
         match self.loaded.get() {
-            Some(Some((_, name))) => name,
+            Some((faces, name)) if !faces.is_empty() => name,
             _ => "approximate",
         }
     }
 
-    pub fn metrics(&self) -> &dyn TextMetrics {
-        match self.set() {
-            Some(set) => set,
-            None => &Approximate,
-        }
+    /// Measurement and glyphs for Broxee's interface (`font::FontKey::UI`) and for pages
+    /// without `@font-face`.
+    pub fn ui(&self) -> Fonts<'_> {
+        Fonts::system(self.system())
     }
 }
 
-fn load_fonts() -> Fonts {
+fn load_fonts() -> ProcessFonts {
+    let mut faces = Vec::new();
+    let mut name = String::new();
     for (regular, bold) in FONT_CANDIDATES {
         if let Ok(font) = Font::load(Path::new(regular)) {
-            let bold = Font::load(Path::new(bold)).ok();
-            let name = Path::new(regular)
+            faces.push((SystemFace::Ready(Box::new(font)), Role::Page, 400));
+            if let Ok(bold) = Font::load(Path::new(bold)) {
+                faces.push((SystemFace::Ready(Box::new(bold)), Role::Page, 700));
+            }
+            name = Path::new(regular)
                 .file_stem()
                 .map_or(String::new(), |s| s.to_string_lossy().into_owned());
-            return Some((
-                FontSet {
-                    regular: font,
-                    bold,
-                },
-                name,
-            ));
+            break;
         }
     }
-    None
+    if name.is_empty() {
+        name = "Figtree".into();
+    }
+    // Decoded the first time something draws with them (see `SystemFace::Lazy`).
+    for (data, weight) in [(font::FIGTREE_REGULAR, 400), (font::FIGTREE_SEMIBOLD, 600)] {
+        let load = move || {
+            Font::parse_any(data)
+                .map_err(|e| eprintln!("font: bundled Figtree: {e}"))
+                .ok()
+        };
+        faces.push((SystemFace::Lazy(Box::new(load)), Role::Ui, weight));
+    }
+    for path in SYMBOL_FONTS {
+        if Path::new(path).exists() {
+            let load = move || Font::load(Path::new(path)).ok();
+            faces.push((SystemFace::Lazy(Box::new(load)), Role::Symbols, 400));
+        }
+    }
+    (SystemFaces::new(faces), name)
 }
 
 /// Everything the engine produces for one page.
@@ -139,6 +166,8 @@ pub struct Loaded {
     pub script: Option<Box<crate::script::PageScript>>,
     /// The HTML and stylesheets as they arrived, to rebuild the page without the network.
     pub sources: Sources,
+    /// `@font-face` fonts the page's text uses.
+    pub webfonts: WebFonts,
     pub styles: StyleMap,
     pub layout: Layout,
     /// What the pointer is over, what is pressed and what has focus, for `:hover` and the
@@ -163,6 +192,8 @@ pub struct Sources {
     pub stylesheets: Vec<(String, net::Wire)>,
     /// External scripts by URL, in document order.
     pub scripts: Vec<(String, net::Wire)>,
+    /// `@font-face` files the page used, by URL.
+    pub fonts: Vec<(String, net::Wire)>,
 }
 
 /// A page put to sleep: its sources and compressed images, and nothing built from them.
@@ -369,9 +400,14 @@ fn finish(
     mut dom: Dom,
     settings: Settings,
     fonts: &FontStore,
-    from: From,
+    mut from: From,
     progress: &mut dyn FnMut(f32) -> bool,
 ) -> Option<Loaded> {
+    let font_from = match &mut from {
+        From::Network(cookies) => FontFrom::Network(*cookies),
+        From::Snapshot(sources, _) => FontFrom::Stored(std::mem::take(&mut sources.fonts)),
+        From::Nowhere => FontFrom::Nowhere,
+    };
     // Controls get the nodes they draw with before anything reads the DOM.
     let mut forms = Forms::prepare(&mut dom);
     // Images are found among the parser's nodes only: nodes scripts add are not rebuilt the
@@ -395,8 +431,15 @@ fn finish(
     // Join stage 1 before layout, the first stage that measures text.
     let fonts_wait_ms = fonts.ready();
     let states = css::States::default();
-    let (styles, cascade_ms, layout, layout_ms) =
-        style_and_layout(&mut dom, &css, &images, &states, settings, fonts);
+    let (styles, cascade_ms) = cascade(&mut dom, &css, &states, settings);
+    // Fonts are found from the styled text, so they load between the cascade and layout.
+    let (mut webfonts, font_files) =
+        webfonts::load(&dom, &styles, &css.sheets, &source.url, font_from, fonts);
+    if !progress(0.85) {
+        return None;
+    }
+    webfonts.plan(&styles, fonts);
+    let (layout, layout_ms) = lay_out(&dom, &styles, &images, &webfonts, settings, fonts);
     progress(0.95);
     Some(Loaded {
         url: source.url,
@@ -411,7 +454,9 @@ fn finish(
             html: net::Wire::default(),
             stylesheets,
             scripts,
+            fonts: font_files,
         },
+        webfonts,
         styles,
         layout,
         states,
@@ -428,11 +473,13 @@ fn finish(
 /// change, so the cascade reruns as well.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
 pub fn relayout(page: &mut Loaded, settings: Settings, fonts: &FontStore) {
-    let (styles, cascade_ms, layout, layout_ms) = style_and_layout(
-        &mut page.dom,
-        &page.css,
+    let (styles, cascade_ms) = cascade(&mut page.dom, &page.css, &page.states, settings);
+    page.webfonts.plan(&styles, fonts);
+    let (layout, layout_ms) = lay_out(
+        &page.dom,
+        &styles,
         &page.images,
-        &page.states,
+        &page.webfonts,
         settings,
         fonts,
     );
@@ -443,14 +490,12 @@ pub fn relayout(page: &mut Loaded, settings: Settings, fonts: &FontStore) {
     page.layout_ms = layout_ms;
 }
 
-fn style_and_layout(
+fn cascade(
     dom: &mut Dom,
     css: &LoadedCss,
-    images: &ImageStore,
     states: &css::States,
     settings: Settings,
-    fonts: &FontStore,
-) -> (StyleMap, f64, Layout, f64) {
+) -> (StyleMap, f64) {
     let media = settings.media();
     let mut sheets: Vec<(Origin, &css::Stylesheet)> =
         vec![(Origin::UserAgent, css::user_agent_stylesheet())];
@@ -465,27 +510,40 @@ fn style_and_layout(
     let mut styles = css::cascade_with(dom, &sheets, &media, states);
     // Boxes `::before` and `::after` generate become nodes outside the tree.
     styles.attach_generated(dom);
-    let cascade_ms = millis(started);
-    let started = Instant::now();
-    let natural = |node: NodeId| images.natural_size(node);
-    let layout = layout::layout(
-        dom,
-        &styles,
-        fonts.metrics(),
-        &natural,
-        media.width,
-        media.height,
-    );
-    (styles, cascade_ms, layout, millis(started))
+    (styles, millis(started))
 }
 
-pub fn page_view<'a>(page: &'a Loaded, fonts: &'a FontStore) -> paint::Page<'a> {
+fn lay_out(
+    dom: &Dom,
+    styles: &StyleMap,
+    images: &ImageStore,
+    webfonts: &WebFonts,
+    settings: Settings,
+    fonts: &FontStore,
+) -> (Layout, f64) {
+    let started = Instant::now();
+    let media = settings.media();
+    let natural = |node: NodeId| images.natural_size(node);
+    let metrics = webfonts.metrics(fonts);
+    let layout = layout::layout(dom, styles, &metrics, &natural, media.width, media.height);
+    (layout, millis(started))
+}
+
+impl Loaded {
+    /// How this page's text is measured and drawn: its `@font-face` faces, then the process's.
+    pub fn metrics<'a>(&'a self, fonts: &'a FontStore) -> Fonts<'a> {
+        self.webfonts.metrics(fonts)
+    }
+}
+
+/// What paint needs to draw a page. `metrics` is `page.metrics(fonts)`, made by the caller so
+/// it outlives the view.
+pub fn page_view<'a>(page: &'a Loaded, metrics: &'a Fonts<'a>) -> paint::Page<'a> {
     paint::Page {
         dom: &page.dom,
         styles: &page.styles,
         layout: &page.layout,
-        metrics: fonts.metrics(),
-        fonts: fonts.set(),
+        metrics,
         images: Some(&page.images),
     }
 }
@@ -578,7 +636,7 @@ fn load_subresources(
     let stored = stored_sheets.as_deref();
     let started = Instant::now();
     let results = pool::map_ordered(jobs, FETCH_WORKERS, |job| match job {
-        Job::Css(source) => Done::Css(load_css(source, &vocabulary, stored, jar)),
+        Job::Css(source) => Done::Css(load_css(source, base, &vocabulary, stored, jar)),
         Job::Image(images::Source::Inline(bytes)) => Done::Image(Some(bytes)),
         Job::Image(images::Source::Url(url)) => Done::Image(
             net::fetch_in(&url, jar)
@@ -621,6 +679,7 @@ fn load_subresources(
 /// One stylesheet: inline text, or fetched (or, for a waking page, taken from its stored bytes).
 fn load_css(
     source: CssSource,
+    page_url: &net::Url,
     vocabulary: &css::Vocabulary,
     stored: Option<&[(String, net::Wire)]>,
     jar: Option<(&net::Cookies, &net::Context)>,
@@ -630,6 +689,10 @@ fn load_css(
         fetched: false,
         parse_ms: 0.0,
         wire: None,
+    };
+    let sheet_url = match &source {
+        CssSource::Inline(_) => page_url.clone(),
+        CssSource::External(url) => url.clone(),
     };
     let (bytes, wire, fetched) = match source {
         CssSource::Inline(text) => (text.into_bytes(), None, false),
@@ -668,7 +731,9 @@ fn load_css(
         Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
     };
     let parse_started = Instant::now();
-    let sheet = css::parse_stylesheet_for(text, vocabulary);
+    let mut sheet = css::parse_stylesheet_for(text, vocabulary);
+    // `@font-face` URLs are relative to the sheet they are in.
+    webfonts::resolve_sources(&mut sheet, &sheet_url);
     CssResult {
         sheet: Some(sheet),
         fetched,
@@ -763,6 +828,60 @@ mod tests {
             1,
             "inline styles come from the HTML"
         );
+    }
+
+    #[test]
+    fn loads_only_the_font_faces_its_text_uses() {
+        let dir = std::env::temp_dir().join(format!("broxee-fonts-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("f")).unwrap();
+        let icons = include_bytes!("../../font/src/testdata/icons.woff2");
+        std::fs::write(dir.join("f/icons.woff2"), icons).unwrap();
+        // Two faces: the icon font (used through ::before) and one nothing uses.
+        let html = r#"<!doctype html><style>
+            @font-face { font-family: "Icons"; src: url(missing.woff2) format("woff2"),
+                         url(f/icons.woff2) format("woff2"); unicode-range: U+E000-F8FF }
+            @font-face { font-family: Unused; src: url(f/unused.woff2) }
+            i::before { content: "\e001\e002"; font-family: Icons, sans-serif }
+            em { font-family: Icons }
+            </style><p><i></i></p><p><em>AB</em></p>"#;
+        std::fs::write(dir.join("page.html"), html).unwrap();
+        let url = to_url(&dir.join("page.html").display().to_string()).unwrap();
+        let settings = Settings {
+            width: 400.0,
+            height: 300.0,
+            dark: false,
+            fetch_css: true,
+        };
+        let fonts = FontStore::default();
+        let page = load(&url, settings, &fonts, None, &mut |_| true).unwrap();
+        let web = &page.webfonts;
+        assert_eq!((web.declared, web.faces.len(), web.failed), (2, 1, 0));
+        assert_eq!(page.sources.fonts.len(), 1, "kept for a sleeping tab");
+        assert!(page.sources.fonts[0].0.ends_with("/f/icons.woff2"));
+        // Each icon is 1000 units of a 1000-unit em: 16 px at the default size, where the
+        // approximate fallback would give 8.
+        let width = |page: &Loaded, text: &str| {
+            let t = page
+                .layout
+                .texts
+                .iter()
+                .find(|t| page.layout.text(t) == text)
+                .expect("text run");
+            t.width
+        };
+        assert_eq!(width(&page, "\u{e001}\u{e002}"), 32.0);
+        assert_eq!(
+            width(&page, "AB"),
+            16.0,
+            "letters fall back past the icon font"
+        );
+
+        // A sleeping tab wakes with its fonts, without the files.
+        std::fs::remove_file(dir.join("f/icons.woff2")).unwrap();
+        let woken = restore(snapshot(page), settings, &fonts).expect("restores");
+        assert_eq!(woken.webfonts.faces.len(), 1);
+        assert_eq!(width(&woken, "\u{e001}\u{e002}"), 32.0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn page(src: &str) -> Loaded {

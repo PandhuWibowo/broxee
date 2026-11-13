@@ -72,6 +72,7 @@ pub(crate) fn hints(dom: &Dom, id: NodeId) -> Option<String> {
         "font" => {
             add("color", attr("color").and_then(color));
             add("font-size", attr("size").and_then(font_size));
+            add("font-family", attr("face").map(String::from));
         }
         "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "caption" => {
             add("text-align", attr("align").and_then(text_align));

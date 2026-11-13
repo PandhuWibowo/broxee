@@ -31,7 +31,7 @@ use css::{
     Align, Clear, ComputedStyle, Display, Float, Justify, Length, LineHeight, Position, StyleMap,
     TextAlign, VAlign, WhiteSpace,
 };
-use font::TextMetrics;
+use font::{FontKey, TextMetrics};
 use html::{ChunkVec, Dom, FastBuildHasher, NodeId, NodeKind};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -204,6 +204,15 @@ pub type NaturalSize<'a> = &'a dyn Fn(NodeId) -> Option<(f32, f32)>;
 /// `NaturalSize` for documents without images.
 pub fn no_images(_: NodeId) -> Option<(f32, f32)> {
     None
+}
+
+/// The font a style asks for: its family list, weight and style. Paint draws with the same key.
+pub fn font_key(s: &ComputedStyle) -> FontKey {
+    FontKey {
+        family: s.font_family,
+        weight: s.font_weight,
+        italic: s.font_style == css::FontStyle::Italic,
+    }
 }
 
 pub fn layout(
@@ -1550,9 +1559,11 @@ impl<'a> Engine<'a> {
         let s = self.style(node);
         let size = s.font_size.to_f32();
         let edges = Edges::of(s, self.line_width);
-        let top = baseline - self.metrics.ascent_em() * size - edges.padding[0] - edges.border[0];
+        let key = font_key(s);
+        let top =
+            baseline - self.metrics.ascent_em(key) * size - edges.padding[0] - edges.border[0];
         let bottom =
-            baseline + self.metrics.descent_em() * size + edges.padding[2] + edges.border[2];
+            baseline + self.metrics.descent_em(key) * size + edges.padding[2] + edges.border[2];
         self.out.boxes[index].rect = Rect {
             x: x0,
             y: top,
@@ -1757,8 +1768,8 @@ impl<'a> Engine<'a> {
     fn collect_text(&mut self, id: NodeId, text: &str) {
         let s = self.style(id);
         let size = s.font_size.to_f32();
-        let bold = s.font_weight >= 600;
-        let space = self.metrics.width(" ", size, bold);
+        let key = font_key(s);
+        let space = self.metrics.width(" ", size, key);
         match s.white_space {
             WhiteSpace::Normal | WhiteSpace::NoWrap => {
                 let breakable = s.white_space == WhiteSpace::Normal;
@@ -1766,7 +1777,7 @@ impl<'a> Engine<'a> {
                     self.mark_space(space);
                 }
                 for word in text.split_ascii_whitespace() {
-                    self.push_word(id, word, size, bold, breakable);
+                    self.push_word(id, word, size, key, breakable);
                     self.mark_space(space);
                 }
                 if !text.ends_with(|c: char| c.is_ascii_whitespace()) {
@@ -1788,25 +1799,25 @@ impl<'a> Engine<'a> {
                                 self.mark_space(space);
                             }
                             if !word.is_empty() {
-                                self.push_word(id, word, size, bold, true);
+                                self.push_word(id, word, size, key, true);
                             }
                         }
                     } else if !line.is_empty() {
-                        self.push_word(id, &line, size, bold, false);
+                        self.push_word(id, &line, size, key, false);
                     }
                 }
             }
         }
     }
 
-    fn push_word(&mut self, node: NodeId, word: &str, size: f32, bold: bool, breakable: bool) {
+    fn push_word(&mut self, node: NodeId, word: &str, size: f32, key: FontKey, breakable: bool) {
         let start = self.words.len() as u32;
         self.words.push_str(word);
         self.items.push(Item::Word {
             node,
             start,
             len: word.len() as u32,
-            width: self.metrics.width(word, size, bold),
+            width: self.metrics.width(word, size, key),
             space_after: 0.0,
             breakable,
         });
@@ -1828,10 +1839,10 @@ impl<'a> Engine<'a> {
 
     fn extent(&self, s: &ComputedStyle) -> Extent {
         let size = s.font_size.to_f32();
-        let ascent = self.metrics.ascent_em() * size;
-        let descent = self.metrics.descent_em() * size;
+        let v = self.metrics.vmetrics(font_key(s));
+        let (ascent, descent) = (v.ascent * size, v.descent * size);
         let line_height = match s.line_height {
-            LineHeight::Normal => ascent + descent + self.metrics.line_gap_em() * size,
+            LineHeight::Normal => ascent + descent + v.line_gap * size,
             LineHeight::Factor(f) => size * f as f32 / 100.0,
             LineHeight::Px(px) => px.to_f32(),
         };

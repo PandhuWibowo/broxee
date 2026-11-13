@@ -18,6 +18,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::sync::Arc;
 use std::time::Duration;
 
+use font::TextMetrics;
 use html::NodeId;
 use paint::{Painter, Target, Viewport};
 use platform::{Event, Key, KeyEvent};
@@ -1323,8 +1324,11 @@ impl<S: Screen> Browser<S> {
         let (r, fixed) = (layout.boxes[b].rect, layout.box_is_fixed(b));
         let style = page.styles.style(c.node);
         let size = style.font_size.to_f32();
-        let bold = style.font_weight >= 600;
-        let (ascent, descent) = (metrics.ascent_em() * size, metrics.descent_em() * size);
+        let key = layout::font_key(style);
+        let (ascent, descent) = (
+            metrics.ascent_em(key) * size,
+            metrics.descent_em(key) * size,
+        );
         // Where its text starts: the first run of the value or placeholder.
         let (shown, placeholder) = page.forms.text_nodes(i);
         let first = layout
@@ -1341,10 +1345,10 @@ impl<S: Screen> Browser<S> {
         let line = before.matches('\n').count() as f32;
         let tail = before.rsplit('\n').next().unwrap_or("");
         let width: f32 = if c.kind == forms::Kind::Password {
-            tail.chars().count() as f32 * metrics.advance_em('•', bold) * size
+            tail.chars().count() as f32 * metrics.advance_em('•', key) * size
         } else {
             tail.chars()
-                .map(|ch| metrics.advance_em(ch, bold) * size)
+                .map(|ch| metrics.advance_em(ch, key) * size)
                 .sum()
         };
         let line_height = (ascent + descent) * 1.15;
@@ -1358,14 +1362,15 @@ impl<S: Screen> Browser<S> {
     fn node_at(&self, x: f32, y_view: f32) -> Option<NodeId> {
         let page = self.page.as_ref()?;
         let layout = &page.layout;
-        let metrics = self.fonts.metrics();
+        let metrics = page.metrics(&self.fonts);
         let doc_y = |fixed: bool| if fixed { y_view } else { y_view + self.scroll };
         for i in (0..layout.texts.len()).rev() {
             let t = &layout.texts[i];
-            let size = page.styles.style(t.node).font_size.to_f32();
+            let style = page.styles.style(t.node);
+            let (size, key) = (style.font_size.to_f32(), layout::font_key(style));
             let y = doc_y(layout.text_is_fixed(i));
-            let top = t.baseline - metrics.ascent_em() * size;
-            let bottom = t.baseline + metrics.descent_em() * size;
+            let top = t.baseline - metrics.ascent_em(key) * size;
+            let bottom = t.baseline + metrics.descent_em(key) * size;
             if (t.x..=t.x + t.width).contains(&x) && (top..=bottom).contains(&y) {
                 return Some(t.node);
             }
@@ -1828,7 +1833,7 @@ impl<S: Screen> Browser<S> {
                 .map(|i| (page.layout.boxes[i].rect, page.layout.box_is_fixed(i)))
                 .collect()
         } else {
-            link_rects(page, node, self.fonts.metrics())
+            link_rects(page, node, &page.metrics(&self.fonts))
         };
         if rects.is_empty() {
             return;
@@ -3241,15 +3246,15 @@ impl<S: Screen> Browser<S> {
     fn link_at(&self, x: f32, y_view: f32) -> Option<net::Url> {
         let page = self.page.as_ref()?;
         let layout = &page.layout;
-        let metrics = self.fonts.metrics();
+        let metrics = page.metrics(&self.fonts);
         let doc_y = |fixed: bool| if fixed { y_view } else { y_view + self.scroll };
         for i in (0..layout.texts.len()).rev() {
             let t = &layout.texts[i];
             let style = page.styles.style(t.node);
-            let size = style.font_size.to_f32();
+            let (size, key) = (style.font_size.to_f32(), layout::font_key(style));
             let y = doc_y(layout.text_is_fixed(i));
-            let top = t.baseline - metrics.ascent_em() * size;
-            let bottom = t.baseline + metrics.descent_em() * size;
+            let top = t.baseline - metrics.ascent_em(key) * size;
+            let bottom = t.baseline + metrics.descent_em(key) * size;
             if style.visible
                 && !style.transparent
                 && (t.x..=t.x + t.width).contains(&x)
@@ -3349,7 +3354,7 @@ impl<S: Screen> Browser<S> {
                     width: pane_px,
                     scale,
                 };
-                chrome.draw(painter, frame, fonts.set(), fonts.metrics(), &header);
+                chrome.draw(painter, frame, &fonts.ui(), &header);
             },
         );
         match shown {
@@ -3527,8 +3532,13 @@ impl<S: Screen> Browser<S> {
                 })
                 .collect()
         });
-        let caret = self.caret(fonts.metrics());
-        let view = self.page.as_ref().map(|p| engine::page_view(p, fonts));
+        let page_metrics = self.page.as_ref().map(|p| p.metrics(fonts));
+        let caret = page_metrics.as_ref().and_then(|m| self.caret(m));
+        let view = self
+            .page
+            .as_ref()
+            .zip(page_metrics.as_ref())
+            .map(|(p, m)| engine::page_view(p, m));
         let viewport = Viewport {
             width: pane_px as f32 / scale,
             height: page_rows as f32 / scale,
@@ -3587,13 +3597,7 @@ impl<S: Screen> Browser<S> {
                                 width: w,
                                 scale,
                             };
-                            chrome.draw_placeholder(
-                                painter,
-                                frame,
-                                fonts.set(),
-                                fonts.metrics(),
-                                title,
-                            );
+                            chrome.draw_placeholder(painter, frame, &fonts.ui(), title);
                         }
                     }
                     let frame = Frame {
@@ -3603,7 +3607,7 @@ impl<S: Screen> Browser<S> {
                         width: w,
                         scale,
                     };
-                    chrome.draw(painter, frame, fonts.set(), fonts.metrics(), header);
+                    chrome.draw(painter, frame, &fonts.ui(), header);
                 }
                 if let Some(sidebar) = &sidebar {
                     let frame = Frame {
@@ -3613,7 +3617,7 @@ impl<S: Screen> Browser<S> {
                         width: sidebar_px,
                         scale,
                     };
-                    chrome.draw_sidebar(painter, frame, fonts.set(), fonts.metrics(), sidebar);
+                    chrome.draw_sidebar(painter, frame, &fonts.ui(), sidebar);
                 }
                 let pane_rows = &mut pixels[pane_y * stride..(pane_y + pane_h) * stride];
                 let (top, bottom) = pane_rows.split_at_mut(header_rows * stride);
@@ -3659,7 +3663,7 @@ impl<S: Screen> Browser<S> {
                     width: pane_px,
                     scale,
                 };
-                chrome.draw(painter, frame, fonts.set(), fonts.metrics(), &header);
+                chrome.draw(painter, frame, &fonts.ui(), &header);
                 if let Some(dialog) = &dialog_view {
                     let frame = Frame {
                         pixels: &mut *pane_rows,
@@ -3668,7 +3672,7 @@ impl<S: Screen> Browser<S> {
                         width: pane_px,
                         scale,
                     };
-                    chrome.draw_dialog(painter, frame, fonts.set(), fonts.metrics(), dialog);
+                    chrome.draw_dialog(painter, frame, &fonts.ui(), dialog);
                 }
                 if let Some(palette) = &palette_view {
                     let frame = Frame {
@@ -3678,7 +3682,7 @@ impl<S: Screen> Browser<S> {
                         width: pane_px,
                         scale,
                     };
-                    chrome.draw_palette(painter, frame, fonts.set(), fonts.metrics(), palette);
+                    chrome.draw_palette(painter, frame, &fonts.ui(), palette);
                 }
                 if let Some(menu) = &menu_view {
                     let frame = Frame {
@@ -3688,7 +3692,7 @@ impl<S: Screen> Browser<S> {
                         width: pane_px,
                         scale,
                     };
-                    chrome.draw_menu(painter, frame, fonts.set(), fonts.metrics(), menu);
+                    chrome.draw_menu(painter, frame, &fonts.ui(), menu);
                 }
                 if let Some((at, text)) = tooltip {
                     let frame = Frame {
@@ -3698,7 +3702,7 @@ impl<S: Screen> Browser<S> {
                         width: width_px,
                         scale,
                     };
-                    chrome.draw_tooltip(painter, frame, fonts.set(), fonts.metrics(), at, text);
+                    chrome.draw_tooltip(painter, frame, &fonts.ui(), at, text);
                 }
             });
         if let Err(e) = shown {
@@ -4179,13 +4183,13 @@ fn link_rects(
         if !style.visible {
             continue;
         }
-        let size = style.font_size.to_f32();
-        let top = t.baseline - metrics.ascent_em() * size;
+        let (size, key) = (style.font_size.to_f32(), layout::font_key(style));
+        let top = t.baseline - metrics.ascent_em(key) * size;
         let rect = layout::Rect {
             x: t.x,
             y: top,
             width: t.width,
-            height: t.baseline + metrics.descent_em() * size - top,
+            height: t.baseline + metrics.descent_em(key) * size - top,
         };
         let fixed = layout.text_is_fixed(i);
         // Join with the previous run when it is on the same line and close by.
@@ -4950,6 +4954,41 @@ mod tests {
         assert_eq!(b.page.as_ref().unwrap().layout.width, 490.0);
     }
 
+    #[test]
+    fn interface_text_is_figtree_and_modifiers_are_glyphs() {
+        use font::FontKey;
+        let page = page_file("fonts-ui.html", "<title>Fonts</title><p>Page text</p>");
+        let mut b = browser_with(&page, None);
+        act(&mut b, command('k'));
+        assert!(b.palette.is_some());
+        b.render();
+        let fonts = b.fonts.clone();
+        let ui = fonts.ui();
+        let figtree = font::Font::parse_any(font::FIGTREE_REGULAR).unwrap();
+        assert_eq!(
+            ui.advance_em('a', FontKey::UI),
+            figtree.advance_em('a'),
+            "interface text is measured with Figtree"
+        );
+        // Figtree has no ⌘; the system's symbol font draws it where there is one.
+        let symbol_font = std::path::Path::new("/System/Library/Fonts/Keyboard.ttf").exists();
+        let drawn = ui.glyph('⌘', FontKey::UI).is_some_and(|(_, g)| g != 0);
+        assert_eq!(drawn, symbol_font);
+        if let Ok(path) = std::env::var("FONTS_PNG") {
+            let frame = b.window.frame.borrow();
+            let stride = frame.0 * 4 + PAD;
+            let rgba: Vec<u8> = (0..frame.1)
+                .flat_map(|y| {
+                    frame.2[y * stride..y * stride + frame.0 * 4]
+                        .chunks(4)
+                        .flat_map(|p| [p[2], p[1], p[0], 255])
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            std::fs::write(path, paint::png::encode(frame.0, frame.1, &rgba)).unwrap();
+        }
+    }
+
     fn command_shift(c: char) -> Event {
         Event::Key(KeyEvent {
             key: Key::Char(c),
@@ -5436,7 +5475,8 @@ mod tests {
             "hello wörd"
         );
         b.render();
-        assert!(b.caret(b.fonts.metrics()).is_some(), "a caret is drawn");
+        let metrics = b.page.as_ref().unwrap().metrics(&b.fonts);
+        assert!(b.caret(&metrics).is_some(), "a caret is drawn");
 
         assert!(click_control(&mut b, 1));
         assert!(

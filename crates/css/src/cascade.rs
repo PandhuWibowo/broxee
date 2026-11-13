@@ -4,6 +4,7 @@ use std::hash::Hasher;
 
 use html::{Atom, Dom, Element, FastBuildHasher, FastHasher, NodeId, NodeKind};
 
+use crate::fontface::FamilyList;
 use crate::grid::{
     resolve_tracks, GridPlacement, GridSlot, GridTables, GridTemplate, GridValue, GRID_SLOTS,
 };
@@ -26,6 +27,7 @@ pub struct StyleMap {
     styles: Vec<ComputedStyle>,
     node_style: Vec<u32>,
     grids: GridTables,
+    families: FamilyTable,
     /// Boxes `::before` and `::after` generate, in document order of their elements.
     generated: Vec<Generated>,
     /// Every compound that looks at a state, with its states and `:not()` taken out, and
@@ -41,6 +43,12 @@ impl StyleMap {
     /// The grid template of a style (`ComputedStyle::grid`); empty when it has none.
     pub fn grid_template(&self, style: &ComputedStyle) -> &GridTemplate {
         &self.grids.templates[style.grid as usize]
+    }
+
+    /// Every `font-family` list the page's styles use, indexed by `ComputedStyle::font_family`;
+    /// index 0 is the empty list (the browser's default).
+    pub fn families(&self) -> &[FamilyList] {
+        &self.families.list
     }
 
     pub fn grid_placement(&self, style: &ComputedStyle) -> &GridPlacement {
@@ -383,6 +391,42 @@ fn hash_ids(ids: &[u32]) -> u64 {
     FastBuildHasher::default().hash_one(ids)
 }
 
+/// Distinct `font-family` lists. A page has a handful; past `MAX_FAMILIES` the rest use the
+/// default family, which bounds the font plan built from them.
+struct FamilyTable {
+    list: Vec<FamilyList>,
+    index: HashMap<FamilyList, u16, FastBuildHasher>,
+}
+
+const MAX_FAMILIES: usize = 1024;
+
+impl Default for FamilyTable {
+    fn default() -> FamilyTable {
+        FamilyTable {
+            list: vec![FamilyList::default()],
+            index: HashMap::default(),
+        }
+    }
+}
+
+impl FamilyTable {
+    fn intern(&mut self, family: &[Box<str>]) -> u16 {
+        if family.is_empty() {
+            return 0;
+        }
+        if let Some(&id) = self.index.get(family) {
+            return id;
+        }
+        if self.list.len() >= MAX_FAMILIES {
+            return 0;
+        }
+        let id = self.list.len() as u16;
+        self.list.push(family.into());
+        self.index.insert(family.into(), id);
+        id
+    }
+}
+
 #[derive(Default)]
 struct StyleTable {
     list: Vec<ComputedStyle>,
@@ -700,6 +744,7 @@ struct Styler<'s, 'a> {
     table: StyleTable,
     customs: CustomSets<'a>,
     grids: GridTables,
+    families: FamilyTable,
     custom_rules: Vec<u32>,
     var_cache: HashMap<(usize, u32), Vec<Declaration>, FastBuildHasher>,
     root_font_size: Px,
@@ -786,6 +831,7 @@ impl<'a> Styler<'_, 'a> {
         let mut specified: [Option<Value>; PROP_COUNT] = [None; PROP_COUNT];
         let mut grid: [Option<&GridValue>; GRID_SLOTS] = [None; GRID_SLOTS];
         let mut content: Option<Content> = None;
+        let mut family: Option<&[Box<str>]> = None;
         // Grid values that came out of `var()` substitution, kept alive for `grid`.
         let mut substituted: Vec<Declaration> = Vec::new();
         for important in [false, true] {
@@ -794,6 +840,7 @@ impl<'a> Styler<'_, 'a> {
                     Declaration::Typed(d) => specified[d.prop as usize] = Some(d.value),
                     Declaration::Grid { slot, value, .. } => grid[*slot as usize] = Some(value),
                     Declaration::Content { value, .. } => content = Some((**value).clone()),
+                    Declaration::Family { value, .. } => family = Some(value),
                     Declaration::Pending { name, value, .. } => {
                         // The result depends only on the declaration and the variable set,
                         // so siblings and cousins reuse it. Inline declarations are not cached
@@ -826,7 +873,9 @@ impl<'a> Styler<'_, 'a> {
                             match d {
                                 Declaration::Typed(d) => specified[d.prop as usize] = Some(d.value),
                                 Declaration::Content { value, .. } => content = Some(*value),
-                                grid_decl @ Declaration::Grid { .. } => substituted.push(grid_decl),
+                                d @ (Declaration::Grid { .. } | Declaration::Family { .. }) => {
+                                    substituted.push(d)
+                                }
                                 _ => {}
                             }
                         }
@@ -843,9 +892,14 @@ impl<'a> Styler<'_, 'a> {
         );
         style.custom = custom;
         for decl in &substituted {
-            if let Declaration::Grid { slot, value, .. } = decl {
-                grid[*slot as usize] = Some(value);
+            match decl {
+                Declaration::Grid { slot, value, .. } => grid[*slot as usize] = Some(value),
+                Declaration::Family { value, .. } => family = Some(value),
+                _ => {}
             }
+        }
+        if let Some(family) = family {
+            style.font_family = self.families.intern(family);
         }
         if grid.iter().any(Option::is_some) {
             let (root_font_size, media) = (self.root_font_size, self.media);
@@ -886,6 +940,7 @@ pub fn cascade_with(
         table: StyleTable::default(),
         customs: CustomSets::new(),
         grids: GridTables::default(),
+        families: FamilyTable::default(),
         custom_rules: Vec::new(),
         var_cache: HashMap::default(),
         root_font_size: ComputedStyle::initial().font_size,
@@ -1093,6 +1148,7 @@ pub fn cascade_with(
         styles: styler.table.list,
         node_style,
         grids: styler.grids,
+        families: styler.families,
         generated,
         state_compounds: index.state_compounds,
     }
@@ -1440,6 +1496,7 @@ fn compute(
         font_size: parent.font_size,
         font_weight: parent.font_weight,
         font_style: parent.font_style,
+        font_family: parent.font_family,
         line_height: parent.line_height,
         text_align: parent.text_align,
         white_space: parent.white_space,
@@ -1830,6 +1887,60 @@ mod tests {
         let items = all(&dom, "li");
         assert_eq!(map.style(items[0]).color, RED);
         assert_eq!(map.style(items[1]).color, BLUE);
+    }
+
+    #[test]
+    fn font_family_is_interned_and_inherited() {
+        let (dom, map) = styled(
+            r#"<div><p>a</p><b>b</b><font face="Georgia">c</font><i style="font: 12px/1 'Fira Code', monospace">d</i></div><s>e</s>"#,
+            r#":root { --brand: "Inter", sans-serif } div { font-family: var(--brand) }
+               b { font-family: Arial, x 12 } s { font-family: initial }"#,
+        );
+        let family = |tag| {
+            let style = first(&dom, &map, tag);
+            map.families()[style.font_family as usize]
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            family("p"),
+            ["inter", "sans-serif"],
+            "inherited, through var()"
+        );
+        assert_eq!(
+            family("b"),
+            ["inter", "sans-serif"],
+            "an invalid list is dropped"
+        );
+        assert_eq!(family("font"), ["georgia"], "<font face>");
+        assert_eq!(
+            family("i"),
+            ["fira code", "monospace"],
+            "the font shorthand"
+        );
+        assert_eq!(first(&dom, &map, "i").font_size, Px::new(12.0));
+        assert!(family("s").is_empty());
+        assert_eq!(
+            first(&dom, &map, "p").font_family,
+            first(&dom, &map, "b").font_family
+        );
+        assert_eq!(
+            map.families().len(),
+            4,
+            "default, inter, georgia, fira code"
+        );
+    }
+
+    #[test]
+    fn collects_font_face_rules() {
+        let sheet = crate::parse_stylesheet(
+            "@font-face { font-family: Icons; src: url(i.woff2) format('woff2') } \
+             @media screen { @font-face { font-family: B; src: url(b.woff) } } p { color: red }",
+        );
+        let families: Vec<&str> = sheet.font_faces.iter().map(|f| f.family.as_str()).collect();
+        assert_eq!(families, ["icons", "b"]);
+        assert_eq!(sheet.rules.len(), 1);
     }
 
     #[test]

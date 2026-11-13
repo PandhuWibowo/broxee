@@ -105,7 +105,9 @@ Tabs and profiles:
 
 Everything is written in this repository against the operating system's own interfaces, with one
 exception: **TLS** uses `rustls` (and its `ring` crypto backend), because hand-written cryptography puts users
-at risk. That is the only dependency; `libc` appears in the build only as a dependency of `ring`.
+at risk, with `webpki-roots` (Mozilla's list of trusted certificate authorities, as data). Everything else in
+`Cargo.lock` comes in through those two: `libc`, `getrandom` and friends at run time, `cc` only to build
+`ring`.
 
 The window layer calls AppKit through the Objective-C runtime (`objc_msgSend`) and shows frames through
 `IOSurface`; process memory is read with a hand-declared `getrusage`.
@@ -114,7 +116,8 @@ Data taken from elsewhere, as data: the Brotli dictionary and tables (RFC 7932, 
 **Public Suffix List** (publicsuffix.org, Mozilla Public License 2.0), stored as
 `crates/net/src/public_suffix_list.gz`: its 10,406 rules, punycode for internationalised labels, 46 KB in the
 binary and about 150 KB in memory once a cookie first needs it. `scripts/update-public-suffixes.sh`
-refreshes it.
+refreshes it. **Figtree** (SIL Open Font License 1.1), the interface font, is stored as its two WOFF2 files
+(46 KB) in `crates/font/src/figtree/` and decoded by Broxee's own WOFF2 decoder.
 
 ## Crates
 
@@ -124,7 +127,7 @@ refreshes it.
 | `net` | URL parsing/joining, HTTP/1.1 over TCP, keep-alive connection pool, chunked and gzip bodies, redirects, `file://`, one retry on a reset or stale connection | ✅ |
 | `html` | Tokenizer, entity decoding, tree builder with implied end tags, chunked arena DOM of 28-byte nodes | ✅ |
 | `css` | Parser, `@media`, selector matching, cascade, computed styles, custom properties, grid values | ✅ |
-| `font` | TrueType/OpenType reader: advances, vertical metrics, cmap formats 4 and 12, `.ttc`, glyph outlines (simple and composite) | ✅ |
+| `font` | TrueType/OpenType reader: advances, vertical metrics, cmap formats 4 and 12, `.ttc`, glyph outlines (simple and composite); WOFF and WOFF2 (Brotli, with the `glyf`/`loca`/`hmtx` transforms rebuilt); face matching by family, weight and style with fallback per character | ✅ |
 | `layout` | Block, inline, inline-block, flex and grid layout, positioning, line breaking, white-space, text-align, baselines | ✅ |
 | `paint` | Display list, anti-aliased glyph rasterizer, glyph cache, image cache with parallel decoding, parallel band compositing, streaming PNG writer | ✅ |
 | `image` | PNG (all color types and depths, `tRNS`, Adam7), JPEG baseline and progressive (any subsampling, restarts, Adobe RGB) with a scaled inverse DCT, GIF (first frame, interlaced, transparency), WebP lossy, lossless, alpha and the first animation frame, and an SVG subset rasterized at the drawn size; all decoded straight to the drawn size | ✅ |
@@ -134,8 +137,17 @@ refreshes it.
 
 How the stages run (sequential, parallel, which thread) is documented in [`docs/pipeline.md`](docs/pipeline.md).
 
-Text is measured and drawn with Arial (macOS) or DejaVu Sans (Linux) until Figtree is bundled (see
-`DESIGN.md`); without either, layout uses a fixed half-em approximation and text is not drawn.
+Pages are drawn in their own `@font-face` fonts, then Arial (macOS) or DejaVu Sans (Linux), character by
+character; Broxee's interface uses Figtree (bundled, see `DESIGN.md`). Characters none of those have fall back
+to the system's symbol font (macOS `Keyboard.ttf` for ⌘ ⇧ ⌥). Without a page font, pages use Figtree; tests use
+a fixed half-em approximation.
+
+Web fonts: only the faces that some text on the page uses are fetched (rust-lang.org declares 45 and loads 4),
+each from the first `src` that loads, after the cascade and before layout. A page may load 24 faces of up to 4 MB
+each, holding at most 8 MB together. Fonts are kept as they arrived with the page's sources, so a sleeping tab
+wakes with them. Not yet: CFF outlines (`.otf` and CFF-flavored WOFF2 fall back to the next font), variable
+font axes (the default instance draws), synthetic bold and italic, `font-display` (text waits for its fonts),
+fonts for text that scripts add after loading.
 
 ## Layout support
 
@@ -165,8 +177,8 @@ TLS uses `rustls` (ring backend). Everything else is written here; crypto is the
 |---|---|---|
 | Selectors | type, `.class`, `#id`, `*`, attributes (`=`, `~=`, `\|=`, `^=`, `$=`, `*=`, `i` flag), `:root`, descendant, `>`, `+`, `~`, `:first-child`/`:last-child`/`:only-child`, `:nth-child()`/`:nth-last-child()`, `:not()` with simple arguments, `:checked`, `:disabled`/`:enabled`, `:empty`, `:link`, `:hover`, `:active`, `:focus`, `:focus-visible`, `:focus-within` | `:is()`/`:where()`/`:has()`, complex `:not()` arguments; `:visited`, `:target` and validation states never match (dropped) |
 | Generated content | `::before`/`::after` (and `:before`/`:after`) with `content` as strings (escapes such as `"\f101"`), `attr()` and `none`; styled and laid out like any inline or block box | counters, quotes, `url()` in `content` (the declaration is dropped), `::marker`, `::first-line`, `::placeholder` |
-| At-rules | `@media` (type, min/max width and height, range syntax, `calc(a ± b)`, `prefers-color-scheme`, orientation, reduced motion), `@supports` and `@layer` contents | `@container`, `@import`, `@font-face`, `@keyframes` (skipped) |
-| Properties | display (incl. `flex`, `inline-flex`), color, background(-color), font, font-size/weight/style, line-height, text-align, white-space, text-decoration, width, height, min/max, `box-sizing`, margin, padding, border (+ sides, width/style/color), position, inset (`top`/`right`/`bottom`/`left`), visibility, overflow, opacity (0 or visible), `outline` (+ `-width`/`-style`/`-color`/`-offset`), flex-direction/-wrap/-flow, justify-content, align-items/-self, flex/-grow/-shrink/-basis, gap/row-gap/column-gap, order, `vw`/`vh`/`vmin`/`vmax` | everything else, `light-dark()`, `calc()` in property values |
+| At-rules | `@media` (type, min/max width and height, range syntax, `calc(a ± b)`, `prefers-color-scheme`, orientation, reduced motion), `@supports` and `@layer` contents, `@font-face` (`font-family`, `src` with `url()` and `format()`, `font-weight` and its ranges, `font-style`, `unicode-range`; `data:` URLs) | `@container`, `@import`, `@keyframes` (skipped), `local()` sources |
+| Properties | display (incl. `flex`, `inline-flex`), color, background(-color), font (with its family), font-family (and `<font face>`), font-size/weight/style, line-height, text-align, white-space, text-decoration, width, height, min/max, `box-sizing`, margin, padding, border (+ sides, width/style/color), position, inset (`top`/`right`/`bottom`/`left`), visibility, overflow, opacity (0 or visible), `outline` (+ `-width`/`-style`/`-color`/`-offset`), flex-direction/-wrap/-flow, justify-content, align-items/-self, flex/-grow/-shrink/-basis, gap/row-gap/column-gap, order, `vw`/`vh`/`vmin`/`vmax` | everything else, `light-dark()`, `calc()` in property values |
 | Grid | `display: grid`/`inline-grid`, `grid-template-columns`/`-rows`/`-areas`, `grid-template`, `grid` (template forms), `grid-auto-rows`/`-columns`/`-flow`, `grid-row`/`-column` (+ `-start`/`-end`), `grid-area` | `grid: auto-flow ...`, `span <name>`, `<name> <n>` |
 | Custom properties | `--name` declarations (inherited), `var(--name, fallback)` in any property including shorthands, nested `var()`, cycle detection, inline `style` variables | `@property` |
 | Cascade | UA → presentational hints (`bgcolor`, `width`, `align`, `valign`, `cellpadding`, `cellspacing`, `border`, `<font color size>`, `nowrap`) → author → inline, specificity, order, `!important`, inheritance, `inherit`/`initial`; quirks-mode table reset for documents without a doctype | cascade layers order, `unset` treated as `initial` |
@@ -235,6 +247,7 @@ time something reads it (most theme variables never are). A `var()` value is sub
 | 2026-11-10 | JavaScript, written here (#12) | 2.9 MB | 49.6 MB peak painted at 2x | example.com 20 MB, HN 22 MB, Wikipedia 27 MB, GitHub 32 MB peak with their scripts run; scripts that use unsupported syntax are skipped and logged |
 | 2026-11-12 | Floats and clear (#23) | 2.9 MB (+16 KB) | 49.6 MB peak painted at 2x; layout 14.1 → 14.7 ms (+4%) | Rust article: infobox and thumbnails on the right with text beside them, 34.0 MB peak (unchanged) |
 | 2026-11-12 | `::before`/`::after`, `:hover`/`:focus`/`:focus-visible`/`:focus-within`/`:active`, `outline` (#24) | 2.9 MB | 49.6 MB peak painted at 2x; layout unchanged | Cascade on saved copies (200 runs, minimum): Wikipedia 2.9 → 4.1 ms (it now matches its `::before`/`::after` rules on `a`, `span`, `li`), MDN 1.60 → 1.64 ms. A pointer move restyles only when a rule can see the change |
+| 2026-11-13 | Web fonts: `@font-face`, WOFF/WOFF2, matching with fallback per character; Figtree bundled (#25) | 3.0 MB (3,071,888 → 3,171,088 bytes, +99 KB, Figtree 46 KB of it) | 49.6–49.7 → 49.7 MB peak painted at 2x; layout 14.7 → 15.6 ms (+6%, a bench of 300 layouts) | rust-lang.org: 4 of 45 faces (136 KB in memory, 31 ms). MDN: 2 of 13 faces, peak 22.6 → 24.0 MB. Font Awesome's site draws its icons (7 of 8 faces, 195 KB). Wikipedia (no web fonts): 24.3 → 24.6 MB |
 
 Other pages after the layout milestone: GitHub home 22.7 MB peak (8,170 rules); Hacker News 11.5 MB.
 
@@ -323,8 +336,8 @@ Where data lives, and what compression does for it (measured 2026-11-07):
   orange bar.
 - The palette cannot search the web: with no search engine chosen, a query that matches nothing says
   "Broxee can't search the web yet." Bookmarks will join its results when they exist.
-- The UI font (Arial, until Figtree is bundled) has no ⌘ ⇧ ⌥ glyphs, so the chrome draws those three as
-  icons; page text that uses them shows nothing for them.
+- Figtree has no ⌘ ⇧ ⌥: they come from the system's symbol font, and the chrome draws them as icons on systems
+  without one.
 - Bookmarks cannot be imported from other browsers yet, and folders are flat (no folders inside folders).
   They are saved per profile in `profiles/<profile>/bookmarks` (0600).
 - Sidebar rows have no keyboard focus of their own: tabs are reached with ⌘1 … ⌘9 and the palette, which

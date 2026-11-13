@@ -34,9 +34,12 @@ crates/
            fast hasher shared with css, layout and paint)
   css/     parser.rs (rules, declarations, shorthands, @media), media.rs (query evaluation), grid.rs,
            hints.rs (presentational attributes), vocabulary.rs (rules that cannot match), quirks.css,
-           selector.rs, values.rs (specified + computed values), cascade.rs, ua.css
+           selector.rs, values.rs (specified + computed values), cascade.rs, ua.css,
+           fontface.rs (`font-family` lists, `@font-face` rules, `unicode-range`)
   font/    TrueType/OpenType metrics (advances, ascent/descent, cmap 4/12, .ttc), TextMetrics trait,
-           Approximate fallback used by tests
+           Approximate fallback used by tests; woff.rs (WOFF, WOFF2 with the glyf/loca/hmtx
+           transforms), faces.rs (FontKey, matching by family/weight/style, per-character fallback),
+           figtree/ (the interface font, OFL, as data)
   layout/  block + inline layout into BoxFragment / TextFragment lists, one shared text buffer;
            flex.rs (flex containers, intrinsic widths), grid.rs (grid containers), table.rs (tables)
   image/   PNG, JPEG, GIF, WebP (vp8.rs lossy, vp8l.rs lossless, vp8_tables.rs from RFC 6386) decoders
@@ -52,7 +55,7 @@ crates/
            script.rs (which scripts run, `js::Host` over the DOM, dispatch and timers),
            hibernate.rs (sleeping tabs on disk), palette.rs (⌘K results and ranking),
            chrome.rs (sidebar, header and palette drawing from DESIGN.md),
-           pool.rs (fetch pool)
+           pool.rs (fetch pool), webfonts.rs (`@font-face`: which faces the text uses, fetching)
 scripts/
   budget.sh  60 MB check: binary size + peak RAM on a generated 2.6 MB page with a <style> block
 ```
@@ -141,6 +144,19 @@ casts), not taken from binding crates. Ask before proposing any dependency.
   directly (raw/stored bytes) must call `discard_ahead` first.
 - **`unsafe` in `flate` is only the ARMv8 CRC32 intrinsics**, behind a runtime feature check, with the table
   version as fallback and a test that the two agree.
+
+### Font invariants
+
+- **Text is measured and drawn with the same `FontKey`** (`layout::font_key`): family list, weight, style.
+  Layout and paint both go through `TextMetrics`, so a glyph is drawn by the face that measured it.
+- **Only faces some styled text uses are fetched** (`webfonts::needed`, after the cascade, `::before`/`::after`
+  text included). Font files are page sources (`Sources::fonts`): a sleeping tab wakes with them, no network.
+  `data:` fonts are not stored twice; their stylesheet holds them.
+- **Face ids from `font::WEB_FACES` are per page.** `Painter::forget_images` drops their glyphs; the process's
+  own faces (below it) stay cached.
+- **The process's extra faces load lazily** (`SystemFace::Lazy`): Figtree when the interface first draws
+  text, the symbol font when a character needs it. Decoding them up front cost 0.5 MB of peak RAM on every page.
+- **`Fonts::head` must inline**: it runs per word and per line. As a call it cost 9% of the stress page's layout.
 
 ### Layout invariants
 

@@ -1,88 +1,92 @@
-//! The parts of a TrueType / OpenType font that layout needs: glyph advances and vertical
-//! metrics. Outlines (for drawing) come with the paint milestone.
+//! The parts of a TrueType / OpenType font that layout and paint need: glyph advances,
+//! vertical metrics and outlines; WOFF and WOFF2 decoding (`woff`); and choosing a face per
+//! character by family, weight and style (`faces`).
 //!
-//! Only the small tables are kept in memory (advances and the character map), never the
-//! whole font file.
+//! Only the tables Broxee reads are kept in memory, never the whole font file.
+
+mod faces;
+pub mod woff;
+
+/// Figtree, Broxee's interface face (DESIGN.md), bundled as WOFF2 (SIL Open Font License 1.1,
+/// `figtree/OFL.txt`).
+pub const FIGTREE_REGULAR: &[u8] = include_bytes!("figtree/Figtree-Regular.woff2");
+pub const FIGTREE_SEMIBOLD: &[u8] = include_bytes!("figtree/Figtree-SemiBold.woff2");
+
+pub use faces::{
+    match_family, page_chain, FaceDesc, FaceId, FaceLoader, FacePlan, FontKey, Fonts, Role,
+    SystemFace, SystemFaces, UI_FAMILY, WEB_FACES,
+};
+
+/// A face's vertical metrics in em: what a line needs, in one lookup.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VMetrics {
+    pub ascent: f32,
+    /// Positive distance below the baseline.
+    pub descent: f32,
+    pub line_gap: f32,
+}
 
 use std::path::Path;
 
-/// Text measurement used by layout. All values are in em, so multiply by the font size in px.
+/// Text measurement used by layout, and glyph lookup used by paint. Values are in em, so
+/// multiply by the font size in px. `key` names the family, weight and style asked for.
 pub trait TextMetrics {
-    fn advance_em(&self, ch: char, bold: bool) -> f32;
-    fn ascent_em(&self) -> f32;
+    fn advance_em(&self, ch: char, key: FontKey) -> f32;
+    fn ascent_em(&self, key: FontKey) -> f32;
     /// Positive distance below the baseline.
-    fn descent_em(&self) -> f32;
-    fn line_gap_em(&self) -> f32;
+    fn descent_em(&self, key: FontKey) -> f32;
+    fn line_gap_em(&self, key: FontKey) -> f32;
 
-    fn width(&self, text: &str, size: f32, bold: bool) -> f32 {
-        text.chars().map(|c| self.advance_em(c, bold)).sum::<f32>() * size
+    fn vmetrics(&self, key: FontKey) -> VMetrics {
+        VMetrics {
+            ascent: self.ascent_em(key),
+            descent: self.descent_em(key),
+            line_gap: self.line_gap_em(key),
+        }
+    }
+
+    fn width(&self, text: &str, size: f32, key: FontKey) -> f32 {
+        text.chars().map(|c| self.advance_em(c, key)).sum::<f32>() * size
+    }
+
+    /// The face and glyph that draw `ch`; `None` when nothing can draw text.
+    fn glyph(&self, _ch: char, _key: FontKey) -> Option<(FaceId, u32)> {
+        None
+    }
+
+    /// A face returned by `glyph`, for rasterizing.
+    fn face(&self, _id: FaceId) -> Option<&Font> {
+        None
     }
 }
+
+/// Finds a table of a font by tag.
+type TableLookup<'a> = dyn Fn(&[u8; 4]) -> Result<&'a [u8], String> + 'a;
 
 /// Fallback when no font file is available: every character is half an em wide.
 /// Keeps layout deterministic in tests and on machines without the expected fonts.
 pub struct Approximate;
 
 impl TextMetrics for Approximate {
-    fn advance_em(&self, ch: char, bold: bool) -> f32 {
+    fn advance_em(&self, ch: char, key: FontKey) -> f32 {
         let base = if ch == ' ' { 0.25 } else { 0.5 };
-        if bold {
+        if key.weight >= 600 {
             base * 1.1
         } else {
             base
         }
     }
 
-    fn ascent_em(&self) -> f32 {
+    fn ascent_em(&self, _: FontKey) -> f32 {
         0.8
     }
 
-    fn descent_em(&self) -> f32 {
+    fn descent_em(&self, _: FontKey) -> f32 {
         0.2
     }
 
-    fn line_gap_em(&self) -> f32 {
+    fn line_gap_em(&self, _: FontKey) -> f32 {
         0.0
-    }
-}
-
-/// A regular face plus an optional bold face. Bold text falls back to regular metrics.
-pub struct FontSet {
-    pub regular: Font,
-    pub bold: Option<Font>,
-}
-
-impl TextMetrics for FontSet {
-    fn advance_em(&self, ch: char, bold: bool) -> f32 {
-        let face = if bold {
-            self.bold.as_ref().unwrap_or(&self.regular)
-        } else {
-            &self.regular
-        };
-        face.advance_em(ch)
-    }
-
-    fn ascent_em(&self) -> f32 {
-        self.regular.ascent_em()
-    }
-
-    fn descent_em(&self) -> f32 {
-        self.regular.descent_em()
-    }
-
-    fn line_gap_em(&self) -> f32 {
-        self.regular.line_gap_em()
-    }
-}
-
-impl FontSet {
-    /// The face used for text of this weight. Must match the face `advance_em` measures with.
-    pub fn face(&self, bold: bool) -> &Font {
-        if bold {
-            self.bold.as_ref().unwrap_or(&self.regular)
-        } else {
-            &self.regular
-        }
     }
 }
 
@@ -163,8 +167,10 @@ pub struct Font {
     line_gap: f32,
     /// Advance per glyph id, in font units.
     advances: Vec<u16>,
-    /// Advances for ASCII, looked up once at load so common text never touches the cmap.
+    /// Glyph ids and advances for ASCII, looked up once at load so common text never touches
+    /// the cmap or the advance list.
     ascii: [u16; 128],
+    ascii_advance: [u16; 128],
     cmap: Cmap,
     /// Glyph outlines (`glyf`) and where each glyph starts in it (`loca`, one extra entry for the end).
     /// Empty for fonts with CFF outlines, which Broxee does not draw yet.
@@ -176,6 +182,33 @@ impl Font {
     pub fn load(path: &Path) -> Result<Font, String> {
         let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
         Font::parse(&data).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// Parse a font in any container the web uses: WOFF2, WOFF, or a plain sfnt.
+    /// WOFF and WOFF2 tables go straight into the font, without assembling an sfnt first.
+    pub fn parse_any(data: &[u8]) -> Result<Font, String> {
+        match woff::container(data) {
+            Some(woff::Container::Woff2) => Font::from_tables(woff::woff2_tables(data)?.1),
+            Some(woff::Container::Woff) => Font::from_tables(woff::woff_tables(data)?.1),
+            Some(woff::Container::Sfnt) => Font::parse(data),
+            None => Err("not a font file".into()),
+        }
+    }
+
+    /// Build a font from decoded tables, keeping the `glyf` buffer instead of copying it.
+    fn from_tables(mut tables: Vec<([u8; 4], Vec<u8>)>) -> Result<Font, String> {
+        let glyf = tables
+            .iter()
+            .position(|(tag, _)| tag == b"glyf")
+            .map(|i| tables.swap_remove(i).1);
+        let table = |tag: &[u8; 4]| -> Result<&[u8], String> {
+            tables
+                .iter()
+                .find(|(t, _)| t == tag)
+                .map(|(_, d)| d.as_slice())
+                .ok_or_else(|| format!("missing table {}", String::from_utf8_lossy(tag)))
+        };
+        Font::build(&table, glyf)
     }
 
     /// Parse a `.ttf`, `.otf`, or the first face of a `.ttc` collection.
@@ -199,7 +232,11 @@ impl Font {
             }
             Err(format!("missing table {}", String::from_utf8_lossy(tag)))
         };
+        Font::build(&table, None)
+    }
 
+    /// Read the tables Broxee uses. `glyf` is moved in when the caller owns it, else copied.
+    fn build<'a>(table: &TableLookup<'a>, owned_glyf: Option<Vec<u8>>) -> Result<Font, String> {
         let head = table(b"head")?;
         let hhea = table(b"hhea")?;
         let maxp = table(b"maxp")?;
@@ -224,7 +261,11 @@ impl Font {
         let last = advances.last().copied().unwrap_or(0);
         advances.resize(glyph_count.max(metric_count), last);
 
-        let (glyf, loca) = match (table(b"glyf"), table(b"loca")) {
+        let glyf = match owned_glyf {
+            Some(glyf) => Ok(glyf),
+            None => table(b"glyf").map(<[u8]>::to_vec),
+        };
+        let (mut glyf, loca) = match (glyf, table(b"loca")) {
             (Ok(glyf), Ok(loca)) => {
                 let long = read_i16(head, 50).ok_or("bad head")? == 1;
                 let count = glyph_count + 1;
@@ -238,11 +279,12 @@ impl Font {
                     })
                     .collect::<Option<Vec<u32>>>()
                     .ok_or("truncated loca")?;
-                (glyf.to_vec(), offsets)
+                (glyf, offsets)
             }
             _ => (Vec::new(), Vec::new()),
         };
 
+        glyf.shrink_to_fit();
         let mut font = Font {
             units_per_em,
             ascent,
@@ -250,18 +292,28 @@ impl Font {
             line_gap,
             advances,
             ascii: [0; 128],
+            ascii_advance: [0; 128],
             cmap: parse_cmap(cmap)?,
             glyf,
             loca,
         };
-        for c in 0..128u8 {
-            font.ascii[c as usize] = font.advance_units(font.glyph(char::from(c)));
+        for c in 0..128usize {
+            let glyph = font.lookup(char::from(c as u8));
+            font.ascii[c] = glyph as u16;
+            font.ascii_advance[c] = font.advance_units(glyph);
         }
         Ok(font)
     }
 
     /// Glyph id for `ch`, or 0 (the missing glyph).
     pub fn glyph(&self, ch: char) -> u32 {
+        match ch as u32 {
+            c @ 0..128 => u32::from(self.ascii[c as usize]),
+            _ => self.lookup(ch),
+        }
+    }
+
+    fn lookup(&self, ch: char) -> u32 {
         let c = ch as u32;
         match &self.cmap {
             Cmap::Format12(groups) => {
@@ -284,11 +336,37 @@ impl Font {
     }
 
     pub fn advance_em(&self, ch: char) -> f32 {
-        let units = match ch as u32 {
-            c @ 0..128 => self.ascii[c as usize],
-            _ => self.advance_units(self.glyph(ch)),
+        self.glyph_advance_em(self.glyph(ch))
+    }
+
+    /// For ASCII `ch` this font has: its advance in font units.
+    #[inline]
+    fn ascii_units(&self, ch: char) -> Option<u16> {
+        let c = ch as usize;
+        (c < 128 && self.ascii[c] != 0).then(|| self.ascii_advance[c])
+    }
+
+    /// Bytes this font holds in memory: outlines, their offsets, advances and the char map.
+    pub fn memory(&self) -> usize {
+        let cmap = match &self.cmap {
+            Cmap::Format4(t) => t.len(),
+            Cmap::Format12(groups) => groups.len() * 12,
         };
-        f32::from(units) / self.units_per_em
+        self.glyf.len() + self.loca.len() * 4 + self.advances.len() * 2 + cmap + 256
+    }
+
+    pub fn glyph_count(&self) -> usize {
+        self.advances.len()
+    }
+
+    pub fn glyph_advance_em(&self, glyph: u32) -> f32 {
+        f32::from(self.advance_units(glyph)) / self.units_per_em
+    }
+
+    /// Whether glyphs can be drawn: TrueType outlines. Fonts with CFF outlines measure text
+    /// but cannot draw it yet.
+    pub fn has_outlines(&self) -> bool {
+        !self.loca.is_empty()
     }
 
     pub fn ascent_em(&self) -> f32 {
@@ -819,6 +897,6 @@ mod tests {
 
     #[test]
     fn approximate_metrics_are_deterministic() {
-        assert_eq!(Approximate.width("ab c", 10.0, false), 17.5);
+        assert_eq!(Approximate.width("ab c", 10.0, FontKey::weight(400)), 17.5);
     }
 }

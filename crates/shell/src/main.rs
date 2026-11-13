@@ -5,6 +5,7 @@ mod hibernate;
 mod images;
 mod pool;
 mod script;
+mod webfonts;
 
 #[cfg(any(target_os = "macos", test))]
 mod browser;
@@ -199,7 +200,8 @@ fn run(opts: &Options) -> Result<(), String> {
     }
 
     let painted = (opts.paint || opts.png.is_some()).then(|| {
-        let view = engine::page_view(&page, &fonts);
+        let metrics = page.metrics(&fonts);
+        let view = engine::page_view(&page, &metrics);
         let viewport = Viewport {
             width: opts.width,
             height: opts.height,
@@ -253,6 +255,17 @@ fn run(opts: &Options) -> Result<(), String> {
         fonts.name(),
         page.fonts_wait_ms
     );
+    let web = &page.webfonts;
+    if web.declared > 0 {
+        println!(
+            "webfonts  {} of {} faces loaded ({} failed), {:.0} KB in memory, {:.1} ms",
+            web.faces.len(),
+            web.declared,
+            web.failed,
+            web.bytes as f64 / 1024.0,
+            web.ms
+        );
+    }
     println!(
         "layout    {:.2} ms, {} boxes, {} text runs, {:.0}x{:.0} px",
         page.layout_ms,

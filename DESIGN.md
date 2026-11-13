@@ -111,8 +111,11 @@ Amber in light mode is at the limit (4.53): never lighten it.
 ## 4. Typography
 
 - **UI: Figtree**, the family's body face, bundled with the app so tabs and menus render identically on every OS.
-  Its open, friendly shapes stay legible at the small sizes a sidebar needs. One variable font file, budgeted at
-  under 1 MB.
+  Its open, friendly shapes stay legible at the small sizes a sidebar needs. Two static faces, Regular (400) and
+  SemiBold (600), stored in the binary as WOFF2: 46 KB together, decoded the first time the interface draws text.
+  A variable font would need glyph variations (`gvar`) Broxee does not read yet; 500 renders as 400.
+- **Modifier symbols (⌘ ⇧ ⌥)** are not in Figtree. They come from the system's symbol font (macOS
+  `Keyboard.ttf`) through per-character fallback, and are drawn as icons where no font has them.
 - **Wordmark: Figtree semibold** in `signature`. No separate display face: Broxee has no headlines in its chrome,
   so a second font would cost bytes for nothing. **(agent)**
 - **No monospace in the chrome.** URLs are shown in Figtree. A mono face arrives only if developer tools do.
@@ -224,7 +227,7 @@ The design has to fit inside the 60 MB budget enforced by `scripts/budget.sh`.
 
 | Item | Budget |
 |---|---|
-| Figtree variable font | under 1 MB |
+| Figtree (Regular + SemiBold, WOFF2) | under 1 MB (46 KB) |
 | Icons (vector paths in code) | under 20 KB |
 | Images in the chrome | none |
 | Animation duration | 120 ms maximum, ease-out; off under reduced motion |
