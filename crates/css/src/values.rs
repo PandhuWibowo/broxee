@@ -338,6 +338,8 @@ pub struct ComputedStyle {
     pub border_collapse: bool,
     /// `caption-side: bottom` (inherited).
     pub caption_bottom: bool,
+    /// `font-family` (inherited), an index into `StyleMap::families` (0: the default).
+    pub font_family: u16,
     /// Grid container template, an index into `StyleMap`'s grid tables (0: none).
     pub grid: u32,
     /// Grid item placement, an index into `StyleMap`'s grid tables (0: auto).
@@ -399,6 +401,7 @@ impl ComputedStyle {
             border_spacing: [Px::ZERO; 2],
             border_collapse: false,
             caption_bottom: false,
+            font_family: 0,
             grid: 0,
             grid_item: 0,
             custom: 0,

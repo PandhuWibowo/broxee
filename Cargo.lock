@@ -38,6 +38,9 @@ version = "0.1.1"
 [[package]]
 name = "font"
 version = "0.1.1"
+dependencies = [
+ "flate",
+]
 
 [[package]]
 name = "getrandom"

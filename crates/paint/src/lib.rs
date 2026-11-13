@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use css::{Color, Length, StyleMap};
-use font::{FontSet, TextMetrics};
+use font::{FaceId, FontKey, TextMetrics, WEB_FACES};
 use html::{Dom, FastBuildHasher, NodeId};
 use layout::{Layout, Rect};
 
@@ -71,10 +71,9 @@ pub struct Page<'a> {
     pub dom: &'a Dom,
     pub styles: &'a StyleMap,
     pub layout: &'a Layout,
-    /// Text is positioned with these metrics, so it lines up with layout.
+    /// Text is positioned with these metrics, so it lines up with layout, and drawn with their
+    /// faces. Without fonts (`font::Approximate`), text is laid out but not drawn.
     pub metrics: &'a dyn TextMetrics,
-    /// Outlines for drawing glyphs. Without fonts, text is laid out but not drawn.
-    pub fonts: Option<&'a FontSet>,
     /// Compressed image files for `<img>` elements; without them images are not drawn.
     pub images: Option<&'a dyn ImageSource>,
 }
@@ -121,7 +120,7 @@ pub struct PaintStats {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct GlyphKey {
-    bold: bool,
+    face: FaceId,
     glyph: u32,
     /// Device pixel size in quarter pixels.
     size: u32,
@@ -242,7 +241,7 @@ pub enum Op<'a> {
         baseline: f32,
         text: &'a str,
         size: f32,
-        bold: bool,
+        font: FontKey,
         color: Color,
     },
     Mask {
@@ -322,9 +321,9 @@ impl Painter {
             if self.glyphs.contains_key(&key) {
                 continue;
             }
-            let bitmap = match page.fonts {
-                Some(fonts) => rasterize_glyph_at(
-                    fonts.face(key.bold),
+            let bitmap = match page.metrics.face(key.face) {
+                Some(face) => rasterize_glyph_at(
+                    face,
                     key.glyph,
                     key.size as f32 / 4.0,
                     f32::from(key.phase) / 4.0,
@@ -380,7 +379,6 @@ impl Painter {
         target: Target,
         width: usize,
         clip: (i32, i32),
-        fonts: Option<&FontSet>,
         metrics: &dyn TextMetrics,
         ops: &[Op<'_>],
     ) {
@@ -413,24 +411,28 @@ impl Painter {
                     baseline,
                     text,
                     size,
-                    bold,
+                    font,
                     color,
                 } => {
-                    let Some(fonts) = fonts else { continue };
                     let size_key = (size * 4.0).round() as u32;
                     let mut pen = x;
                     for ch in text.chars() {
-                        if !ch.is_whitespace() {
+                        if let Some((face, glyph)) =
+                            metrics.glyph(ch, font).filter(|_| !ch.is_whitespace())
+                        {
                             let (at, phase) = place(pen);
                             let key = GlyphKey {
-                                bold,
-                                glyph: fonts.face(bold).glyph(ch),
+                                face,
+                                glyph,
                                 size: size_key,
                                 phase,
                             };
                             self.glyphs.entry(key).or_insert_with(|| {
                                 let shift = f32::from(phase) / 4.0;
-                                rasterize_glyph_at(fonts.face(bold), key.glyph, size, shift)
+                                match metrics.face(face) {
+                                    Some(f) => rasterize_glyph_at(f, glyph, size, shift),
+                                    None => GlyphBitmap::default(),
+                                }
                             });
                             items.push(Item::Glyph {
                                 x: at,
@@ -440,7 +442,7 @@ impl Painter {
                                 clip: NO_CLIP,
                             });
                         }
-                        pen += metrics.advance_em(ch, bold) * size;
+                        pen += metrics.advance_em(ch, font) * size;
                     }
                 }
             }
@@ -530,8 +532,11 @@ impl Painter {
 
     /// Forget every decoded image. Call it when the page changes: image ids are only unique
     /// within one page, so another page's image 0 at the same size must not reuse the pixels.
+    /// Forget what belongs to the page being left: its decoded images, and the glyphs of its
+    /// `@font-face` faces (their ids are per page; the process's own faces stay cached).
     pub fn forget_images(&mut self) {
         self.images = HashMap::default();
+        self.glyphs.retain(|key, _| key.face < WEB_FACES);
     }
 
     fn build<'p>(
@@ -688,32 +693,32 @@ impl Painter {
                 {
                     continue;
                 }
-                let bold = style.font_weight >= 600;
+                let font = layout::font_key(style);
                 let color = style.color;
                 let device_baseline = (baseline * s).round() as i32;
                 let size_key = (size * s * 4.0).round() as u32;
                 let mut pen = t.x;
                 for ch in layout.text(t).chars() {
-                    if !ch.is_whitespace() {
-                        if let Some(fonts) = page.fonts {
-                            let (at, phase) = place(pen * s);
-                            let key = GlyphKey {
-                                bold,
-                                glyph: fonts.face(bold).glyph(ch),
-                                size: size_key,
-                                phase,
-                            };
-                            wanted.push(key);
-                            items.push(Item::Glyph {
-                                x: at,
-                                y: device_baseline,
-                                key,
-                                color,
-                                clip,
-                            });
-                        }
+                    if let Some((face, glyph)) =
+                        page.metrics.glyph(ch, font).filter(|_| !ch.is_whitespace())
+                    {
+                        let (at, phase) = place(pen * s);
+                        let key = GlyphKey {
+                            face,
+                            glyph,
+                            size: size_key,
+                            phase,
+                        };
+                        wanted.push(key);
+                        items.push(Item::Glyph {
+                            x: at,
+                            y: device_baseline,
+                            key,
+                            color,
+                            clip,
+                        });
                     }
-                    pen += page.metrics.advance_em(ch, bold) * size;
+                    pen += page.metrics.advance_em(ch, font) * size;
                 }
                 if style.underline {
                     let y0 = ((baseline + size * 0.1) * s).round() as i32;
@@ -1008,7 +1013,6 @@ mod tests {
             styles: &styles,
             layout: &laid_out,
             metrics: &Approximate,
-            fonts: None,
             images: None,
         };
         Painter::new()
@@ -1129,7 +1133,6 @@ mod tests {
                 styles: &styles,
                 layout,
                 metrics: &Approximate,
-                fonts: None,
                 images: None,
             };
             let view = Viewport {
@@ -1167,7 +1170,6 @@ mod tests {
             styles: &styles,
             layout: &laid_out,
             metrics: &Approximate,
-            fonts: None,
             images: None,
         };
         // 3 pixels per row padded to 16 bytes; the padding must stay untouched.
@@ -1249,7 +1251,7 @@ mod tests {
             bgra: false,
             left: 0,
         };
-        Painter::new().overlay(target, 4, (0, 3), None, &Approximate, &ops);
+        Painter::new().overlay(target, 4, (0, 3), &Approximate, &ops);
         assert_eq!(&pixels[0..4], &[0, 0, 255, 255], "mask pixel");
         assert_eq!(
             &pixels[4..8],
@@ -1293,7 +1295,6 @@ mod tests {
             styles: &styles,
             layout: &laid_out,
             metrics: &Approximate,
-            fonts: None,
             images: Some(&OneImage),
         };
         let view = Viewport {
@@ -1368,7 +1369,6 @@ mod tests {
             styles: &styles,
             layout: &laid_out,
             metrics: &Approximate,
-            fonts: None,
             images: None,
         };
         let mut painter = Painter::new();

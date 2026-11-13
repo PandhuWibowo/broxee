@@ -6,7 +6,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use css::Color;
-use font::{FontSet, TextMetrics};
+use font::{FontKey, TextMetrics};
 use paint::{GlyphBitmap, Op, Painter, Rasterizer, Target};
 
 /// Pane header height in points (DESIGN.md, section 7).
@@ -61,8 +61,23 @@ const PALETTE_TEXT: f32 = 16.0;
 /// The one soft shadow of things that float (DESIGN.md, section 5).
 const SHADOW_BLUR: f32 = 14.0;
 const SHADOW_DROP: f32 = 6.0;
-/// Modifier symbols drawn as icons: the UI font has no ⌘, ⇧ or ⌥.
+/// Modifier symbols are drawn as icons when no face has ⌘, ⇧ or ⌥: Figtree lacks them, and
+/// the symbol fallback (macOS Keyboard.ttf) may be missing.
 const KEY_ICON: f32 = 12.0;
+
+/// The icon for a modifier symbol, or `None` when a face draws it as text.
+fn modifier_icon(c: char, metrics: &dyn TextMetrics) -> Option<Shape> {
+    let shape = match c {
+        '⌘' => Shape::Command,
+        '⇧' => Shape::Shift,
+        '⌥' => Shape::Option,
+        _ => return None,
+    };
+    let drawn = metrics
+        .glyph(c, FontKey::UI)
+        .is_some_and(|(_, glyph)| glyph != 0);
+    (!drawn).then_some(shape)
+}
 
 /// Profile colors (DESIGN.md, section 3, "Profile colors"), each checked to 4.5:1 on `canvas`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -488,7 +503,6 @@ impl Chrome {
         &mut self,
         painter: &mut Painter,
         frame: Frame,
-        fonts: Option<&FontSet>,
         metrics: &dyn TextMetrics,
         view: &HeaderView,
     ) {
@@ -651,7 +665,7 @@ impl Chrome {
                     baseline: px(22.5) as f32,
                     text: &label,
                     size: 12.5 * s,
-                    bold: false,
+                    font: FontKey::UI,
                     color: t.text_2,
                 });
             }
@@ -673,8 +687,8 @@ impl Chrome {
                 let size = 13.0 * s;
                 let left = (FIELD_LEFT + FIELD_PADDING) * s;
                 let right = (width_pt - FIELD_RIGHT_GAP - FIELD_PADDING) * s;
-                let caret = metrics.width(&field.text[..field.cursor], size, false);
-                let full = metrics.width(field.text, size, false);
+                let caret = metrics.width(&field.text[..field.cursor], size, FontKey::UI);
+                let full = metrics.width(field.text, size, FontKey::UI);
                 // Scroll the text left so the caret stays inside the field.
                 let shift = (left + caret - right).max(0.0);
                 let x = left - shift;
@@ -694,7 +708,7 @@ impl Chrome {
                     baseline: px(FIELD_TOP + 17.5) as f32,
                     text: field_text,
                     size,
-                    bold: false,
+                    font: FontKey::UI,
                     color: t.text,
                 });
                 if !field.all_selected {
@@ -721,7 +735,6 @@ impl Chrome {
             },
             frame.width,
             (0, w),
-            fonts,
             metrics,
             &ops,
         );
@@ -734,7 +747,6 @@ impl Chrome {
             },
             frame.width,
             text_clip,
-            fonts,
             metrics,
             &text_ops,
         );
@@ -746,7 +758,6 @@ impl Chrome {
         &mut self,
         painter: &mut Painter,
         frame: Frame,
-        fonts: Option<&FontSet>,
         metrics: &dyn TextMetrics,
         view: &SidebarView,
     ) {
@@ -787,7 +798,7 @@ impl Chrome {
                 _ if !visible(i) => Cow::Borrowed(""),
                 ListRow::Label(text) => {
                     let room = (sw - ROW_INSET - 8.0 - ROW_TEXT) * s;
-                    fit_in(text, room, 12.0 * s, true, metrics)
+                    fit_in(text, room, 12.0 * s, FontKey::UI_SEMIBOLD, metrics)
                 }
                 ListRow::Item {
                     title, closable, ..
@@ -817,7 +828,7 @@ impl Chrome {
                     baseline: px(row_top(i) + 20.0) as f32,
                     text,
                     size: 12.0 * s,
-                    bold: true,
+                    font: FontKey::UI_SEMIBOLD,
                     color: t.muted,
                 }),
                 ListRow::Item {
@@ -846,7 +857,7 @@ impl Chrome {
                         baseline: px(row_top(i) + 19.5) as f32,
                         text,
                         size: 13.0 * s,
-                        bold: false,
+                        font: FontKey::UI,
                         color,
                     });
                 }
@@ -858,7 +869,7 @@ impl Chrome {
                 baseline: px(row_top(0) + 19.5) as f32,
                 text: line,
                 size: 13.0 * s,
-                bold: false,
+                font: FontKey::UI,
                 color: t.text_2,
             });
             push_keys(
@@ -877,7 +888,7 @@ impl Chrome {
                 baseline: px(row_top(view.rows.len()) + 19.5) as f32,
                 text: footer,
                 size: 13.0 * s,
-                bold: false,
+                font: FontKey::UI,
                 color: t.text_2,
             });
         }
@@ -946,7 +957,7 @@ impl Chrome {
                 baseline: px(26.0) as f32,
                 text: view.profile,
                 size: 13.0 * s,
-                bold: true,
+                font: FontKey::UI_SEMIBOLD,
                 color: t.text,
             },
             Op::Text {
@@ -954,7 +965,7 @@ impl Chrome {
                 baseline: px(SEARCH_TOP + 19.5) as f32,
                 text: "Search or go to",
                 size: 13.0 * s,
-                bold: false,
+                font: FontKey::UI,
                 color: t.text_2,
             },
         ];
@@ -976,7 +987,6 @@ impl Chrome {
                 },
                 frame.width,
                 clip,
-                fonts,
                 metrics,
                 ops,
             );
@@ -989,7 +999,6 @@ impl Chrome {
         &mut self,
         painter: &mut Painter,
         frame: Frame,
-        fonts: Option<&FontSet>,
         metrics: &dyn TextMetrics,
         view: &PaletteView,
     ) {
@@ -1028,7 +1037,7 @@ impl Chrome {
         let right = px(x + w - PALETTE_TEXT) as f32;
         let row_top = |i: usize| y + PALETTE_INPUT + 1.0 + PALETTE_PAD + PALETTE_ROW * i as f32;
         let hint_width = |hint: &HintView| match hint {
-            HintView::Label(label) => metrics.width(label, 12.0 * s, false),
+            HintView::Label(label) => metrics.width(label, 12.0 * s, FontKey::UI),
             HintView::Keys(keys) => keys_width(keys, s, 12.0, metrics),
         };
         let fitted: Vec<(Cow<str>, Cow<str>, f32)> = view
@@ -1090,7 +1099,7 @@ impl Chrome {
         let mut text = Vec::new();
         // The query, scrolled left so the caret stays visible, with its caret.
         let size = 14.0 * s;
-        let caret = metrics.width(&view.query[..view.cursor], size, false);
+        let caret = metrics.width(&view.query[..view.cursor], size, FontKey::UI);
         let shift = (left + caret - right).max(0.0);
         let baseline = px(y + 27.0) as f32;
         if view.query.is_empty() {
@@ -1099,7 +1108,7 @@ impl Chrome {
                 baseline,
                 text: "Search tabs, history and commands",
                 size,
-                bold: false,
+                font: FontKey::UI,
                 color: t.muted,
             });
         } else {
@@ -1108,7 +1117,7 @@ impl Chrome {
                 baseline,
                 text: view.query,
                 size,
-                bold: false,
+                font: FontKey::UI,
                 color: t.text,
             });
         }
@@ -1127,7 +1136,7 @@ impl Chrome {
                 baseline: px(top + 19.0) as f32,
                 text: title,
                 size: 13.5 * s,
-                bold: false,
+                font: FontKey::UI,
                 color: t.text,
             });
             text.push(Op::Text {
@@ -1135,7 +1144,7 @@ impl Chrome {
                 baseline: px(top + 35.0) as f32,
                 text: detail,
                 size: 12.0 * s,
-                bold: false,
+                font: FontKey::UI,
                 color: t.text_2,
             });
             // `text-2`, not `muted`: a hint may sit on `selected` (DESIGN.md, section 3).
@@ -1145,7 +1154,7 @@ impl Chrome {
                     baseline: px(top + 27.0) as f32,
                     text: label,
                     size: 12.0 * s,
-                    bold: false,
+                    font: FontKey::UI,
                     color: t.text_2,
                 }),
                 HintView::Keys(keys) => push_keys(
@@ -1166,7 +1175,7 @@ impl Chrome {
                 baseline: px(top + 19.0) as f32,
                 text: line,
                 size: 13.5 * s,
-                bold: false,
+                font: FontKey::UI,
                 color: t.text,
             });
             text.push(Op::Text {
@@ -1174,7 +1183,7 @@ impl Chrome {
                 baseline: px(top + 35.0) as f32,
                 text: second,
                 size: 12.0 * s,
-                bold: false,
+                font: FontKey::UI,
                 color: t.text_2,
             });
         }
@@ -1189,7 +1198,6 @@ impl Chrome {
             },
             width,
             (0, width as i32),
-            fonts,
             metrics,
             &shapes,
         );
@@ -1202,7 +1210,6 @@ impl Chrome {
             },
             width,
             (px(x + PALETTE_TEXT / 2.0), px(x + w - PALETTE_TEXT / 2.0)),
-            fonts,
             metrics,
             &text,
         );
@@ -1249,7 +1256,6 @@ impl Chrome {
             },
             width,
             (0, width as i32),
-            None,
             &font::Approximate,
             &ops,
         );
@@ -1261,7 +1267,6 @@ impl Chrome {
         &self,
         painter: &mut Painter,
         frame: Frame,
-        fonts: Option<&FontSet>,
         metrics: &dyn TextMetrics,
         title: &str,
     ) {
@@ -1272,14 +1277,14 @@ impl Chrome {
         let text = fit(title, max.max(0.0), size, metrics);
         let width: f32 = text
             .chars()
-            .map(|c| metrics.advance_em(c, false) * size)
+            .map(|c| metrics.advance_em(c, FontKey::UI) * size)
             .sum();
         let ops = [Op::Text {
             x: ((frame.width as f32 - width) / 2.0).max(0.0),
             baseline: (height as f32 / 2.0).round(),
             text: &text,
             size,
-            bold: false,
+            font: FontKey::UI,
             color: self.theme.text_2,
         }];
         let (stride, left, width) = (frame.stride, frame.left, frame.width);
@@ -1292,7 +1297,6 @@ impl Chrome {
             },
             width,
             (0, width as i32),
-            fonts,
             metrics,
             &ops,
         );
@@ -1321,7 +1325,6 @@ impl Chrome {
             },
             width,
             (0, width as i32),
-            None,
             &font::Approximate,
             &ops,
         );
@@ -1359,7 +1362,6 @@ impl Chrome {
         &mut self,
         painter: &mut Painter,
         frame: Frame,
-        fonts: Option<&FontSet>,
         metrics: &dyn TextMetrics,
         view: &DialogView,
     ) {
@@ -1410,7 +1412,7 @@ impl Chrome {
             baseline: px(y + 30.0) as f32,
             text: view.heading,
             size: 14.0 * s,
-            bold: true,
+            font: FontKey::UI_SEMIBOLD,
             color: t.text,
         }];
         let size = 13.0 * s;
@@ -1423,7 +1425,7 @@ impl Chrome {
                 baseline: px(top + 12.0) as f32,
                 text: label,
                 size: 12.0 * s,
-                bold: false,
+                font: FontKey::UI,
                 color: t.text_2,
             });
             let box_y = top + 18.0;
@@ -1450,7 +1452,7 @@ impl Chrome {
                 )],
                 color: t.canvas,
             });
-            let caret = metrics.width(&value[..*cursor], size, false);
+            let caret = metrics.width(&value[..*cursor], size, FontKey::UI);
             let shift = if active {
                 (left + caret - right).max(0.0)
             } else {
@@ -1461,7 +1463,7 @@ impl Chrome {
                 baseline: px(box_y + 20.5) as f32,
                 text: value,
                 size,
-                bold: false,
+                font: FontKey::UI,
                 color: t.text,
             });
             if active {
@@ -1480,7 +1482,7 @@ impl Chrome {
             baseline: px(y + h - DIALOG_PAD) as f32,
             text: view.help,
             size: 12.0 * s,
-            bold: false,
+            font: FontKey::UI,
             color: t.text_2,
         });
         let (stride, frame_left, width) = (frame.stride, frame.left, frame.width);
@@ -1493,7 +1495,6 @@ impl Chrome {
             },
             width,
             (0, width as i32),
-            fonts,
             metrics,
             &shapes,
         );
@@ -1506,7 +1507,6 @@ impl Chrome {
             },
             width,
             (px(x + DIALOG_PAD), px(x + w - DIALOG_PAD)),
-            fonts,
             metrics,
             &text,
         );
@@ -1518,7 +1518,6 @@ impl Chrome {
         &mut self,
         painter: &mut Painter,
         frame: Frame,
-        fonts: Option<&FontSet>,
         metrics: &dyn TextMetrics,
         view: &MenuView,
     ) {
@@ -1578,7 +1577,7 @@ impl Chrome {
                 baseline: px(y + MENU_PAD + MENU_ROW * i as f32 + 19.5) as f32,
                 text: item,
                 size: 13.0 * s,
-                bold: false,
+                font: FontKey::UI,
                 color: t.text,
             })
             .collect();
@@ -1596,7 +1595,6 @@ impl Chrome {
                 },
                 width,
                 clip,
-                fonts,
                 metrics,
                 ops,
             );
@@ -1609,7 +1607,6 @@ impl Chrome {
         &mut self,
         painter: &mut Painter,
         frame: Frame,
-        fonts: Option<&FontSet>,
         metrics: &dyn TextMetrics,
         (x, y): (f32, f32),
         text: &str,
@@ -1678,7 +1675,6 @@ impl Chrome {
             },
             width,
             (0, width as i32),
-            fonts,
             metrics,
             &ops,
         );
@@ -1703,20 +1699,20 @@ pub fn fill(pixels: &mut [u8], stride: usize, left: usize, width: usize, color: 
 
 /// `text` cut to fit `max` device pixels at `size`, ending with "…" when cut.
 fn fit<'t>(text: &'t str, max: f32, size: f32, metrics: &dyn TextMetrics) -> Cow<'t, str> {
-    fit_in(text, max, size, false, metrics)
+    fit_in(text, max, size, FontKey::UI, metrics)
 }
 
 fn fit_in<'t>(
     text: &'t str,
     max: f32,
     size: f32,
-    bold: bool,
+    font: FontKey,
     metrics: &dyn TextMetrics,
 ) -> Cow<'t, str> {
-    if metrics.width(text, size, bold) <= max {
+    if metrics.width(text, size, font) <= max {
         return Cow::Borrowed(text);
     }
-    let room = max - metrics.width("…", size, bold);
+    let room = max - metrics.width("…", size, font);
     // The most characters, ending on a char boundary, that leave room for the ellipsis.
     // `ends[k - 1]` is the byte length of the first `k` characters.
     let ends: Vec<usize> = text
@@ -1728,7 +1724,7 @@ fn fit_in<'t>(
     let (mut lo, mut hi) = (0, ends.len());
     while lo < hi {
         let mid = (lo + hi).div_ceil(2);
-        if metrics.width(&text[..ends[mid - 1]], size, bold) <= room {
+        if metrics.width(&text[..ends[mid - 1]], size, font) <= room {
             lo = mid;
         } else {
             hi = mid - 1;
@@ -1741,9 +1737,9 @@ fn fit_in<'t>(
 /// Width in device pixels of a shortcut such as "⌘⇧T" at `size` points.
 fn keys_width(keys: &str, scale: f32, size: f32, metrics: &dyn TextMetrics) -> f32 {
     keys.chars()
-        .map(|c| match c {
-            '⌘' | '⇧' | '⌥' => ((KEY_ICON + 1.0) * scale).round(),
-            _ => metrics.width(c.encode_utf8(&mut [0; 4]), size * scale, false),
+        .map(|c| match modifier_icon(c, metrics) {
+            Some(_) => ((KEY_ICON + 1.0) * scale).round(),
+            None => metrics.width(c.encode_utf8(&mut [0; 4]), size * scale, FontKey::UI),
         })
         .sum()
 }
@@ -1761,12 +1757,7 @@ fn push_keys<'m>(
 ) {
     let icon_px = (KEY_ICON * scale).round() as u32;
     for (i, c) in keys.char_indices() {
-        let shape = match c {
-            '⌘' => Some(Shape::Command),
-            '⇧' => Some(Shape::Shift),
-            '⌥' => Some(Shape::Option),
-            _ => None,
-        };
+        let shape = modifier_icon(c, metrics);
         match shape.and_then(|shape| masks.get(&(shape, icon_px, icon_px))) {
             Some(mask) => {
                 out.push(Op::Mask {
@@ -1784,10 +1775,10 @@ fn push_keys<'m>(
                     baseline,
                     text: key,
                     size: size * scale,
-                    bold: false,
+                    font: FontKey::UI,
                     color,
                 });
-                x += metrics.width(key, size * scale, false);
+                x += metrics.width(key, size * scale, FontKey::UI);
             }
         }
     }
@@ -2093,7 +2084,7 @@ mod tests {
         assert_eq!(fit("short", 100.0, 20.0, &m), "short");
         let cut = fit("a long title", 60.0, 20.0, &m);
         assert!(
-            cut.ends_with('…') && m.width(&cut, 20.0, false) <= 60.0,
+            cut.ends_with('…') && m.width(&cut, 20.0, FontKey::UI) <= 60.0,
             "{cut}"
         );
         assert_eq!(

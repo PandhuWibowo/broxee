@@ -13,7 +13,7 @@ depends on document order stays sequential.
 | **Loader** (one per page load) | one load: fetch, parse, subresources, cascade, layout | A load builds its `Loaded` alone and sends it to the engine thread whole. At most one runs at a time for memory; dropping its channel cancels it at the next stage boundary (a fetch already waiting finishes first, then the thread frees what it built). |
 | **Fetch pool** (scoped, up to 6) | one subresource request each | Network waits dominate load time. Six concurrent requests per page matches what browsers allow per host. Finished connections go to a shared keep-alive pool (`net`, up to 8 idle for 30 s), so later requests to the same host skip the TCP and TLS handshakes. |
 | **Raster bands** (scoped, one per core) | one horizontal band of the framebuffer each | Bands never overlap, so each thread writes its own rows with no locking. |
-| **Font loader** | reading font files at startup | Independent of the page, so it overlaps with the HTML request. |
+| **Font loader** | reading the default page font at startup | Independent of the page, so it overlaps with the HTML request. Figtree and the symbol font are decoded later, on the thread that first draws with them. |
 
 There is no async runtime. Blocking I/O on a small, bounded set of threads is enough for dozens of requests
 and keeps the binary small; an event-driven (kqueue/epoll) network layer can replace the fetch pool later
@@ -33,6 +33,7 @@ thread) and, later, the JavaScript event loop (single-threaded, as in every brow
 | 6 | Parse each stylesheet | its own body + the DOM's tags, ids and classes | **parallel**, inside its fetch thread; rules that cannot match the document are skipped | fetch pool | done |
 | 7 | Join | all of 6 | **barrier**: sheets back in document order | engine | done |
 | 8 | Cascade | DOM + every sheet, in order | sequential (parallel per subtree is possible later: style sharing, the matched-rule cache and the bloom filter are per-thread state) | engine | done |
+| 8b | Find and fetch web fonts | styles + `@font-face` rules | the text's characters are matched to faces (sequential), then the needed faces are fetched and decoded **in parallel**, up to 6; pages without `@font-face` skip it | loader + fetch pool | done |
 | 9 | Layout | styles + fonts (1 joined here) | sequential: a block's position depends on its previous siblings; flex items need their siblings' sizes. Each box is laid out once | engine | done |
 | 10 | Build display list | layout | sequential, linear and cheap | engine | done |
 | 11 | Rasterize glyphs | unique (glyph, size) pairs from 10 | sequential into a shared cache, read-only afterwards | engine | done |

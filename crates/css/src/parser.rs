@@ -1,3 +1,4 @@
+use crate::fontface::{parse_family_list, parse_font_face, FamilyList, FontFace};
 use crate::grid::{expand_grid, is_grid_property, GridSlot, GridValue};
 use crate::media::{Media, MediaList};
 use crate::selector::{parse_selector_list, Selector};
@@ -28,6 +29,8 @@ pub enum Declaration {
         value: Box<GridValue>,
         important: bool,
     },
+    /// `font-family`, as lowercase names.
+    Family { value: FamilyList, important: bool },
     /// `content`, kept as written (strings keep their case).
     Content {
         value: Box<Content>,
@@ -48,6 +51,7 @@ impl Declaration {
             Declaration::Custom { important, .. }
             | Declaration::Pending { important, .. }
             | Declaration::Content { important, .. }
+            | Declaration::Family { important, .. }
             | Declaration::Grid { important, .. } => *important,
         }
     }
@@ -68,6 +72,8 @@ pub struct Stylesheet {
     pub skipped: usize,
     /// Each condition is the media lists of every enclosing `@media`; all must match.
     pub conditions: Vec<Vec<MediaList>>,
+    /// `@font-face` rules, in order. Their URLs are relative to the stylesheet.
+    pub font_faces: Vec<FontFace>,
 }
 
 impl Stylesheet {
@@ -90,7 +96,8 @@ impl Stylesheet {
 
 /// Parse a stylesheet. Unknown properties and invalid values are skipped one declaration at
 /// a time, as browsers do. `@media` rules are kept with their condition; `@supports` and
-/// `@layer` blocks are read as if their condition held; other at-rules are skipped.
+/// `@layer` blocks are read as if their condition held; `@font-face` rules are collected;
+/// other at-rules are skipped.
 pub fn parse_stylesheet(src: &str) -> Stylesheet {
     parse_stylesheet_owned(src.to_owned())
 }
@@ -152,6 +159,7 @@ fn parse_rules(
                             parse_rules(body, condition, sheet, vocabulary);
                         }
                         "layer" => parse_rules(body, condition, sheet, vocabulary),
+                        "font-face" => sheet.font_faces.extend(parse_font_face(body)),
                         _ => {}
                     }
                     i = close + 1;
@@ -242,6 +250,17 @@ pub fn parse_declarations(src: &str) -> Vec<Declaration> {
 
 /// Expand one declaration whose value no longer contains `var()` into longhand declarations.
 pub fn expand_declaration(name: &str, value: &str, important: bool) -> Vec<Declaration> {
+    if name == "font-family" {
+        let value = match value.trim() {
+            v if v.eq_ignore_ascii_case("initial") => Some(FamilyList::default()),
+            v if v.eq_ignore_ascii_case("inherit") || v.eq_ignore_ascii_case("unset") => None,
+            v => parse_family_list(v),
+        };
+        return value
+            .map(|value| Declaration::Family { value, important })
+            .into_iter()
+            .collect();
+    }
     if name == "content" {
         return parse_content(value)
             .map(|c| Declaration::Content {
@@ -751,7 +770,7 @@ pub(crate) fn parse_content(v: &str) -> Option<Content> {
 
 /// The text of a CSS string after its opening quote `q`, with escapes decoded (`\f101`, `\"`),
 /// and what follows the closing quote.
-fn css_string(s: &str, q: char) -> Option<(String, &str)> {
+pub(crate) fn css_string(s: &str, q: char) -> Option<(String, &str)> {
     let mut out = String::new();
     let mut chars = s.char_indices().peekable();
     while let Some((i, c)) = chars.next() {
@@ -803,7 +822,7 @@ fn background(v: &str, sink: &mut Sink) {
     sink.set(Prop::BackgroundColor, color);
 }
 
-/// `font: italic bold 16px/1.5 system-ui, sans-serif`. The family is not used yet.
+/// `font: italic bold 16px/1.5 system-ui, sans-serif`.
 fn font(v: &str, sink: &mut Sink) {
     let tokens = split_values(v);
     let mut weight = Value::FontWeight(400);
@@ -830,6 +849,24 @@ fn font(v: &str, sink: &mut Sink) {
                 },
                 None => Value::Normal,
             };
+            // The family is everything after the size and line height, and it is required.
+            let after = match (inline_lh, lh_text) {
+                (Some(lh), _) if !lh.is_empty() => i + 1,
+                (_, None) => i + 1,
+                (Some(_), Some(_)) => i + 2,
+                (None, Some(_)) if tokens.get(i + 1) == Some(&"/") => i + 3,
+                (None, Some(_)) => i + 2,
+            };
+            let Some(family) = tokens
+                .get(after..)
+                .and_then(|rest| parse_family_list(&rest.join(" ")))
+            else {
+                return;
+            };
+            sink.out.push(Declaration::Family {
+                value: family,
+                important: sink.important,
+            });
             sink.set(Prop::FontSize, Value::Length(size));
             sink.set(Prop::LineHeight, line);
             sink.set(Prop::FontWeight, weight);
@@ -1066,7 +1103,7 @@ fn split_values(v: &str) -> Vec<&str> {
 }
 
 /// Split on `sep` outside parentheses, brackets and quotes.
-fn split_top_level(s: &str, sep: u8) -> Vec<&str> {
+pub(crate) fn split_top_level(s: &str, sep: u8) -> Vec<&str> {
     let mut out = Vec::new();
     let mut depth = 0i32;
     let mut quote: Option<u8> = None;
