@@ -140,7 +140,9 @@ Sentence case everywhere. No uppercase tracked labels. Numbers use tabular figur
 - Radius: 6px for tab rows, inputs and buttons; 10px for menus, the ⌘K palette and dialogs. Nothing is pill-shaped.
 - Shadow: only on things that float above the page (menus, ⌘K, dialogs), one soft shadow. Everything else is flat
   and separated by `line` hairlines.
-- Panes in a split are separated by a 1px `line` hairline and a 6px drag handle that only shows on hover.
+- Panes in a split are separated by a 1px `line` hairline and a 6px drag handle (`text-2`) that only shows on
+  hover. A tab shown in a pane carries a 16px outlined box with the pane's number (`text-2`) in its sidebar
+  row: a number, never only a color. A tab dragged over a pane washes it in translucent `accent`.
 
 ## 6. Identity motif: the profile edge **(agent)**
 

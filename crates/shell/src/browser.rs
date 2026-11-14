@@ -332,6 +332,26 @@ enum Drag {
     Resizing,
     /// Text in the page, being selected.
     Selecting,
+    /// A tab row dragged out of the sidebar, over pane `pane`: dropping puts it there.
+    OntoPane { tab: usize, pane: usize },
+    /// The handle between panes, resizing them.
+    Splitting(Axis),
+}
+
+/// Which divider between panes: the one between columns, or (with four) between rows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Axis {
+    Columns,
+    Rows,
+}
+
+/// The panes as saved: each one's (profile, tab) by position, which has focus, and where
+/// the dividers are (fractions of the pane area).
+#[derive(Clone, Debug, PartialEq)]
+struct SavedPanes {
+    panes: Vec<(usize, usize)>,
+    focused: usize,
+    split: (f32, f32),
 }
 
 /// Find in page (⌘F): the query, its matches and the one Enter moved to.
@@ -566,6 +586,10 @@ struct Browser<S: Screen> {
     hover: Option<Hover>,
     /// Sidebar width in points, 200 to 320.
     sidebar_width: f32,
+    /// Where the dividers between panes sit, as fractions of the pane area (columns, rows).
+    split: (f32, f32),
+    /// The divider under the pointer: its handle shows.
+    handle_hover: Option<Axis>,
     /// How far the sidebar's list is scrolled.
     sidebar_scroll: f32,
     drag: Option<Drag>,
@@ -654,6 +678,8 @@ impl<S: Screen> Browser<S> {
             menu: None,
             hover: None,
             sidebar_width: SIDEBAR_WIDTH,
+            split: (0.5, 0.5),
+            handle_hover: None,
             sidebar_scroll: 0.0,
             drag: None,
             selection: None,
@@ -701,8 +727,8 @@ impl<S: Screen> Browser<S> {
     fn pane_rects(&self) -> Vec<(f32, f32, f32, f32)> {
         let x0 = self.sidebar_edge();
         let (w, h) = ((self.width - x0).max(1.0), self.height.max(1.0));
-        let half = |len: f32| ((len - 1.0) / 2.0).floor().max(1.0);
-        let (a, b) = (half(w), half(h));
+        let part = |len: f32, f: f32| ((len - 1.0) * f).floor().clamp(1.0, (len - 2.0).max(1.0));
+        let (a, b) = (part(w, self.split.0), part(h, self.split.1));
         match self.panes.len() {
             2 => vec![
                 (x0, 0.0, a, h),
@@ -719,6 +745,46 @@ impl<S: Screen> Browser<S> {
             }
             _ => vec![(x0, 0.0, w, h)],
         }
+    }
+
+    /// The divider whose handle (3 points either side of the hairline) is under (x, y).
+    fn handle_at(&self, x: f32, y: f32) -> Option<Axis> {
+        if self.panes.len() < 2 || x < self.sidebar_edge() + 4.0 {
+            return None;
+        }
+        let r = self.pane_rects()[0];
+        if (x - (r.0 + r.2 + 0.5)).abs() <= 3.0 {
+            return Some(Axis::Columns);
+        }
+        if self.panes.len() == 4 && (y - (r.1 + r.3 + 0.5)).abs() <= 3.0 {
+            return Some(Axis::Rows);
+        }
+        None
+    }
+
+    /// The pane at (x, y) in window points.
+    fn pane_at(&self, x: f32, y: f32) -> Option<usize> {
+        self.pane_rects()
+            .iter()
+            .position(|r| x >= r.0 && x < r.0 + r.2 + 1.0 && y >= r.1 && y < r.1 + r.3 + 1.0)
+    }
+
+    /// Show tab `tab` of the visible profile in pane `j`, and give that pane focus.
+    fn put_in_pane(&mut self, tab: usize, j: usize) -> bool {
+        let Some(id) = self.profiles[self.profile].tabs.get(tab).map(|t| t.id) else {
+            return false;
+        };
+        if j == self.focused.min(self.panes.len() - 1) {
+            return self.select_tab(tab);
+        }
+        self.panes[j] = Pane {
+            profile: self.profile,
+            tab: id,
+            painted: false,
+        };
+        self.focus_pane(j);
+        self.save_session();
+        true
     }
 
     /// The focused pane.
@@ -831,6 +897,9 @@ impl<S: Screen> Browser<S> {
                 self.sidebar_width = width;
                 self.sidebar = shown;
             }
+            if let Some(saved) = session.panes {
+                self.restore_panes(&saved);
+            }
         }
         let targets: Vec<String> = std::iter::once(&self.opts.target)
             .chain(&self.opts.more)
@@ -847,6 +916,21 @@ impl<S: Screen> Browser<S> {
             // background while the window answers input.
             if i < last {
                 self.wait_for_load();
+            }
+        }
+        if self.panes.len() > 1 && self.opts.panes <= 1 {
+            // Restored panes: show each once so every one has its page, ending with the one
+            // that had focus.
+            let focused = self.focused;
+            let order: Vec<usize> = (0..self.panes.len())
+                .rev()
+                .filter(|&j| j != focused)
+                .chain(std::iter::once(focused))
+                .collect();
+            for j in order {
+                self.focus_pane(j);
+                self.wait_for_load();
+                self.render();
             }
         }
         if self.opts.panes > 1 {
@@ -913,12 +997,33 @@ impl<S: Screen> Browser<S> {
     }
 
     fn handle(&mut self, event: Event) -> bool {
+        // The handle between panes sits over both of them: it comes before routing.
+        let mut handle_changed = false;
+        if let Event::Hover { x, y } = event {
+            let over = if self.drag.is_none() {
+                self.handle_at(x as f32, y as f32)
+            } else {
+                self.handle_hover
+            };
+            handle_changed = over != self.handle_hover;
+            self.handle_hover = over;
+            if over.is_some() {
+                return handle_changed;
+            }
+        }
+        if let Event::Click { x, y } = event {
+            if let Some(axis) = self.handle_at(x as f32, y as f32) {
+                self.drag = Some(Drag::Splitting(axis));
+                self.handle_hover = Some(axis);
+                return true;
+            }
+        }
         let event = match self.route(event) {
             Ok(event) => event,
             Err(dirty) => return dirty,
         };
         if let Event::Hover { x, y } = event {
-            return self.hover_at(x as f32, y as f32);
+            return self.hover_at(x as f32, y as f32) | handle_changed;
         }
         let from_key = matches!(event, Event::Key(_));
         let focus_before = self.link_focus.as_ref().map(|l| l.node);
@@ -1096,6 +1201,35 @@ impl<S: Screen> Browser<S> {
         let f = self.focused.min(self.panes.len() - 1);
         self.panes[f].profile = self.profile;
         self.panes[f].tab = tab;
+    }
+
+    /// Bring back saved panes. Their tabs are looked up by position; anything that does not
+    /// fit any more leaves one pane.
+    fn restore_panes(&mut self, saved: &SavedPanes) {
+        let panes: Option<Vec<Pane>> = saved
+            .panes
+            .iter()
+            .map(|&(p, t)| {
+                let tab = self.profiles.get(p)?.tabs.get(t)?.id;
+                Some(Pane {
+                    profile: p,
+                    tab,
+                    painted: false,
+                })
+            })
+            .collect();
+        let Some(panes) = panes.filter(|p| matches!(p.len(), 2 | 4)) else {
+            return;
+        };
+        let focused = saved.focused.min(panes.len() - 1);
+        let (p, tab) = (panes[focused].profile, panes[focused].tab);
+        self.profile = p;
+        if let Some(i) = self.profiles[p].tabs.iter().position(|t| t.id == tab) {
+            self.profiles[p].active = i;
+        }
+        self.panes = panes;
+        self.focused = focused;
+        self.split = saved.split;
     }
 
     /// Give pane `j` focus: the focused tab sleeps (its pixels stay on screen) and pane
@@ -1300,7 +1434,13 @@ impl<S: Screen> Browser<S> {
                     Some((SidebarItem::Footer, _)) => self.new_tab(),
                     Some((_, Some(RowTarget::Tab(i)))) => {
                         self.drag = Some(Drag::Pressed { tab: i, y });
-                        self.select_tab(i)
+                        // In a split, the tab may be on its way to another pane: it is
+                        // selected when the button comes up without a drag.
+                        if self.panes.len() > 1 {
+                            false
+                        } else {
+                            self.select_tab(i)
+                        }
                     }
                     Some((_, Some(RowTarget::Bookmark(i)))) => self.open_bookmark(i),
                     Some((_, Some(RowTarget::Section(Section::Group(i))))) => self.fold_group(i),
@@ -2761,6 +2901,47 @@ impl<S: Screen> Browser<S> {
         if self.drag == Some(Drag::Selecting) {
             return self.extend_selection(x - self.pane_left(), y - HEADER_HEIGHT);
         }
+        if let Some(Drag::Splitting(axis)) = self.drag {
+            let x0 = self.sidebar_edge();
+            let f = match axis {
+                Axis::Columns => (x - x0) / (self.width - x0).max(1.0),
+                Axis::Rows => y / self.height.max(1.0),
+            };
+            let f = f.clamp(0.15, 0.85);
+            let before = self.split;
+            match axis {
+                Axis::Columns => self.split.0 = f,
+                Axis::Rows => self.split.1 = f,
+            }
+            if self.split == before {
+                return false;
+            }
+            for pane in &mut self.panes {
+                pane.painted = false;
+            }
+            return true;
+        }
+        // A tab row dragged over a pane, or back into the list.
+        let over_pane = (self.panes.len() > 1 && x >= self.sidebar_edge())
+            .then(|| self.pane_at(x, y))
+            .flatten();
+        match (self.drag, over_pane) {
+            (Some(Drag::Pressed { tab, .. } | Drag::Moving { tab, .. }), Some(pane)) => {
+                self.drag = Some(Drag::OntoPane { tab, pane });
+                return true;
+            }
+            (Some(Drag::OntoPane { tab, pane }), Some(to)) => {
+                self.drag = Some(Drag::OntoPane { tab, pane: to });
+                return to != pane;
+            }
+            (Some(Drag::OntoPane { tab, .. }), None) => {
+                let rows = self.sidebar_rows().rows.len();
+                let drop = chrome::sidebar_drop(y, self.sidebar_scroll, rows);
+                self.drag = Some(Drag::Moving { tab, drop });
+                return true;
+            }
+            _ => {}
+        }
         match self.drag {
             Some(Drag::Resizing) => {
                 let width = x.round().clamp(SIDEBAR_MIN, SIDEBAR_MAX);
@@ -2805,6 +2986,14 @@ impl<S: Screen> Browser<S> {
                 true
             }
             Some(Drag::Moving { tab, drop }) => self.move_tab(tab, drop),
+            Some(Drag::OntoPane { tab, pane }) => self.put_in_pane(tab, pane),
+            Some(Drag::Pressed { tab, .. }) if self.panes.len() > 1 => self.select_tab(tab),
+            Some(Drag::Splitting(_)) => {
+                self.handle_hover = None;
+                self.relayout();
+                self.save_session();
+                true
+            }
             _ => false,
         }
     }
@@ -2917,7 +3106,39 @@ impl<S: Screen> Browser<S> {
     }
 
     fn sidebar_rows(&self) -> SidebarRows<'_> {
-        sidebar_rows(&self.profiles[self.profile], self.list, self.bookmark_row)
+        sidebar_rows(
+            &self.profiles[self.profile],
+            self.list,
+            self.bookmark_row,
+            &self.pane_numbers(),
+        )
+    }
+
+    /// The visible profile's tabs shown in a pane, with that pane's number (from 1), when
+    /// there is more than one pane.
+    fn pane_numbers(&self) -> Vec<(u64, u8)> {
+        if self.panes.len() < 2 {
+            return Vec::new();
+        }
+        let focused = self.focused.min(self.panes.len() - 1);
+        let active = {
+            let p = &self.profiles[self.profile];
+            p.tabs.get(p.active).map(|t| t.id)
+        };
+        self.panes
+            .iter()
+            .enumerate()
+            .filter(|(_, pane)| pane.profile == self.profile)
+            .map(|(j, pane)| {
+                // The focused pane shows the active tab, even before `sync_pane` runs.
+                let tab = if j == focused {
+                    active.unwrap_or(pane.tab)
+                } else {
+                    pane.tab
+                };
+                (tab, j as u8 + 1)
+            })
+            .collect()
     }
 
     /// Write the visible profile's bookmarks, readable by this user only.
@@ -3582,6 +3803,34 @@ impl<S: Screen> Browser<S> {
     }
 
     /// Write the tabs and their history (not their pages) so the next start brings them back.
+    /// The panes as the session file keeps them: tabs by position, not by id (ids are new
+    /// each run). `None` with a single pane.
+    fn saved_panes(&self) -> Option<SavedPanes> {
+        if self.panes.len() < 2 {
+            return None;
+        }
+        let focused = self.focused.min(self.panes.len() - 1);
+        let panes = self
+            .panes
+            .iter()
+            .enumerate()
+            .map(|(j, pane)| {
+                let p = self.profiles.get(pane.profile)?;
+                let index = if j == focused && pane.profile == self.profile {
+                    p.active
+                } else {
+                    p.tabs.iter().position(|t| t.id == pane.tab)?
+                };
+                Some((pane.profile, index))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(SavedPanes {
+            panes,
+            focused,
+            split: self.split,
+        })
+    }
+
     fn save_session(&self) {
         let Some(path) = &self.session else {
             return;
@@ -3590,6 +3839,7 @@ impl<S: Screen> Browser<S> {
             &self.profiles,
             self.profile,
             (self.sidebar_width, self.sidebar),
+            self.saved_panes().as_ref(),
         );
         // History is private: the file is this user's only, like the cookies.
         if let Err(e) = write_private(path, text.as_bytes()) {
@@ -3828,7 +4078,8 @@ impl<S: Screen> Browser<S> {
             self.focus,
             self.loading,
         );
-        let list = sidebar_rows(profile, self.list, self.bookmark_row);
+        let numbers = self.pane_numbers();
+        let list = sidebar_rows(profile, self.list, self.bookmark_row, &numbers);
         let drop_at = match self.drag {
             Some(Drag::Moving { drop, .. }) => Some(drop),
             _ => None,
@@ -3964,9 +4215,38 @@ impl<S: Screen> Browser<S> {
             let (x, y) = h.at;
             ((x, if x >= edge { y + top_pt } else { y }), h.text.as_str())
         });
+        // A tab dragged over a pane washes it in the accent; the hovered divider shows its
+        // 6-point handle.
+        let rects_pt = self.pane_rects();
+        let drop_wash = match self.drag {
+            Some(Drag::OntoPane { pane, .. }) => rects_pt
+                .get(pane)
+                .map(|r| (r.0, r.1, r.2, r.3, MarkKind::Selection)),
+            _ => None,
+        };
+        let handle_px = self.handle_hover.map(|axis| {
+            let r = rects_pt[0];
+            let s = scale;
+            let px = |v: f32| ((v * s).round().max(0.0) as usize).min(width_px);
+            let py = |v: f32| ((v * s).round().max(0.0) as usize).min(height_px);
+            match axis {
+                Axis::Columns => {
+                    let mid = r.0 + r.2 + 0.5;
+                    (px(mid - 3.0), px(mid + 3.0), 0, height_px)
+                }
+                Axis::Rows => {
+                    let mid = r.1 + r.3 + 0.5;
+                    (sidebar_px, width_px, py(mid - 3.0), py(mid + 3.0))
+                }
+            }
+        });
         let (painter, chrome) = (&mut self.painter, &mut self.chrome);
         let blank = chrome.theme().surface;
         let line = chrome.theme().line;
+        let handle_color = {
+            let c = chrome.theme().text_2;
+            [c.b, c.g, c.r, 255]
+        };
         let shown = self
             .window
             .render(width_px, height_px, &mut |pixels, stride, previous| {
@@ -4109,6 +4389,23 @@ impl<S: Screen> Browser<S> {
                     };
                     chrome.draw_menu(painter, frame, &fonts.ui(), menu);
                 }
+                if let Some(rect) = drop_wash {
+                    let frame = Frame {
+                        pixels: &mut *pixels,
+                        stride,
+                        left: 0,
+                        width: width_px,
+                        scale,
+                    };
+                    chrome.draw_marks(painter, frame, &[rect]);
+                }
+                if let Some((x0, x1, y0, y1)) = handle_px {
+                    for row in pixels[y0 * stride..y1 * stride].chunks_mut(stride) {
+                        for px in row[x0 * 4..x1 * 4].chunks_mut(4) {
+                            px.copy_from_slice(&handle_color);
+                        }
+                    }
+                }
                 if let Some((at, text)) = tooltip {
                     let frame = Frame {
                         pixels: &mut *pixels,
@@ -4171,11 +4468,12 @@ fn header_view<'a>(
 
 /// The sidebar's rows for the current list, what each stands for, and its footer and
 /// empty-state text.
-fn sidebar_rows(
-    profile: &Profile,
+fn sidebar_rows<'a>(
+    profile: &'a Profile,
     list: SidebarList,
     bookmark_row: Option<usize>,
-) -> SidebarRows<'_> {
+    panes: &[(u64, u8)],
+) -> SidebarRows<'a> {
     match list {
         SidebarList::Tabs => {
             // Tabs are kept in this order (`Profile::normalize`): pinned, groups, the rest.
@@ -4227,6 +4525,7 @@ fn sidebar_rows(
                     title: tab.title(),
                     muted: i != profile.active,
                     closable: i == profile.active,
+                    pane: panes.iter().find(|(id, _)| *id == tab.id).map(|(_, n)| *n),
                 });
                 targets.push(RowTarget::Tab(i));
             }
@@ -4261,6 +4560,7 @@ fn sidebar_rows(
                             title: &b.title,
                             muted: false,
                             closable: false,
+                            pane: None,
                         });
                         targets.push(RowTarget::Bookmark(i));
                     }
@@ -4366,7 +4666,12 @@ fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
 
 /// The session as text: one line per profile, tab and history entry, tab-separated. Pages
 /// are not saved; restored tabs reload when selected.
-fn write_session(profiles: &[Profile], visible: usize, sidebar: (f32, bool)) -> String {
+fn write_session(
+    profiles: &[Profile],
+    visible: usize,
+    sidebar: (f32, bool),
+    panes: Option<&SavedPanes>,
+) -> String {
     let clean = |s: &str| s.replace(['\t', '\n', '\r'], " ");
     let mut out = format!(
         "broxee-session 1\nvisible\t{visible}\nsidebar\t{}\t{}\n",
@@ -4402,6 +4707,15 @@ fn write_session(profiles: &[Profile], visible: usize, sidebar: (f32, bool)) -> 
             }
         }
     }
+    if let Some(saved) = panes {
+        out += &format!(
+            "panes\t{}\t{}\t{}\n",
+            saved.focused, saved.split.0, saved.split.1
+        );
+        for (profile, tab) in &saved.panes {
+            out += &format!("pane\t{profile}\t{tab}\n");
+        }
+    }
     out
 }
 
@@ -4420,6 +4734,8 @@ struct Session {
     visible: usize,
     /// Sidebar width and whether it is shown.
     sidebar: Option<(f32, bool)>,
+    /// Two or four panes, when they were saved and still make sense (`restore_panes`).
+    panes: Option<SavedPanes>,
 }
 
 /// Read a session written by `write_session`; anything malformed is skipped, never trusted.
@@ -4430,6 +4746,7 @@ fn parse_session(text: &str) -> Option<Session> {
     }
     let mut visible = 0;
     let mut sidebar = None;
+    let mut panes: Option<SavedPanes> = None;
     let mut profiles: Vec<SavedProfile> = Vec::new();
     for line in lines {
         let mut parts = line.splitn(3, '\t');
@@ -4438,6 +4755,28 @@ fn parse_session(text: &str) -> Option<Session> {
         let name = a.map(str::trim).filter(|n| !n.is_empty()).map(String::from);
         match kind {
             "visible" => visible = number,
+            "panes" => {
+                let mut f = b.unwrap_or_default().split('\t');
+                let fraction = |v: Option<&str>| {
+                    v.and_then(|v| v.parse::<f32>().ok())
+                        .filter(|v| v.is_finite())
+                        .map_or(0.5, |v| v.clamp(0.15, 0.85))
+                };
+                let (fx, fy) = (fraction(f.next()), fraction(f.next()));
+                panes = Some(SavedPanes {
+                    panes: Vec::new(),
+                    focused: number,
+                    split: (fx, fy),
+                });
+            }
+            "pane" => {
+                let tab = b.and_then(|b| b.trim().parse::<usize>().ok());
+                if let (Some(saved), Some(tab)) = (panes.as_mut(), tab) {
+                    if saved.panes.len() < 4 {
+                        saved.panes.push((number, tab));
+                    }
+                }
+            }
             "sidebar" => {
                 let width = a
                     .and_then(|a| a.parse::<f32>().ok())
@@ -4532,10 +4871,21 @@ fn parse_session(text: &str) -> Option<Session> {
             tab.index = tab.index.min(tab.history.len().saturating_sub(1));
         }
     }
+    // Panes must name profiles and tabs that were read, and come two or four.
+    let panes = panes.filter(|saved: &SavedPanes| {
+        matches!(saved.panes.len(), 2 | 4)
+            && saved.focused < saved.panes.len()
+            && saved.panes.iter().all(|&(p, t)| {
+                profiles
+                    .get(p)
+                    .is_some_and(|p| !p.name.is_empty() && t < p.tabs.len())
+            })
+    });
     Some(Session {
         profiles,
         visible,
         sidebar,
+        panes,
     })
 }
 
@@ -5636,7 +5986,7 @@ mod tests {
             ..Tab::default()
         });
         personal.folded.push("Research".into());
-        let text = write_session(&[personal], 0, (999.0, false));
+        let text = write_session(&[personal], 0, (999.0, false), None);
         let session = parse_session(&text).unwrap();
         assert_eq!(
             session.sidebar,
@@ -6950,6 +7300,124 @@ mod tests {
 
     fn row_center(row: usize) -> f64 {
         f64::from(chrome::LIST_TOP + chrome::TAB_ROW * row as f32 + 15.0)
+    }
+
+    #[test]
+    fn restores_two_panes_with_two_profiles() {
+        let (a, bpath) = site("panes-restore");
+        let path = a.with_file_name("session");
+        let url = |p: &Path| net::Url::parse(&format!("file://{}", p.display())).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "broxee-session 1\nvisible\t0\n\
+                 profile\t0\tPersonal\tpersonal\temerald\ntab\t0\tPage A\nentry\t0\t{}\tPage A\n\
+                 profile\t0\tWork\twork\tamber\ntab\t0\tPage B\nentry\t0\t{}\tPage B\n\
+                 panes\t1\t0.6\t0.5\npane\t0\t0\npane\t1\t0\n",
+                url(&a),
+                url(&bpath)
+            ),
+        )
+        .unwrap();
+        let b = browser_with(Path::new(""), Some(path.clone()));
+        assert_eq!(b.panes.len(), 2);
+        assert_eq!((b.panes[0].profile, b.panes[1].profile), (0, 1));
+        assert_eq!(b.focused, 1);
+        assert_eq!(
+            b.profile, 1,
+            "the focused pane's profile is the visible one"
+        );
+        assert_eq!(title(&b), "Page B");
+        assert_eq!(b.split.0, 0.6);
+        assert_eq!(b.pane_numbers(), [(b.profiles[1].tabs[0].id, 2)]);
+        b.save_session();
+        let saved = parse_session(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved.panes,
+            Some(SavedPanes {
+                panes: vec![(0, 0), (1, 0)],
+                focused: 1,
+                split: (0.6, 0.5),
+            })
+        );
+        // Panes that name tabs which are not there leave one pane.
+        let broken = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("pane\t1\t0", "pane\t1\t7");
+        assert!(parse_session(&broken).unwrap().panes.is_none());
+    }
+
+    #[test]
+    fn drags_a_tab_onto_a_pane_and_resizes_panes() {
+        let (a, bpath) = site("panes-drag");
+        let mut b = browser(&a);
+        act(&mut b, command('t'));
+        open(&mut b, &bpath);
+        act(&mut b, command_shift('2'));
+        assert_eq!(b.panes.len(), 2);
+        let first = b.profiles[0].tabs[0].id;
+
+        // Drag the first tab's row onto the right pane.
+        let right = b.pane_rects()[1];
+        let (cx, cy) = (
+            f64::from(right.0 + right.2 / 2.0),
+            f64::from(right.1 + 150.0),
+        );
+        act(
+            &mut b,
+            Event::Click {
+                x: 100.0,
+                y: row_center(0),
+            },
+        );
+        assert!(
+            act(&mut b, Event::Drag { x: cx, y: cy }),
+            "the pane shows it would land"
+        );
+        assert!(matches!(b.drag, Some(Drag::OntoPane { pane: 1, .. })));
+        act(&mut b, Event::Release { x: cx, y: cy });
+        assert_eq!(b.panes[1].tab, first);
+        assert_eq!(b.focused, 1, "the pane it landed in has focus");
+        assert_eq!(title(&b), "Page A");
+        let rows = b.sidebar_rows();
+        assert!(
+            rows.rows
+                .iter()
+                .any(|r| matches!(r, ListRow::Item { pane: Some(2), .. })),
+            "its row says which pane shows it"
+        );
+
+        // Hover the divider, press its handle and drag it right.
+        let left = b.pane_rects()[0];
+        let hx = f64::from(left.0 + left.2 + 0.5);
+        assert!(
+            act(&mut b, Event::Hover { x: hx, y: 150.0 }),
+            "the handle shows"
+        );
+        assert_eq!(b.handle_hover, Some(Axis::Columns));
+        act(&mut b, Event::Click { x: hx, y: 150.0 });
+        act(
+            &mut b,
+            Event::Drag {
+                x: hx + 40.0,
+                y: 150.0,
+            },
+        );
+        act(
+            &mut b,
+            Event::Release {
+                x: hx + 40.0,
+                y: 150.0,
+            },
+        );
+        assert!(b.split.0 > 0.5);
+        let wider = b.pane_rects()[0].2;
+        assert!(
+            (wider - left.2 - 40.0).abs() <= 1.0,
+            "{} -> {wider}",
+            left.2
+        );
+        b.render();
     }
 
     fn run_palette(b: &mut Browser<FakeScreen>, text: &str) {
