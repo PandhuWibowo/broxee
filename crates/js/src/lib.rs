@@ -107,6 +107,27 @@ impl Runtime {
         }
     }
 
+    /// The end of a task: run promise reactions until none are left, then report rejections
+    /// nothing handled.
+    fn checkpoint(&mut self, host: &mut dyn Host) {
+        if self.interp.stopped.is_some() {
+            return;
+        }
+        let r = self.interp.run_microtasks(host);
+        if r.is_err() {
+            self.finish(host, r.map(|_| Value::Undefined), "promise reaction");
+        }
+        for reason in self.interp.take_unhandled() {
+            let line = format!(
+                "Uncaught (in promise) {}",
+                self.interp.describe(host, &reason)
+            );
+            host.log(&line);
+            self.console.push(line);
+        }
+        self.interp.steps = 0;
+    }
+
     /// Parse and run a script. Syntax Broxee does not support skips the script, as an error
     /// would in a browser.
     pub fn run(&mut self, host: &mut dyn Host, source: &str, name: &str) {
@@ -127,6 +148,7 @@ impl Runtime {
             .run_program(host, &program)
             .map(|_| Value::Undefined);
         self.finish(host, r, name);
+        self.checkpoint(host);
     }
 
     /// Tell listeners the document is ready (`DOMContentLoaded`, then `load`).
@@ -174,7 +196,7 @@ impl Runtime {
             return false;
         }
         let r = builtins::dispatch(&mut self.interp, host, node, kind);
-        match r {
+        let prevented = match r {
             Ok(prevented) => {
                 self.interp.steps = 0;
                 prevented
@@ -183,7 +205,9 @@ impl Runtime {
                 self.finish(host, Err(e), kind);
                 false
             }
-        }
+        };
+        self.checkpoint(host);
+        prevented
     }
 
     fn dispatch_window(&mut self, host: &mut dyn Host, kind: &str) {
@@ -195,6 +219,7 @@ impl Runtime {
             self.finish(host, Err(e), kind);
         }
         self.interp.steps = 0;
+        self.checkpoint(host);
     }
 
     /// When the next timer is due, in page milliseconds.
@@ -235,6 +260,7 @@ impl Runtime {
                 self.interp.call(host, &callback, Value::Undefined, &args)
             };
             self.finish(host, r, &format!("timer {id}"));
+            self.checkpoint(host);
             ran += 1;
         }
         ran
@@ -255,6 +281,10 @@ impl Runtime {
                 Ctrl::Throw(v) => format!("Uncaught {}", self.interp.describe(host, &v)),
                 other => format!("{other:?}"),
             };
+        }
+        // The program is one task: its promise reactions run before the result is read.
+        if let Err(e) = self.interp.run_microtasks(host) {
+            return format!("{e:?}");
         }
         let env = self.interp.global_env;
         let r = match program.get(last) {
@@ -427,6 +457,7 @@ mod tests {
             ("var o = { _v: 1, get v() { return this._v * 10 }, set v(x) { this._v = x } }; o.v = 3; [o.v, o._v]", "[30, 3]"),
             ("var o = {}; Object.defineProperty(o, 'x', { get() { return 'got' } }); o.x = 'ignored'; o.x", "got"),
             ("var a = true; a?.5:1", "0.5"),
+            ("var a = 1, b = 2, z; [a, b] = [b, a]; ({z, w = 4} = {z: 3}); [a, b, z, w, [1, 2][0]]", "[2, 1, 3, 4, 1]"),
             ("const m = new Map([['a', 1], ['b', 2]]); let s = ''; for (const [k, v] of m) s += k + v; [s, [...new Set([3, 3, 4])]]", "[\"a1b2\", [3, 4]]"),
             ("class R { constructor(n) { this.n = n } [Symbol.iterator]() { let i = 0; const n = this.n; return { next: () => i < n ? { value: i++, done: false } : { done: true } } } } [...new R(3)]", "[0, 1, 2]"),
             ("const f = Object.freeze({}); [Object.isFrozen(f), Object.isFrozen({}), Object.isExtensible({})]", "[true, false, true]"),
@@ -438,6 +469,93 @@ mod tests {
         for (src, want) in cases {
             assert_eq!(eval(src), want, "{src}");
         }
+    }
+
+    #[test]
+    fn runs_promises_and_async_functions() {
+        big_stack(runs_promises_and_async_functions_inner);
+    }
+
+    fn runs_promises_and_async_functions_inner() {
+        let cases = [
+            ("var log = []; Promise.resolve(1).then(v => log.push('a' + v)); log.push('sync'); queueMicrotask(() => log.push('q')); log", "[\"sync\", \"a1\", \"q\"]"),
+            ("var r; new Promise((ok, no) => no(new Error('x'))).catch(e => e.message + '!').then(v => r = v); r", "x!"),
+            ("var r = []; Promise.resolve(2).then(v => { throw v * 2 }).then(() => r.push('skipped'), e => r.push(e)).finally(() => r.push('fin')); r", "[4, \"fin\"]"),
+            ("var r; Promise.all([1, Promise.resolve(2), new Promise(ok => ok(3))]).then(v => r = v); r", "[1, 2, 3]"),
+            ("var r; Promise.all([1, Promise.reject('no')]).catch(e => r = e); r", "no"),
+            ("var r; Promise.allSettled([Promise.resolve(1), Promise.reject(2)]).then(v => r = v.map(x => x.status)); r", "[\"fulfilled\", \"rejected\"]"),
+            ("var r; Promise.race([new Promise(() => {}), Promise.resolve('fast')]).then(v => r = v); r", "fast"),
+            ("var r; Promise.any([Promise.reject(1), Promise.resolve(2)]).then(v => r = v); r", "2"),
+            ("var r; Promise.resolve({ then(ok) { ok('thenable') } }).then(v => r = v); r", "thenable"),
+            ("var r; async function f(x) { const a = await x; const b = await Promise.resolve(a + 1); return a + b } f(1).then(v => r = v); r", "3"),
+            ("var log = []; async function f() { log.push('in'); await null; log.push('after') } f(); log.push('out'); log", "[\"in\", \"out\", \"after\"]"),
+            ("var r; async function f() { try { await Promise.reject(new Error('bad')) } catch (e) { return 'caught ' + e.message } } f().then(v => r = v); r", "caught bad"),
+            ("var r; async function f() { throw new TypeError('t') } f().catch(e => r = e instanceof TypeError); r", "true"),
+            ("var r = 0; async function f() { for (let i = 0; i < 3; i++) { r += await i } for (const x of [10, 20]) r += await x; let n = 0; while (await (n < 2)) n++; return r + n } var out; f().then(v => out = v); out", "35"),
+            ("var fs = []; async function f() { for (let i = 0; i < 3; i++) { await 0; fs.push(() => i) } } f(); fs.map(g => g()).join()", "0,1,2"),
+            ("var log = []; async function f() { try { await 1; return 'r' } finally { log.push('finally') } } var r; f().then(v => r = v); [r, log]", "[\"r\", [\"finally\"]]"),
+            ("var r; async function f(k) { switch (await k) { case 1: return 'one'; default: return 'other' } } Promise.all([f(1), f(2)]).then(v => r = v); r", "[\"one\", \"other\"]"),
+            ("var r; const g = async () => (await 2) * (await 3); g().then(v => r = v); r", "6"),
+            ("var r; class S { async load() { await 0; return this.v } v = 'class' } new S().load().then(v => r = v); r", "class"),
+            ("var r; const o = { async m(x) { return await x + 1 } }; o.m(1).then(v => r = v); r", "2"),
+            ("var r; async function f() { outer: for (const a of [1, 2]) { for (const b of [1, 2]) { await 0; if (b == 2) continue outer; r = (r || 0) + a } } } f(); r", "3"),
+            ("var r; async function inner() { await 0; return 'i' } async function outer() { return 'o' + await inner() } outer().then(v => r = v); r", "oi"),
+            ("var r = typeof (async function () {})(); r", "object"),
+        ];
+        for (src, want) in cases {
+            assert_eq!(eval(src), want, "{src}");
+        }
+    }
+
+    #[test]
+    fn runs_generators() {
+        big_stack(runs_generators_inner);
+    }
+
+    fn runs_generators_inner() {
+        let cases = [
+            ("function* g() { yield 1; yield 2; return 3 } const it = g(); [it.next(), it.next(), it.next(), it.next()].map(r => r.value + ':' + r.done)", "[\"1:false\", \"2:false\", \"3:true\", \"undefined:true\"]"),
+            ("function* count(n) { for (let i = 0; i < n; i++) yield i } [...count(4)]", "[0, 1, 2, 3]"),
+            ("function* g() { const a = yield 'first'; const b = yield a * 2; return a + b } const it = g(); it.next('ignored'); [it.next(5).value, it.next(10).value]", "[10, 15]"),
+            ("function* inner() { yield 'a'; yield 'b' } function* outer() { yield 0; const r = yield* inner(); yield* [1, 2] } [...outer()]", "[0, \"a\", \"b\", 1, 2]"),
+            ("function* g() { try { yield 1 } catch (e) { yield 'caught ' + e } } const it = g(); it.next(); it.throw('boom').value", "caught boom"),
+            ("var log = []; function* g() { try { yield 1; yield 2 } finally { log.push('f') } } const it = g(); it.next(); [it.return(7), it.next().done]", "[{value: 7, done: true}, true]"),
+            ("function* fib() { let [a, b] = [0, 1]; while (true) { yield a; [a, b] = [b, a + b] } } const out = []; for (const x of fib()) { if (x > 20) break; out.push(x) } out", "[0, 1, 1, 2, 3, 5, 8, 13]"),
+            ("class Tree { constructor(...v) { this.v = v } *[Symbol.iterator]() { for (const x of this.v) yield x * 10 } } [...new Tree(1, 2)]", "[10, 20]"),
+            ("const o = { *pairs() { yield ['k', 1]; yield ['j', 2] } }; Object.fromEntries ? [...o.pairs()].length : 2", "2"),
+            ("const gen = function* () { yield* 'hi' }; Array.from(gen()).join('-')", "h-i"),
+            ("function* g() { yield 1 } const it = g(); it[Symbol.iterator]() === it", "true"),
+            ("function* g() { yield 1 } var r; try { g().throw(new Error('early')) } catch (e) { r = e.message } r", "early"),
+        ];
+        for (src, want) in cases {
+            assert_eq!(eval(src), want, "{src}");
+        }
+    }
+
+    #[test]
+    fn reports_rejections_nothing_handled() {
+        let mut host = Bare::default();
+        let mut rt = Runtime::new();
+        rt.run(
+            &mut host,
+            "Promise.reject(new Error('lost')); Promise.reject(1).catch(() => {})",
+            "a.js",
+        );
+        assert_eq!(host.log, ["Uncaught (in promise) Error: lost"]);
+        rt.run(&mut host, "async function f() { await new Promise(r => setTimeout(r, 10)); console.log('resumed') } f()", "b.js");
+        assert_eq!(host.log.len(), 1, "waiting for the timer");
+        rt.set_time(10.0, 0.0);
+        rt.run_timers(&mut host);
+        assert_eq!(host.log.last().map(String::as_str), Some("resumed"));
+        rt.run(
+            &mut host,
+            "let n = 0; function spin() { Promise.resolve().then(spin) } spin()",
+            "c.js",
+        );
+        assert!(
+            rt.stopped().is_some(),
+            "endless reactions stop the page's scripts"
+        );
     }
 
     #[test]
@@ -469,7 +587,7 @@ mod tests {
     fn stops_runaway_and_broken_scripts_inner() {
         let mut host = Bare::default();
         let mut rt = Runtime::new();
-        rt.run(&mut host, "function* gen() {}", "a.js");
+        rt.run(&mut host, "async function* gen() {}", "a.js");
         assert!(host.log[0].starts_with("SyntaxError in a.js"));
         rt.run(&mut host, "undefinedFunction()", "b.js");
         assert!(host.log[1].contains("ReferenceError"), "{}", host.log[1]);

@@ -7,8 +7,11 @@
 //! when the call returns. A script that runs too long or allocates too much is stopped and
 //! scripts are turned off for the page.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+
+mod asyncs;
+pub use asyncs::{Handler, Mode, Resume};
 
 use crate::parser::{
     Class, Elem, Expr, Func, MemberKind, Name, Param, Pattern, Prop, Stmt, VarKind,
@@ -63,6 +66,15 @@ pub enum Kind {
     RegExp(Arc<crate::regex::Regex>),
     /// A getter and setter, held in a property slot in place of a value.
     Accessor(Option<Value>, Option<Value>),
+    Promise(Box<asyncs::PromiseData>),
+    /// The resolve (or, when `true`, reject) function of a promise.
+    Resolver(ObjId, bool),
+    /// A generator: its paused call in `Interp::coros`.
+    Generator {
+        slot: usize,
+        started: bool,
+        done: bool,
+    },
 }
 
 /// What `new` needs of a class beyond its constructor function.
@@ -96,6 +108,12 @@ struct Env {
     this: Option<Value>,
 }
 
+/// The values a `for…of` or `for…in` loop walks.
+pub enum Source {
+    List(Vec<Value>, usize),
+    Iter { iterator: Value, next: Value },
+}
+
 /// Why evaluation stopped early.
 #[derive(Debug)]
 pub enum Ctrl {
@@ -120,6 +138,8 @@ pub struct Protos {
     pub class_list: ObjId,
     pub style: ObjId,
     pub event: ObjId,
+    pub promise: ObjId,
+    pub generator: ObjId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -167,6 +187,15 @@ pub struct Interp {
     /// Objects passed to `Object.freeze` (and `seal`, `preventExtensions`), for `isFrozen`.
     /// Writes to them are not refused.
     pub frozen: std::collections::HashSet<ObjId>,
+    /// Promise reactions waiting for the current task to end.
+    microtasks: VecDeque<asyncs::Job>,
+    /// `async` calls paused at an `await`.
+    coros: Vec<asyncs::Slot>,
+    /// Settled `await`s of the statement the running `async` call is about to run.
+    slots: HashMap<usize, Result<Value, Value>>,
+    aggregates: Vec<asyncs::Aggregate>,
+    /// Promises rejected while nothing reacted to them.
+    unhandled: Vec<ObjId>,
 }
 
 pub fn number_to_string(v: f64) -> String {
@@ -247,6 +276,11 @@ impl Interp {
             classes: HashMap::new(),
             constructing: false,
             frozen: std::collections::HashSet::new(),
+            microtasks: VecDeque::new(),
+            coros: Vec::new(),
+            slots: HashMap::new(),
+            aggregates: Vec::new(),
+            unhandled: Vec::new(),
         };
         let object = it.raw_alloc(None, Kind::Plain);
         let mut proto = |kind| it.raw_alloc(Some(object), kind);
@@ -260,6 +294,8 @@ impl Interp {
         let class_list = proto(Kind::Plain);
         let style = proto(Kind::Plain);
         let event = proto(Kind::Plain);
+        let promise = proto(Kind::Plain);
+        let generator = proto(Kind::Plain);
         it.protos = Protos {
             object,
             function,
@@ -272,6 +308,8 @@ impl Interp {
             class_list,
             style,
             event,
+            promise,
+            generator,
         };
         it.global = it.raw_alloc(Some(object), Kind::Plain);
         it.envs.push(Env {
@@ -376,7 +414,7 @@ impl Interp {
     }
 
     pub fn is_callable(&self, v: &Value) -> bool {
-        matches!(v, Value::Obj(o) if matches!(self.objects[*o as usize].kind, Kind::Function(..) | Kind::Native(_) | Kind::Bound(..)))
+        matches!(v, Value::Obj(o) if matches!(self.objects[*o as usize].kind, Kind::Function(..) | Kind::Native(_) | Kind::Bound(..) | Kind::Resolver(..)))
     }
 
     pub fn to_number(&mut self, host: &mut dyn Host, v: &Value) -> Result<f64, Ctrl> {
@@ -875,7 +913,7 @@ impl Interp {
 
     /// Function declarations and `var` names are defined before the code runs.
     fn hoist(&mut self, env: EnvId, body: &[Stmt]) -> Result<(), Ctrl> {
-        for s in body {
+        for s in body.iter() {
             self.hoist_stmt(env, s, true)?;
         }
         Ok(())
@@ -912,21 +950,21 @@ impl Interp {
                 }
             }
             Stmt::Block(body) | Stmt::Try(body, None, None) => {
-                for s in body {
+                for s in body.iter() {
                     self.hoist_stmt(env, s, false)?;
                 }
             }
             Stmt::Try(body, handler, fin) => {
-                for s in body {
+                for s in body.iter() {
                     self.hoist_stmt(env, s, false)?;
                 }
                 if let Some((_, h)) = handler {
-                    for s in h {
+                    for s in h.iter() {
                         self.hoist_stmt(env, s, false)?;
                     }
                 }
                 if let Some(f) = fin {
-                    for s in f {
+                    for s in f.iter() {
                         self.hoist_stmt(env, s, false)?;
                     }
                 }
@@ -950,7 +988,7 @@ impl Interp {
             }
             Stmt::Switch(_, cases) => {
                 for (_, body) in cases {
-                    for s in body {
+                    for s in body.iter() {
                         self.hoist_stmt(env, s, false)?;
                     }
                 }
@@ -978,7 +1016,7 @@ impl Interp {
     fn block(&mut self, host: &mut dyn Host, env: EnvId, body: &[Stmt]) -> Result<(), Ctrl> {
         let mark = self.envs.len();
         let inner = self.new_env(env, None)?;
-        for s in body {
+        for s in body.iter() {
             if let Stmt::Function(f) = s {
                 let v = self.closure(f, inner, None)?;
                 if let Some(name) = &f.name {
@@ -1110,37 +1148,8 @@ impl Interp {
             Stmt::ForIn(kind, pattern, object, body, of) => {
                 let label = self.pending_label.take();
                 let o = self.eval(host, env, object)?;
-                let items: Vec<Value> = if *of {
-                    self.iterate(host, &o)?
-                } else {
-                    let mut keys = Vec::new();
-                    let mut at = if o.is_nullish() {
-                        None
-                    } else {
-                        Some(o.clone())
-                    };
-                    // Own keys, then inherited ones, as for-in does (prototypes of builtins
-                    // hold only methods, which are not enumerable there).
-                    while let Some(v) = at {
-                        for k in self.keys(&v) {
-                            if !keys
-                                .iter()
-                                .any(|x: &Value| matches!(x, Value::Str(s) if *s == k))
-                            {
-                                keys.push(Value::Str(k));
-                            }
-                        }
-                        at = match v {
-                            Value::Obj(id) => self.objects[id as usize]
-                                .proto
-                                .filter(|p| !self.is_builtin_proto(*p))
-                                .map(Value::Obj),
-                            _ => None,
-                        };
-                    }
-                    keys
-                };
-                for item in items {
+                let mut source = self.for_source(host, &o, *of)?;
+                while let Some(item) = self.next_item(host, &mut source)? {
                     let mark = self.envs.len();
                     let scope = self.new_env(env, None)?;
                     let k = kind.unwrap_or(VarKind::Var);
@@ -1152,9 +1161,16 @@ impl Interp {
                     let r = self.exec(host, scope, body);
                     self.release_envs(mark);
                     match r {
-                        Err(Ctrl::Break(None)) => break,
+                        Err(Ctrl::Break(None)) => {
+                            self.close_source(host, &source)?;
+                            break;
+                        }
                         Err(Ctrl::Continue(l)) if l.is_none() || l == label => {}
-                        other => other?,
+                        Err(other) => {
+                            self.close_source(host, &source)?;
+                            return Err(other);
+                        }
+                        Ok(()) => {}
                     }
                 }
             }
@@ -1199,7 +1215,7 @@ impl Interp {
                     let scope = self.new_env(env, None)?;
                     let r = (|| {
                         for (_, body) in &cases[start..] {
-                            for s in body {
+                            for s in body.iter() {
                                 self.exec(host, scope, s)?;
                             }
                         }
@@ -1231,6 +1247,106 @@ impl Interp {
             Stmt::Empty => {}
         }
         Ok(())
+    }
+
+    /// What `for…of` walks, taken one value at a time from an iterator (a generator may
+    /// never end), or what `for…in` walks.
+    pub(crate) fn for_source(
+        &mut self,
+        host: &mut dyn Host,
+        o: &Value,
+        of: bool,
+    ) -> Result<Source, Ctrl> {
+        if of {
+            if let Value::Obj(id) = o {
+                if !matches!(self.objects[*id as usize].kind, Kind::Array(_)) {
+                    if let Some(f) = self.get(host, o, "@@iterator")? {
+                        let iterator = self.call(host, &f, o.clone(), &[])?;
+                        if let Value::Obj(i) = iterator {
+                            if let Kind::Array(items) = &self.objects[i as usize].kind {
+                                return Ok(Source::List(items.clone(), 0));
+                            }
+                        }
+                        let next = self.get_value(host, &iterator, "next")?;
+                        return Ok(Source::Iter { iterator, next });
+                    }
+                }
+            }
+        }
+        Ok(Source::List(self.for_items(host, o, of)?, 0))
+    }
+
+    pub(crate) fn next_item(
+        &mut self,
+        host: &mut dyn Host,
+        source: &mut Source,
+    ) -> Result<Option<Value>, Ctrl> {
+        match source {
+            Source::List(items, i) => {
+                let item = items.get(*i).cloned();
+                *i += 1;
+                Ok(item)
+            }
+            Source::Iter { iterator, next } => {
+                self.step()?;
+                let r = self.call(host, next, iterator.clone(), &[])?;
+                let done = self.get_value(host, &r, "done")?;
+                if self.truthy(&done) {
+                    return Ok(None);
+                }
+                Ok(Some(self.get_value(host, &r, "value")?))
+            }
+        }
+    }
+
+    /// A loop left early: tell the iterator (a generator runs its `finally`).
+    pub(crate) fn close_source(
+        &mut self,
+        host: &mut dyn Host,
+        source: &Source,
+    ) -> Result<(), Ctrl> {
+        if let Source::Iter { iterator, .. } = source {
+            if let Some(f) = self.get(host, iterator, "return")? {
+                if self.is_callable(&f) {
+                    self.call(host, &f, iterator.clone(), &[])?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// What `for…of` (values) or `for…in` (keys, own then inherited) walks.
+    fn for_items(&mut self, host: &mut dyn Host, o: &Value, of: bool) -> Result<Vec<Value>, Ctrl> {
+        Ok(if of {
+            self.iterate(host, o)?
+        } else {
+            let mut keys = Vec::new();
+            let mut at = if o.is_nullish() {
+                None
+            } else {
+                Some(o.clone())
+            };
+            // Own keys, then inherited ones, as for-in does (prototypes of builtins
+            // hold only methods, which are not enumerable there).
+            while let Some(v) = at {
+                for k in self.keys(&v) {
+                    if !keys
+                        .iter()
+                        .any(|x: &Value| matches!(x, Value::Str(s) if *s == k))
+                    {
+                        keys.push(Value::Str(k));
+                    }
+                }
+                at = match v {
+                    Value::Obj(id) => self.objects[id as usize]
+                        .proto
+                        .filter(|p| !self.is_builtin_proto(*p))
+                        .map(Value::Obj),
+                    _ => None,
+                };
+            }
+            keys
+        })
     }
 
     fn is_builtin_proto(&self, o: ObjId) -> bool {
@@ -1584,6 +1700,22 @@ impl Interp {
                 last
             }
             Expr::Class(class) => self.eval_class(host, env, class)?,
+            Expr::Destructure(pattern, value) => {
+                let v = self.eval(host, env, value)?;
+                self.bind(host, env, pattern, v.clone(), None)?;
+                v
+            }
+            Expr::Yield(..) => match self.slots.remove(&(e as *const Expr as usize)) {
+                Some(r) => r.map_err(Ctrl::Throw)?,
+                None => return self.type_error("yield inside a condition is not supported"),
+            },
+            Expr::Await(operand) => {
+                if let Some(r) = self.slots.remove(&(e as *const Expr as usize)) {
+                    return r.map_err(Ctrl::Throw);
+                }
+                let v = self.eval(host, env, operand)?;
+                self.await_now(v)?
+            }
             Expr::SuperCall(args) => {
                 let args = self.eval_args(host, env, args)?;
                 let this = self.this_of(env);
@@ -1637,8 +1769,10 @@ impl Interp {
             Arc::new(Func {
                 name: class.name.clone(),
                 params: Vec::new(),
-                body: Vec::new(),
+                body: Vec::new().into(),
                 arrow: false,
+                is_async: false,
+                is_generator: false,
             })
         });
         let ctor = self.closure(&func, instance_env, None)?;
@@ -1952,6 +2086,16 @@ impl Interp {
                 return self.call(host, &Value::Obj(target), bound_this, &all);
             }
             Kind::Function(func, scope, arrow_this) => (func.clone(), *scope, arrow_this.clone()),
+            Kind::Resolver(p, reject) => {
+                let (p, reject) = (*p, *reject);
+                let v = args.first().cloned().unwrap_or(Value::Undefined);
+                if reject {
+                    self.settle(p, false, v);
+                } else {
+                    self.resolve_promise(host, p, v)?;
+                }
+                return Ok(Value::Undefined);
+            }
             _ => return self.type_error("not a function"),
         };
         let mark = self.envs.len();
@@ -1966,6 +2110,18 @@ impl Interp {
         };
         let env = self.new_env(scope, this)?;
         self.depth += 1;
+        if func.is_async || func.is_generator {
+            let r = self.enter_body(host, env, &func, args, *id).and_then(|()| {
+                if func.is_generator {
+                    self.call_generator(env, &func)
+                } else {
+                    self.call_async(host, env, &func)
+                }
+            });
+            self.depth -= 1;
+            self.release_envs(mark);
+            return r;
+        }
         let r = self.call_body(host, env, &func, args, *id);
         self.depth -= 1;
         self.release_envs(mark);
@@ -1977,7 +2133,8 @@ impl Interp {
         }
     }
 
-    fn call_body(
+    /// Bind `arguments`, the function's own name and its parameters, and hoist its body.
+    fn enter_body(
         &mut self,
         host: &mut dyn Host,
         env: EnvId,
@@ -2017,10 +2174,38 @@ impl Interp {
             self.bind(host, env, pattern, v, Some(VarKind::Let))?;
         }
         self.hoist(env, &func.body)?;
-        for s in &func.body {
+        Ok(())
+    }
+
+    fn call_body(
+        &mut self,
+        host: &mut dyn Host,
+        env: EnvId,
+        func: &Arc<Func>,
+        args: &[Value],
+        callee: ObjId,
+    ) -> Result<(), Ctrl> {
+        self.enter_body(host, env, func, args, callee)?;
+        for s in func.body.iter() {
             self.exec(host, env, s)?;
         }
         Ok(())
+    }
+
+    fn copy_vars(&self, env: EnvId) -> Vec<Binding> {
+        self.envs[env as usize]
+            .vars
+            .iter()
+            .map(|b| Binding {
+                name: b.name.clone(),
+                value: b.value.clone(),
+                constant: b.constant,
+            })
+            .collect()
+    }
+
+    fn set_vars(&mut self, env: EnvId, vars: Vec<Binding>) {
+        self.envs[env as usize].vars = vars;
     }
 
     pub fn construct(
@@ -2063,8 +2248,10 @@ impl Interp {
                 default: None,
                 rest: false,
             }],
-            body: program,
+            body: program.into(),
             arrow: false,
+            is_async: false,
+            is_generator: false,
         });
         let env = self.global_env;
         self.closure(&func, env, None)

@@ -164,6 +164,16 @@ casts), not taken from binding crates. Ask before proposing any dependency.
   property slot; `get` calls the getter, and `put` looks up the prototype chain for a setter only once the page
   has made an accessor (`Interp::accessors`). A class is its constructor function plus a `ClassRec` (fields,
   parent); `super` finds its home through the hidden `%super`/`%class` bindings of the class scopes.
+- **`async` and generator bodies run on a statement machine** (`interp/asyncs.rs`); `yield` is a pause
+  point like `await`, and a generator object holds its paused call in `Interp::coros` (`Slot::Running`
+  while it runs, so a call it makes never takes its place). `for…of` pulls one value at a time
+  (`Interp::for_source`): never collect an iterator whole there, a generator may not end.
+  The machine itself (`async` too): frames for blocks, loops, `try` and
+  `switch`, so a call can pause between statements and resume from the microtask queue. Before a statement
+  runs, the `await`s it always evaluates are settled one by one into `Interp::slots` (keyed by the node's
+  address; the AST is shared through `Arc`, so addresses stay put); statements without `await` run whole on
+  the recursive evaluator. A paused call's scopes are pinned. The microtask queue drains at the end of every
+  task (`Runtime::checkpoint`), bounded by `MICROTASK_LIMIT`.
 - **Scripts see no cookies, cannot fetch or navigate, and store nothing on disk.** Widen this only on purpose.
 
 ### Compression invariants

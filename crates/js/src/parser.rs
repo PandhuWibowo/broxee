@@ -33,6 +33,11 @@ pub enum Expr {
     Call(Box<Expr>, Vec<Elem>, bool),
     New(Box<Expr>, Vec<Elem>),
     Seq(Vec<Expr>),
+    Await(Box<Expr>),
+    /// `[a, b] = value`, `({x} = value)`: destructuring assignment to existing names.
+    Destructure(Pattern, Box<Expr>),
+    /// `yield`, `yield value`, and `yield* iterable` (`true`).
+    Yield(Option<Box<Expr>>, bool),
     Class(Arc<Class>),
     /// `super(...)` in a constructor.
     SuperCall(Vec<Elem>),
@@ -63,7 +68,7 @@ pub enum MemberKind {
     /// A field and its initializer.
     Field(Option<Expr>),
     /// `static { ... }`.
-    Block(Vec<Stmt>),
+    Block(Body),
 }
 
 #[derive(Debug)]
@@ -100,8 +105,12 @@ pub struct Param {
 pub struct Func {
     pub name: Option<Name>,
     pub params: Vec<Param>,
-    pub body: Vec<Stmt>,
+    pub body: Body,
     pub arrow: bool,
+    /// `async`: a call returns a promise and `await` pauses the body.
+    pub is_async: bool,
+    /// `function*`: a call returns a generator and `yield` pauses the body.
+    pub is_generator: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -111,29 +120,28 @@ pub enum VarKind {
     Const,
 }
 
+/// A list of statements, shared so a paused `async` function can hold its place in it.
+pub type Body = Arc<[Stmt]>;
+
 #[derive(Debug)]
 pub enum Stmt {
     Expr(Expr),
     Var(VarKind, Vec<(Pattern, Option<Expr>)>),
     Function(Arc<Func>),
     Return(Option<Expr>),
-    If(Expr, Box<Stmt>, Option<Box<Stmt>>),
-    Block(Vec<Stmt>),
-    While(Expr, Box<Stmt>),
-    DoWhile(Box<Stmt>, Expr),
-    For(Option<Box<Stmt>>, Option<Expr>, Option<Expr>, Box<Stmt>),
+    If(Expr, Arc<Stmt>, Option<Arc<Stmt>>),
+    Block(Body),
+    While(Expr, Arc<Stmt>),
+    DoWhile(Arc<Stmt>, Expr),
+    For(Option<Arc<Stmt>>, Option<Expr>, Option<Expr>, Arc<Stmt>),
     /// Declaration kind (if declared), target, object, body; `true` for `of`.
-    ForIn(Option<VarKind>, Pattern, Expr, Box<Stmt>, bool),
+    ForIn(Option<VarKind>, Pattern, Expr, Arc<Stmt>, bool),
     Break(Option<Name>),
     Continue(Option<Name>),
     Throw(Expr),
-    Try(
-        Vec<Stmt>,
-        Option<(Option<Pattern>, Vec<Stmt>)>,
-        Option<Vec<Stmt>>,
-    ),
-    Switch(Expr, Vec<(Option<Expr>, Vec<Stmt>)>),
-    Labeled(Name, Box<Stmt>),
+    Try(Body, Option<(Option<Pattern>, Body)>, Option<Body>),
+    Switch(Expr, Vec<(Option<Expr>, Body)>),
+    Labeled(Name, Arc<Stmt>),
     Class(Arc<Class>),
     Empty,
 }
@@ -145,6 +153,12 @@ struct Parser {
     no_in: bool,
     /// How deeply expressions nest, so a hostile script cannot exhaust the stack.
     depth: usize,
+    /// `async` was just read: the function about to be parsed is async.
+    next_async: bool,
+    /// `*` was just read before a method name: the method is a generator.
+    next_generator: bool,
+    /// Inside a generator's body, where `yield` is an operator.
+    in_generator: bool,
 }
 
 const NESTING_LIMIT: usize = 300;
@@ -155,6 +169,9 @@ pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
         pos: 0,
         no_in: false,
         depth: 0,
+        next_async: false,
+        next_generator: false,
+        in_generator: false,
     };
     let mut out = Vec::new();
     while !p.at_eof() {
@@ -279,7 +296,7 @@ impl Parser {
         }
     }
 
-    fn block(&mut self) -> Result<Vec<Stmt>, String> {
+    fn block(&mut self) -> Result<Body, String> {
         self.expect("{")?;
         let mut out = Vec::new();
         while !self.eat("}") {
@@ -288,7 +305,7 @@ impl Parser {
             }
             out.push(self.statement()?);
         }
-        Ok(out)
+        Ok(out.into())
     }
 
     fn var_kind(&self) -> Option<VarKind> {
@@ -335,7 +352,7 @@ impl Parser {
             if !RESERVED.contains(&w.as_str()) {
                 self.pos += 2;
                 let body = self.statement()?;
-                return Ok(Stmt::Labeled(w.as_str().into(), Box::new(body)));
+                return Ok(Stmt::Labeled(w.as_str().into(), Arc::new(body)));
             }
         }
         match word.as_deref() {
@@ -346,6 +363,7 @@ impl Parser {
             }
             Some("async") if matches!(self.peek_at(1), Tok::Ident(w) if w == "function") => {
                 self.pos += 2;
+                self.next_async = true;
                 Ok(Stmt::Function(self.function_rest(true)?))
             }
             Some("return") => {
@@ -369,18 +387,18 @@ impl Parser {
                 self.expect(")")?;
                 let then = self.statement()?;
                 let otherwise = if self.eat_word("else") {
-                    Some(Box::new(self.statement()?))
+                    Some(Arc::new(self.statement()?))
                 } else {
                     None
                 };
-                Ok(Stmt::If(test, Box::new(then), otherwise))
+                Ok(Stmt::If(test, Arc::new(then), otherwise))
             }
             Some("while") => {
                 self.pos += 1;
                 self.expect("(")?;
                 let test = self.expression()?;
                 self.expect(")")?;
-                Ok(Stmt::While(test, Box::new(self.statement()?)))
+                Ok(Stmt::While(test, Arc::new(self.statement()?)))
             }
             Some("do") => {
                 self.pos += 1;
@@ -392,7 +410,7 @@ impl Parser {
                 let test = self.expression()?;
                 self.expect(")")?;
                 self.eat(";");
-                Ok(Stmt::DoWhile(Box::new(body), test))
+                Ok(Stmt::DoWhile(Arc::new(body), test))
             }
             Some("for") => self.for_statement(),
             Some("break" | "continue") => {
@@ -466,7 +484,7 @@ impl Parser {
                         }
                         body.push(self.statement()?);
                     }
-                    cases.push((test, body));
+                    cases.push((test, body.into()));
                 }
                 Ok(Stmt::Switch(subject, cases))
             }
@@ -513,7 +531,7 @@ impl Parser {
                 let object = self.expression()?;
                 self.expect(")")?;
                 let body = self.statement()?;
-                return Ok(Stmt::ForIn(Some(kind), pattern, object, Box::new(body), of));
+                return Ok(Stmt::ForIn(Some(kind), pattern, object, Arc::new(body), of));
             }
             let first_init = if self.eat("=") {
                 self.no_in = true;
@@ -536,7 +554,7 @@ impl Parser {
                 };
                 decls.push((p, e));
             }
-            init = Some(Box::new(Stmt::Var(kind, decls)));
+            init = Some(Arc::new(Stmt::Var(kind, decls)));
         } else if !self.is(";") {
             self.no_in = true;
             let e = self.expression();
@@ -551,9 +569,9 @@ impl Parser {
                 let object = self.expression()?;
                 self.expect(")")?;
                 let body = self.statement()?;
-                return Ok(Stmt::ForIn(None, target, object, Box::new(body), of));
+                return Ok(Stmt::ForIn(None, target, object, Arc::new(body), of));
             }
-            init = Some(Box::new(Stmt::Expr(e)));
+            init = Some(Arc::new(Stmt::Expr(e)));
         }
         self.expect(";")?;
         let test = if self.is(";") {
@@ -569,7 +587,7 @@ impl Parser {
         };
         self.expect(")")?;
         let body = self.statement()?;
-        Ok(Stmt::For(init, test, update, Box::new(body)))
+        Ok(Stmt::For(init, test, update, Arc::new(body)))
     }
 
     fn pattern(&mut self) -> Result<Pattern, String> {
@@ -673,11 +691,13 @@ impl Parser {
 
     /// Parameters and body of a method named `key`.
     fn method(&mut self, key: &Expr) -> Result<Arc<Func>, String> {
-        if self.is("*") {
-            return self.error("generators are not supported");
+        let is_async = std::mem::take(&mut self.next_async);
+        let is_generator = std::mem::take(&mut self.next_generator);
+        if is_async && is_generator {
+            return self.error("async generators are not supported");
         }
         let params = self.params()?;
-        let body = self.block()?;
+        let body = self.body(is_generator)?;
         let name = match key {
             Expr::Str(s) => Some(s.clone()),
             _ => None,
@@ -687,7 +707,17 @@ impl Parser {
             params,
             body,
             arrow: false,
+            is_async,
+            is_generator,
         }))
+    }
+
+    /// A function's body, where `yield` is an operator when it is a generator.
+    fn body(&mut self, generator: bool) -> Result<Body, String> {
+        let outer = std::mem::replace(&mut self.in_generator, generator);
+        let body = self.block();
+        self.in_generator = outer;
+        body
     }
 
     /// After `class`: a name (required for a declaration), `extends`, and the body.
@@ -727,6 +757,7 @@ impl Parser {
             }
             if self.is_word("async") && self.modifier_ahead() {
                 self.pos += 1;
+                self.next_async = true;
             }
             let accessor = match self.peek() {
                 Tok::Ident(w) if (w == "get" || w == "set") && self.modifier_ahead() => {
@@ -737,8 +768,8 @@ impl Parser {
             if accessor.is_some() {
                 self.pos += 1;
             }
-            if self.is("*") {
-                return self.error("generators are not supported");
+            if self.eat("*") {
+                self.next_generator = true;
             }
             let (key, _) = self.property_key()?;
             let kind = if self.is("(") {
@@ -777,8 +808,10 @@ impl Parser {
 
     /// After `function`: an optional name, parameters and body.
     fn function_rest(&mut self, needs_name: bool) -> Result<Arc<Func>, String> {
-        if self.eat("*") {
-            return self.error("generators are not supported");
+        let is_generator = self.eat("*");
+        let is_async = std::mem::take(&mut self.next_async);
+        if is_async && is_generator {
+            return self.error("async generators are not supported");
         }
         let name = match self.peek() {
             Tok::Ident(_) if !self.is("(") => Some(self.name()?),
@@ -786,12 +819,14 @@ impl Parser {
             _ => None,
         };
         let params = self.params()?;
-        let body = self.block()?;
+        let body = self.body(is_generator)?;
         Ok(Arc::new(Func {
             name,
             params,
             body,
             arrow: false,
+            is_async,
+            is_generator,
         }))
     }
 
@@ -865,10 +900,8 @@ impl Parser {
     }
 
     fn arrow(&mut self) -> Result<Expr, String> {
-        if self.is_word("async")
-            && !self.is_word("=>")
-            && !matches!(self.peek_at(1), Tok::Punct("=>"))
-        {
+        let is_async = self.is_word("async") && !matches!(self.peek_at(1), Tok::Punct("=>"));
+        if is_async {
             self.pos += 1;
         }
         let params = if self.is("(") {
@@ -882,19 +915,21 @@ impl Parser {
         };
         self.expect("=>")?;
         let body = if self.is("{") {
-            self.block()?
+            self.body(false)?
         } else {
             let saved = self.no_in;
             self.no_in = false;
             let e = self.assignment();
             self.no_in = saved;
-            vec![Stmt::Return(Some(e?))]
+            vec![Stmt::Return(Some(e?))].into()
         };
         Ok(Expr::Function(Arc::new(Func {
             name: None,
             params,
             body,
             arrow: true,
+            is_async,
+            is_generator: false,
         })))
     }
 
@@ -909,8 +944,35 @@ impl Parser {
     }
 
     fn assignment_inner(&mut self) -> Result<Expr, String> {
+        if self.in_generator && self.is_word("yield") {
+            self.pos += 1;
+            let delegate = self.eat("*");
+            let ends = self.toks[self.pos.min(self.toks.len() - 1)].newline_before
+                || matches!(
+                    self.peek(),
+                    Tok::Punct(")" | "]" | "}" | "," | ";" | ":") | Tok::Eof
+                );
+            let value = if ends && !delegate {
+                None
+            } else {
+                Some(Box::new(self.assignment()?))
+            };
+            return Ok(Expr::Yield(value, delegate));
+        }
         if self.arrow_ahead() {
             return self.arrow();
+        }
+        if self.is("[") || self.is("{") {
+            // A pattern followed by `=` assigns by destructuring; anything else is a literal.
+            let start = self.pos;
+            if let Ok(pattern) = self.pattern() {
+                if matches!(self.peek(), Tok::Punct("=")) {
+                    self.pos += 1;
+                    let value = self.assignment()?;
+                    return Ok(Expr::Destructure(pattern, Box::new(value)));
+                }
+            }
+            self.pos = start;
         }
         let target = self.conditional()?;
         const OPS: &[&str] = &[
@@ -1009,8 +1071,7 @@ impl Parser {
             self.pos += 1;
             let operand = self.unary()?;
             if op == "await" {
-                // No promises: an awaited value is used as it is.
-                return Ok(operand);
+                return Ok(Expr::Await(Box::new(operand)));
             }
             return Ok(Expr::Unary(op, Box::new(operand)));
         }
@@ -1195,6 +1256,9 @@ impl Parser {
                     }
                     quasis.push(std::mem::take(&mut text).into());
                     let mut inner = Parser {
+                        next_async: false,
+                        next_generator: false,
+                        in_generator: false,
                         toks: tokenize(&raw[start..end])?,
                         pos: 0,
                         no_in: false,
@@ -1289,14 +1353,23 @@ impl Parser {
                             && !matches!(self.peek_at(1), Tok::Punct("," | ":" | "(" | "}"))
                         {
                             self.pos += 1;
+                            self.next_async = true;
+                        }
+                        if self.eat("*") {
+                            self.next_generator = true;
                         }
                         let (key, shorthand) = self.property_key()?;
                         let value = if self.eat(":") {
                             self.assignment()?
                         } else if self.is("(") {
                             // A method.
+                            let is_async = std::mem::take(&mut self.next_async);
+                            let is_generator = std::mem::take(&mut self.next_generator);
+                            if is_async && is_generator {
+                                return self.error("async generators are not supported");
+                            }
                             let params = self.params()?;
-                            let body = self.block()?;
+                            let body = self.body(is_generator)?;
                             let name = match &key {
                                 Expr::Str(s) => Some(s.clone()),
                                 _ => None,
@@ -1306,6 +1379,8 @@ impl Parser {
                                 params,
                                 body,
                                 arrow: false,
+                                is_async,
+                                is_generator,
                             }))
                         } else {
                             match shorthand {
@@ -1327,6 +1402,7 @@ impl Parser {
                 "function" => Ok(Expr::Function(self.function_rest(false)?)),
                 "async" if self.is_word("function") => {
                     self.pos += 1;
+                    self.next_async = true;
                     Ok(Expr::Function(self.function_rest(false)?))
                 }
                 "this" => Ok(Expr::This),
@@ -1404,8 +1480,11 @@ mod tests {
     #[test]
     fn reports_what_it_does_not_support() {
         assert!(parse("class { }").is_err(), "a declaration needs a name");
-        assert!(parse("class A { *g() {} }").is_err());
-        assert!(parse("function* g() {}").is_err());
+        assert!(parse("async function* g() {}").is_err());
+        assert!(
+            parse("var yield = 1; yield + 1").is_ok(),
+            "a name outside generators"
+        );
         assert!(parse("var = 3").is_err());
         assert!(
             parse("a = 1 b = 2").is_err(),
