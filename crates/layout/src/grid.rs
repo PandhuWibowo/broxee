@@ -315,6 +315,7 @@ impl Engine<'_> {
             return;
         }
         self.out.boxes[i].rect.height = border_height;
+        self.moved(i..i + 1);
         for c in clips {
             if self.out.clips[c].boxes.0 as usize == i + 1 {
                 self.out.clips[c].rect.height = (self.out.clips[c].rect.height + delta).max(0.0);

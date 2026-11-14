@@ -51,6 +51,7 @@ thread) and, later, the JavaScript event loop (single-threaded, as in every brow
 | Navigation runs stages 2 to 9 on the loader thread; after each stage it reports progress and the engine thread repaints the loading line on its next frame | sequential, off the engine thread | loader, then engine |
 | Frames are painted straight into one of two `IOSurface`s; the one on screen is never written | double-buffered | engine, then main |
 | A change to the header alone (typing in the address field, the loading line) paints only the header, into the header layer's own two small surfaces; a full frame includes the header and hides that layer | double-buffered | engine, then main |
+| A DOM change (a key in a field, a script's handler or timer, `:hover`/`:focus` that a rule sees) runs `engine::update` once for everything that task changed: the cascade again unless only text changed and no rule reads text, then layout inside the smallest anchor around the changes (a full layout when none fits) | sequential, coalesced per task | engine |
 | Switching tab: the visible page is reduced to its sources, written to disk, then dropped; the selected tab is read back and rebuilt with stages 2 to 9 (no fetches) | sequential | engine |
 | The session file is rewritten (temporary file, then rename) after each tab or navigation change | sequential, a few KB | engine |
 

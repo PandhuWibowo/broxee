@@ -22,6 +22,7 @@
 
 mod flex;
 mod grid;
+mod incremental;
 mod table;
 
 use std::collections::HashMap;
@@ -248,6 +249,10 @@ pub struct Layout {
     pub texts: ChunkVec<TextFragment>,
     /// The laid-out text of every fragment, back to back.
     text: String,
+    /// Bytes of `text` no fragment uses any more, left by `relayout`.
+    text_garbage: usize,
+    /// Boxes that can be laid out again on their own, by box index (`relayout`).
+    anchors: Vec<Anchor>,
     pub layers: Vec<Layer>,
     pub clips: Vec<Clip>,
     pub groups: Vec<Group>,
@@ -352,6 +357,8 @@ impl Layout {
             boxes: Vec::new(),
             texts: ChunkVec::new(),
             text: String::new(),
+            text_garbage: 0,
+            anchors: Vec::new(),
             layers: vec![FLOW_LAYER],
             clips: Vec::new(),
             groups: Vec::new(),
@@ -406,6 +413,57 @@ impl Layout {
     }
 }
 
+/// A box `relayout` can lay out again by itself: it clips its overflow (so nothing inside
+/// reaches the scrollable height), is in normal flow, and what it was built from is recorded.
+/// Ranges are its fragments and those of everything inside it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Anchor {
+    node: NodeId,
+    boxes: (u32, u32),
+    texts: (u32, u32),
+    clips: (u32, u32),
+    groups: (u32, u32),
+    /// How many anchors inside it follow it in `Layout::anchors`.
+    inner: u32,
+    place: Place,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Place {
+    /// Built where it is by `build_box` with these arguments.
+    Flow {
+        x: f32,
+        y: f32,
+        content_width: f32,
+        cb_width: f32,
+        cb_height: Option<f32>,
+    },
+    /// An inline block laid out at the origin, with its line item's size, not yet on a line.
+    Origin(Atomic),
+    /// An inline block moved onto its line by (dx, dy).
+    Line(Atomic, f32, f32),
+    /// Moved or resized after it was built: only a full layout reproduces it.
+    Moved,
+}
+
+/// What a line knows of an inline block: its width with margins, its outer height, and how
+/// far its baseline is below its top margin edge; and the line width it shrank to fit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Atomic {
+    cb: f32,
+    width: f32,
+    height: f32,
+    above: f32,
+}
+
+/// Where an entry outside the replaced box sits relative to it, by box indices.
+#[derive(Clone, Copy, PartialEq)]
+enum Around {
+    Before,
+    Encloses,
+    After,
+}
+
 const FLOW_LAYER: Layer = Layer {
     boxes: 0,
     texts: 0,
@@ -431,6 +489,62 @@ pub fn font_key(s: &ComputedStyle) -> FontKey {
     }
 }
 
+impl<'a> Engine<'a> {
+    /// An engine laying out for a viewport of `width` by `height` CSS px, with nothing laid out.
+    fn new(
+        dom: &'a Dom,
+        styles: &'a StyleMap,
+        metrics: &'a dyn TextMetrics,
+        natural: NaturalSize<'a>,
+        width: f32,
+        height: f32,
+    ) -> Engine<'a> {
+        Engine {
+            dom,
+            natural,
+            styles,
+            metrics,
+            out: Layout {
+                boxes: Vec::new(),
+                texts: ChunkVec::new(),
+                text: String::new(),
+                text_garbage: 0,
+                anchors: Vec::new(),
+                layers: vec![FLOW_LAYER],
+                clips: Vec::new(),
+                groups: Vec::new(),
+                width,
+                height: 0.0,
+                box_extents: Vec::new(),
+                text_extents: Vec::new(),
+            },
+            items: Vec::new(),
+            words: String::new(),
+            bottom: 0.0,
+            deferred: Vec::new(),
+            containing: HashMap::default(),
+            current_box: None,
+            intrinsic: HashMap::default(),
+            measuring: false,
+            atomics: Vec::new(),
+            line_width: width,
+            centering: false,
+            img: dom.atom("img"),
+            viewport: Rect {
+                x: 0.0,
+                y: 0.0,
+                width,
+                height,
+            },
+            ifc_origin: (0.0, 0.0),
+            in_fixed: false,
+            layer_z: [0, 0],
+            floats: Vec::new(),
+            float_floor: f32::MIN,
+        }
+    }
+}
+
 pub fn layout(
     dom: &Dom,
     styles: &StyleMap,
@@ -439,48 +553,9 @@ pub fn layout(
     width: f32,
     height: f32,
 ) -> Layout {
-    let mut engine = Engine {
-        dom,
-        natural,
-        styles,
-        metrics,
-        out: Layout {
-            // At most one box per element: reserving avoids the up-to-2x overshoot of Vec growth.
-            boxes: Vec::with_capacity(dom.element_count()),
-            texts: ChunkVec::new(),
-            text: String::new(),
-            layers: vec![FLOW_LAYER],
-            clips: Vec::new(),
-            groups: Vec::new(),
-            width,
-            height: 0.0,
-            box_extents: Vec::new(),
-            text_extents: Vec::new(),
-        },
-        items: Vec::new(),
-        words: String::new(),
-        bottom: 0.0,
-        deferred: Vec::new(),
-        containing: HashMap::default(),
-        current_box: None,
-        intrinsic: HashMap::default(),
-        measuring: false,
-        atomics: Vec::new(),
-        line_width: width,
-        centering: false,
-        img: dom.atom("img"),
-        viewport: Rect {
-            x: 0.0,
-            y: 0.0,
-            width,
-            height,
-        },
-        ifc_origin: (0.0, 0.0),
-        in_fixed: false,
-        layer_z: [0, 0],
-        floats: Vec::new(),
-        float_floor: f32::MIN,
-    };
+    let mut engine = Engine::new(dom, styles, metrics, natural, width, height);
+    // At most one box per element: reserving avoids the up-to-2x overshoot of Vec growth.
+    engine.out.boxes.reserve_exact(dom.element_count());
     let content = engine.layout_children(Dom::ROOT, 0.0, 0.0, width, Some(height));
     // Out-of-flow boxes last, in document order; laying one out can defer more (nested ones).
     let mut next = 0;
@@ -954,6 +1029,33 @@ impl<'a> Engine<'a> {
         let index = self.out.boxes.len();
         let first_text = self.out.texts.len();
         let first_clip = self.out.clips.len();
+        let first_group = self.out.groups.len();
+        let clips_content = s.clips && !self.overflows_to_viewport(id);
+        // Floats outside reach into a box that does not start a context: it depends on them.
+        let anchor = (clips_content
+            && forced_height.is_none()
+            && s.position == Position::Static
+            && s.float == Float::None
+            && s.display != Display::Inline
+            && (self.floats.is_empty() || self.starts_context(id, s)))
+        .then(|| {
+            self.out.anchors.push(Anchor {
+                node: id,
+                boxes: (index as u32, 0),
+                texts: (first_text as u32, 0),
+                clips: (first_clip as u32, 0),
+                groups: (first_group as u32, 0),
+                inner: 0,
+                place: Place::Flow {
+                    x,
+                    y,
+                    content_width,
+                    cb_width,
+                    cb_height,
+                },
+            });
+            self.out.anchors.len() - 1
+        });
         // A relatively positioned box with a z-index paints in its own layer; the flow after
         // it resumes in the layer it interrupted.
         let resume_z = (s.position == Position::Relative && s.z_index.is_some()).then(|| {
@@ -987,6 +1089,7 @@ impl<'a> Engine<'a> {
             )
         });
         let had_floats = !self.floats.is_empty() || outer_floats.is_some();
+        let bottom_before = self.bottom;
         let mut content_height = if s.display.is_flex() {
             self.layout_flex(id, content_x, content_y, content_width, own_height)
         } else if s.display.is_grid() {
@@ -1008,6 +1111,10 @@ impl<'a> Engine<'a> {
             }
             None => None,
         };
+        if clips_content {
+            // Clipped content does not scroll the page (CSS Overflow 3, 2.2): only the box.
+            self.bottom = bottom_before;
+        }
         // Floats grow the box that holds their formatting context, and no other.
         if let Some(bottom) = inner.and_then(|f| f.iter().map(|f| f.bottom).reduce(f32::max)) {
             content_height = content_height.max(bottom - content_y);
@@ -1059,6 +1166,15 @@ impl<'a> Engine<'a> {
                 node: id,
                 kind: GroupKind::Transform,
             });
+        }
+        if let Some(a) = anchor {
+            let inner = (self.out.anchors.len() - a - 1) as u32;
+            let anchor = &mut self.out.anchors[a];
+            anchor.boxes.1 = self.out.boxes.len() as u32;
+            anchor.texts.1 = self.out.texts.len() as u32;
+            anchor.clips.1 = self.out.clips.len() as u32;
+            anchor.groups.1 = self.out.groups.len() as u32;
+            anchor.inner = inner;
         }
         let mut offset = (0.0, 0.0);
         if s.position == Position::Relative {
@@ -1384,6 +1500,7 @@ impl<'a> Engine<'a> {
         dx: f32,
         dy: f32,
     ) {
+        self.moved(boxes.clone());
         if dx == 0.0 && dy == 0.0 {
             return;
         }
@@ -1399,6 +1516,44 @@ impl<'a> Engine<'a> {
         for c in &mut self.out.clips[clips] {
             c.rect.x += dx;
             c.rect.y += dy;
+        }
+    }
+
+    /// Whether `id` is the root element or `<body>`, whose `overflow` browsers apply to the
+    /// viewport (CSS Overflow 3, 3.3): what they hide still scrolls the page.
+    fn overflows_to_viewport(&self, id: NodeId) -> bool {
+        match self.dom.parent(id) {
+            Some(Dom::ROOT) => true,
+            Some(p) => {
+                self.dom.parent(p) == Some(Dom::ROOT) && self.dom.tag_name(id) == Some("body")
+            }
+            None => false,
+        }
+    }
+
+    /// The anchor of the inline block whose box is `first`, while it waits for its line.
+    fn origin_of(&self, first: usize) -> Option<(usize, Atomic)> {
+        let anchors = &self.out.anchors;
+        let i = anchors.partition_point(|a| (a.boxes.0 as usize) < first);
+        match anchors.get(i) {
+            Some(a) if a.boxes.0 as usize == first => match a.place {
+                Place::Origin(atomic) => Some((i, atomic)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Boxes in `boxes` are moved or resized after they were built: their anchors no longer
+    /// say how to build them where they are.
+    pub(crate) fn moved(&mut self, boxes: Range<usize>) {
+        let anchors = &mut self.out.anchors;
+        let first = anchors.partition_point(|a| (a.boxes.0 as usize) < boxes.start);
+        for a in &mut anchors[first..] {
+            if a.boxes.0 as usize >= boxes.end {
+                break;
+            }
+            a.place = Place::Moved;
         }
     }
 
@@ -1752,7 +1907,12 @@ impl<'a> Engine<'a> {
                             // Laid out at the origin while collecting; move it onto the line.
                             let (boxes, texts, clips) = self.atomics[laid as usize].clone();
                             let top = baseline - above;
+                            let origin = self.origin_of(boxes.start);
                             self.shift_range(boxes, texts, clips, pen, top);
+                            if let Some((a, atomic)) = origin {
+                                // The one move a line makes is recorded, not a reason to give up.
+                                self.out.anchors[a].place = Place::Line(atomic, pen, top);
+                            }
                             if !self.in_fixed {
                                 self.bottom = self.bottom.max(top + h);
                             }
@@ -1869,8 +2029,6 @@ impl<'a> Engine<'a> {
     fn collect_inline_block(&mut self, id: NodeId) {
         let s = self.style(id);
         let cb = self.line_width;
-        let edges = Edges::of(s, cb);
-        let extra = edges.x();
         let margin = [0, 1, 2, 3].map(|i| resolve(s.margin[i], cb).unwrap_or(0.0));
         let horizontal = margin[1] + margin[3];
         let (min_content, max_content) = self.intrinsic_width(id);
@@ -1886,6 +2044,35 @@ impl<'a> Engine<'a> {
             });
             return;
         }
+        let (atomic, ranges) = self.build_inline_block(id, min_content, max_content);
+        self.atomics.push(ranges);
+        self.items.push(Item::Atomic {
+            node: id,
+            width: atomic.width,
+            height: atomic.height,
+            above: atomic.above,
+            min: 0.0,
+            laid: (self.atomics.len() - 1) as u32,
+            space_after: 0.0,
+        });
+    }
+
+    /// Lay out inline block `id` at the origin for a line `self.line_width` wide. Returns
+    /// what the line needs to know of it and its fragment ranges (boxes, texts, clips).
+    #[allow(clippy::type_complexity)]
+    fn build_inline_block(
+        &mut self,
+        id: NodeId,
+        min_content: f32,
+        max_content: f32,
+    ) -> (Atomic, (Range<usize>, Range<usize>, Range<usize>)) {
+        let s = self.style(id);
+        let cb = self.line_width;
+        let edges = Edges::of(s, cb);
+        let extra = edges.x();
+        let margin = [0, 1, 2, 3].map(|i| resolve(s.margin[i], cb).unwrap_or(0.0));
+        let horizontal = margin[1] + margin[3];
+        let first_anchor = self.out.anchors.len();
         let available = (cb - horizontal - extra).max(0.0);
         let content_width = match content_size(s, s.width, Some(cb), extra) {
             Some(w) => w,
@@ -1928,20 +2115,23 @@ impl<'a> Engine<'a> {
             }
             _ => outer_height,
         };
-        self.atomics.push((
-            start.0..self.out.boxes.len(),
-            texts,
-            start.2..self.out.clips.len(),
-        ));
-        self.items.push(Item::Atomic {
-            node: id,
+        let atomic = Atomic {
+            cb,
             width: content_width + extra + horizontal,
             height: outer_height,
             above,
-            min: 0.0,
-            laid: (self.atomics.len() - 1) as u32,
-            space_after: 0.0,
-        });
+        };
+        if let Some(a) = self.out.anchors.get_mut(first_anchor) {
+            if a.boxes.0 as usize == start.0 && a.place != Place::Moved {
+                a.place = Place::Origin(atomic);
+            }
+        }
+        let ranges = (
+            start.0..self.out.boxes.len(),
+            texts,
+            start.2..self.out.clips.len(),
+        );
+        (atomic, ranges)
     }
 
     /// Flatten an inline node into items.

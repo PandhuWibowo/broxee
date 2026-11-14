@@ -124,7 +124,25 @@ pub struct Dom {
     generated: HashMap<NodeId, [(NodeId, bool); 2], FastBuildHasher>,
     /// How many generated boxes are shown: zero lets `generated()` skip the lookup.
     shown_generated: usize,
+    /// What scripts and form controls changed since `take_changes`, for incremental restyle
+    /// and relayout. `None` once there were too many to be worth tracking.
+    changes: Option<Vec<Change>>,
 }
+
+/// One change to the tree since the page was last styled and laid out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Change {
+    /// The text of this text node.
+    Text(NodeId),
+    /// An attribute or the tag of this element.
+    Element(NodeId),
+    /// The children of this node: one was added, removed or moved.
+    Children(NodeId),
+}
+
+/// Past this many changes a page is restyled and laid out whole: tracking more costs more
+/// than it saves.
+const MAX_CHANGES: usize = 1024;
 
 /// Hasher for engine tables keyed by page data (tags, classes, computed styles, glyph keys).
 /// std's SipHash resists collision attacks, which costs more than it protects here: a page can
@@ -215,6 +233,7 @@ impl Dom {
             atom_index: HashMap::default(),
             generated: HashMap::default(),
             shown_generated: 0,
+            changes: Some(Vec::new()),
         }
     }
 
@@ -375,6 +394,7 @@ impl Dom {
     /// form controls the parts they draw (a value, a placeholder, a check mark); the page's
     /// own nodes keep their ids.
     pub fn append_element(&mut self, parent: NodeId, tag: &str) -> NodeId {
+        self.record(Change::Children(parent));
         let atom = self.intern(tag);
         let first = self.attrs.len() as u32;
         self.append(parent, Kind::Element, atom, first, 0)
@@ -382,8 +402,28 @@ impl Dom {
 
     /// Append a text node as the last child of `parent`.
     pub fn append_text(&mut self, parent: NodeId, text: &str) -> NodeId {
+        self.record(Change::Children(parent));
         let (start, len) = self.push_text(text);
         self.append(parent, Kind::Text, start, len, 0)
+    }
+
+    fn record(&mut self, change: Change) {
+        if let Some(list) = &mut self.changes {
+            if list.last() == Some(&change) {
+                return;
+            }
+            if list.len() < MAX_CHANGES {
+                list.push(change);
+            } else {
+                self.changes = None;
+            }
+        }
+    }
+
+    /// The changes made since the last call, in order (repeats of the last one left out), or
+    /// `None` when there were too many: then anything may have changed.
+    pub fn take_changes(&mut self) -> Option<Vec<Change>> {
+        self.changes.replace(Vec::new())
     }
 
     /// Replace the text of text node `id`. The old text stays in the buffer unused, so this
@@ -392,6 +432,14 @@ impl Dom {
         if self.nodes[id as usize].kind != Kind::Text {
             return;
         }
+        if matches!(self.kind(id), NodeKind::Text(t) if t == text) {
+            return;
+        }
+        self.record(Change::Text(id));
+        self.replace_text(id, text);
+    }
+
+    fn replace_text(&mut self, id: NodeId, text: &str) {
         let (start, len) = self.push_text(text);
         let n = &mut self.nodes[id as usize];
         n.a = start;
@@ -430,13 +478,15 @@ impl Dom {
                 let node = self.create_element(if after { "::after" } else { "::before" });
                 // The parent link without a place among the children.
                 self.nodes[node as usize].parent = owner;
-                self.append_text(node, "");
+                let (start, len) = self.push_text("");
+                self.append(node, Kind::Text, start, len, 0);
                 node
             }
         };
         let text_node = self.nodes[element as usize].first_child;
         if !matches!(self.kind(text_node), NodeKind::Text(t) if t == text) {
-            self.set_text(text_node, text);
+            // The cascade shows these; the change is not one it has to be told about.
+            self.replace_text(text_node, text);
         }
         let pair = self.generated.entry(owner).or_insert([(NONE, false); 2]);
         if !pair[slot].1 {
@@ -491,6 +541,7 @@ impl Dom {
         if parent == NONE {
             return;
         }
+        self.record(Change::Children(parent));
         let next = self.nodes[id as usize].next_sibling;
         let p = &self.nodes[parent as usize];
         if p.first_child == id {
@@ -526,6 +577,7 @@ impl Dom {
             a = self.parent(n);
         }
         self.detach(child);
+        self.record(Change::Children(parent));
         let prev_last = self.nodes[parent as usize].last_child;
         self.nodes[child as usize].parent = parent;
         self.nodes[parent as usize].last_child = child;
@@ -567,6 +619,10 @@ impl Dom {
         if self.nodes[id as usize].kind != Kind::Element {
             return;
         }
+        if self.attr(id, name) == Some(value) {
+            return;
+        }
+        self.record(Change::Element(id));
         let atom = self.intern(name);
         let n = &self.nodes[id as usize];
         let (first, count) = (n.b as usize, usize::from(n.attr_count));
@@ -608,6 +664,7 @@ impl Dom {
         if attrs.len() == count {
             return;
         }
+        self.record(Change::Element(id));
         let at = self.attrs.len() as u32;
         self.attrs.extend_from_slice(&attrs);
         let n = &mut self.nodes[id as usize];
@@ -621,6 +678,9 @@ impl Dom {
             return;
         }
         let atom = self.intern(tag);
+        if self.nodes[id as usize].a != atom {
+            self.record(Change::Element(id));
+        }
         self.nodes[id as usize].a = atom;
     }
 
@@ -876,6 +936,45 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn records_changes_for_incremental_layout() {
+        let mut dom = parse("<p id=a>one</p><div></div>");
+        assert_eq!(dom.take_changes(), Some(vec![]), "parsing is not a change");
+        let p = dom
+            .descendants(Dom::ROOT)
+            .find(|&n| dom.tag_name(n) == Some("p"))
+            .unwrap();
+        let div = dom.siblings_from(p).nth(1).unwrap();
+        let text = dom.children(p).next().unwrap();
+        dom.set_text(text, "one");
+        dom.set_attr(p, "id", "a");
+        assert_eq!(
+            dom.take_changes(),
+            Some(vec![]),
+            "setting what is there changes nothing"
+        );
+        dom.set_text(text, "two");
+        dom.set_attr(p, "class", "x");
+        dom.append_child(div, text);
+        dom.show_generated(div, false, "*");
+        assert_eq!(
+            dom.take_changes(),
+            Some(vec![
+                Change::Text(text),
+                Change::Element(p),
+                Change::Children(p),
+                Change::Children(div),
+            ]),
+            "generated boxes are the cascade's, not changes"
+        );
+        for i in 0..=MAX_CHANGES {
+            dom.set_text(text, &i.to_string());
+            dom.set_attr(div, "n", &i.to_string());
+        }
+        assert_eq!(dom.take_changes(), None, "too many to track");
+        assert_eq!(dom.take_changes(), Some(vec![]), "tracking starts again");
+    }
 
     #[test]
     fn appends_and_edits_nodes_keeping_ids() {

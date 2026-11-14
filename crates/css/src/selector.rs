@@ -139,6 +139,11 @@ impl Compound {
         !self.nth.is_empty() || self.empty || self.not.iter().any(Compound::is_structural)
     }
 
+    /// Whether matching looks at the element's text (`:empty`).
+    pub fn reads_text(&self) -> bool {
+        self.empty || self.not.iter().any(Compound::reads_text)
+    }
+
     /// The states this compound or its `:not()` arguments look at.
     pub fn all_states(&self) -> u8 {
         self.not.iter().fold(self.states, |s, c| s | c.all_states())
