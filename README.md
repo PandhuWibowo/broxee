@@ -267,6 +267,8 @@ time something reads it (most theme variables never are). A `var()` value is sub
 
 | 2026-11-14 | HTTP disk cache, one per profile (#30) | 3.6 MB (3,584,656 → 3,617,808 bytes, +33 KB) | 50.0 MB peak painted at 2x | GitHub repository page, reloaded with a warm cache (`--cache DIR`): 2,294 → 248 ms in all, 700 → 52 KB received (only the HTML, which sets cookies, is fetched again; 23 stylesheets and 9 images come from disk). Entries keep the encoding they arrived in; `max-age`, `Expires`, heuristic freshness, `ETag`/`Last-Modified` revalidation, `no-store`, `Vary: Accept-Encoding` |
 
+| 2026-11-14 | Split view: panes saved with the session, numbered badges on tabs in panes, drag a tab onto a pane, resize panes (#31) | 3.6 MB (unchanged, 3,617,808 bytes) | 49.8 MB peak painted at 2x | Window with GitHub, Wikipedia, HN and example.com in 4 panes (`footprint`): 29 MB idle, 61 MB peak, the same as `main`. It was 31 MB idle and 45 MB peak at #7: pages now run scripts and load web fonts while the panes fill |
+
 Other pages after the layout milestone: GitHub home 22.7 MB peak (8,170 rules); Hacker News 11.5 MB.
 
 GitHub after custom properties: 39 MB peak, 24 ms cascade, 24,822 rules. Rules that only declare or use
@@ -360,9 +362,9 @@ Where data lives, and what compression does for it (measured 2026-11-07):
   They are saved per profile in `profiles/<profile>/bookmarks` (0600).
 - Sidebar rows have no keyboard focus of their own: tabs are reached with ⌘1 … ⌘9 and the palette, which
   also runs every sidebar action. Dragging needs the mouse.
-- Split view: panes are not saved with the session yet, the tab list does not mark which tabs are in a pane,
-  and tabs cannot be dragged onto a pane. A pane that has not had focus since the layout changed shows its
-  tab's title until it is clicked.
+- Split view: a pane that has not had focus since the layout changed (or since its divider moved) shows its
+  tab's title until it is clicked. With four panes on GitHub, Wikipedia, HN and example.com the window peaks
+  at 61 MB while the pages load (29 MB idle), on `main` as on this change: over the 60 MB budget.
 - A tooltip can stay on screen when the pointer leaves the window over it, until the next input: the
   window does not track the pointer leaving yet.
 - Profiles start as Personal and Work; up to 12, each with its own folder in `profiles/` (named by a fixed

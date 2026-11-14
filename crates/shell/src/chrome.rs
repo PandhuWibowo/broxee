@@ -247,6 +247,9 @@ pub fn sidebar_drop(y: f32, scroll: f32, rows: usize) -> usize {
 }
 
 /// A row of the sidebar's list.
+/// The numbered box marking a tab shown in a pane, in points.
+const BADGE: f32 = 16.0;
+
 pub enum ListRow<'a> {
     /// A section label, 12px semibold in `muted` (DESIGN.md, section 4): "Pinned", a tab
     /// group, a bookmark folder.
@@ -257,6 +260,8 @@ pub enum ListRow<'a> {
         muted: bool,
         /// With a close button at its right end.
         closable: bool,
+        /// Shown in this pane of a split (from 1): a numbered badge, not only a color.
+        pane: Option<u8>,
     },
 }
 
@@ -892,9 +897,13 @@ impl Chrome {
                     fit_in(text, room, 12.0 * s, FontKey::UI_SEMIBOLD, metrics)
                 }
                 ListRow::Item {
-                    title, closable, ..
+                    title,
+                    closable,
+                    pane,
+                    ..
                 } => {
-                    let right = if *closable { CLOSE_SIZE } else { 8.0 };
+                    let badge = if pane.is_some() { BADGE + 4.0 } else { 0.0 };
+                    let right = if *closable { CLOSE_SIZE } else { 8.0 } + badge;
                     let room = (sw - ROW_INSET - right - ROW_TEXT) * s;
                     fit(title, room, 13.0 * s, metrics)
                 }
@@ -923,8 +932,44 @@ impl Chrome {
                     color: t.muted,
                 }),
                 ListRow::Item {
-                    muted, closable, ..
+                    muted,
+                    closable,
+                    pane,
+                    ..
                 } => {
+                    if let Some(n) = pane {
+                        // A small outlined box with the pane's number, left of the close
+                        // button's place.
+                        let right = sw - ROW_INSET - if *closable { CLOSE_SIZE } else { 8.0 };
+                        let (bx, by) = (right - BADGE, row_top(i) + (TAB_ROW - BADGE) / 2.0);
+                        let (b0, b1) = (px(bx), px(bx + BADGE));
+                        let (t0, t1) = (px(by), px(by + BADGE));
+                        let edge = px(1.0).max(1);
+                        for (x0, y0, x1, y1) in [
+                            (b0, t0, b1, t0 + edge),
+                            (b0, t1 - edge, b1, t1),
+                            (b0, t0, b0 + edge, t1),
+                            (b1 - edge, t0, b1, t1),
+                        ] {
+                            list.push(Op::Fill {
+                                x0,
+                                y0,
+                                x1,
+                                y1,
+                                color: t.text_2,
+                            });
+                        }
+                        let label = ["1", "2", "3", "4"][usize::from(n.clamp(&1, &4) - 1)];
+                        let w = metrics.width(label, 11.0 * s, FontKey::UI_SEMIBOLD);
+                        list_text.push(Op::Text {
+                            x: px(bx + BADGE / 2.0) as f32 - w / 2.0,
+                            baseline: px(by + BADGE - 4.5) as f32,
+                            text: label,
+                            size: 11.0 * s,
+                            font: FontKey::UI_SEMIBOLD,
+                            color: t.text_2,
+                        });
+                    }
                     if selected {
                         list.push(Op::Mask {
                             x: px(ROW_INSET),
@@ -2099,6 +2144,7 @@ mod tests {
             title,
             muted: false,
             closable: false,
+            pane: None,
         };
         let rows = [
             item("a"),
@@ -2106,6 +2152,7 @@ mod tests {
                 title: "b",
                 muted: false,
                 closable: true,
+                pane: None,
             },
             ListRow::Label("Folder".into()),
             item("c"),
