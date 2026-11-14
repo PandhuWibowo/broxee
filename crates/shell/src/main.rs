@@ -7,6 +7,8 @@ mod images;
 mod pool;
 mod script;
 mod scriptnet;
+// Used by the window (browser.rs), which only macOS builds; its tests run everywhere.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod selection;
 mod webfonts;
 
