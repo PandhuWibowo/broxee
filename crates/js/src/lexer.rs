@@ -166,6 +166,8 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, String> {
         } else {
             let p = PUNCTS
                 .iter()
+                // `a?.5:1` is a conditional, not optional chaining.
+                .filter(|p| **p != "?." || !b.get(i + 2).is_some_and(u8::is_ascii_digit))
                 .find(|p| src[i..].starts_with(**p))
                 .ok_or_else(|| format!("line {line}: unexpected character {:?}", c as char))?;
             i += p.len();

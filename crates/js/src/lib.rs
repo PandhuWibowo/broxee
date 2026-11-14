@@ -405,6 +405,42 @@ mod tests {
     }
 
     #[test]
+    fn runs_classes_and_accessors() {
+        big_stack(runs_classes_and_accessors_inner);
+    }
+
+    fn runs_classes_and_accessors_inner() {
+        let cases = [
+            ("class A { constructor(x) { this.x = x } double() { return this.x * 2 } } new A(4).double()", "8"),
+            ("class A { n = 1; m = this.n + 1; static k = 'K'; static of() { return new this() } } const a = A.of(); [a.n, a.m, A.k, a instanceof A]", "[1, 2, \"K\", true]"),
+            ("class A { constructor(x) { this.x = x } hi() { return 'A' + this.x } static make() { return 's' } }\
+              class B extends A { y = 'y'; constructor(x) { super(x + 1); this.z = this.y } hi() { return 'B' + super.hi() } }\
+              const b = new B(1); [b.hi(), b.z, b instanceof A, B.make(), Object.getPrototypeOf(B) === A]", "[\"BA2\", \"y\", true, \"s\", true]"),
+            ("class A { constructor(...xs) { this.n = xs.length } } class B extends A { f = this.n } [new B(1, 2, 3).f, new B().n]", "[3, 0]"),
+            ("class Temp { #c = 0; get f() { return this.#c * 9 / 5 + 32 } set f(v) { this.#c = (v - 32) * 5 / 9 } } const t = new Temp(); t.f = 212; [t.f, Math.round(t.#c)]", "[212, 100]"),
+            ("class A { static #count = 0; static next() { return ++A.#count } static { A.ready = true } } A.next(); [A.next(), A.ready]", "[2, true]"),
+            ("class MyError extends Error { constructor(m) { super(m); this.name = 'MyError' } }\
+              var r; try { throw new MyError('bad') } catch (e) { r = [e instanceof MyError, e instanceof Error, e.message, e.name] } r", "[true, true, \"bad\", \"MyError\"]"),
+            ("class A {} var r; try { A() } catch (e) { r = e instanceof TypeError } r", "true"),
+            ("const C = class Named { who() { return Named.name } }; [new C().who(), C.name]", "[\"Named\", \"Named\"]"),
+            ("class A { ['comp' + 'uted']() { return 1 } handle = () => this.v; v = 7 } const a = new A(); const h = a.handle; [a.computed(), h()]", "[1, 7]"),
+            ("var o = { _v: 1, get v() { return this._v * 10 }, set v(x) { this._v = x } }; o.v = 3; [o.v, o._v]", "[30, 3]"),
+            ("var o = {}; Object.defineProperty(o, 'x', { get() { return 'got' } }); o.x = 'ignored'; o.x", "got"),
+            ("var a = true; a?.5:1", "0.5"),
+            ("const m = new Map([['a', 1], ['b', 2]]); let s = ''; for (const [k, v] of m) s += k + v; [s, [...new Set([3, 3, 4])]]", "[\"a1b2\", [3, 4]]"),
+            ("class R { constructor(n) { this.n = n } [Symbol.iterator]() { let i = 0; const n = this.n; return { next: () => i < n ? { value: i++, done: false } : { done: true } } } } [...new R(3)]", "[0, 1, 2]"),
+            ("const f = Object.freeze({}); [Object.isFrozen(f), Object.isFrozen({}), Object.isExtensible({})]", "[true, false, true]"),
+            ("var o = { get g() { return 1 }, v: 2 }; const d = Object.getOwnPropertyDescriptor(o, 'g'); [typeof d.get, Object.getOwnPropertyDescriptor(o, 'v').value, Object.getOwnPropertyNames(o)]", "[\"function\", 2, [\"g\", \"v\"]]"),
+            ("const s = Symbol('k'), o = {[s]: 1}; [o[s], Symbol('k') === s, Symbol.for('x') === Symbol.for('x'), typeof Symbol.iterator]", "[1, false, true, \"string\"]"),
+            ("const w = new WeakMap(); const k = {}; w.set(k, 2); [w.get(k), w.has({}), new WeakSet([k]).has(k)]", "[2, false, true]"),
+            ("class P { get kind() { return 'p' } } class Q extends P { get kind() { return 'q' + super.kind } } new Q().kind", "qp"),
+        ];
+        for (src, want) in cases {
+            assert_eq!(eval(src), want, "{src}");
+        }
+    }
+
+    #[test]
     fn timers_and_logs() {
         let mut host = Bare::default();
         let mut rt = Runtime::new();
@@ -433,7 +469,7 @@ mod tests {
     fn stops_runaway_and_broken_scripts_inner() {
         let mut host = Bare::default();
         let mut rt = Runtime::new();
-        rt.run(&mut host, "class A {}", "a.js");
+        rt.run(&mut host, "function* gen() {}", "a.js");
         assert!(host.log[0].starts_with("SyntaxError in a.js"));
         rt.run(&mut host, "undefinedFunction()", "b.js");
         assert!(host.log[1].contains("ReferenceError"), "{}", host.log[1]);

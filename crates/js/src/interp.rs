@@ -10,7 +10,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::parser::{Elem, Expr, Func, Name, Param, Pattern, Prop, Stmt, VarKind};
+use crate::parser::{
+    Class, Elem, Expr, Func, MemberKind, Name, Param, Pattern, Prop, Stmt, VarKind,
+};
 use crate::Host;
 
 pub type ObjId = u32;
@@ -59,6 +61,20 @@ pub enum Kind {
     Style(u32),
     Error,
     RegExp(Arc<crate::regex::Regex>),
+    /// A getter and setter, held in a property slot in place of a value.
+    Accessor(Option<Value>, Option<Value>),
+}
+
+/// What `new` needs of a class beyond its constructor function.
+#[derive(Clone)]
+struct ClassRec {
+    def: Arc<Class>,
+    /// The scope its methods and field initializers see.
+    env: EnvId,
+    /// What it `extends` (not `null`).
+    parent: Option<Value>,
+    /// Instance fields: key and index into `def.members`, in order.
+    fields: Arc<[(Arc<str>, usize)]>,
 }
 
 pub struct Object {
@@ -142,6 +158,15 @@ pub struct Interp {
     pub storage: Vec<(String, String)>,
     /// The label of the loop about to run (`outer: for …`), for `continue outer`.
     pending_label: Option<Name>,
+    /// Some property is an accessor: assignments look up the prototype chain for setters.
+    accessors: bool,
+    /// Classes by their constructor.
+    classes: HashMap<ObjId, ClassRec>,
+    /// The next call of a class constructor comes from `new` (or `super`), not a plain call.
+    constructing: bool,
+    /// Objects passed to `Object.freeze` (and `seal`, `preventExtensions`), for `isFrozen`.
+    /// Writes to them are not refused.
+    pub frozen: std::collections::HashSet<ObjId>,
 }
 
 pub fn number_to_string(v: f64) -> String {
@@ -218,6 +243,10 @@ impl Interp {
             stopped: None,
             storage: Vec::new(),
             pending_label: None,
+            accessors: false,
+            classes: HashMap::new(),
+            constructing: false,
+            frozen: std::collections::HashSet::new(),
         };
         let object = it.raw_alloc(None, Kind::Plain);
         let mut proto = |kind| it.raw_alloc(Some(object), kind);
@@ -489,7 +518,11 @@ impl Interp {
                     return Ok(Some(Value::Num(f.params.len() as f64)));
                 }
                 Kind::Function(f, ..) if key == "name" => {
-                    return Ok(Some(Value::str(f.name.as_deref().unwrap_or(""))));
+                    let name = match self.classes.get(o) {
+                        Some(class) => class.def.name.as_deref(),
+                        None => f.name.as_deref(),
+                    };
+                    return Ok(Some(Value::str(name.unwrap_or(""))));
                 }
                 Kind::Element(n) => {
                     let n = *n;
@@ -522,11 +555,62 @@ impl Interp {
         let mut at = self.proto_of(v);
         while let Some(o) = at {
             if let Some(found) = self.get_own(o, key) {
+                if let Value::Obj(a) = found {
+                    if let Kind::Accessor(getter, _) = &self.objects[a as usize].kind {
+                        return match getter.clone() {
+                            Some(g) => Ok(Some(self.call(host, &g, v.clone(), &[])?)),
+                            None => Ok(Some(Value::Undefined)),
+                        };
+                    }
+                }
                 return Ok(Some(found));
             }
             at = self.objects[o as usize].proto;
         }
         Ok(None)
+    }
+
+    /// Make `key` of `on` an accessor, keeping the half (getter or setter) not given.
+    pub fn define_accessor(
+        &mut self,
+        on: ObjId,
+        key: &str,
+        get: Option<Value>,
+        set: Option<Value>,
+    ) -> Result<(), Ctrl> {
+        self.accessors = true;
+        if let Some(Value::Obj(a)) = self.get_own(on, key) {
+            if let Kind::Accessor(g, s) = &mut self.objects[a as usize].kind {
+                if get.is_some() {
+                    *g = get;
+                }
+                if set.is_some() {
+                    *s = set;
+                }
+                return Ok(());
+            }
+        }
+        let a = self.alloc(None, Kind::Accessor(get, set))?;
+        self.set_own(on, key, Value::Obj(a));
+        Ok(())
+    }
+
+    /// The setter `key` meets on `o` or its prototypes, if an accessor is found first.
+    fn setter(&self, o: ObjId, key: &str) -> Option<Option<Value>> {
+        let mut at = Some(o);
+        while let Some(x) = at {
+            if let Some(found) = self.get_own(x, key) {
+                return match found {
+                    Value::Obj(a) => match &self.objects[a as usize].kind {
+                        Kind::Accessor(_, set) => Some(set.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+            }
+            at = self.objects[x as usize].proto;
+        }
+        None
     }
 
     pub fn get_value(&mut self, host: &mut dyn Host, v: &Value, key: &str) -> Result<Value, Ctrl> {
@@ -591,6 +675,14 @@ impl Interp {
             }
             _ => {}
         }
+        if self.accessors {
+            if let Some(setter) = self.setter(o, key) {
+                if let Some(f) = setter {
+                    self.call(host, &f, target.clone(), &[value])?;
+                }
+                return Ok(());
+            }
+        }
         self.set_own(o, key, value);
         Ok(())
     }
@@ -629,10 +721,35 @@ impl Interp {
                 if let Kind::Array(items) = &self.objects[*o as usize].kind {
                     return Ok(items.clone());
                 }
+                // The iterator protocol: `[Symbol.iterator]()`, then `next()` until done.
+                if let Some(f) = self.get(host, v, "@@iterator")? {
+                    let iterator = self.call(host, &f, v.clone(), &[])?;
+                    if let Value::Obj(i) = iterator {
+                        if let Kind::Array(items) = &self.objects[i as usize].kind {
+                            return Ok(items.clone());
+                        }
+                    }
+                    let next = self.get_value(host, &iterator, "next")?;
+                    let mut out = Vec::new();
+                    loop {
+                        self.step()?;
+                        let r = self.call(host, &next, iterator.clone(), &[])?;
+                        let done = self.get_value(host, &r, "done")?;
+                        if self.truthy(&done) {
+                            return Ok(out);
+                        }
+                        if out.len() >= 10_000_000 {
+                            return Err(Ctrl::Abort("an iterator ran too long".into()));
+                        }
+                        out.push(self.get_value(host, &r, "value")?);
+                    }
+                }
                 let len = self.get_value(host, v, "length")?;
                 let n = self.to_number(host, &len)?;
                 if n.is_nan() {
-                    return self.type_error("value is not iterable");
+                    let what = self.describe(host, v);
+                    let what: String = what.chars().take(60).collect();
+                    return self.type_error(&format!("{what} is not iterable"));
                 }
                 let mut out = Vec::new();
                 for i in 0..(n as usize).min(10_000_000) {
@@ -640,7 +757,10 @@ impl Interp {
                 }
                 Ok(out)
             }
-            _ => self.type_error("value is not iterable"),
+            other => {
+                let what = self.type_of(other);
+                self.type_error(&format!("{what} is not iterable"))
+            }
         }
     }
 
@@ -874,6 +994,12 @@ impl Interp {
     fn exec(&mut self, host: &mut dyn Host, env: EnvId, s: &Stmt) -> Result<(), Ctrl> {
         self.step()?;
         match s {
+            Stmt::Class(class) => {
+                let v = self.eval_class(host, env, class)?;
+                if let Some(name) = &class.name {
+                    self.declare(env, name, v, false);
+                }
+            }
             Stmt::Expr(e) => {
                 self.eval(host, env, e)?;
             }
@@ -1282,6 +1408,17 @@ impl Interp {
                             let v = self.eval(host, env, v)?;
                             self.put(host, &o, &k, v)?;
                         }
+                        Prop::Get(k, f) | Prop::Set(k, f) => {
+                            let k = self.eval(host, env, k)?;
+                            let k = self.property_key(host, &k)?;
+                            let f = self.closure(f, env, None)?;
+                            let Value::Obj(on) = o else { unreachable!() };
+                            if matches!(p, Prop::Get(..)) {
+                                self.define_accessor(on, &k, Some(f), None)?;
+                            } else {
+                                self.define_accessor(on, &k, None, Some(f))?;
+                            }
+                        }
                         Prop::Spread(e) => {
                             let src = self.eval(host, env, e)?;
                             for k in self.keys(&src) {
@@ -1419,6 +1556,10 @@ impl Interp {
                         }
                         (f, o)
                     }
+                    Expr::SuperMember(_) => {
+                        let f = self.eval(host, env, callee)?;
+                        (f, self.this_of(env))
+                    }
                     other => {
                         let f = self.eval(host, env, other)?;
                         (f, Value::Undefined)
@@ -1442,7 +1583,220 @@ impl Interp {
                 }
                 last
             }
+            Expr::Class(class) => self.eval_class(host, env, class)?,
+            Expr::SuperCall(args) => {
+                let args = self.eval_args(host, env, args)?;
+                let this = self.this_of(env);
+                let Value::Obj(class) = self.lookup(host, env, "%class")? else {
+                    return self.type_error("super() outside a class");
+                };
+                self.super_construct(host, class, &this, &args)?;
+                Value::Undefined
+            }
+            Expr::SuperMember(k) => {
+                let home = self.lookup(host, env, "%super")?;
+                let k = self.eval(host, env, k)?;
+                let k = self.property_key(host, &k)?;
+                if home.is_nullish() {
+                    return Ok(Value::Undefined);
+                }
+                self.get_value(host, &home, &k)?
+            }
         })
+    }
+
+    /// Evaluate a class: its constructor function, with methods and accessors on its
+    /// prototype (or itself, when static), static fields and blocks run now, and instance
+    /// fields kept for `new`.
+    fn eval_class(
+        &mut self,
+        host: &mut dyn Host,
+        env: EnvId,
+        class: &Arc<Class>,
+    ) -> Result<Value, Ctrl> {
+        let parent = match &class.extends {
+            Some(e) => Some(self.eval(host, env, e)?),
+            None => None,
+        };
+        let (proto_parent, ctor_parent) = match &parent {
+            None => (Some(self.protos.object), self.protos.function),
+            Some(Value::Null) => (None, self.protos.function),
+            Some(p @ Value::Obj(id)) if self.is_callable(p) => {
+                let id = *id;
+                match self.get_value(host, p, "prototype")? {
+                    Value::Obj(o) => (Some(o), id),
+                    Value::Null => (None, id),
+                    _ => return self.type_error("a class extends a value without a prototype"),
+                }
+            }
+            Some(_) => return self.type_error("a class extends a value that is not a constructor"),
+        };
+        let instance_env = self.new_env(env, None)?;
+        let static_env = self.new_env(env, None)?;
+        let func = class.constructor.clone().unwrap_or_else(|| {
+            Arc::new(Func {
+                name: class.name.clone(),
+                params: Vec::new(),
+                body: Vec::new(),
+                arrow: false,
+            })
+        });
+        let ctor = self.closure(&func, instance_env, None)?;
+        let Value::Obj(c) = ctor else {
+            unreachable!("a closure is an object")
+        };
+        self.pinned = self.pinned.max(static_env as usize + 1);
+        self.objects[c as usize].proto = Some(ctor_parent);
+        let Some(Value::Obj(proto)) = self.get_own(c, "prototype") else {
+            unreachable!("a function has a prototype")
+        };
+        self.objects[proto as usize].proto = proto_parent;
+        let home = proto_parent.map_or(Value::Null, Value::Obj);
+        for (scope, sup) in [(instance_env, home), (static_env, Value::Obj(ctor_parent))] {
+            self.declare(scope, &Name::from("%super"), sup, true);
+            self.declare(scope, &Name::from("%class"), ctor.clone(), true);
+            if let Some(name) = &class.name {
+                self.declare(scope, name, ctor.clone(), true);
+            }
+        }
+        let mut fields = Vec::new();
+        let mut statics: Vec<(usize, Option<Arc<str>>)> = Vec::new();
+        for (i, m) in class.members.iter().enumerate() {
+            let key = match &m.kind {
+                MemberKind::Block(_) => None,
+                _ => {
+                    let k = self.eval(host, instance_env, &m.key)?;
+                    Some(self.property_key(host, &k)?)
+                }
+            };
+            let (target, scope) = if m.is_static {
+                (c, static_env)
+            } else {
+                (proto, instance_env)
+            };
+            match (&m.kind, key) {
+                (MemberKind::Method(f), Some(k)) => {
+                    let v = self.closure(f, scope, None)?;
+                    self.set_own(target, &k, v);
+                }
+                (MemberKind::Get(f), Some(k)) => {
+                    let v = self.closure(f, scope, None)?;
+                    self.define_accessor(target, &k, Some(v), None)?;
+                }
+                (MemberKind::Set(f), Some(k)) => {
+                    let v = self.closure(f, scope, None)?;
+                    self.define_accessor(target, &k, None, Some(v))?;
+                }
+                (MemberKind::Field(_), Some(k)) if !m.is_static => fields.push((k, i)),
+                (_, key) => statics.push((i, key)),
+            }
+        }
+        self.classes.insert(
+            c,
+            ClassRec {
+                def: class.clone(),
+                env: instance_env,
+                parent: parent.filter(|p| !matches!(p, Value::Null)),
+                fields: fields.into(),
+            },
+        );
+        for (i, key) in statics {
+            let scope = self.new_env(static_env, Some(ctor.clone()))?;
+            match (&class.members[i].kind, key) {
+                (MemberKind::Field(init), Some(k)) => {
+                    let v = match init {
+                        Some(e) => self.eval(host, scope, e)?,
+                        None => Value::Undefined,
+                    };
+                    self.set_own(c, &k, v);
+                }
+                (MemberKind::Block(body), _) => self.block(host, scope, body)?,
+                _ => {}
+            }
+        }
+        Ok(ctor)
+    }
+
+    /// Run class `class`'s construction on `this`: fields, then its constructor (a derived
+    /// class without one passes its arguments to `super`).
+    fn construct_class(
+        &mut self,
+        host: &mut dyn Host,
+        class: ObjId,
+        this: &Value,
+        args: &[Value],
+    ) -> Result<(), Ctrl> {
+        let rec = self.classes[&class].clone();
+        if rec.parent.is_none() {
+            self.init_fields(host, &rec, this)?;
+        }
+        if rec.def.constructor.is_some() {
+            self.constructing = true;
+            self.call(host, &Value::Obj(class), this.clone(), args)?;
+        } else if rec.parent.is_some() {
+            self.super_construct(host, class, this, args)?;
+        }
+        Ok(())
+    }
+
+    /// `super(args)` in class `class`: its parent builds `this`, then `class`'s fields.
+    fn super_construct(
+        &mut self,
+        host: &mut dyn Host,
+        class: ObjId,
+        this: &Value,
+        args: &[Value],
+    ) -> Result<(), Ctrl> {
+        let rec = self.classes[&class].clone();
+        let Some(parent) = rec.parent.clone() else {
+            return self.type_error("super() in a class that extends nothing");
+        };
+        let Value::Obj(p) = parent else {
+            return self.type_error("super() of a value that is not a constructor");
+        };
+        if self.classes.contains_key(&p) {
+            self.construct_class(host, p, this, args)?;
+        } else if matches!(self.objects[p as usize].kind, Kind::Function(..)) {
+            self.call(host, &parent, this.clone(), args)?;
+        } else if let Value::Obj(t) = this {
+            // A built-in (Error, Array…) makes its own object: take what it set up.
+            let made = self.construct(host, &parent, args)?;
+            if let Value::Obj(m) = made {
+                let props = self.objects[m as usize].props.clone();
+                for (k, v) in props {
+                    self.set_own(*t, &k, v);
+                }
+                if matches!(self.objects[m as usize].kind, Kind::Error) {
+                    self.objects[*t as usize].kind = Kind::Error;
+                }
+            }
+        }
+        self.init_fields(host, &rec, this)
+    }
+
+    fn init_fields(
+        &mut self,
+        host: &mut dyn Host,
+        rec: &ClassRec,
+        this: &Value,
+    ) -> Result<(), Ctrl> {
+        let Value::Obj(t) = this else {
+            return Ok(());
+        };
+        for (key, i) in rec.fields.iter() {
+            let MemberKind::Field(init) = &rec.def.members[*i].kind else {
+                continue;
+            };
+            let v = match init {
+                Some(e) => {
+                    let scope = self.new_env(rec.env, Some(this.clone()))?;
+                    self.eval(host, scope, e)?
+                }
+                None => Value::Undefined,
+            };
+            self.set_own(*t, key, v);
+        }
+        Ok(())
     }
 
     fn assign_to(
@@ -1580,6 +1934,9 @@ impl Interp {
         if self.depth >= DEPTH_LIMIT {
             return Err(self.throw_error("RangeError", "maximum call stack size exceeded"));
         }
+        if !std::mem::take(&mut self.constructing) && self.classes.contains_key(id) {
+            return self.type_error("a class constructor needs `new`");
+        }
         let (func, scope, arrow_this) = match &self.objects[*id as usize].kind {
             Kind::Native(n) => {
                 let n = *n;
@@ -1685,6 +2042,12 @@ impl Interp {
             _ => self.protos.object,
         };
         let obj = Value::Obj(self.alloc(Some(proto), Kind::Plain)?);
+        if let Value::Obj(id) = f {
+            if self.classes.contains_key(id) {
+                self.construct_class(host, *id, &obj, args)?;
+                return Ok(obj);
+            }
+        }
         let r = self.call(host, f, obj.clone(), args)?;
         Ok(if matches!(r, Value::Obj(_)) { r } else { obj })
     }

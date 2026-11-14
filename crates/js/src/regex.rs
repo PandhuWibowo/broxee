@@ -16,6 +16,11 @@ enum Node {
     Alt(Vec<Node>),
     Concat(Vec<Node>),
     Repeat(Box<Node>, usize, usize, bool),
+    /// `(?=…)`, `(?!…)`, `(?<=…)`, `(?<!…)`: the pattern, whether it looks behind, whether
+    /// it must not match.
+    Look(Box<Node>, bool, bool),
+    /// `\1`: the text group 1 captured (nothing when it captured nothing).
+    Backref(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -198,7 +203,14 @@ impl P<'_> {
                         .unwrap_or('\u{fffd}'),
                 )
             }
-            '1'..='9' => return Err("backreferences are not supported".into()),
+            '1'..='9' => {
+                let mut n = c.to_digit(10).unwrap_or(0) as usize;
+                while let Some(d) = self.peek().and_then(|d| d.to_digit(10)) {
+                    n = n * 10 + d as usize;
+                    self.i += 1;
+                }
+                ClassOrNode::Node(Node::Backref(n))
+            }
             other => ClassOrNode::Char(other),
         })
     }
@@ -211,11 +223,37 @@ impl P<'_> {
             '^' => Node::Start,
             '$' => Node::End,
             '(' => {
+                let next = |k: usize| self.c.get(self.i + k).copied();
+                let look = match (next(0), next(1), next(2)) {
+                    (Some('?'), Some('='), _) => Some((false, false, 2)),
+                    (Some('?'), Some('!'), _) => Some((false, true, 2)),
+                    (Some('?'), Some('<'), Some('=')) => Some((true, false, 3)),
+                    (Some('?'), Some('<'), Some('!')) => Some((true, true, 3)),
+                    _ => None,
+                };
+                if let Some((behind, negate, len)) = look {
+                    self.i += len;
+                    let inner = self.alt()?;
+                    if self.peek() != Some(')') {
+                        return Err("missing )".into());
+                    }
+                    self.i += 1;
+                    return Ok(Node::Look(Box::new(inner), behind, negate));
+                }
                 let index = if self.c.get(self.i..self.i + 2) == Some(&['?', ':']) {
                     self.i += 2;
                     None
+                } else if self.c.get(self.i..self.i + 2) == Some(&['?', '<']) {
+                    // A named group captures like any other (names are not kept).
+                    let close = self.c[self.i..].iter().position(|&c| c == '>');
+                    let Some(close) = close else {
+                        return Err("unterminated group name".into());
+                    };
+                    self.i += close + 1;
+                    self.groups += 1;
+                    Some(self.groups)
                 } else if self.peek() == Some('?') {
-                    return Err("lookaround is not supported".into());
+                    return Err("unsupported group".into());
                 } else {
                     self.groups += 1;
                     Some(self.groups)
@@ -385,6 +423,36 @@ impl Matcher<'_> {
                 None
             }
             Node::Concat(items) => self.concat(items, i, caps, k),
+            Node::Backref(g) => {
+                let Some(&Some((from, to))) = caps.get(*g) else {
+                    return k(self, i, caps);
+                };
+                let len = to - from;
+                let same = i + len <= t.len() && (0..len).all(|j| self.eq(t[i + j], t[from + j]));
+                same.then(|| k(self, i + len, caps)).flatten()
+            }
+            Node::Look(inner, behind, negate) => {
+                let mut inside = caps.clone();
+                let found = if *behind {
+                    (0..=i).rev().any(|from| {
+                        self.run(inner, from, &mut inside, &mut |_, end, _| {
+                            (end == i).then_some(end)
+                        })
+                        .is_some()
+                    })
+                } else {
+                    self.run(inner, i, &mut inside, &mut |_, end, _| Some(end))
+                        .is_some()
+                };
+                if found == *negate {
+                    return None;
+                }
+                // A positive lookaround keeps what it captured.
+                if !negate {
+                    *caps = inside;
+                }
+                k(self, i, caps)
+            }
             Node::Repeat(inner, min, max, greedy) => {
                 self.repeat(inner, *min, *max, *greedy, i, 0, caps, k)
             }
@@ -493,7 +561,23 @@ mod tests {
         let caps = re.find_at(&text, 0).unwrap();
         assert_eq!(caps[1], Some((3, 7)));
         assert_eq!(caps[2], Some((8, 10)));
-        assert!(Regex::new("(?=x)", "").is_err());
+        assert_eq!(find(r"\d+(?=px)", "", "10em 20px").as_deref(), Some("20"));
+        assert_eq!(find(r"\b\w+\b(?!\()", "", "f(x) y").as_deref(), Some("x"));
+        assert_eq!(find(r"(?<=\$)\d+", "", "a1 $25").as_deref(), Some("25"));
+        assert_eq!(find(r"(?<!-)\b\d", "", "-1 2").as_deref(), Some("2"));
+        assert_eq!(find(r"(?=\/[^/\n]*\/)", "", "a /b/").as_deref(), Some(""));
+        let named = Regex::new(r"(?<year>\d{4})-(\d\d)", "").unwrap();
+        let text: Vec<char> = "on 2024-05".chars().collect();
+        assert_eq!(named.find_at(&text, 0).unwrap()[2], Some((8, 10)));
+        assert!(Regex::new("(?x)", "").is_err());
+        assert_eq!(
+            find(r#"(['"]).*?\1"#, "", r#"say "it's" ok"#).as_deref(),
+            Some(r#""it's""#)
+        );
+        assert_eq!(
+            find(r##"r(#*)"(.|\n)*?"\1(?!#)"##, "", r##"x = r#"a "q" b"#;"##).as_deref(),
+            Some(r##"r#"a "q" b"#"##)
+        );
         assert!(Regex::new("(a", "").is_err());
         // Catastrophic patterns give up instead of hanging.
         let _ = find("(a*)*b", "", &"a".repeat(40));

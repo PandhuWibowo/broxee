@@ -1,7 +1,7 @@
 //! The syntax tree and a recursive-descent parser for the subset of JavaScript Broxee runs:
 //! statements, functions and arrows, objects and arrays, destructuring, template literals,
-//! spread, optional chaining. Classes, generators, getters and setters are not parsed; a
-//! script using them fails to parse and is skipped as a whole.
+//! spread, optional chaining, classes, getters and setters. Generators and modules are not
+//! parsed yet; a script using them fails to parse and is skipped as a whole.
 
 use std::sync::Arc;
 
@@ -33,6 +33,37 @@ pub enum Expr {
     Call(Box<Expr>, Vec<Elem>, bool),
     New(Box<Expr>, Vec<Elem>),
     Seq(Vec<Expr>),
+    Class(Arc<Class>),
+    /// `super(...)` in a constructor.
+    SuperCall(Vec<Elem>),
+    /// `super.key` / `super[key]` in a method.
+    SuperMember(Box<Expr>),
+}
+
+#[derive(Debug)]
+pub struct Class {
+    pub name: Option<Name>,
+    pub extends: Option<Expr>,
+    pub constructor: Option<Arc<Func>>,
+    pub members: Vec<Member>,
+}
+
+#[derive(Debug)]
+pub struct Member {
+    pub key: Expr,
+    pub is_static: bool,
+    pub kind: MemberKind,
+}
+
+#[derive(Debug)]
+pub enum MemberKind {
+    Method(Arc<Func>),
+    Get(Arc<Func>),
+    Set(Arc<Func>),
+    /// A field and its initializer.
+    Field(Option<Expr>),
+    /// `static { ... }`.
+    Block(Vec<Stmt>),
 }
 
 #[derive(Debug)]
@@ -46,6 +77,8 @@ pub enum Elem {
 pub enum Prop {
     Init(Expr, Expr),
     Spread(Expr),
+    Get(Expr, Arc<Func>),
+    Set(Expr, Arc<Func>),
 }
 
 #[derive(Debug)]
@@ -101,6 +134,7 @@ pub enum Stmt {
     ),
     Switch(Expr, Vec<(Option<Expr>, Vec<Stmt>)>),
     Labeled(Name, Box<Stmt>),
+    Class(Arc<Class>),
     Empty,
 }
 
@@ -436,7 +470,12 @@ impl Parser {
                 }
                 Ok(Stmt::Switch(subject, cases))
             }
-            Some("class" | "import" | "export") => self.error("unsupported syntax"),
+            Some("class") => {
+                self.pos += 1;
+                let class = self.class_rest(true)?;
+                Ok(Stmt::Class(class))
+            }
+            Some("import" | "export") => self.error("unsupported syntax"),
             _ => {
                 let e = self.expression()?;
                 self.semicolon()?;
@@ -608,11 +647,132 @@ impl Parser {
                 self.expect("]")?;
                 Ok((e, None))
             }
+            // Private names (`#x`) are plain properties, as `obj.#x` reads them.
+            Tok::Punct("#") => match self.next() {
+                Tok::Ident(n) => Ok((Expr::Str(n.as_str().into()), None)),
+                _ => {
+                    self.pos -= 1;
+                    self.error("expected a property name")
+                }
+            },
             _ => {
                 self.pos -= 1;
                 self.error("expected a property name")
             }
         }
+    }
+
+    /// Whether the word at the cursor (`get`, `set`, `static`, `async`) starts something
+    /// rather than being a property name itself.
+    fn modifier_ahead(&self) -> bool {
+        !matches!(
+            self.peek_at(1),
+            Tok::Punct("," | ":" | "(" | "}" | "=" | ";")
+        )
+    }
+
+    /// Parameters and body of a method named `key`.
+    fn method(&mut self, key: &Expr) -> Result<Arc<Func>, String> {
+        if self.is("*") {
+            return self.error("generators are not supported");
+        }
+        let params = self.params()?;
+        let body = self.block()?;
+        let name = match key {
+            Expr::Str(s) => Some(s.clone()),
+            _ => None,
+        };
+        Ok(Arc::new(Func {
+            name,
+            params,
+            body,
+            arrow: false,
+        }))
+    }
+
+    /// After `class`: a name (required for a declaration), `extends`, and the body.
+    fn class_rest(&mut self, needs_name: bool) -> Result<Arc<Class>, String> {
+        let name = match self.peek() {
+            Tok::Ident(w) if w != "extends" => Some(self.name()?),
+            _ if needs_name => return self.error("expected a class name"),
+            _ => None,
+        };
+        let extends = if self.eat_word("extends") {
+            Some(self.postfix()?)
+        } else {
+            None
+        };
+        self.expect("{")?;
+        let mut constructor = None;
+        let mut members = Vec::new();
+        while !self.eat("}") {
+            if self.at_eof() {
+                return self.error("expected `}`");
+            }
+            if self.eat(";") {
+                continue;
+            }
+            let is_static = self.is_word("static") && self.modifier_ahead();
+            if is_static {
+                self.pos += 1;
+                if self.is("{") {
+                    let body = self.block()?;
+                    members.push(Member {
+                        key: Expr::Null,
+                        is_static,
+                        kind: MemberKind::Block(body),
+                    });
+                    continue;
+                }
+            }
+            if self.is_word("async") && self.modifier_ahead() {
+                self.pos += 1;
+            }
+            let accessor = match self.peek() {
+                Tok::Ident(w) if (w == "get" || w == "set") && self.modifier_ahead() => {
+                    Some(w == "get")
+                }
+                _ => None,
+            };
+            if accessor.is_some() {
+                self.pos += 1;
+            }
+            if self.is("*") {
+                return self.error("generators are not supported");
+            }
+            let (key, _) = self.property_key()?;
+            let kind = if self.is("(") {
+                let f = self.method(&key)?;
+                match accessor {
+                    Some(true) => MemberKind::Get(f),
+                    Some(false) => MemberKind::Set(f),
+                    None if !is_static && matches!(&key, Expr::Str(k) if &**k == "constructor") => {
+                        constructor = Some(f);
+                        continue;
+                    }
+                    None => MemberKind::Method(f),
+                }
+            } else {
+                let init = if self.eat("=") {
+                    Some(self.assignment()?)
+                } else {
+                    None
+                };
+                self.semicolon()?;
+                MemberKind::Field(init)
+            };
+            members.push(Member {
+                key,
+                is_static,
+                kind,
+            });
+        }
+        Ok(Arc::new(Class {
+            name,
+            extends,
+            constructor,
+            members,
+        }))
     }
 
     /// After `function`: an optional name, parameters and body.
@@ -1098,10 +1258,32 @@ impl Parser {
                     if self.eat("...") {
                         props.push(Prop::Spread(self.assignment()?));
                     } else {
-                        if matches!(self.peek(), Tok::Ident(w) if w == "get" || w == "set")
-                            && !matches!(self.peek_at(1), Tok::Punct("," | ":" | "(" | "}"))
-                        {
-                            return self.error("getters and setters are not supported");
+                        let accessor = match self.peek() {
+                            Tok::Ident(w)
+                                if (w == "get" || w == "set")
+                                    && !matches!(
+                                        self.peek_at(1),
+                                        Tok::Punct("," | ":" | "(" | "}")
+                                    ) =>
+                            {
+                                Some(w == "get")
+                            }
+                            _ => None,
+                        };
+                        if let Some(get) = accessor {
+                            self.pos += 1;
+                            let (key, _) = self.property_key()?;
+                            let f = self.method(&key)?;
+                            props.push(if get {
+                                Prop::Get(key, f)
+                            } else {
+                                Prop::Set(key, f)
+                            });
+                            if !self.eat(",") {
+                                self.expect("}")?;
+                                break;
+                            }
+                            continue;
                         }
                         if self.is_word("async")
                             && !matches!(self.peek_at(1), Tok::Punct("," | ":" | "(" | "}"))
@@ -1151,7 +1333,15 @@ impl Parser {
                 "null" => Ok(Expr::Null),
                 "true" => Ok(Expr::Bool(true)),
                 "false" => Ok(Expr::Bool(false)),
-                "class" | "super" | "import" => {
+                "class" => Ok(Expr::Class(self.class_rest(false)?)),
+                "super" if self.is("(") => Ok(Expr::SuperCall(self.arguments()?)),
+                "super" if self.eat(".") => Ok(Expr::SuperMember(Box::new(self.member_name()?))),
+                "super" if self.eat("[") => {
+                    let key = self.expression()?;
+                    self.expect("]")?;
+                    Ok(Expr::SuperMember(Box::new(key)))
+                }
+                "super" | "import" => {
                     self.pos -= 1;
                     self.error("unsupported syntax")
                 }
@@ -1194,9 +1384,27 @@ mod tests {
     }
 
     #[test]
+    fn parses_classes_and_accessors() {
+        let src = r#"
+            class A extends B.C { #n = 1; static count = 0; x; constructor(a) { super(a); this.#n = a }
+              get n() { return this.#n } set n(v) { this.#n = v } static make() { return new A(1) }
+              async load() { return super.load() } ['comp' + 1]() {} static { A.count = 2 } }
+            const K = class { m() {} };
+            var o = { get x() { return 1 }, set x(v) {}, get: 1, set() {} };
+        "#;
+        let program = parse(src).expect("parses");
+        assert_eq!(program.len(), 3);
+        let Stmt::Class(a) = &program[0] else {
+            panic!("a class declaration")
+        };
+        assert!(a.constructor.is_some() && a.extends.is_some());
+        assert_eq!(a.members.len(), 9);
+    }
+
+    #[test]
     fn reports_what_it_does_not_support() {
-        assert!(parse("class A {}").is_err());
-        assert!(parse("var o = { get x() { return 1 } }").is_err());
+        assert!(parse("class { }").is_err(), "a declaration needs a name");
+        assert!(parse("class A { *g() {} }").is_err());
         assert!(parse("function* g() {}").is_err());
         assert!(parse("var = 3").is_err());
         assert!(
