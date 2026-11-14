@@ -270,19 +270,14 @@ fn common_ancestors(dom: &Dom, nodes: &[NodeId]) -> Option<Vec<NodeId>> {
         return None;
     }
     for &node in rest {
-        let mut at = Some(node);
-        loop {
-            match at {
-                Some(n) => match chain.iter().position(|&c| c == n) {
-                    Some(i) => {
-                        chain.drain(..i);
-                        break;
-                    }
-                    None => at = dom.parent(n),
-                },
-                None => return None,
+        let mut n = node;
+        let i = loop {
+            if let Some(i) = chain.iter().position(|&c| c == n) {
+                break i;
             }
-        }
+            n = dom.parent(n)?;
+        };
+        chain.drain(..i);
     }
     Some(chain)
 }
