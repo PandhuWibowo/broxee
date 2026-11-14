@@ -40,6 +40,22 @@ pub struct Control {
     /// `<option>` elements of a select, and which one is chosen.
     options: Vec<NodeId>,
     pub selected: usize,
+    /// A select drawn as a list (`multiple`, or `size` above 1).
+    pub list: Option<List>,
+}
+
+/// A select shown as a list box: one row per option, `size` of them at a time.
+#[derive(Clone, Debug, PartialEq)]
+pub struct List {
+    pub multiple: bool,
+    size: usize,
+    /// The first row shown, and the row the keyboard is on.
+    first: usize,
+    active: usize,
+    /// Which options are chosen (a `multiple` select; otherwise `selected` says).
+    picked: Vec<bool>,
+    /// The `broxee-row` element of each option.
+    pub rows: Vec<NodeId>,
 }
 
 #[derive(Default)]
@@ -134,6 +150,7 @@ impl Forms {
                 checked: dom.attr(node, "checked").is_some(),
                 options: Vec::new(),
                 selected: 0,
+                list: None,
             };
             let is_button_element = dom.tag_name(node) == Some("button");
             match kind {
@@ -189,11 +206,52 @@ impl Forms {
                         .iter()
                         .position(|&o| dom.attr(o, "selected").is_some())
                         .unwrap_or(0);
-                    c.options = options;
-                    let v = dom.append_element(node, "broxee-value");
-                    c.shown = Some(dom.append_text(v, ""));
-                    let arrow = dom.append_element(node, "broxee-arrow");
-                    dom.append_text(arrow, "▼");
+                    let multiple = dom.attr(node, "multiple").is_some();
+                    let size = dom
+                        .attr(node, "size")
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .filter(|&n| n > 1)
+                        .or(multiple.then_some(4));
+                    if let Some(size) = size {
+                        // A list box: a row per option, drawn by the page like the rest.
+                        let list = dom.append_element(node, "broxee-list");
+                        let rows = options
+                            .iter()
+                            .map(|&o| {
+                                let label = dom
+                                    .attr(o, "label")
+                                    .map(collapse)
+                                    .unwrap_or_else(|| collapse(&dom.text_content(o)));
+                                let row = dom.append_element(list, "broxee-row");
+                                dom.append_text(row, &label);
+                                row
+                            })
+                            .collect();
+                        let picked: Vec<bool> = options
+                            .iter()
+                            .map(|&o| dom.attr(o, "selected").is_some())
+                            .collect();
+                        let active = if multiple {
+                            picked.iter().position(|&p| p).unwrap_or(0)
+                        } else {
+                            c.selected
+                        };
+                        c.list = Some(List {
+                            multiple,
+                            size: size.min(64),
+                            first: active.saturating_sub(size.saturating_sub(1)),
+                            active,
+                            picked,
+                            rows,
+                        });
+                        c.options = options;
+                    } else {
+                        c.options = options;
+                        let v = dom.append_element(node, "broxee-value");
+                        c.shown = Some(dom.append_text(v, ""));
+                        let arrow = dom.append_element(node, "broxee-arrow");
+                        dom.append_text(arrow, "▼");
+                    }
                 }
                 _ => {}
             }
@@ -220,6 +278,34 @@ impl Forms {
     fn show(&mut self, dom: &mut Dom, i: usize) {
         let c = &self.controls[i];
         match c.kind {
+            Kind::Select if c.list.is_some() => {
+                let selected = c.selected;
+                let list = c.list.as_ref().expect("checked");
+                let tags: Vec<(NodeId, &str)> = list
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &row)| {
+                        let chosen = if list.multiple {
+                            list.picked.get(k).copied().unwrap_or(false)
+                        } else {
+                            k == selected
+                        };
+                        let shown = k >= list.first && k < list.first + list.size;
+                        let tag = match (shown, chosen) {
+                            (false, _) => "broxee-out",
+                            (true, true) => "broxee-chosen",
+                            (true, false) => "broxee-row",
+                        };
+                        (row, tag)
+                    })
+                    .collect();
+                for (row, tag) in tags {
+                    if dom.tag_name(row) != Some(tag) {
+                        dom.set_tag(row, tag);
+                    }
+                }
+            }
             Kind::Select => {
                 let label = c.options.get(c.selected).map(|&o| {
                     dom.attr(o, "label")
@@ -374,10 +460,110 @@ impl Forms {
         rows
     }
 
+    /// The option values of select `i` that are chosen, in order.
+    fn chosen_values(&self, dom: &Dom, i: usize) -> Vec<String> {
+        let c = &self.controls[i];
+        let value = |o: NodeId| {
+            dom.attr(o, "value")
+                .map(str::to_string)
+                .unwrap_or_else(|| collapse(&dom.text_content(o)))
+        };
+        match &c.list {
+            Some(l) if l.multiple => c
+                .options
+                .iter()
+                .zip(&l.picked)
+                .filter(|(_, &p)| p)
+                .map(|(&o, _)| value(o))
+                .collect(),
+            _ => c
+                .options
+                .get(c.selected)
+                .map(|&o| value(o))
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    /// A press on list select `i` at `node` (one of its rows, or inside one): choose that
+    /// option, or with `multiple` turn it on or off. Returns whether anything changed.
+    pub fn list_press(&mut self, dom: &mut Dom, i: usize, node: NodeId) -> bool {
+        let Some(list) = self.controls[i].list.as_ref() else {
+            return false;
+        };
+        let mut at = Some(node);
+        let mut row = None;
+        while let Some(n) = at {
+            if let Some(k) = list.rows.iter().position(|&r| r == n) {
+                row = Some(k);
+                break;
+            }
+            at = dom.parent(n);
+        }
+        let Some(k) = row else {
+            return false;
+        };
+        let c = &mut self.controls[i];
+        let list = c.list.as_mut().expect("checked");
+        list.active = k;
+        if list.multiple {
+            list.picked[k] = !list.picked[k];
+        } else {
+            c.selected = k;
+        }
+        self.show(dom, i);
+        true
+    }
+
+    /// ↑ ↓ on list select `i`: move to the next or previous row (choosing it unless the
+    /// select is `multiple`, where Space does), scrolling it into view.
+    pub fn list_step(&mut self, dom: &mut Dom, i: usize, delta: isize) -> bool {
+        let c = &mut self.controls[i];
+        let Some(list) = c.list.as_mut() else {
+            return false;
+        };
+        let n = list.rows.len() as isize;
+        let to = (list.active as isize + delta).clamp(0, (n - 1).max(0)) as usize;
+        if to == list.active && (list.multiple || to == c.selected) {
+            return false;
+        }
+        list.active = to;
+        if to < list.first {
+            list.first = to;
+        } else if to >= list.first + list.size {
+            list.first = to + 1 - list.size;
+        }
+        if !list.multiple {
+            c.selected = to;
+        }
+        self.show(dom, i);
+        true
+    }
+
+    /// Space on a `multiple` list: turn the row the keyboard is on on or off.
+    pub fn list_toggle(&mut self, dom: &mut Dom, i: usize) -> bool {
+        let Some(list) = self.controls[i].list.as_mut().filter(|l| l.multiple) else {
+            return false;
+        };
+        let k = list.active;
+        if let Some(p) = list.picked.get_mut(k) {
+            *p = !*p;
+        }
+        self.show(dom, i);
+        true
+    }
+
     /// What control `i` holds, as scripts read it and a form sends it: a select's chosen
     /// option's `value` (or its text), anything else its typed or set value.
     pub fn value_of(&self, dom: &Dom, i: usize) -> String {
         let c = &self.controls[i];
+        if c.list.as_ref().is_some_and(|l| l.multiple) {
+            return self
+                .chosen_values(dom, i)
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+        }
         match (c.kind, c.options.get(c.selected)) {
             (Kind::Select, Some(&o)) => dom
                 .attr(o, "value")
@@ -475,7 +661,9 @@ impl Forms {
                 Kind::Radio if required && !self.group_checked(dom, j) => {
                     Some("Please choose one of these options.")
                 }
-                Kind::Select if required && self.value_of(dom, j).is_empty() => {
+                Kind::Select
+                    if required && self.chosen_values(dom, j).iter().all(String::is_empty) =>
+                {
                     Some("Please choose an option.")
                 }
                 Kind::Text if !value.is_empty() && ty == "email" && !is_email(value) => {
@@ -571,8 +759,12 @@ impl Forms {
                     c.value.replace("\r\n", "\n").replace('\n', "\r\n")
                 }
                 Kind::Checkbox | Kind::Radio if c.checked => c.value.clone(),
-                Kind::Select if c.options.get(c.selected).is_some() => self.value_of(dom, j),
-                Kind::Select => continue,
+                Kind::Select => {
+                    for v in self.chosen_values(dom, j) {
+                        pairs.push((name.to_string(), v));
+                    }
+                    continue;
+                }
                 Kind::Submit if Some(j) == submitter => {
                     dom.attr(c.node, "value").unwrap_or("").to_string()
                 }
@@ -822,6 +1014,71 @@ mod tests {
             None,
             "only number fields step"
         );
+    }
+
+    #[test]
+    fn list_selects_choose_rows_and_send_every_chosen_value() {
+        let (mut dom, mut forms) = page(
+            "<form><select name=m multiple required><option>a<option selected>b<option>c\
+             <option>d<option value=E>e</select><select name=s size=2><option>x<option>y\
+             <option>z</select><select name=d><option>plain</select><button>Go</button></form>",
+        );
+        let tags = |dom: &Dom, forms: &Forms, i: usize| -> Vec<String> {
+            forms.controls[i]
+                .list
+                .as_ref()
+                .unwrap()
+                .rows
+                .iter()
+                .map(|&r| dom.tag_name(r).unwrap().to_string())
+                .collect()
+        };
+        assert!(
+            forms.controls[2].list.is_none(),
+            "a plain select stays a dropdown"
+        );
+        assert_eq!(
+            tags(&dom, &forms, 0),
+            [
+                "broxee-row",
+                "broxee-chosen",
+                "broxee-row",
+                "broxee-row",
+                "broxee-out"
+            ],
+            "four rows shown by default"
+        );
+        let rows = forms.controls[0].list.as_ref().unwrap().rows.clone();
+        assert!(forms.list_press(&mut dom, 0, rows[0]));
+        forms.list_step(&mut dom, 0, 4);
+        forms.list_toggle(&mut dom, 0);
+        assert_eq!(
+            tags(&dom, &forms, 0),
+            [
+                "broxee-out",
+                "broxee-chosen",
+                "broxee-row",
+                "broxee-row",
+                "broxee-chosen"
+            ],
+            "scrolled to the last row; b was chosen from the start"
+        );
+        let sent = forms.submission(&dom, 3, &base()).unwrap();
+        assert!(
+            sent.url.path.ends_with("?m=a&m=b&m=E&s=x&d=plain"),
+            "{}",
+            sent.url.path
+        );
+        // Nothing chosen in a required multiple select stops the form.
+        for k in [0, 1, 4] {
+            let row = forms.controls[0].list.as_ref().unwrap().rows[k];
+            forms.list_press(&mut dom, 0, row);
+        }
+        assert_eq!(forms.invalid(&dom, 3).map(|v| v.0), Some(0));
+        // A size=2 list chooses one row; ↓ moves the choice.
+        forms.list_step(&mut dom, 1, 1);
+        assert_eq!(forms.controls[1].selected, 1);
+        assert_eq!(forms.value_of(&dom, 1), "y");
     }
 
     #[test]
