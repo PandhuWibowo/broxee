@@ -269,6 +269,7 @@ time something reads it (most theme variables never are). A `var()` value is sub
 
 | 2026-11-14 | Split view: panes saved with the session, numbered badges on tabs in panes, drag a tab onto a pane, resize panes (#31) | 3.6 MB (unchanged, 3,617,808 bytes) | 49.8 MB peak painted at 2x | Window with GitHub, Wikipedia, HN and example.com in 4 panes (`footprint`): 29 MB idle, 61 MB peak, the same as `main`. It was 31 MB idle and 45 MB peak at #7: pages now run scripts and load web fonts while the panes fill |
 
+| 2026-11-14 | Forms: `multiple` and `size` selects as list boxes (#32) | 3.7 MB (unchanged, 3,650,896 bytes) | 49.9 MB peak painted at 2x | Rows are nodes the browser adds (`broxee-row`, `broxee-chosen`, `broxee-out` past `size`), drawn by the page's own layout like the other controls |
 | 2026-11-14 | Forms: selection, copy, cut and paste in fields; validation; multipart (part of #32) | 3.7 MB (3,634,352 → 3,650,896 bytes, +16.5 KB) | 49.9 MB peak painted at 2x | Messages are tooltips under the control that stops a form; an edit that breaks `readonly` or `maxlength` is undone in one place, for typing, paste and cut alike |
 | 2026-11-14 | Forms: select dropdown, fields that scroll to the caret (part of #32) | 3.6 MB (3,617,808 → 3,634,352 bytes, +16.5 KB) | 49.8 MB peak painted at 2x | The dropdown is the menus' panel (one list painter for both); a field's runs shift left after layout and back before the next, so incremental layout never sees them moved |
 
@@ -380,8 +381,9 @@ Where data lives, and what compression does for it (measured 2026-11-07):
   (never on passwords). `required`, `type=email`, `url` and `number` (with `min`/`max`) stop a form from
   being sent and say why under the control (`novalidate` skips it); `maxlength`, `readonly`, `disabled` and
   `autofocus` are kept; ↑ ↓ step a number field. GET and POST as `application/x-www-form-urlencoded` or
-  `multipart/form-data`; file inputs cannot pick files yet (they say so, and send an empty part). No
-  `multiple` or `size` lists yet. Typed values live with the page: a tab that sleeps forgets them, and
+  `multipart/form-data`; file inputs cannot pick files yet (they say so, and send an empty part). `multiple`
+  and `size` selects are list boxes (four rows unless `size` says): a click or ↑ ↓ chooses, Space turns
+  a row of a `multiple` list on or off, and every chosen value is sent. Typed values live with the page: a tab that sleeps forgets them, and
   passwords are never written to disk or copied.
 - JavaScript: classic scripts (inline and `src`) run, with classes (fields, `static`, `extends`, `super`,
   `#private` names read as plain properties), getters and setters, the iterator protocol (`for…of` and spread

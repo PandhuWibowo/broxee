@@ -1684,6 +1684,23 @@ impl<S: Screen> Browser<S> {
                 return true;
             }
             self.focus_control(i);
+            let list = self
+                .page
+                .as_ref()
+                .is_some_and(|p| p.forms.controls[i].list.is_some());
+            if list {
+                // A list select: the row under the pointer.
+                let node = self.node_at(x, y - HEADER_HEIGHT);
+                if let (Some(node), Some(page)) = (node, self.page.as_mut()) {
+                    let control = page.forms.controls[i].node;
+                    if page.forms.list_press(&mut page.dom, i, node) {
+                        self.relayout_page();
+                        self.dispatch_page(control, "input");
+                        self.dispatch_page(control, "change");
+                    }
+                }
+                return true;
+            }
             self.press_control(i);
             if self.editing.is_some() {
                 let fonts = Arc::clone(&self.fonts);
@@ -2742,6 +2759,23 @@ impl<S: Screen> Browser<S> {
             self.relayout_page();
             self.typed_into(i);
             return Some(true);
+        }
+        let list = self.page.as_ref()?.forms.controls[i].list.is_some();
+        if list {
+            let page = self.page.as_mut()?;
+            let node = page.forms.controls[i].node;
+            let changed = match k.key {
+                Key::Up => page.forms.list_step(&mut page.dom, i, -1),
+                Key::Down => page.forms.list_step(&mut page.dom, i, 1),
+                Key::Char(' ') => page.forms.list_toggle(&mut page.dom, i),
+                _ => return None,
+            };
+            if changed {
+                self.relayout_page();
+                self.dispatch_page(node, "input");
+                self.dispatch_page(node, "change");
+            }
+            return Some(changed);
         }
         match (kind, k.key) {
             (forms::Kind::Select, Key::Up) => {
@@ -7363,6 +7397,55 @@ mod tests {
         assert_eq!(
             b.hover.as_ref().map(|h| h.text.as_str()),
             Some("Please fill in this field.")
+        );
+        b.render();
+    }
+
+    #[test]
+    fn list_selects_answer_clicks_and_keys() {
+        let mut b = browser(&page_file(
+            "list-select",
+            "<!doctype html><select multiple><option>one<option>two<option>three</select>",
+        ));
+        let row_point = |b: &Browser<FakeScreen>, label: &str| {
+            let p = b.page.as_ref().unwrap();
+            let t = p
+                .layout
+                .texts
+                .iter()
+                .find(|t| p.layout.text(t) == label)
+                .unwrap();
+            (
+                f64::from(t.x + 2.0 + b.pane_left()),
+                f64::from(t.baseline - 4.0 - b.scroll + HEADER_HEIGHT),
+            )
+        };
+        let (x, y) = row_point(&b, "two");
+        act(&mut b, Event::Click { x, y });
+        let (x, y) = row_point(&b, "three");
+        act(&mut b, Event::Click { x, y });
+        let p = b.page.as_ref().unwrap();
+        let list = p.forms.controls[0].list.as_ref().unwrap();
+        let chosen: Vec<&str> = list
+            .rows
+            .iter()
+            .map(|&r| p.dom.tag_name(r).unwrap())
+            .collect();
+        assert_eq!(chosen, ["broxee-row", "broxee-chosen", "broxee-chosen"]);
+        // The chosen rows are drawn highlighted.
+        let row = list.rows[1];
+        assert_ne!(
+            p.styles.style(row).background_color,
+            p.styles.style(list.rows[0]).background_color
+        );
+        act(&mut b, key(Key::Up));
+        act(&mut b, key(Key::Char(' ')));
+        let p = b.page.as_ref().unwrap();
+        let list = p.forms.controls[0].list.as_ref().unwrap();
+        assert_eq!(
+            p.dom.tag_name(list.rows[1]),
+            Some("broxee-row"),
+            "Space turned it off"
         );
         b.render();
     }

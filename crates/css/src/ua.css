@@ -71,3 +71,7 @@ broxee-placeholder { color: #757575 }
 broxee-check { display: block; width: 7px; height: 7px; margin: 2px; background-color: #1a73e8 }
 broxee-uncheck { display: none }
 broxee-arrow { margin-left: 6px; font-size: 8px; color: #444; vertical-align: 1px }
+broxee-list { display: block; min-width: 60px }
+broxee-row, broxee-chosen { display: block; padding: 0 4px 0 2px; white-space: nowrap }
+broxee-chosen { background-color: #cfe0f5 }
+broxee-out { display: none }
