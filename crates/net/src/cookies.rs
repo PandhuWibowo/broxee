@@ -89,6 +89,8 @@ impl Context {
 pub struct Cookies {
     jar: Mutex<Vec<Cookie>>,
     changed: AtomicBool,
+    /// The profile's HTTP cache, travelling with its cookies so it is never another's.
+    cache: std::sync::OnceLock<crate::Cache>,
 }
 
 fn now() -> u64 {
@@ -100,6 +102,15 @@ fn now() -> u64 {
 impl Cookies {
     pub fn new() -> Cookies {
         Cookies::default()
+    }
+
+    /// Give this profile its HTTP cache (once; later calls are ignored).
+    pub fn attach_cache(&self, cache: crate::Cache) {
+        let _ = self.cache.set(cache);
+    }
+
+    pub fn cache(&self) -> Option<&crate::Cache> {
+        self.cache.get()
     }
 
     fn jar(&self) -> std::sync::MutexGuard<'_, Vec<Cookie>> {
@@ -346,6 +357,7 @@ impl Cookies {
         Cookies {
             jar: Mutex::new(jar),
             changed: AtomicBool::new(false),
+            cache: std::sync::OnceLock::new(),
         }
     }
 }

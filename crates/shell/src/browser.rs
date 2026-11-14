@@ -377,6 +377,9 @@ struct Closed {
     position: usize,
 }
 
+/// Disk space for one profile's HTTP cache; the least recently used entries go past it.
+const PROFILE_CACHE_BYTES: u64 = 200 << 20;
+
 /// Work and personal browsing kept apart: each profile has its own tabs and history, and
 /// switching drops every open connection and TLS session (`net::forget_sessions`).
 struct Profile {
@@ -406,6 +409,11 @@ impl Profile {
         };
         if let Some(text) = read("cookies") {
             self.cookies = Arc::new(net::Cookies::load(&text));
+        }
+        // Its HTTP cache sits in its folder and travels with its cookies (`net::Cache`).
+        if let Some(dir) = profile_file(session, &self.id, "cache") {
+            self.cookies
+                .attach_cache(net::Cache::open(dir, PROFILE_CACHE_BYTES));
         }
         if let Some(text) = read("bookmarks") {
             let (bookmarks, last) = parse_bookmarks(&text);
@@ -4828,6 +4836,7 @@ mod tests {
             scale: 1.0,
             fetch_css: false,
             panes: 1,
+            cache: None,
         };
         let mut b = Browser::new(opts, FakeScreen::default(), session, Some(store));
         b.start();

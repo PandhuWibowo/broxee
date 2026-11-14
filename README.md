@@ -265,6 +265,8 @@ time something reads it (most theme variables never are). A `var()` value is sub
 
 | 2026-11-14 | Select and copy page text, find in page (#29) | 3.6 MB (3,551,600 → 3,584,656 bytes, +33 KB) | 49.9 MB peak painted at 2x | Drag, double click (word), triple click (paragraph), Shift+click, ⌘A and ⌘C, with line breaks between blocks; ⌘F finds case-insensitively across inline elements, Enter / Shift+Enter move and scroll. Positions are (text node, offset), so they survive relayout |
 
+| 2026-11-14 | HTTP disk cache, one per profile (#30) | 3.6 MB (3,584,656 → 3,617,808 bytes, +33 KB) | 50.0 MB peak painted at 2x | GitHub repository page, reloaded with a warm cache (`--cache DIR`): 2,294 → 248 ms in all, 700 → 52 KB received (only the HTML, which sets cookies, is fetched again; 23 stylesheets and 9 images come from disk). Entries keep the encoding they arrived in; `max-age`, `Expires`, heuristic freshness, `ETag`/`Last-Modified` revalidation, `no-store`, `Vary: Accept-Encoding` |
+
 Other pages after the layout milestone: GitHub home 22.7 MB peak (8,170 rules); Hacker News 11.5 MB.
 
 GitHub after custom properties: 39 MB peak, 24 ms cascade, 24,822 rules. Rules that only declare or use
