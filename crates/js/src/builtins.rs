@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use crate::interp::{Ctrl, Interp, Kind, ObjId, Target, Timer, Value};
+use crate::interp::{Ctrl, Handler, Interp, Kind, Mode, ObjId, Resume, Target, Timer, Value};
 use crate::regex::Regex;
 use crate::Host;
 
@@ -108,8 +108,120 @@ pub fn install(it: &mut Interp) {
     install_json(it);
     install_collections(it);
     install_symbol(it);
+    install_promise(it);
     install_window(it);
     install_dom(it);
+}
+
+/// `Promise` and `queueMicrotask`. Reactions run at the microtask checkpoint after each task.
+fn install_promise(it: &mut Interp) {
+    let p = it.protos.promise;
+    let c = constructor(
+        it,
+        "Promise",
+        |it, host, _, args| {
+            let executor = arg(args, 0);
+            if !it.is_callable(&executor) {
+                return it.type_error("Promise needs an executor function");
+            }
+            let promise = it.new_promise()?;
+            let (ok, err) = it.resolvers(promise)?;
+            match it.call(host, &executor, Value::Undefined, &[ok, err]) {
+                Err(Ctrl::Throw(e)) => it.settle(promise, false, e),
+                Err(abort @ Ctrl::Abort(_)) => return Err(abort),
+                _ => {}
+            }
+            Ok(Value::Obj(promise))
+        },
+        p,
+    );
+    fn this_promise(it: &mut Interp, this: &Value) -> Result<ObjId, Ctrl> {
+        match it.is_promise(this) {
+            Some(q) => Ok(q),
+            None => it.type_error("not a promise"),
+        }
+    }
+    it.method(p, "then", |it, _, this, args| {
+        let q = this_promise(it, &this)?;
+        Ok(Value::Obj(it.promise_then(
+            q,
+            arg(args, 0),
+            arg(args, 1),
+        )?))
+    });
+    it.method(p, "catch", |it, _, this, args| {
+        let q = this_promise(it, &this)?;
+        Ok(Value::Obj(it.promise_then(
+            q,
+            Value::Undefined,
+            arg(args, 0),
+        )?))
+    });
+    it.method(p, "finally", |it, _, this, args| {
+        let q = this_promise(it, &this)?;
+        let f = arg(args, 0);
+        let h = if it.is_callable(&f) {
+            Handler::Finally(f)
+        } else {
+            Handler::Pass
+        };
+        let result = it.new_promise()?;
+        it.subscribe(q, h.clone(), h, Some(result));
+        Ok(Value::Obj(result))
+    });
+    it.method(c, "resolve", |it, host, _, args| {
+        Ok(Value::Obj(it.promise_resolved(host, arg(args, 0))?))
+    });
+    it.method(c, "reject", |it, _, _, args| {
+        let r = it.new_promise()?;
+        it.settle(r, false, arg(args, 0));
+        Ok(Value::Obj(r))
+    });
+    it.method(c, "all", |it, host, _, args| {
+        let items = it.iterate(host, &arg(args, 0))?;
+        Ok(Value::Obj(it.promise_aggregate(host, items, Mode::All)?))
+    });
+    it.method(c, "allSettled", |it, host, _, args| {
+        let items = it.iterate(host, &arg(args, 0))?;
+        Ok(Value::Obj(it.promise_aggregate(
+            host,
+            items,
+            Mode::AllSettled,
+        )?))
+    });
+    it.method(c, "any", |it, host, _, args| {
+        let items = it.iterate(host, &arg(args, 0))?;
+        Ok(Value::Obj(it.promise_aggregate(host, items, Mode::Any)?))
+    });
+    it.method(c, "race", |it, host, _, args| {
+        let items = it.iterate(host, &arg(args, 0))?;
+        let result = it.new_promise()?;
+        for item in items {
+            let q = it.promise_resolved(host, item)?;
+            it.subscribe(q, Handler::Pass, Handler::Pass, Some(result));
+        }
+        Ok(Value::Obj(result))
+    });
+    let gen = it.protos.generator;
+    it.method(gen, "next", |it, host, this, args| {
+        it.generator_resume(host, &this, Resume::Next(arg(args, 0)))
+    });
+    it.method(gen, "return", |it, host, this, args| {
+        it.generator_resume(host, &this, Resume::Return(arg(args, 0)))
+    });
+    it.method(gen, "throw", |it, host, this, args| {
+        it.generator_resume(host, &this, Resume::Throw(arg(args, 0)))
+    });
+    it.method(gen, "@@iterator", |_, _, this, _| Ok(this));
+    let g = it.global;
+    it.method(g, "queueMicrotask", |it, _, _, args| {
+        let f = arg(args, 0);
+        if !it.is_callable(&f) {
+            return it.type_error("queueMicrotask needs a function");
+        }
+        it.queue_microtask(f);
+        Ok(Value::Undefined)
+    });
 }
 
 /// `Symbol`, as unique strings: they work as property keys that never collide, and the
@@ -2090,9 +2202,6 @@ fn install_window(it: &mut Interp) {
         let f = arg(args, 0);
         let now = Value::Num(it.now);
         add_timer(it, host, &[f, Value::Num(16.0), now], false)
-    });
-    it.method(g, "queueMicrotask", |it, host, _, args| {
-        add_timer(it, host, &[arg(args, 0)], false)
     });
     let clear: crate::interp::NativeFn = |it, host, _, args| {
         let id = num(it, host, args, 0)?;
