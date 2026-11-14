@@ -24,6 +24,11 @@ pub enum Event {
         x: f64,
         y: f64,
     },
+    /// The primary button went down with Shift held: extend a text selection.
+    ShiftClick {
+        x: f64,
+        y: f64,
+    },
     /// The pointer moved with the button down.
     Drag {
         x: f64,

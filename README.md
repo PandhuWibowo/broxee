@@ -263,6 +263,8 @@ time something reads it (most theme variables never are). A `var()` value is sub
 
 | 2026-11-14 | `fetch`, `XMLHttpRequest`, `document.cookie` (#28) | 3.6 MB (3,468,880 → 3,551,600 bytes, +82.7 KB) | 49.7 MB peak painted at 2x | Requests run on their own threads (6 at once per page) and answer as tasks; CORS with preflight; cookies only for the page's site. Tested against local servers: GET, POST with JSON, an allowed and a blocked cross-origin read, a preflighted header, cookies kept from another site |
 
+| 2026-11-14 | Select and copy page text, find in page (#29) | 3.6 MB (3,551,600 → 3,584,656 bytes, +33 KB) | 49.9 MB peak painted at 2x | Drag, double click (word), triple click (paragraph), Shift+click, ⌘A and ⌘C, with line breaks between blocks; ⌘F finds case-insensitively across inline elements, Enter / Shift+Enter move and scroll. Positions are (text node, offset), so they survive relayout |
+
 Other pages after the layout milestone: GitHub home 22.7 MB peak (8,170 rules); Hacker News 11.5 MB.
 
 GitHub after custom properties: 39 MB peak, 24 ms cascade, 24,822 rules. Rules that only declare or use

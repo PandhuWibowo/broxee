@@ -85,6 +85,10 @@ Rules:
 
 - **`muted` is at the limit in light mode (4.52).** Never lighten it, and never put it on `selected`. A sleeping tab
   that gets selected wakes up, so its title returns to `text` anyway.
+- **Marks over page text are translucent `accent`** (selection 40%, find matches 24%, the current match 51%),
+  never an opaque fill: a page's own colors and text stay readable under them, in either theme. The find
+  field takes the address field's place in the pane header, with "Find in page" as its placeholder and
+  "2 of 5" (or "No matches") muted at its right end.
 - **One accent.** Sky marks the thing you can act on now: a link, the focused control, the primary button, page
   load progress. It is never a background for a whole region.
 - **Emerald is a signature, not a second accent.** It appears on the wordmark and as a profile color. Buttons and
@@ -196,6 +200,8 @@ uses). It never appears as decoration anywhere else.
 | Show or hide the sidebar | ⌘\\ |
 | Bookmark this page / bookmarks panel | ⌘D / ⌘⌥B |
 | Switch profile | ⌘⇧P |
+| Find in page / next / previous match | ⌘F, then Enter / Shift+Enter (or ⌘G / ⌘⇧G); Esc closes |
+| Select all page text / copy the selection | ⌘A / ⌘C |
 
 ## 8. Icons
 

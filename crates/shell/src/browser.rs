@@ -16,7 +16,7 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use font::TextMetrics;
 use html::NodeId;
@@ -25,13 +25,14 @@ use platform::{Event, Key, KeyEvent};
 
 use crate::chrome::{
     self, Button, Chrome, DialogView, FieldView, Frame, HeaderView, HintView, Hue, ListRow,
-    MenuView, PaletteHit, PaletteRow, PaletteView, SidebarItem, SidebarView, HEADER_HEIGHT,
-    SIDEBAR_MAX, SIDEBAR_MIN, SIDEBAR_WIDTH,
+    MarkKind, MenuView, PaletteHit, PaletteRow, PaletteView, SidebarItem, SidebarView,
+    HEADER_HEIGHT, SIDEBAR_MAX, SIDEBAR_MIN, SIDEBAR_WIDTH,
 };
 use crate::engine::{self, FontStore, Loaded, Settings};
 use crate::forms;
 use crate::hibernate::{Stored, TabStore};
 use crate::palette::{self, Action, Command, Hint};
+use crate::selection::{self, Selection};
 use crate::Options;
 
 /// Arrow keys scroll by this many points.
@@ -320,8 +321,8 @@ enum DialogKind {
     RemoveProfile,
 }
 
-/// A press in the sidebar that may become a drag.
-#[derive(Clone, Copy, Debug)]
+/// A press in the sidebar that may become a drag, or a selection being dragged.
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Drag {
     /// On a tab row; it becomes a move once the pointer travels a few points.
     Pressed { tab: usize, y: f32 },
@@ -329,6 +330,17 @@ enum Drag {
     Moving { tab: usize, drop: usize },
     /// The sidebar's edge, resizing it.
     Resizing,
+    /// Text in the page, being selected.
+    Selecting,
+}
+
+/// Find in page (⌘F): the query, its matches and the one Enter moved to.
+struct Find {
+    field: Field,
+    matches: Vec<Selection>,
+    current: usize,
+    /// Keys go to the field (until a click in the page).
+    focused: bool,
 }
 
 /// What the sidebar lists.
@@ -549,6 +561,11 @@ struct Browser<S: Screen> {
     /// How far the sidebar's list is scrolled.
     sidebar_scroll: f32,
     drag: Option<Drag>,
+    /// Text selected in the page.
+    selection: Option<Selection>,
+    find: Option<Find>,
+    /// The last press on the page, for double and triple clicks: when, where, the count.
+    last_press: Option<(Instant, f32, f32, u8)>,
     list: SidebarList,
     /// The bookmark row chosen with ↑ ↓ while the bookmarks panel is open.
     bookmark_row: Option<usize>,
@@ -631,6 +648,9 @@ impl<S: Screen> Browser<S> {
             sidebar_width: SIDEBAR_WIDTH,
             sidebar_scroll: 0.0,
             drag: None,
+            selection: None,
+            find: None,
+            last_press: None,
             list: SidebarList::Tabs,
             bookmark_row: None,
             focus: None,
@@ -907,6 +927,7 @@ impl<S: Screen> Browser<S> {
             }
             Event::Scroll { dy, .. } => self.scroll_by(-(dy as f32)),
             Event::Drag { x, y } => self.drag_to(x as f32, y as f32),
+            Event::ShiftClick { x, y } => self.shift_click(x as f32, y as f32),
             Event::Release { x, y } => self.release(x as f32, y as f32),
             Event::Hover { .. } => false,
             Event::Resize {
@@ -1022,6 +1043,7 @@ impl<S: Screen> Browser<S> {
     fn route(&mut self, event: Event) -> Result<Event, bool> {
         let (x, y) = match event {
             Event::Click { x, y }
+            | Event::ShiftClick { x, y }
             | Event::Hover { x, y }
             | Event::Drag { x, y }
             | Event::Release { x, y }
@@ -1029,7 +1051,8 @@ impl<S: Screen> Browser<S> {
             _ => return Ok(event),
         };
         // The sidebar, and drags that started there, keep window coordinates.
-        if self.drag.is_some() || x < self.sidebar_edge() {
+        let sidebar_drag = self.drag.is_some() && self.drag != Some(Drag::Selecting);
+        if sidebar_drag || x < self.sidebar_edge() {
             return Ok(event);
         }
         let rects = self.pane_rects();
@@ -1049,6 +1072,7 @@ impl<S: Screen> Browser<S> {
         let top = f64::from(rects[j].1);
         Ok(match event {
             Event::Click { x, y } => Event::Click { x, y: y - top },
+            Event::ShiftClick { x, y } => Event::ShiftClick { x, y: y - top },
             Event::Hover { x, y } => Event::Hover { x, y: y - top },
             Event::Drag { x, y } => Event::Drag { x, y: y - top },
             Event::Release { x, y } => Event::Release { x, y: y - top },
@@ -1315,7 +1339,261 @@ impl<S: Screen> Browser<S> {
             self.follow(url);
             return true;
         }
-        was_editing
+        if let Some(find) = self.find.as_mut() {
+            find.focused = false;
+        }
+        let count = self.press_count(x, y);
+        self.start_selection(x, y - HEADER_HEIGHT, count) | was_editing
+    }
+
+    /// How many presses in a row this one is at (x, y): 1, 2 (a word) or 3 (a paragraph).
+    fn press_count(&mut self, x: f32, y: f32) -> u8 {
+        let now = Instant::now();
+        let count = match self.last_press {
+            Some((at, px, py, n))
+                if now.duration_since(at) < Duration::from_millis(500)
+                    && (px - x).abs() < 4.0
+                    && (py - y).abs() < 4.0 =>
+            {
+                n % 3 + 1
+            }
+            _ => 1,
+        };
+        self.last_press = Some((now, x, y, count));
+        count
+    }
+
+    /// A press on the page at (x, y) in pane points: select from there (a word on a double
+    /// click, a paragraph on a triple), dragging extends it.
+    fn start_selection(&mut self, x: f32, y_view: f32, count: u8) -> bool {
+        let had = self.selection.take().is_some();
+        let Some(page) = self.page.as_ref() else {
+            return had;
+        };
+        let metrics = page.metrics(&self.fonts);
+        let (layout, styles) = (&page.layout, &page.styles);
+        let Some(pos) = selection::hit(layout, styles, &metrics, x, y_view + self.scroll) else {
+            return had;
+        };
+        let point = Selection {
+            anchor: pos,
+            focus: pos,
+        };
+        let sel = match count {
+            1 => point,
+            2 => selection::word(layout, pos).unwrap_or(point),
+            _ => selection::paragraph(layout, &page.dom, styles, pos).unwrap_or(point),
+        };
+        self.selection = Some(sel);
+        self.drag = Some(Drag::Selecting);
+        true
+    }
+
+    /// Move the selection's free end to (x, y) in pane points.
+    fn extend_selection(&mut self, x: f32, y_view: f32) -> bool {
+        let (Some(page), Some(sel)) = (self.page.as_ref(), self.selection) else {
+            return false;
+        };
+        let metrics = page.metrics(&self.fonts);
+        let Some(pos) = selection::hit(
+            &page.layout,
+            &page.styles,
+            &metrics,
+            x,
+            y_view + self.scroll,
+        ) else {
+            return false;
+        };
+        let moved = sel.focus != pos;
+        self.selection = Some(Selection { focus: pos, ..sel });
+        moved
+    }
+
+    /// Shift+click: extend the selection there, or press as usual when there is none.
+    fn shift_click(&mut self, x: f32, y: f32) -> bool {
+        let left = self.pane_left();
+        if self.selection.is_none() || x < left || y < HEADER_HEIGHT {
+            return self.click(x, y);
+        }
+        self.drag = Some(Drag::Selecting);
+        self.extend_selection(x - left, y - HEADER_HEIGHT)
+    }
+
+    /// ⌘C: the selected page text (or the whole address being edited) to the clipboard.
+    fn copy_selection(&mut self) -> bool {
+        if let Some(field) = self.field.as_ref() {
+            self.window.copy(&field.text);
+            return false;
+        }
+        let (Some(page), Some(sel)) = (self.page.as_ref(), self.selection) else {
+            return false;
+        };
+        let text = selection::text(&page.layout, &page.dom, &page.styles, sel);
+        if !text.is_empty() {
+            self.window.copy(&text);
+        }
+        false
+    }
+
+    /// ⌘F: open find in page, or select its query when it is open.
+    fn open_find(&mut self) -> bool {
+        self.field = None;
+        self.editing = None;
+        match self.find.as_mut() {
+            Some(find) => {
+                find.focused = true;
+                find.field.all_selected = true;
+            }
+            None => {
+                self.find = Some(Find {
+                    field: Field {
+                        text: String::new(),
+                        cursor: 0,
+                        all_selected: false,
+                    },
+                    matches: Vec::new(),
+                    current: 0,
+                    focused: true,
+                });
+            }
+        }
+        self.header_change = true;
+        true
+    }
+
+    /// The query changed: find it again and show the first match.
+    fn refresh_find(&mut self) {
+        let Some(find) = self.find.as_mut() else {
+            return;
+        };
+        find.matches = match self.page.as_ref() {
+            Some(p) => selection::find(&p.layout, &p.dom, &p.styles, &find.field.text, 1000),
+            None => Vec::new(),
+        };
+        find.current = 0;
+        self.scroll_to_match();
+    }
+
+    /// Enter (forward) or Shift+Enter in find: the next or previous match, wrapping.
+    fn find_step(&mut self, forward: bool) -> bool {
+        let Some(find) = self.find.as_mut() else {
+            return false;
+        };
+        let n = find.matches.len();
+        if n == 0 {
+            return false;
+        }
+        find.current = if forward {
+            (find.current + 1) % n
+        } else {
+            (find.current + n - 1) % n
+        };
+        self.scroll_to_match();
+        true
+    }
+
+    /// Scroll so the current match sits in the upper third of the view, unless it shows.
+    fn scroll_to_match(&mut self) {
+        let (Some(find), Some(page)) = (self.find.as_ref(), self.page.as_ref()) else {
+            return;
+        };
+        let Some(m) = find.matches.get(find.current) else {
+            return;
+        };
+        let Some((run, _)) = selection::locate(&page.layout, m.anchor) else {
+            return;
+        };
+        if page.layout.text_is_fixed(run) {
+            return;
+        }
+        let y = page.layout.texts[run].baseline;
+        let view = self.page_height();
+        if y < self.scroll + 20.0 || y > self.scroll + view - 20.0 {
+            self.scroll = y - view / 3.0;
+            self.clamp_scroll();
+        }
+    }
+
+    /// Keys while the find field has them.
+    fn find_key(&mut self, k: KeyEvent) -> bool {
+        let Some(find) = self.find.as_mut() else {
+            return false;
+        };
+        let field = &mut find.field;
+        let edited = match k.key {
+            Key::Char(c) => {
+                field.insert(c.encode_utf8(&mut [0; 4]));
+                true
+            }
+            Key::Backspace => {
+                field.backspace();
+                true
+            }
+            Key::Left => {
+                field.left();
+                false
+            }
+            Key::Right => {
+                field.right();
+                false
+            }
+            Key::Enter => return self.find_step(!k.shift),
+            Key::Escape => {
+                self.find = None;
+                self.header_change = true;
+                return true;
+            }
+            _ => return false,
+        };
+        if edited {
+            self.refresh_find();
+        }
+        self.header_change = true;
+        true
+    }
+
+    /// What the find field says at its right end: "2 of 5", or "No matches".
+    fn find_hint(&self) -> Option<String> {
+        let find = self.find.as_ref()?;
+        if find.field.text.is_empty() {
+            return None;
+        }
+        Some(match find.matches.len() {
+            0 => "No matches".to_string(),
+            n => format!("{} of {n}", find.current + 1),
+        })
+    }
+
+    /// The marks over the page text (pane points) and how to draw each.
+    fn page_marks(&self, metrics: &dyn font::TextMetrics) -> Vec<(f32, f32, f32, f32, MarkKind)> {
+        let Some(page) = self.page.as_ref() else {
+            return Vec::new();
+        };
+        let (layout, styles) = (&page.layout, &page.styles);
+        let mut out = Vec::new();
+        let view = self.page_height();
+        let mut add = |sel: Selection, kind: MarkKind| {
+            for m in selection::marks(layout, styles, metrics, sel) {
+                let y = if m.fixed { m.y } else { m.y - self.scroll };
+                if y + m.height >= 0.0 && y <= view {
+                    out.push((m.x, y, m.width, m.height, kind));
+                }
+            }
+        };
+        if let Some(find) = &self.find {
+            for (i, m) in find.matches.iter().enumerate() {
+                let kind = if i == find.current {
+                    MarkKind::Current
+                } else {
+                    MarkKind::Match
+                };
+                add(*m, kind);
+            }
+        }
+        if let Some(sel) = self.selection {
+            add(sel, MarkKind::Selection);
+        }
+        out
     }
 
     /// Where the caret of the focused field is: x, top and height in page-area points.
@@ -1707,10 +1985,36 @@ impl<S: Screen> Browser<S> {
                         self.header_change = true;
                         true
                     }
-                    None => false,
+                    None => match self.find.as_mut().filter(|f| f.focused) {
+                        Some(find) => {
+                            find.field.all_selected = true;
+                            self.header_change = true;
+                            true
+                        }
+                        None => {
+                            self.selection =
+                                self.page.as_ref().and_then(|p| selection::all(&p.layout));
+                            self.selection.is_some()
+                        }
+                    },
                 },
+                Key::Char('c') => self.copy_selection(),
+                Key::Char('f') => self.open_find(),
+                Key::Char('g') => self.find_step(!k.shift),
                 _ => false,
             };
+        }
+        if self.find.as_ref().is_some_and(|f| f.focused) {
+            return self.find_key(k);
+        }
+        if k.key == Key::Escape && self.field.is_none() && self.editing.is_none() {
+            if self.find.take().is_some() {
+                self.header_change = true;
+                return true;
+            }
+            if self.selection.take().is_some() {
+                return true;
+            }
         }
         if let Some(field) = self.field.as_mut() {
             match k.key {
@@ -2446,6 +2750,9 @@ impl<S: Screen> Browser<S> {
 
     /// The pointer moved with the button down: resize the sidebar or move a tab.
     fn drag_to(&mut self, x: f32, y: f32) -> bool {
+        if self.drag == Some(Drag::Selecting) {
+            return self.extend_selection(x - self.pane_left(), y - HEADER_HEIGHT);
+        }
         match self.drag {
             Some(Drag::Resizing) => {
                 let width = x.round().clamp(SIDEBAR_MIN, SIDEBAR_MAX);
@@ -2471,6 +2778,14 @@ impl<S: Screen> Browser<S> {
 
     /// The button came up: finish a resize or a move.
     fn release(&mut self, _x: f32, _y: f32) -> bool {
+        if self.drag == Some(Drag::Selecting) {
+            self.drag = None;
+            // A press without a drag selects nothing.
+            if self.selection.is_some_and(|s| s.anchor == s.focus) {
+                self.selection = None;
+            }
+            return self.set_states(|s| s.active = None) | true;
+        }
         if self.set_states(|s| s.active = None) {
             return true;
         }
@@ -3290,6 +3605,11 @@ impl<S: Screen> Browser<S> {
         self.window.set_title(&title);
         self.page_is_entry = false;
         self.page = Some(page);
+        // Positions are node ids of the page they were made on.
+        self.selection = None;
+        if self.find.take().is_some() {
+            self.header_change = true;
+        }
         self.link_focus = None;
         self.editing = None;
         self.loading = None;
@@ -3404,10 +3724,12 @@ impl<S: Screen> Browser<S> {
         let scale = self.scale;
         let profile = &self.profiles[self.profile];
         let host = header_host(profile);
+        let hint = self.find_hint();
         let header = header_view(
             profile,
             &host,
             self.field.as_ref(),
+            self.find.as_ref().map(|f| (&f.field, hint.as_deref())),
             self.focus,
             self.loading,
         );
@@ -3489,10 +3811,12 @@ impl<S: Screen> Browser<S> {
 
         let profile = &self.profiles[self.profile];
         let host = header_host(profile);
+        let hint = self.find_hint();
         let header = header_view(
             profile,
             &host,
             self.field.as_ref(),
+            self.find.as_ref().map(|f| (&f.field, hint.as_deref())),
             self.focus,
             self.loading,
         );
@@ -3604,6 +3928,9 @@ impl<S: Screen> Browser<S> {
         });
         let page_metrics = self.page.as_ref().map(|p| p.metrics(fonts));
         let caret = page_metrics.as_ref().and_then(|m| self.caret(m));
+        let marks = page_metrics
+            .as_ref()
+            .map_or(Vec::new(), |m| self.page_marks(m));
         let view = self
             .page
             .as_ref()
@@ -3716,6 +4043,16 @@ impl<S: Screen> Browser<S> {
                     };
                     chrome.draw_focus_ring(painter, frame, &ring);
                 }
+                if !marks.is_empty() && page_rows > 0 {
+                    let frame = Frame {
+                        pixels: &mut *bottom,
+                        stride,
+                        left: pane_x,
+                        width: pane_px,
+                        scale,
+                    };
+                    chrome.draw_marks(painter, frame, &marks);
+                }
                 if let (Some(caret), true) = (caret, page_rows > 0) {
                     let frame = Frame {
                         pixels: &mut *bottom,
@@ -3791,6 +4128,7 @@ fn header_view<'a>(
     profile: &'a Profile,
     host: &'a str,
     field: Option<&'a Field>,
+    find: Option<(&'a Field, Option<&'a str>)>,
     focus: Option<Button>,
     loading: Option<f32>,
 ) -> HeaderView<'a> {
@@ -3802,11 +4140,23 @@ fn header_view<'a>(
         can_forward: tab.index + 1 < tab.history.len(),
         loading,
         host,
-        field: field.map(|f| FieldView {
-            text: &f.text,
-            cursor: f.cursor,
-            all_selected: f.all_selected,
-        }),
+        field: match (field, find) {
+            (Some(f), _) => Some(FieldView {
+                text: &f.text,
+                cursor: f.cursor,
+                all_selected: f.all_selected,
+                placeholder: None,
+                hint: None,
+            }),
+            (None, Some((f, hint))) => Some(FieldView {
+                text: &f.text,
+                cursor: f.cursor,
+                all_selected: f.all_selected,
+                placeholder: Some("Find in page"),
+                hint,
+            }),
+            (None, None) => None,
+        },
         focused: focus,
     }
 }
@@ -6041,6 +6391,134 @@ mod tests {
         let whole = started.elapsed().as_secs_f64() * 1000.0;
         assert!(incremental == fields(&b.page.as_ref().unwrap().layout));
         (per_key, whole)
+    }
+
+    /// Where to point at character `c` of the first run starting with `starts`, in window points.
+    fn text_point(b: &Browser<FakeScreen>, starts: &str, c: usize) -> (f64, f64) {
+        let page = b.page.as_ref().unwrap();
+        let l = &page.layout;
+        let t = l
+            .texts
+            .iter()
+            .find(|t| l.text(t).starts_with(starts))
+            .expect("the run is on the page");
+        let style = page.styles.style(t.node);
+        let (size, key) = (style.font_size.to_f32(), layout::font_key(style));
+        let metrics = page.metrics(&b.fonts);
+        let advances: Vec<f32> = l
+            .text(t)
+            .chars()
+            .map(|ch| font::TextMetrics::advance_em(&metrics, ch, key) * size)
+            .collect();
+        let before: f32 = advances[..c].iter().sum();
+        // A little into the character: its left edge can sit on the sidebar's resize edge.
+        let x = t.x + before + advances.get(c).copied().unwrap_or(0.0) * 0.3 + b.pane_left();
+        let y = t.baseline - 4.0 - b.scroll + HEADER_HEIGHT;
+        (f64::from(x), f64::from(y))
+    }
+
+    const SELECT_PAGE: &str =
+        "<!doctype html><style>body { margin: 8px; font-family: monospace }</style>\
+        <p>First paragraph with a line</p><p>Second line of <b>bold</b> text</p>\
+        <div style='height: 3000px'></div><p>A far line at the bottom</p>";
+
+    #[test]
+    fn drag_selects_across_paragraphs_and_copies() {
+        let mut b = browser(&page_file("select", SELECT_PAGE));
+        let (x0, y0) = text_point(&b, "First", 0);
+        let (x1, y1) = text_point(&b, "Second", 6);
+        act(&mut b, Event::Click { x: x0, y: y0 });
+        assert!(
+            act(&mut b, Event::Drag { x: x1, y: y1 }),
+            "dragging repaints"
+        );
+        act(&mut b, Event::Release { x: x1, y: y1 });
+        let metrics = b.page.as_ref().unwrap().metrics(&b.fonts);
+        assert_eq!(b.page_marks(&metrics).len(), 2, "one mark per run selected");
+        act(&mut b, command('c'));
+        assert_eq!(
+            b.window.clipboard.borrow().as_str(),
+            "First paragraph with a line\nSecond"
+        );
+
+        // A double click selects a word, a triple click its paragraph; Shift+click extends.
+        let (x, y) = text_point(&b, "Second", 8);
+        act(&mut b, Event::Click { x, y });
+        act(&mut b, Event::Release { x, y });
+        act(&mut b, Event::Click { x, y });
+        act(&mut b, Event::Release { x, y });
+        act(&mut b, command('c'));
+        assert_eq!(b.window.clipboard.borrow().as_str(), "line");
+        act(&mut b, Event::Click { x, y });
+        act(&mut b, Event::Release { x, y });
+        act(&mut b, command('c'));
+        assert_eq!(
+            b.window.clipboard.borrow().as_str(),
+            "Second line of bold text"
+        );
+        let (fx, fy) = text_point(&b, "First", 6);
+        act(&mut b, Event::ShiftClick { x: fx, y: fy });
+        act(&mut b, Event::Release { x: fx, y: fy });
+        act(&mut b, command('c'));
+        assert_eq!(
+            b.window.clipboard.borrow().as_str(),
+            "paragraph with a line\n",
+            "from the paragraph's end back to where Shift+click landed"
+        );
+
+        // A press without a drag clears it; Esc too.
+        let (x, y) = text_point(&b, "First", 2);
+        act(&mut b, Event::Click { x, y });
+        act(&mut b, Event::Release { x, y });
+        assert!(b.selection.is_none());
+        act(&mut b, command('a'));
+        assert!(b.selection.is_some(), "⌘A selects the page");
+        act(&mut b, key(Key::Escape));
+        assert!(b.selection.is_none());
+    }
+
+    #[test]
+    fn finds_text_and_moves_through_matches() {
+        let mut b = browser(&page_file("find", SELECT_PAGE));
+        act(&mut b, command('f'));
+        assert!(b.find.is_some());
+        type_text(&mut b, "LINE");
+        let count = |b: &Browser<FakeScreen>| b.find.as_ref().unwrap().matches.len();
+        assert_eq!(count(&b), 3, "case-insensitive");
+        assert_eq!(b.find_hint().as_deref(), Some("1 of 3"));
+        assert_eq!(b.scroll, 0.0, "the first match shows already");
+        act(&mut b, key(Key::Enter));
+        act(&mut b, key(Key::Enter));
+        assert_eq!(b.find_hint().as_deref(), Some("3 of 3"));
+        assert!(b.scroll > 2000.0, "scrolled to the far match");
+        act(&mut b, key(Key::Enter));
+        assert_eq!(b.find_hint().as_deref(), Some("1 of 3"), "wraps");
+        act(
+            &mut b,
+            Event::Key(KeyEvent {
+                key: Key::Enter,
+                command: false,
+                shift: true,
+                option: false,
+            }),
+        );
+        assert_eq!(
+            b.find_hint().as_deref(),
+            Some("3 of 3"),
+            "Shift+Enter goes back"
+        );
+        let metrics = b.page.as_ref().unwrap().metrics(&b.fonts);
+        assert!(
+            b.page_marks(&metrics)
+                .iter()
+                .any(|m| m.4 == MarkKind::Current),
+            "the current match is marked"
+        );
+        type_text(&mut b, "zzz");
+        assert_eq!(b.find_hint().as_deref(), Some("No matches"));
+        b.render();
+        act(&mut b, key(Key::Escape));
+        assert!(b.find.is_none(), "Esc closes it");
     }
 
     fn type_text(b: &mut Browser<FakeScreen>, text: &str) {

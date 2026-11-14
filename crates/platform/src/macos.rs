@@ -612,8 +612,15 @@ extern "C" fn scroll_wheel(this: Id, _sel: Sel, event: Id) {
 }
 
 extern "C" fn mouse_down(this: Id, _sel: Sel, event: Id) {
+    const SHIFT: u64 = 1 << 17;
     let (x, y) = location(this, event);
-    emit(Event::Click { x, y });
+    // SAFETY: `event` is the NSEvent passed to mouseDown:; -modifierFlags returns NSUInteger.
+    let flags = unsafe { send!(u64; event, c"modifierFlags") };
+    if flags & SHIFT != 0 {
+        emit(Event::ShiftClick { x, y });
+    } else {
+        emit(Event::Click { x, y });
+    }
 }
 
 extern "C" fn mouse_dragged(this: Id, _sel: Sel, event: Id) {
