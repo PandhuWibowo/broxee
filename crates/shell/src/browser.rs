@@ -5797,8 +5797,11 @@ mod tests {
         }
         let mut b = browser(&page_file(&format!("typing-{rows}"), &html));
         assert!(click_control(&mut b, 0));
+        // The first character can move an empty field's baseline (from the font's metrics to
+        // its line of text): that key may lay the page out whole, as it should.
+        type_text(&mut b, "h");
         let before = b.page.as_ref().unwrap().in_place;
-        let typed = "hello world, a longer query than the field is wide";
+        let typed = "ello world, a longer query than the field is wide";
         let started = std::time::Instant::now();
         type_text(&mut b, typed);
         let keys = typed.chars().count() as u32;
