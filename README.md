@@ -261,6 +261,8 @@ time something reads it (most theme variables never are). A `var()` value is sub
 | 2026-11-14 | JavaScript: generators, lazy `for…of`, destructuring assignment (part of #27) | 3.5 MB (3,452,336 → 3,468,880 bytes, +16.5 KB) | 49.9 MB peak painted at 2x | Generators reuse the `async` statement machine: `yield` is a second pause point. Same five sites run with no console errors; peak RAM unchanged within 0.3 MB |
 | 2026-11-14 | JavaScript: promises, microtasks, `async`/`await` (part of #27) | 3.5 MB (3,402,704 → 3,452,336 bytes, +49.6 KB) | 49.8 MB peak painted at 2x (unchanged) | An `async` body runs on a statement machine that pauses between statements; statements without `await` still run whole on the recursive evaluator. Peak RAM with scripts: rust-lang.org 17.5 MB, GitHub 20.2 MB, Wikipedia 22.2 MB, HN 14.8 MB, MDN 16.7 MB (unchanged) |
 
+| 2026-11-14 | `fetch`, `XMLHttpRequest`, `document.cookie` (#28) | 3.6 MB (3,468,880 → 3,551,600 bytes, +82.7 KB) | 49.7 MB peak painted at 2x | Requests run on their own threads (6 at once per page) and answer as tasks; CORS with preflight; cookies only for the page's site. Tested against local servers: GET, POST with JSON, an allowed and a blocked cross-origin read, a preflighted header, cookies kept from another site |
+
 Other pages after the layout milestone: GitHub home 22.7 MB peak (8,170 rules); Hacker News 11.5 MB.
 
 GitHub after custom properties: 39 MB peak, 24 ms cascade, 24,822 rules. Rules that only declare or use
@@ -376,8 +378,11 @@ Where data lives, and what compression does for it (measured 2026-11-07):
   position (`a && await b`, a ternary branch) only reads already settled promises. Generators
   (`function*`, `yield`, `yield*`, `next`/`return`/`throw`) pause the same way; `for…of` takes their values
   one at a time, so an endless one can be left with `break` (`return()` ends a generator without running
-  its `finally`). Destructuring assignment (`[a, b] = [b, a]`). Modules, async generators, `fetch` and
-  `XMLHttpRequest` do not run yet. A script using unsupported syntax is skipped as a whole and the reason
+  its `finally`). Destructuring assignment (`[a, b] = [b, a]`). `fetch` (text and JSON
+  bodies, `Headers`, `Response`) and `XMLHttpRequest` go out once the page is shown, with the same-origin
+  policy and CORS, and the profile's cookies for the page's own site only; `document.cookie` reads and writes
+  them, never `HttpOnly` ones. Typing in a field fires `input`, then `keyup`, so search boxes can
+  suggest. Modules and async generators do not run yet. A script using unsupported syntax is skipped as a whole and the reason
   goes to stderr (`console:`), with what scripts log. Events: `click` (bubbling, `preventDefault`, `onclick`
   attributes and properties), `DOMContentLoaded`, `load`; timers and `requestAnimationFrame`. highlight.js runs but
   colors keywords only: its rules for strings and comments never match yet, and one code block on

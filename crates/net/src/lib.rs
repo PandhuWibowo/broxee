@@ -392,13 +392,34 @@ pub fn send_in(
     body: Option<&Body>,
     cookies: Option<(&Cookies, &Context)>,
 ) -> Result<Response, String> {
+    send_with(url, body, None, cookies)
+}
+
+/// What a script's request adds to a plain GET or POST: its method and its own headers.
+#[derive(Clone, Debug, Default)]
+pub struct Extra {
+    /// Uppercase, a token (`PUT`, `DELETE`…).
+    pub method: String,
+    /// Already checked by the caller: no forbidden names, no CR or LF.
+    pub headers: Vec<(String, String)>,
+}
+
+/// As `send_in`, with a script's method and headers. A 301, 302 or 303 turns the request
+/// into a plain GET.
+pub fn send_with(
+    url: &Url,
+    body: Option<&Body>,
+    extra: Option<&Extra>,
+    cookies: Option<(&Cookies, &Context)>,
+) -> Result<Response, String> {
     let mut url = url.clone();
     let mut body = body;
+    let mut extra = extra;
     for _ in 0..MAX_REDIRECTS {
         let header = cookies.and_then(|(jar, context)| jar.header(&url, context));
-        let resp = match fetch_once(&url, header.as_deref(), body) {
+        let resp = match fetch_once(&url, header.as_deref(), body, extra) {
             Err(FetchError::Retryable(_)) if body.is_none() => {
-                fetch_once(&url, header.as_deref(), None)?
+                fetch_once(&url, header.as_deref(), None, extra)?
             }
             other => other?,
         };
@@ -414,6 +435,7 @@ pub fn send_in(
                 url = url.join(location)?;
                 if !matches!(resp.status, 307 | 308) {
                     body = None;
+                    extra = None;
                 }
                 continue;
             }
@@ -427,6 +449,7 @@ fn fetch_once(
     url: &Url,
     cookie: Option<&str>,
     body: Option<&Body>,
+    extra: Option<&Extra>,
 ) -> Result<Response, FetchError> {
     if url.scheme == "file" {
         let path = url.decoded_path();
@@ -444,7 +467,7 @@ fn fetch_once(
         Some(conn) => (conn, true),
         None => (Conn::open(url)?, false),
     };
-    match request(&mut conn, url, cookie, body) {
+    match request(&mut conn, url, cookie, body, extra) {
         Ok((resp, reusable)) => {
             if reusable {
                 put_idle(key, conn);
@@ -454,7 +477,7 @@ fn fetch_once(
         // A pooled connection the server already closed: not the server's answer.
         Err(FetchError::Retryable(_)) if reused => {
             let mut conn = Conn::open(url)?;
-            let (resp, reusable) = request(&mut conn, url, cookie, body)?;
+            let (resp, reusable) = request(&mut conn, url, cookie, body, extra)?;
             if reusable {
                 put_idle(key, conn);
             }
@@ -469,6 +492,7 @@ fn request(
     url: &Url,
     cookie: Option<&str>,
     body: Option<&Body>,
+    extra: Option<&Extra>,
 ) -> Result<(Response, bool), FetchError> {
     let host_header = if Some(url.port) == default_port(&url.scheme) {
         url.host.clone()
@@ -488,10 +512,26 @@ fn request(
         ),
         None => ("GET", String::new()),
     };
+    let method = extra.map_or(method, |e| e.method.as_str());
+    let mut own = String::new();
+    let mut accept = "text/html,*/*;q=0.8";
+    for (name, value) in extra.map_or(&[][..], |e| &e.headers[..]) {
+        if name.eq_ignore_ascii_case("accept") {
+            accept = value;
+        } else {
+            own.push_str(&format!("{name}: {value}\r\n"));
+        }
+    }
+    let content = match (body, extra) {
+        (None, Some(e)) if !matches!(e.method.as_str(), "GET" | "HEAD") => {
+            "Content-Length: 0\r\n".to_string()
+        }
+        _ => content,
+    };
     let mut request = format!(
         "{method} {} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: {USER_AGENT}\r\n\
-         Accept: text/html,*/*;q=0.8\r\nAccept-Encoding: br, gzip, deflate\r\n\
-         {cookie}{content}Connection: keep-alive\r\n\r\n",
+         Accept: {accept}\r\nAccept-Encoding: br, gzip, deflate\r\n\
+         {cookie}{own}{content}Connection: keep-alive\r\n\r\n",
         url.path
     )
     .into_bytes();

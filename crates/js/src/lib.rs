@@ -51,6 +51,39 @@ pub trait Host {
     fn set_checked(&mut self, node: u32, checked: bool);
     fn url(&self) -> String;
     fn log(&mut self, line: &str);
+    /// Start a request a script made. Its answer comes back through `Runtime::deliver` with
+    /// the id returned; `None` refuses it (no network here, or too many requests).
+    fn fetch(&mut self, _request: Request) -> Option<u32> {
+        None
+    }
+    /// `document.cookie`: the page's own cookies a script may read (`HttpOnly` ones never).
+    fn cookie(&self) -> String {
+        String::new()
+    }
+    /// `document.cookie = "…"`.
+    fn set_cookie(&mut self, _text: &str) {}
+}
+
+/// A request a script makes (`fetch`, `XMLHttpRequest`), for the host to check and send.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Request {
+    /// As the script wrote it: relative to the page.
+    pub url: String,
+    /// Uppercase.
+    pub method: String,
+    /// Names lowercase.
+    pub headers: Vec<(String, String)>,
+    pub body: Option<String>,
+}
+
+/// A response the script may read.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Reply {
+    pub url: String,
+    pub status: u16,
+    /// Names lowercase; only those the script may see.
+    pub headers: Vec<(String, String)>,
+    pub body: String,
 }
 
 /// The scripts of one page.
@@ -222,6 +255,25 @@ impl Runtime {
         self.checkpoint(host);
     }
 
+    /// The answer to request `id` (`Host::fetch`): a reply, or why there is none (a network
+    /// error, or a response the page may not read). Runs as a task.
+    pub fn deliver(&mut self, host: &mut dyn Host, id: u32, result: Result<Reply, String>) {
+        if self.interp.stopped.is_some() {
+            return;
+        }
+        let r = builtins::deliver(&mut self.interp, host, id, result);
+        if r.is_err() {
+            self.finish(host, r.map(|_| Value::Undefined), "request");
+        }
+        self.interp.steps = 0;
+        self.checkpoint(host);
+    }
+
+    /// Whether requests the scripts made are still waiting for an answer.
+    pub fn waiting(&self) -> bool {
+        self.interp.stopped.is_none() && !self.interp.requests.is_empty()
+    }
+
     /// When the next timer is due, in page milliseconds.
     pub fn next_timer(&self) -> Option<f64> {
         if self.interp.stopped.is_some() {
@@ -308,6 +360,8 @@ mod tests {
     #[derive(Default)]
     struct Bare {
         log: Vec<String>,
+        requests: Vec<Request>,
+        cookies: Vec<String>,
     }
 
     impl Host for Bare {
@@ -365,6 +419,25 @@ mod tests {
         }
         fn log(&mut self, line: &str) {
             self.log.push(line.to_string());
+        }
+        fn fetch(&mut self, request: Request) -> Option<u32> {
+            if request.url.contains("refuse") {
+                return None;
+            }
+            self.requests.push(request);
+            Some(self.requests.len() as u32)
+        }
+        fn cookie(&self) -> String {
+            self.cookies.join("; ")
+        }
+        fn set_cookie(&mut self, text: &str) {
+            let pair = text
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            self.cookies.push(pair);
         }
     }
 
@@ -555,6 +628,79 @@ mod tests {
         assert!(
             rt.stopped().is_some(),
             "endless reactions stop the page's scripts"
+        );
+    }
+
+    #[test]
+    fn fetch_and_xhr_answer_later() {
+        let mut host = Bare::default();
+        let mut rt = Runtime::new();
+        rt.run(
+            &mut host,
+            "var out = [];\
+             fetch('/api/items?q=1', { method: 'post', headers: { 'X-Kind': 'a', Cookie: 'no' }, body: JSON.stringify({a: 1}) })\
+               .then(r => { out.push(r.status, r.ok, r.headers.get('content-type')); return r.json() })\
+               .then(data => out.push(data.items.length));\
+             fetch('/missing').then(r => out.push(r.ok, r.status));\
+             fetch('https://refuse.example/').catch(e => out.push(e.message));\
+             const x = new XMLHttpRequest(); x.open('GET', '/x'); x.setRequestHeader('Accept', 'text/plain');\
+             x.onload = function () { out.push('xhr ' + this.status + ' ' + this.responseText + ' ' + this.getResponseHeader('X-A')) };\
+             x.addEventListener('loadend', () => out.push('end'));\
+             x.send();\
+             document.cookie = 'theme=dark; path=/'; out.push(document.cookie);",
+            "a.js",
+        );
+        assert_eq!(
+            host.requests.len(),
+            3,
+            "the refused one never reached the host"
+        );
+        let first = &host.requests[0];
+        assert_eq!(first.method, "POST");
+        assert_eq!(first.body.as_deref(), Some("{\"a\":1}"));
+        assert!(first.headers.contains(&("x-kind".into(), "a".into())));
+        assert!(
+            !first.headers.iter().any(|(k, _)| k == "cookie"),
+            "scripts cannot set Cookie"
+        );
+        assert_eq!(
+            host.requests[2].headers,
+            [("accept".into(), "text/plain".into())]
+        );
+        assert!(rt.waiting());
+        rt.deliver(
+            &mut host,
+            1,
+            Ok(Reply {
+                url: "https://example.org/api/items?q=1".into(),
+                status: 200,
+                headers: vec![("content-type".into(), "application/json".into())],
+                body: "{\"items\": [1, 2, 3]}".into(),
+            }),
+        );
+        rt.deliver(
+            &mut host,
+            2,
+            Ok(Reply {
+                status: 404,
+                ..Reply::default()
+            }),
+        );
+        rt.deliver(
+            &mut host,
+            3,
+            Ok(Reply {
+                status: 200,
+                headers: vec![("x-a".into(), "b".into())],
+                body: "hi".into(),
+                ..Reply::default()
+            }),
+        );
+        assert!(!rt.waiting());
+        let out = rt.eval_to_string(&mut host, "out");
+        assert_eq!(
+            out,
+            "[\"theme=dark\", \"Failed to fetch\", 200, true, \"application/json\", 3, false, 404, \"xhr 200 hi b\", \"end\"]"
         );
     }
 

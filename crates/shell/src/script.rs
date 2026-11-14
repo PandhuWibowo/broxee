@@ -7,7 +7,9 @@
 //! are parsed without dropping rules for names the document lacks, since scripts can add
 //! them (see CLAUDE.md, CSS invariants).
 //!
-//! Scripts cannot read cookies, fetch, or navigate, and nothing they store reaches disk.
+//! Scripts fetch through `scriptnet` (same origin, CORS, the profile's cookies) and read and
+//! write `document.cookie` for the page's own site, never `HttpOnly` cookies. They cannot
+//! navigate, and nothing they store reaches disk.
 
 use std::time::Instant;
 
@@ -22,17 +24,20 @@ const MAX_SCRIPT_BYTES: usize = 4 << 20;
 /// The scripts of a live page.
 pub struct PageScript {
     pub runtime: js::Runtime,
+    /// Requests the scripts made.
+    pub net: crate::scriptnet::ScriptNet,
     started: Instant,
     epoch_ms: f64,
 }
 
 impl PageScript {
-    fn new() -> PageScript {
+    fn new(page: &net::Url) -> PageScript {
         let epoch_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0.0, |d| d.as_secs_f64() * 1000.0);
         PageScript {
             runtime: js::Runtime::new(),
+            net: crate::scriptnet::ScriptNet::new(page.clone()),
             started: Instant::now(),
             epoch_ms,
         }
@@ -72,6 +77,10 @@ pub struct DomHost<'a> {
     pub dom: &'a mut Dom,
     pub forms: &'a mut Forms,
     pub url: String,
+    /// Where requests go; `None` where scripts cannot fetch (tests of the DOM alone).
+    pub net: Option<&'a mut crate::scriptnet::ScriptNet>,
+    /// The profile's cookies while the page loads (once shown, `net` holds them).
+    pub load_jar: Option<&'a net::Cookies>,
     /// Something scripts did changes what the page shows.
     pub changed: bool,
 }
@@ -116,6 +125,33 @@ impl DomHost<'_> {
 }
 
 impl js::Host for DomHost<'_> {
+    fn fetch(&mut self, request: js::Request) -> Option<u32> {
+        self.net.as_mut()?.request(request)
+    }
+
+    fn cookie(&self) -> String {
+        let Some(net) = self.net.as_deref() else {
+            return String::new();
+        };
+        let page = net.page();
+        match net.jar().or(self.load_jar) {
+            Some(jar) => jar.script_view(page, &net::Context::subresource(page)),
+            None => String::new(),
+        }
+    }
+
+    fn set_cookie(&mut self, text: &str) {
+        let load_jar = self.load_jar;
+        let Some(net) = self.net.as_deref_mut() else {
+            return;
+        };
+        let page = net.page().clone();
+        match net.jar().or(load_jar) {
+            Some(jar) => jar.store_from_script(&page, text, &net::Context::subresource(&page)),
+            None => net.hold_cookie(text),
+        }
+    }
+
     fn select(&mut self, root: Option<u32>, selector: &str) -> Vec<u32> {
         css::select(self.dom, root.unwrap_or(Dom::ROOT), selector)
     }
@@ -344,20 +380,27 @@ pub fn run_page_scripts(
         }
         texts.push((name, text));
     }
-    let mut script = Box::new(PageScript::new());
+    let mut script = Box::new(PageScript::new(url));
     let page_url = url.to_string();
+    let jar = match &from {
+        ScriptFrom::Network(Some((jar, _))) => Some(*jar),
+        _ => None,
+    };
     on_script_stack(|| {
+        script.tick();
+        let PageScript { runtime, net, .. } = &mut *script;
         let mut host = DomHost {
             dom,
             forms,
             url: page_url,
+            net: Some(net),
+            load_jar: jar,
             changed: false,
         };
-        script.tick();
         for (name, text) in &texts {
-            script.runtime.run(&mut host, text, name);
+            runtime.run(&mut host, text, name);
         }
-        script.runtime.loaded(&mut host);
+        runtime.loaded(&mut host);
     });
     (Some(script), wires)
 }
@@ -378,6 +421,8 @@ pub fn dispatch(
             dom,
             forms,
             url: String::new(),
+            net: None,
+            load_jar: None,
             changed: false,
         };
         if !script.runtime.listens(&host, node, kind) {
@@ -386,14 +431,10 @@ pub fn dispatch(
     }
     let page_url = url.to_string();
     on_script_stack(|| {
-        let mut host = DomHost {
-            dom,
-            forms,
-            url: page_url,
-            changed: false,
-        };
         script.tick();
-        let prevented = script.runtime.dispatch(&mut host, node, kind);
+        let PageScript { runtime, net, .. } = &mut *script;
+        let mut host = host_for(dom, forms, page_url, net);
+        let prevented = runtime.dispatch(&mut host, node, kind);
         (host.changed, prevented)
     })
 }
@@ -408,16 +449,55 @@ pub fn run_timers(
 ) -> bool {
     let page_url = url.to_string();
     on_script_stack(|| {
-        let mut host = DomHost {
-            dom,
-            forms,
-            url: page_url,
-            changed: false,
-        };
         script.tick();
-        script.runtime.run_timers(&mut host);
+        let PageScript { runtime, net, .. } = &mut *script;
+        let mut host = host_for(dom, forms, page_url, net);
+        runtime.run_timers(&mut host);
         host.changed
     })
+}
+
+/// Hand the answers to the scripts' requests over, each as a task. Returns whether the page
+/// changed.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
+pub fn deliver(
+    script: &mut PageScript,
+    dom: &mut Dom,
+    forms: &mut Forms,
+    url: &net::Url,
+    answers: Vec<(u32, Result<js::Reply, String>)>,
+) -> bool {
+    let page_url = url.to_string();
+    on_script_stack(|| {
+        script.tick();
+        let PageScript { runtime, net, .. } = &mut *script;
+        let mut host = host_for(dom, forms, page_url, net);
+        for (id, answer) in answers {
+            if let Err(why) = &answer {
+                // Why a request failed, never what it carried (cookies stay out of logs).
+                js::Host::log(&mut host, &format!("request failed: {why}"));
+            }
+            runtime.deliver(&mut host, id, answer);
+        }
+        host.changed
+    })
+}
+
+/// The host for later tasks: the page's requests and, once it is shown, its profile's cookies.
+fn host_for<'a>(
+    dom: &'a mut Dom,
+    forms: &'a mut Forms,
+    url: String,
+    net: &'a mut crate::scriptnet::ScriptNet,
+) -> DomHost<'a> {
+    DomHost {
+        dom,
+        forms,
+        url,
+        net: Some(net),
+        load_jar: None,
+        changed: false,
+    }
 }
 
 #[cfg(test)]

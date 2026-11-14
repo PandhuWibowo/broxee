@@ -750,6 +750,10 @@ impl<S: Screen> Browser<S> {
             if let Some(due) = self.next_page_timer() {
                 wait = wait.min(due);
             }
+            // Answers to the page's requests arrive on their own channel: look each frame.
+            if self.page_requests_busy() {
+                wait = wait.min(LOAD_POLL);
+            }
             let mut repaint = Repaint::Nothing;
             let mut quiet = false;
             match events.recv_timeout(wait) {
@@ -766,7 +770,7 @@ impl<S: Screen> Browser<S> {
                 // Progress moves the loading line; a finished load painted its page already.
                 repaint = repaint.max(Repaint::Header);
             }
-            if self.tick() || self.run_page_timers() {
+            if self.tick() | self.run_page_timers() | self.poll_page_requests() {
                 repaint = Repaint::Frame;
             }
             if repaint != Repaint::Nothing {
@@ -938,6 +942,7 @@ impl<S: Screen> Browser<S> {
                         page.forms.set_value(&mut page.dom, i, &text);
                     }
                     self.relayout_page();
+                    self.typed_into(i);
                     return true;
                 }
                 match self.field.as_mut() {
@@ -1388,6 +1393,16 @@ impl<S: Screen> Browser<S> {
         })
     }
 
+    /// The text of control `i` changed by typing: tell the page's scripts (`input`, then
+    /// `keyup`, which search boxes listen for to show suggestions).
+    fn typed_into(&mut self, i: usize) {
+        let Some(node) = self.page.as_ref().map(|p| p.forms.controls[i].node) else {
+            return;
+        };
+        self.dispatch_page(node, "input");
+        self.dispatch_page(node, "keyup");
+    }
+
     /// Fire `kind` at `node` for the page's scripts. Returns (the page changed and was laid
     /// out again, a listener prevented the default action).
     fn dispatch_page(&mut self, node: NodeId, kind: &str) -> (bool, bool) {
@@ -1439,6 +1454,37 @@ impl<S: Screen> Browser<S> {
             return false;
         };
         let changed = crate::script::run_timers(script, &mut page.dom, &mut page.forms, &page.url);
+        if changed {
+            self.relayout_page();
+        }
+        changed
+    }
+
+    /// Whether the page's scripts wait for answers to requests.
+    fn page_requests_busy(&self) -> bool {
+        self.page
+            .as_ref()
+            .and_then(|p| p.script.as_ref())
+            .is_some_and(|s| s.net.busy() || s.runtime.waiting())
+    }
+
+    /// Let the shown page's requests out with its profile's cookies, and hand the answers
+    /// that arrived to its scripts. Returns whether the page changed (and was laid out again).
+    fn poll_page_requests(&mut self) -> bool {
+        let jar = Arc::clone(&self.profiles[self.profile].cookies);
+        let Some(page) = self.page.as_mut() else {
+            return false;
+        };
+        let Some(script) = page.script.as_mut() else {
+            return false;
+        };
+        script.net.arm(&jar);
+        let answers = script.net.take_answers();
+        if answers.is_empty() {
+            return false;
+        }
+        let changed =
+            crate::script::deliver(script, &mut page.dom, &mut page.forms, &page.url, answers);
         if changed {
             self.relayout_page();
         }
@@ -1575,6 +1621,7 @@ impl<S: Screen> Browser<S> {
             let page = self.page.as_mut()?;
             page.forms.set_value(&mut page.dom, i, &text);
             self.relayout_page();
+            self.typed_into(i);
             return Some(true);
         }
         match (kind, k.key) {
@@ -5447,6 +5494,173 @@ mod tests {
 
     /// A local server for form tests: `/` is a page with a GET form and a POST form; other
     /// requests answer with their request line and body as the title.
+    /// A local HTTP server answering with `answer(method, path, request head, body)`, which
+    /// gives (status, extra header lines, body). Every request is noted in `seen` as
+    /// "METHOD path cookie=<Cookie header or ->".
+    fn http_server(
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+        answer: impl Fn(&str, &str, &str, &str) -> (u16, String, String) + Send + 'static,
+    ) -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = stream.read(&mut chunk).unwrap_or(0);
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    let done = text.find("\r\n\r\n").is_some_and(|end| {
+                        let len = text
+                            .lines()
+                            .find_map(|l| l.strip_prefix("Content-Length: "))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        buf.len() >= end + 4 + len
+                    });
+                    if done || n == 0 {
+                        break;
+                    }
+                }
+                let text = String::from_utf8_lossy(&buf).to_string();
+                let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+                let line = head.lines().next().unwrap_or("");
+                let method = line.split(' ').next().unwrap_or("");
+                let path = line.split(' ').nth(1).unwrap_or("");
+                let cookie = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Cookie: "))
+                    .unwrap_or("-");
+                seen.lock()
+                    .unwrap()
+                    .push(format!("{method} {path} cookie={cookie}"));
+                let (status, extra, page) = answer(method, path, head, body);
+                let reply = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n{page}",
+                    page.len()
+                );
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn scripts_fetch_with_cors_and_only_their_sites_cookies() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Another site: `localhost`, where the page is on 127.0.0.1.
+        let other = http_server(Arc::clone(&seen), |method, path, head, _| {
+            let any = "Access-Control-Allow-Origin: *\r\n".to_string();
+            match (method, path) {
+                ("GET", "/open") => (200, any, "open data".into()),
+                ("GET", "/closed") => (200, String::new(), "secret".into()),
+                ("OPTIONS", "/token") if head.contains("x-token") => (
+                    204,
+                    format!("{any}Access-Control-Allow-Headers: X-Token\r\n"),
+                    String::new(),
+                ),
+                ("GET", "/token") if head.contains("x-token: t1") => (200, any, "tok".into()),
+                _ => (404, String::new(), String::new()),
+            }
+        });
+        let page = format!(
+            "<!doctype html><p id=get></p><p id=post></p><p id=open></p><p id=closed></p>\
+             <p id=token></p><p id=xhr></p><script>\
+             const put = (id, t) => document.getElementById(id).textContent = t;\
+             document.cookie = 'session=s1; path=/';\
+             fetch('/api').then(r => r.json()).then(d => put('get', 'get ' + d.n));\
+             fetch('/echo', {{ method: 'POST', headers: {{ 'Content-Type': 'application/json' }},\
+               body: JSON.stringify({{ n: 2 }}) }}).then(r => r.text()).then(t => put('post', t));\
+             fetch('http://localhost:{other}/open').then(r => r.text()).then(t => put('open', t));\
+             fetch('http://localhost:{other}/closed').then(r => r.text()).then(t => put('closed', t),\
+               e => put('closed', 'blocked'));\
+             fetch('http://localhost:{other}/token', {{ headers: {{ 'X-Token': 't1' }} }})\
+               .then(r => r.text()).then(t => put('token', t));\
+             const x = new XMLHttpRequest(); x.open('GET', '/api');\
+             x.onload = () => put('xhr', 'xhr ' + x.status + ' ' + JSON.parse(x.responseText).n);\
+             x.send();</script>"
+        );
+        let main = http_server(Arc::clone(&seen), move |method, path, head, body| {
+            match (method, path) {
+                ("GET", "/") => (200, "Content-Type: text/html\r\n".into(), page.clone()),
+                ("GET", "/api") => (
+                    200,
+                    "Content-Type: application/json\r\n".into(),
+                    "{\"n\": 1}".into(),
+                ),
+                ("POST", "/echo") => {
+                    let kind = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("Content-Type: "))
+                        .unwrap_or("");
+                    (200, String::new(), format!("{kind} {body}"))
+                }
+                _ => (404, String::new(), String::new()),
+            }
+        });
+        let url = format!("http://127.0.0.1:{main}/");
+        let mut b = browser(Path::new(&url));
+        let text = |b: &Browser<FakeScreen>, id: &str| {
+            let page = b.page.as_ref().unwrap();
+            let n = css::select(&page.dom, html::Dom::ROOT, &format!("#{id}"));
+            page.dom.text_content(n[0])
+        };
+        let ids = ["get", "post", "open", "closed", "token", "xhr"];
+        for _ in 0..500 {
+            b.poll_page_requests();
+            if ids.iter().all(|id| !text(&b, id).is_empty()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(text(&b, "get"), "get 1");
+        assert_eq!(text(&b, "post"), "application/json {\"n\":2}");
+        assert_eq!(text(&b, "open"), "open data", "CORS allows it");
+        assert_eq!(
+            text(&b, "closed"),
+            "blocked",
+            "no Access-Control-Allow-Origin"
+        );
+        assert_eq!(text(&b, "token"), "tok", "a preflight allowed the header");
+        assert_eq!(text(&b, "xhr"), "xhr 200 1");
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            seen.contains(&"GET /api cookie=session=s1".to_string()),
+            "the page's site gets its cookie: {seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .filter(|l| l.contains(" /open") || l.contains(" /closed") || l.contains(" /token"))
+                .all(|l| l.ends_with("cookie=-")),
+            "another site never does: {seen:?}"
+        );
+        assert!(seen.contains(&"OPTIONS /token cookie=-".to_string()));
+    }
+
+    #[test]
+    fn typing_fires_input_and_keyup_for_scripts() {
+        let page = page_file(
+            "typing-events",
+            "<!doctype html><input id=q><p id=out></p><b id=keys></b><script>\
+             const q = document.getElementById('q'), out = document.getElementById('out');\
+             let n = 0;\
+             q.addEventListener('input', e => out.textContent = 'input ' + e.target.value);\
+             q.addEventListener('keyup', () => n++);\
+             q.addEventListener('keyup', () => document.getElementById('keys').textContent = 'keys ' + n);</script>",
+        );
+        let mut b = browser(&page);
+        assert!(click_control(&mut b, 0));
+        type_text(&mut b, "ab");
+        let p = b.page.as_ref().unwrap();
+        let out = p.dom.find_first("p").unwrap();
+        assert_eq!(p.dom.text_content(out), "input ab");
+        let keys = p.dom.find_first("b").unwrap();
+        assert_eq!(p.dom.text_content(keys), "keys 2");
+    }
+
     fn form_server() -> String {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

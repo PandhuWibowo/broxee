@@ -6,6 +6,7 @@ mod hibernate;
 mod images;
 mod pool;
 mod script;
+mod scriptnet;
 mod webfonts;
 
 #[cfg(any(target_os = "macos", test))]
