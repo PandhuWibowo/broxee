@@ -237,6 +237,9 @@ casts), not taken from binding crates. Ask before proposing any dependency.
   moves or resizes a box after building it must go through `shift_range` or call `Engine::moved`, which drops
   the anchors in that range. The randomized test in `incremental.rs` checks the result equals a full pass,
   fragment for fragment; run it after touching layout.
+- **Selections and find matches are (text node, character offset) positions** (`selection.rs`): the offset counts
+  into the node's runs joined by one space, which wrapping does not change. Runs of one node must stay
+  consecutive in `Layout::texts`. They are node ids of one page: `show` drops them when the page changes.
 - **Clipped content does not reach the scrollable height**: a clipping box restores `Engine::bottom` after its
   content (except the root element and `<body>`, whose overflow belongs to the viewport). Incremental layout
   depends on it: nothing inside an anchor can change the page's height.

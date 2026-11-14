@@ -436,6 +436,21 @@ pub struct FieldView<'a> {
     /// Byte offset of the caret.
     pub cursor: usize,
     pub all_selected: bool,
+    /// Shown, muted, while the field is empty ("Find in page").
+    pub placeholder: Option<&'a str>,
+    /// Shown, muted, at the field's right end ("2 of 5").
+    pub hint: Option<&'a str>,
+}
+
+/// How strongly a mark over page text is drawn.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MarkKind {
+    /// A find match.
+    Match,
+    /// The find match Enter moved to.
+    Current,
+    /// Selected text.
+    Selection,
 }
 
 pub struct HeaderView<'a> {
@@ -650,8 +665,10 @@ impl Chrome {
         });
 
         let mut text_ops = Vec::new();
+        let mut ops_after = Vec::new();
         let mut text_clip = (px(FIELD_LEFT + 4.0), px(width_pt - FIELD_RIGHT_GAP));
         let field_text;
+        let hint_text;
         // Always say which profile this pane uses, in words (DESIGN.md, principle 2).
         let label = if view.host.is_empty() {
             view.profile.to_string()
@@ -686,7 +703,20 @@ impl Chrome {
 
                 let size = 13.0 * s;
                 let left = (FIELD_LEFT + FIELD_PADDING) * s;
-                let right = (width_pt - FIELD_RIGHT_GAP - FIELD_PADDING) * s;
+                let mut right = (width_pt - FIELD_RIGHT_GAP - FIELD_PADDING) * s;
+                if let Some(hint) = field.hint {
+                    let w = metrics.width(hint, 12.0 * s, FontKey::UI);
+                    hint_text = hint;
+                    ops_after.push(Op::Text {
+                        x: right - w,
+                        baseline: px(FIELD_TOP + 17.5) as f32,
+                        text: hint_text,
+                        size: 12.0 * s,
+                        font: FontKey::UI,
+                        color: t.muted,
+                    });
+                    right -= w + 8.0 * s;
+                }
                 let caret = metrics.width(&field.text[..field.cursor], size, FontKey::UI);
                 let full = metrics.width(field.text, size, FontKey::UI);
                 // Scroll the text left so the caret stays inside the field.
@@ -703,13 +733,17 @@ impl Chrome {
                     });
                 }
                 field_text = field.text;
+                let (shown, color) = match field.placeholder {
+                    Some(p) if field.text.is_empty() => (p, t.muted),
+                    _ => (field_text, t.text),
+                };
                 text_ops.push(Op::Text {
                     x,
                     baseline: px(FIELD_TOP + 17.5) as f32,
-                    text: field_text,
+                    text: shown,
                     size,
                     font: FontKey::UI,
-                    color: t.text,
+                    color,
                 });
                 if !field.all_selected {
                     let cx = (x + caret).round() as i32;
@@ -749,6 +783,63 @@ impl Chrome {
             text_clip,
             metrics,
             &text_ops,
+        );
+        if !ops_after.is_empty() {
+            painter.overlay(
+                Target {
+                    pixels: frame.pixels,
+                    stride,
+                    bgra: true,
+                    left,
+                },
+                frame.width,
+                (0, w),
+                metrics,
+                &ops_after,
+            );
+        }
+    }
+
+    /// Marks over page text (selection, find matches) in pane points: translucent `accent`,
+    /// so the text stays readable on any page background.
+    pub fn draw_marks(
+        &self,
+        painter: &mut Painter,
+        frame: Frame,
+        marks: &[(f32, f32, f32, f32, MarkKind)],
+    ) {
+        let s = frame.scale;
+        let px = |v: f32| (v * s).round() as i32;
+        let a = self.theme.accent;
+        let ops: Vec<Op> = marks
+            .iter()
+            .map(|&(x, y, w, h, kind)| Op::Fill {
+                x0: px(x),
+                y0: px(y),
+                x1: px(x + w).max(px(x) + 1),
+                y1: px(y + h),
+                color: Color {
+                    a: match kind {
+                        MarkKind::Match => 60,
+                        MarkKind::Current => 130,
+                        MarkKind::Selection => 100,
+                    },
+                    ..a
+                },
+            })
+            .collect();
+        let (stride, left, width) = (frame.stride, frame.left, frame.width);
+        painter.overlay(
+            Target {
+                pixels: frame.pixels,
+                stride,
+                bgra: true,
+                left,
+            },
+            width,
+            (0, width as i32),
+            &font::Approximate,
+            &ops,
         );
     }
 
