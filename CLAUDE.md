@@ -160,6 +160,10 @@ casts), not taken from binding crates. Ask before proposing any dependency.
 - **Scripts run before styles**, after form controls are prepared; later DOM changes (events, timers) restyle
   and lay out the page again. Image ids come from parser nodes only, so a waking tab finds them again even if
   its scripts behave differently the second time.
+- **Accessors and classes live in the same arena.** A getter/setter pair is a `Kind::Accessor` object in the
+  property slot; `get` calls the getter, and `put` looks up the prototype chain for a setter only once the page
+  has made an accessor (`Interp::accessors`). A class is its constructor function plus a `ClassRec` (fields,
+  parent); `super` finds its home through the hidden `%super`/`%class` bindings of the class scopes.
 - **Scripts see no cookies, cannot fetch or navigate, and store nothing on disk.** Widen this only on purpose.
 
 ### Compression invariants

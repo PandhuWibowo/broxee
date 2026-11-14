@@ -107,8 +107,53 @@ pub fn install(it: &mut Interp) {
     install_math(it);
     install_json(it);
     install_collections(it);
+    install_symbol(it);
     install_window(it);
     install_dom(it);
+}
+
+/// `Symbol`, as unique strings: they work as property keys that never collide, and the
+/// well-known ones (`Symbol.iterator`) name the protocol hooks. `typeof` says "string".
+/// `WeakMap` and `WeakSet` are `Map` and `Set`: a page's heap is dropped whole, so holding
+/// keys weakly would change nothing.
+fn install_symbol(it: &mut Interp) {
+    let g = it.global;
+    let c = it.native(|it, host, this, args| {
+        let desc = match arg(args, 0) {
+            Value::Undefined => Arc::from(""),
+            v => it.to_string(host, &v)?,
+        };
+        let _ = this;
+        let Some(Value::Obj(sym)) = it.get_own(it.global, "Symbol") else {
+            return it.type_error("Symbol is gone");
+        };
+        let n = match it.get_own(sym, "__count") {
+            Some(Value::Num(n)) => n + 1.0,
+            _ => 1.0,
+        };
+        it.set_own(sym, "__count", Value::Num(n));
+        Ok(Value::str(&format!("@@{desc}#{n}")))
+    });
+    for name in [
+        "iterator",
+        "asyncIterator",
+        "hasInstance",
+        "toPrimitive",
+        "toStringTag",
+        "species",
+    ] {
+        it.set_own(c, name, Value::str(&format!("@@{name}")));
+    }
+    it.method(c, "for", |it, host, _, args| {
+        let key = it.to_string(host, &arg(args, 0))?;
+        Ok(Value::str(&format!("@@for:{key}")))
+    });
+    it.set_own(g, "Symbol", Value::Obj(c));
+    for (weak, strong) in [("WeakMap", "Map"), ("WeakSet", "Set")] {
+        if let Some(v) = it.get_own(g, strong) {
+            it.set_own(g, weak, v);
+        }
+    }
 }
 
 fn constructor(it: &mut Interp, name: &str, f: crate::interp::NativeFn, proto: ObjId) -> ObjId {
@@ -145,6 +190,42 @@ fn install_object(it: &mut Interp) {
     it.method(c, "keys", |it, _, _, args| {
         let keys = it.keys(&arg(args, 0)).into_iter().map(Value::Str).collect();
         it.new_array(keys)
+    });
+    // Every property is enumerable here, so the names are the keys.
+    it.method(c, "getOwnPropertyNames", |it, _, _, args| {
+        let keys = it.keys(&arg(args, 0)).into_iter().map(Value::Str).collect();
+        it.new_array(keys)
+    });
+    it.method(c, "getOwnPropertyDescriptor", |it, host, _, args| {
+        let o = arg(args, 0);
+        let k = it.property_key(host, &arg(args, 1))?;
+        let Value::Obj(on) = o else {
+            return Ok(Value::Undefined);
+        };
+        let Some(v) = it.get_own(on, &k) else {
+            return Ok(Value::Undefined);
+        };
+        let desc = it.new_object()?;
+        let accessor = match &v {
+            Value::Obj(a) => match &it.objects[*a as usize].kind {
+                Kind::Accessor(g, s) => Some((g.clone(), s.clone())),
+                _ => None,
+            },
+            _ => None,
+        };
+        match accessor {
+            Some((g, s)) => {
+                it.put(host, &desc, "get", g.unwrap_or(Value::Undefined))?;
+                it.put(host, &desc, "set", s.unwrap_or(Value::Undefined))?;
+            }
+            None => {
+                it.put(host, &desc, "value", v)?;
+                it.put(host, &desc, "writable", Value::Bool(true))?;
+            }
+        }
+        it.put(host, &desc, "enumerable", Value::Bool(true))?;
+        it.put(host, &desc, "configurable", Value::Bool(true))?;
+        Ok(desc)
     });
     it.method(c, "values", |it, host, _, args| {
         let o = arg(args, 0);
@@ -189,14 +270,40 @@ fn install_object(it: &mut Interp) {
     it.method(c, "defineProperty", |it, host, _, args| {
         let (o, desc) = (arg(args, 0), arg(args, 2));
         let k = it.property_key(host, &arg(args, 1))?;
-        if let Some(v) = it.get(host, &desc, "value")? {
+        let getter = it.get(host, &desc, "get")?.filter(|f| it.is_callable(f));
+        let setter = it.get(host, &desc, "set")?.filter(|f| it.is_callable(f));
+        if getter.is_some() || setter.is_some() {
+            if let Value::Obj(on) = o {
+                it.define_accessor(on, &k, getter, setter)?;
+            }
+        } else if let Some(v) = it.get(host, &desc, "value")? {
             it.put(host, &o, &k, v)?;
         }
         Ok(o)
     });
     for name in ["freeze", "seal", "preventExtensions"] {
-        it.method(c, name, |_, _, _, args| Ok(arg(args, 0)));
+        it.method(c, name, |it, _, _, args| {
+            let o = arg(args, 0);
+            if let Value::Obj(id) = o {
+                it.frozen.insert(id);
+            }
+            Ok(o)
+        });
     }
+    for name in ["isFrozen", "isSealed"] {
+        it.method(c, name, |it, _, _, args| {
+            Ok(Value::Bool(match arg(args, 0) {
+                Value::Obj(id) => it.frozen.contains(&id),
+                _ => true,
+            }))
+        });
+    }
+    it.method(c, "isExtensible", |it, _, _, args| {
+        Ok(Value::Bool(match arg(args, 0) {
+            Value::Obj(id) => !it.frozen.contains(&id),
+            _ => false,
+        }))
+    });
 }
 
 fn install_function(it: &mut Interp) {
@@ -1858,6 +1965,11 @@ fn install_collections(it: &mut Interp) {
                 let all = items(it, l);
                 it.new_array(all)
             });
+        }
+        // `for…of` and spread: a Map gives its entries, a Set its values.
+        let all = it.get_own(proto, if pairs { "entries" } else { "values" });
+        if let Some(f) = all {
+            it.set_own(proto, "@@iterator", f);
         }
     }
 }

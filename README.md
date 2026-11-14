@@ -256,6 +256,8 @@ time something reads it (most theme variables never are). A `var()` value is sub
 
 | 2026-11-14 | Incremental layout after DOM changes (part of #26) | 3.4 MB (3,336,544 → 3,369,616 bytes, +33 KB) | 49.8 MB peak painted at 2x (unchanged) | Typing into a field above the stress page's 20,000 rows: 0.09 ms a key, against 38.4 ms for a full restyle and layout (release, `typing_cost_on_the_stress_page`). A box rebuilt alone matches a full pass exactly (1,600 random changes, 4 seeds). BBC is 14,041 → 12,633 px tall: a collapsed 1 px wide panel no longer adds its hidden text to the scroll height; seven other sites keep their height |
 
+| 2026-11-14 | JavaScript: classes, getters and setters, iterators, regex lookaround and backreferences (part of #27) | 3.4 MB (3,369,616 → 3,402,704 bytes, +33 KB) | 49.8 MB peak painted at 2x (unchanged) | rust-lang.org's highlight.js parsed, registered its languages and ran with no errors (it was skipped at `class`, then hit lookaround, `Symbol`, `isFrozen` and a backreference). Peak RAM with scripts: GitHub repository page 20.0 → 21.0 MB, Wikipedia 22.3 → 22.4 MB, HN 14.9 → 14.8 MB. BBC's paywall script now parses past its getters |
+
 Other pages after the layout milestone: GitHub home 22.7 MB peak (8,170 rules); Hacker News 11.5 MB.
 
 GitHub after custom properties: 39 MB peak, 24 ms cascade, 24,822 rules. Rules that only declare or use
@@ -362,11 +364,16 @@ Where data lives, and what compression does for it (measured 2026-11-07):
   `application/x-www-form-urlencoded` (multipart and file uploads are not sent). Long values are clipped at
   the field's edge instead of scrolling. Typed values live with the page: a tab that sleeps forgets them, and
   passwords are never written to disk.
-- JavaScript: classic scripts (inline and `src`) run; modules, classes, generators, getters and setters,
-  promises, `fetch` and `XMLHttpRequest` do not. A script using unsupported syntax is skipped as a whole and
-  the reason goes to stderr (`console:`), with what scripts log. Events: `click` (bubbling, `preventDefault`,
-  `onclick` attributes and properties), `DOMContentLoaded`, `load`; timers and `requestAnimationFrame`. Every
-  DOM change restyles and lays out the whole page.
+- JavaScript: classic scripts (inline and `src`) run, with classes (fields, `static`, `extends`, `super`,
+  `#private` names read as plain properties), getters and setters, the iterator protocol (`for…of` and spread
+  over Maps, Sets and `[Symbol.iterator]()`), regex lookaround and backreferences. `Symbol` values are unique
+  strings (`typeof` says "string"); `WeakMap`/`WeakSet` are `Map`/`Set`; `Object.freeze` is recorded, not
+  enforced. Modules, generators, promises and `async`/`await` (an awaited value is used as it is), `fetch`
+  and `XMLHttpRequest` do not run yet. A script using unsupported syntax is skipped as a whole and the reason
+  goes to stderr (`console:`), with what scripts log. Events: `click` (bubbling, `preventDefault`, `onclick`
+  attributes and properties), `DOMContentLoaded`, `load`; timers and `requestAnimationFrame`. highlight.js runs but
+  colors keywords only: its rules for strings and comments never match yet, and one code block on
+  rust-lang.org/what/cli fails ("undefined is not iterable").
 - GIF animations and animated WebP show their first frame. SVG draws shapes, strokes, `use`, simple `<style>`
   rules and transforms; gradients are drawn as the average of their stops, and text, filters, masks and clip
   paths are skipped. Failed images draw nothing.
