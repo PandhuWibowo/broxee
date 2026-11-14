@@ -251,8 +251,7 @@ impl js::Host for DomHost<'_> {
     }
 
     fn value(&self, node: u32) -> Option<String> {
-        self.control(node)
-            .map(|i| self.forms.controls[i].value.clone())
+        self.control(node).map(|i| self.forms.value_of(self.dom, i))
     }
 
     fn set_value(&mut self, node: u32, value: &str) {

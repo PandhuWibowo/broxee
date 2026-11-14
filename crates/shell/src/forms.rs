@@ -48,6 +48,18 @@ pub struct Forms {
     pub controls: Vec<Control>,
 }
 
+/// A line of a select's dropdown: an `<optgroup>` label, or an option to choose.
+#[derive(Clone, Debug, PartialEq)]
+pub enum OptionRow {
+    Group(String),
+    Choice {
+        label: String,
+        /// Its index among the select's options.
+        index: usize,
+        disabled: bool,
+    },
+}
+
 /// What submitting a form asks for: a GET of `url`, or a POST of `body` to it.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
 #[derive(Debug, PartialEq)]
@@ -281,6 +293,21 @@ impl Forms {
     }
 
     pub fn set_value(&mut self, dom: &mut Dom, i: usize, value: &str) {
+        if self.controls[i].kind == Kind::Select {
+            // A select takes the option with that value.
+            let options = self.controls[i].options.clone();
+            let found = options.iter().position(|&o| {
+                dom.attr(o, "value")
+                    .map(str::to_string)
+                    .unwrap_or_else(|| collapse(&dom.text_content(o)))
+                    == value
+            });
+            if let Some(k) = found {
+                self.controls[i].selected = k;
+                self.show(dom, i);
+            }
+            return;
+        }
         let c = &mut self.controls[i];
         c.value = if c.kind == Kind::TextArea {
             value.to_string()
@@ -314,6 +341,62 @@ impl Forms {
             }
             _ => false,
         }
+    }
+
+    /// What select `i`'s dropdown lists: its options in order, under their group labels.
+    pub fn option_rows(&self, dom: &Dom, i: usize) -> Vec<OptionRow> {
+        let mut rows = Vec::new();
+        let mut group: Option<NodeId> = None;
+        for (index, &o) in self.controls[i].options.iter().enumerate() {
+            let parent = dom
+                .parent(o)
+                .filter(|&p| dom.tag_name(p) == Some("optgroup"));
+            if parent != group {
+                group = parent;
+                if let Some(g) = parent {
+                    rows.push(OptionRow::Group(collapse(
+                        dom.attr(g, "label").unwrap_or(""),
+                    )));
+                }
+            }
+            let label = dom
+                .attr(o, "label")
+                .map(collapse)
+                .unwrap_or_else(|| collapse(&dom.text_content(o)));
+            let disabled = dom.attr(o, "disabled").is_some()
+                || parent.is_some_and(|g| dom.attr(g, "disabled").is_some());
+            rows.push(OptionRow::Choice {
+                label,
+                index,
+                disabled,
+            });
+        }
+        rows
+    }
+
+    /// What control `i` holds, as scripts read it and a form sends it: a select's chosen
+    /// option's `value` (or its text), anything else its typed or set value.
+    pub fn value_of(&self, dom: &Dom, i: usize) -> String {
+        let c = &self.controls[i];
+        match (c.kind, c.options.get(c.selected)) {
+            (Kind::Select, Some(&o)) => dom
+                .attr(o, "value")
+                .map(str::to_string)
+                .unwrap_or_else(|| collapse(&dom.text_content(o))),
+            (Kind::Select, None) => String::new(),
+            _ => c.value.clone(),
+        }
+    }
+
+    /// Choose option `k` of select `i`. Returns whether the choice changed.
+    pub fn choose_index(&mut self, dom: &mut Dom, i: usize, k: usize) -> bool {
+        let c = &mut self.controls[i];
+        if c.kind != Kind::Select || k >= c.options.len() || k == c.selected {
+            return false;
+        }
+        c.selected = k;
+        self.show(dom, i);
+        true
     }
 
     /// Move a select's choice by `delta`, wrapping. Returns whether it changed.
@@ -367,6 +450,102 @@ impl Forms {
 
     /// What submitting the form of control `i` sends, `i` being the button pressed (or the
     /// field where Enter was pressed). `None` when `i` is in no form.
+    /// The first control of `i`'s form that stops it from being sent, and why (constraint
+    /// validation: `required`, `type=email`, `url`, `number` with `min` / `max`). `None`
+    /// when the form or the pressed button says `novalidate`.
+    pub fn invalid(&self, dom: &Dom, i: usize) -> Option<(usize, &'static str)> {
+        let form = form_of(dom, self.controls[i].node)?;
+        if dom.attr(form, "novalidate").is_some()
+            || dom.attr(self.controls[i].node, "formnovalidate").is_some()
+        {
+            return None;
+        }
+        for (j, c) in self.controls.iter().enumerate() {
+            if form_of(dom, c.node) != Some(form) || dom.attr(c.node, "disabled").is_some() {
+                continue;
+            }
+            let required = dom.attr(c.node, "required").is_some();
+            let ty = input_type(dom, c.node);
+            let value = c.value.trim();
+            let message = match c.kind {
+                Kind::Text | Kind::Password | Kind::TextArea if required && c.value.is_empty() => {
+                    Some("Please fill in this field.")
+                }
+                Kind::Checkbox if required && !c.checked => Some("Please check this box."),
+                Kind::Radio if required && !self.group_checked(dom, j) => {
+                    Some("Please choose one of these options.")
+                }
+                Kind::Select if required && self.value_of(dom, j).is_empty() => {
+                    Some("Please choose an option.")
+                }
+                Kind::Text if !value.is_empty() && ty == "email" && !is_email(value) => {
+                    Some("Please enter an email address.")
+                }
+                Kind::Text
+                    if !value.is_empty() && ty == "url" && net::Url::parse(value).is_err() =>
+                {
+                    Some("Please enter a URL.")
+                }
+                Kind::Text if !value.is_empty() && ty == "number" => match value.parse::<f64>() {
+                    Err(_) => Some("Please enter a number."),
+                    Ok(n) => {
+                        let bound = |name| {
+                            dom.attr(c.node, name)
+                                .and_then(|v| v.trim().parse::<f64>().ok())
+                        };
+                        let low = bound("min").is_some_and(|m| n < m);
+                        let high = bound("max").is_some_and(|m| n > m);
+                        (low || high).then_some("Please enter a number within the allowed range.")
+                    }
+                },
+                _ => None,
+            };
+            if let Some(m) = message {
+                return Some((j, m));
+            }
+        }
+        None
+    }
+
+    /// Whether radio button `i`'s group has one checked.
+    fn group_checked(&self, dom: &Dom, i: usize) -> bool {
+        let me = &self.controls[i];
+        me.checked
+            || self
+                .controls
+                .iter()
+                .any(|c| c.checked && same_group(dom, me, c))
+    }
+
+    /// One step of a number field (↑ ↓): its value moved by `step` (1 unless set), kept
+    /// within `min` and `max`.
+    pub fn stepped(&self, dom: &Dom, i: usize, up: bool) -> Option<String> {
+        let c = &self.controls[i];
+        if c.kind != Kind::Text || input_type(dom, c.node) != "number" {
+            return None;
+        }
+        let attr = |name| {
+            dom.attr(c.node, name)
+                .and_then(|v| v.trim().parse::<f64>().ok())
+        };
+        let step = attr("step").filter(|s| *s > 0.0).unwrap_or(1.0);
+        let now = c.value.trim().parse::<f64>().unwrap_or(0.0);
+        let mut next = if up { now + step } else { now - step };
+        if let Some(m) = attr("min") {
+            next = next.max(m);
+        }
+        if let Some(m) = attr("max") {
+            next = next.min(m);
+        }
+        // Whole numbers without ".0"; steps like 0.1 without float noise.
+        let rounded = (next * 1e9).round() / 1e9;
+        Some(if rounded.fract() == 0.0 {
+            format!("{}", rounded as i64)
+        } else {
+            format!("{rounded}")
+        })
+    }
+
     pub fn submission(&self, dom: &Dom, i: usize, document: &net::Url) -> Option<Submission> {
         let form = form_of(dom, self.controls[i].node)?;
         let submitter = matches!(self.controls[i].kind, Kind::Submit)
@@ -378,6 +557,7 @@ impl Forms {
                     .position(|c| c.kind == Kind::Submit && form_of(dom, c.node) == Some(form))
             });
         let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut files: Vec<String> = Vec::new();
         for (j, c) in self.controls.iter().enumerate() {
             if form_of(dom, c.node) != Some(form) || dom.attr(c.node, "disabled").is_some() {
                 continue;
@@ -391,15 +571,15 @@ impl Forms {
                     c.value.replace("\r\n", "\n").replace('\n', "\r\n")
                 }
                 Kind::Checkbox | Kind::Radio if c.checked => c.value.clone(),
-                Kind::Select => match c.options.get(c.selected) {
-                    Some(&o) => dom
-                        .attr(o, "value")
-                        .map(str::to_string)
-                        .unwrap_or_else(|| collapse(&dom.text_content(o))),
-                    None => continue,
-                },
+                Kind::Select if c.options.get(c.selected).is_some() => self.value_of(dom, j),
+                Kind::Select => continue,
                 Kind::Submit if Some(j) == submitter => {
                     dom.attr(c.node, "value").unwrap_or("").to_string()
+                }
+                // A file input sends an empty file part (multipart) or nothing.
+                Kind::Button if input_type(dom, c.node) == "file" => {
+                    files.push(name.to_string());
+                    continue;
                 }
                 _ => continue,
             };
@@ -424,19 +604,95 @@ impl Forms {
         // Drop the fragment, then the query.
         let path = url.path.split('#').next().unwrap_or("").to_string();
         let path = path.split('?').next().unwrap_or("").to_string();
+        let enctype = button_attr("formenctype")
+            .or_else(|| dom.attr(form, "enctype"))
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
         if method == "post" {
             url.path = url.path.split('#').next().unwrap_or("").to_string();
-            Some(Submission {
-                url,
-                body: Some(net::Body {
+            let body = if enctype == "multipart/form-data" {
+                multipart(&pairs, &files)
+            } else {
+                net::Body {
                     content_type: "application/x-www-form-urlencoded".into(),
                     bytes: encoded.into_bytes(),
-                }),
+                }
+            };
+            Some(Submission {
+                url,
+                body: Some(body),
             })
         } else {
             url.path = format!("{path}?{encoded}");
             Some(Submission { url, body: None })
         }
+    }
+}
+
+/// An input's `type`, lowercase.
+fn input_type(dom: &Dom, node: NodeId) -> String {
+    dom.attr(node, "type")
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+/// A plausible address: something@domain, no spaces (what browsers check for type=email).
+fn is_email(v: &str) -> bool {
+    match v.split_once('@') {
+        Some((local, domain)) => {
+            !local.is_empty()
+                && !domain.is_empty()
+                && !domain.starts_with('.')
+                && !domain.ends_with('.')
+                && !v.contains(char::is_whitespace)
+                && !domain.contains('@')
+        }
+        None => false,
+    }
+}
+
+/// A `multipart/form-data` body: each field a part, each file input an empty file part
+/// (Broxee cannot pick files yet), names quoted as the HTML spec says.
+fn multipart(pairs: &[(String, String)], files: &[String]) -> net::Body {
+    let quote = |n: &str| {
+        n.replace('"', "%22")
+            .replace('\r', "%0D")
+            .replace('\n', "%0A")
+    };
+    // A boundary that cannot occur in the values.
+    let mut seed: u64 = 0xcbf2_9ce4_8422_2325;
+    for (k, v) in pairs {
+        for b in k.bytes().chain(v.bytes()) {
+            seed = (seed ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    let mut boundary = format!("----BroxeeFormBoundary{seed:016x}");
+    while pairs
+        .iter()
+        .any(|(k, v)| k.contains(&boundary) || v.contains(&boundary))
+    {
+        boundary.push('x');
+    }
+    let mut out = String::new();
+    for (name, value) in pairs {
+        out += &format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"{}\"\r\n\r\n{value}\r\n",
+            quote(name)
+        );
+    }
+    for name in files {
+        out += &format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"{}\"; filename=\"\"\r\n\
+             Content-Type: application/octet-stream\r\n\r\n\r\n",
+            quote(name)
+        );
+    }
+    out += &format!("--{boundary}--\r\n");
+    net::Body {
+        content_type: format!("multipart/form-data; boundary={boundary}"),
+        bytes: out.into_bytes(),
     }
 }
 
@@ -505,6 +761,95 @@ mod tests {
 
     fn base() -> net::Url {
         net::Url::parse("https://example.org/search/page?old=1#top").unwrap()
+    }
+
+    #[test]
+    fn validates_before_sending() {
+        let (mut dom, mut forms) = page(
+            "<form><input name=a required><input type=email name=e><input type=url name=u>\
+             <input type=number name=n min=1 max=5><input type=checkbox name=c required>\
+             <select name=s required><option value=''>Pick</option><option>x</option></select>\
+             <input type=radio name=r value=1 required><input type=radio name=r value=2>\
+             <button>Go</button></form><form novalidate><input required><button>Go</button></form>",
+        );
+        let go = 8;
+        assert_eq!(
+            forms.invalid(&dom, go),
+            Some((0, "Please fill in this field."))
+        );
+        forms.set_value(&mut dom, 0, "x");
+        forms.set_value(&mut dom, 1, "not an address");
+        assert_eq!(
+            forms.invalid(&dom, go),
+            Some((1, "Please enter an email address."))
+        );
+        forms.set_value(&mut dom, 1, "me@example.org");
+        forms.set_value(&mut dom, 2, "example");
+        assert_eq!(forms.invalid(&dom, go).map(|v| v.0), Some(2));
+        forms.set_value(&mut dom, 2, "https://example.org/");
+        forms.set_value(&mut dom, 3, "9");
+        assert_eq!(forms.invalid(&dom, go).map(|v| v.0), Some(3), "above max");
+        forms.set_value(&mut dom, 3, "3");
+        assert_eq!(forms.invalid(&dom, go), Some((4, "Please check this box.")));
+        forms.toggle(&mut dom, 4);
+        assert_eq!(
+            forms.invalid(&dom, go),
+            Some((5, "Please choose an option."))
+        );
+        forms.choose_index(&mut dom, 5, 1);
+        assert_eq!(
+            forms.invalid(&dom, go).map(|v| v.0),
+            Some(6),
+            "no radio of the group"
+        );
+        forms.toggle(&mut dom, 7);
+        assert_eq!(
+            forms.invalid(&dom, go),
+            None,
+            "another radio of the group counts"
+        );
+        assert_eq!(forms.invalid(&dom, 10), None, "novalidate");
+
+        assert_eq!(forms.stepped(&dom, 3, true).as_deref(), Some("4"));
+        forms.set_value(&mut dom, 3, "5");
+        assert_eq!(
+            forms.stepped(&dom, 3, true).as_deref(),
+            Some("5"),
+            "stays within max"
+        );
+        assert_eq!(
+            forms.stepped(&dom, 0, true),
+            None,
+            "only number fields step"
+        );
+    }
+
+    #[test]
+    fn sends_multipart_with_empty_file_parts() {
+        let (mut dom, mut forms) = page(
+            "<form method=post enctype=multipart/form-data action=/up>\
+             <input name='a\"b' value=1><textarea name=t></textarea><input type=file name=f>\
+             <button>Go</button></form>",
+        );
+        forms.set_value(&mut dom, 1, "two\nlines");
+        let sent = forms.submission(&dom, 3, &base()).unwrap();
+        let body = sent.body.unwrap();
+        let boundary = body
+            .content_type
+            .strip_prefix("multipart/form-data; boundary=")
+            .unwrap()
+            .to_string();
+        let text = String::from_utf8(body.bytes).unwrap();
+        assert_eq!(
+            text,
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"a%22b\"\r\n\r\n1\r\n\
+                 --{boundary}\r\nContent-Disposition: form-data; name=\"t\"\r\n\r\ntwo\r\nlines\r\n\
+                 --{boundary}\r\nContent-Disposition: form-data; name=\"f\"; filename=\"\"\r\n\
+                 Content-Type: application/octet-stream\r\n\r\n\r\n--{boundary}--\r\n"
+            )
+        );
+        assert!(is_email("a@b.c") && !is_email("a@") && !is_email("a b@c.d") && !is_email("@c"));
     }
 
     #[test]
