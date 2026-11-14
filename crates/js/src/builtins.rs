@@ -4,9 +4,12 @@
 
 use std::sync::Arc;
 
-use crate::interp::{Ctrl, Handler, Interp, Kind, Mode, ObjId, Resume, Target, Timer, Value};
+use crate::interp::{
+    Ctrl, Handler, Interp, Kind, Mode, ObjId, Pending, Resume, Target, Timer, Value,
+};
 use crate::regex::Regex;
 use crate::Host;
+use crate::{Reply, Request};
 
 type R = Result<Value, Ctrl>;
 
@@ -109,8 +112,613 @@ pub fn install(it: &mut Interp) {
     install_collections(it);
     install_symbol(it);
     install_promise(it);
+    install_fetch(it);
     install_window(it);
     install_dom(it);
+}
+
+/// Header pairs as scripts give them: a `Headers`, an array of pairs, or a plain object.
+fn header_pairs(
+    it: &mut Interp,
+    host: &mut dyn Host,
+    v: &Value,
+) -> Result<Vec<(String, String)>, Ctrl> {
+    let mut out = Vec::new();
+    if v.is_nullish() {
+        return Ok(out);
+    }
+    if let Value::Obj(o) = v {
+        if let Some(list) = it.get_own(*o, "__pairs") {
+            for pair in it.iterate(host, &list)? {
+                let kv = it.iterate(host, &pair)?;
+                out.push((
+                    string(it, host, &arg(&kv, 0))?,
+                    string(it, host, &arg(&kv, 1))?,
+                ));
+            }
+            return Ok(out);
+        }
+        if matches!(it.objects[*o as usize].kind, Kind::Array(_)) {
+            for pair in it.iterate(host, v)? {
+                let kv = it.iterate(host, &pair)?;
+                out.push((
+                    string(it, host, &arg(&kv, 0))?,
+                    string(it, host, &arg(&kv, 1))?,
+                ));
+            }
+            return Ok(out);
+        }
+    }
+    for k in it.keys(v) {
+        let value = it.get_value(host, v, &k)?;
+        out.push((k.to_string(), string(it, host, &value)?));
+    }
+    Ok(out)
+}
+
+/// A request's headers, names lowercase; headers a script may not set are dropped (the
+/// browser owns them), as is anything holding CR or LF.
+fn clean_headers(pairs: Vec<(String, String)>) -> Vec<(String, String)> {
+    const FORBIDDEN: &[&str] = &[
+        "accept-charset",
+        "accept-encoding",
+        "access-control-request-headers",
+        "access-control-request-method",
+        "connection",
+        "content-length",
+        "cookie",
+        "cookie2",
+        "date",
+        "dnt",
+        "expect",
+        "host",
+        "keep-alive",
+        "origin",
+        "referer",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "user-agent",
+        "via",
+    ];
+    pairs
+        .into_iter()
+        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .filter(|(k, v)| {
+            !k.is_empty()
+                && k.bytes().all(|b| b.is_ascii_graphic() && b != b':')
+                && !v.contains(['\r', '\n'])
+                && !FORBIDDEN.contains(&k.as_str())
+                && !k.starts_with("proxy-")
+                && !k.starts_with("sec-")
+        })
+        .collect()
+}
+
+fn headers_object(it: &mut Interp, pairs: &[(String, String)]) -> Result<Value, Ctrl> {
+    let proto = constructor_proto(it, "Headers");
+    let o = it.alloc(Some(proto), Kind::Plain)?;
+    let mut list = Vec::new();
+    for (k, v) in pairs {
+        let pair = it.new_array(vec![Value::str(&k.to_ascii_lowercase()), Value::str(v)])?;
+        list.push(pair);
+    }
+    let list = it.new_array(list)?;
+    it.set_own(o, "__pairs", list);
+    Ok(Value::Obj(o))
+}
+
+/// The `[name, value]` arrays of a `Headers`.
+fn header_list(it: &mut Interp, this: &Value) -> Result<ObjId, Ctrl> {
+    match this {
+        Value::Obj(o) => match it.get_own(*o, "__pairs") {
+            Some(Value::Obj(list)) => Ok(list),
+            _ => it.type_error("not a Headers object"),
+        },
+        _ => it.type_error("not a Headers object"),
+    }
+}
+
+/// Send `request` for a script; `None` when the host refused it.
+fn start_request(it: &mut Interp, host: &mut dyn Host, request: Request, pending: Pending) -> bool {
+    match host.fetch(request) {
+        Some(id) => {
+            it.requests.insert(id, pending);
+            true
+        }
+        None => false,
+    }
+}
+
+/// `fetch`, `Headers`, `Response` and `XMLHttpRequest`. The host sends requests and checks
+/// them (same origin, CORS, cookies); answers arrive later as tasks (`deliver`).
+fn install_fetch(it: &mut Interp) {
+    let g = it.global;
+    it.method(g, "fetch", |it, host, _, args| {
+        let input = arg(args, 0);
+        let init = arg(args, 1);
+        let url = match &input {
+            Value::Obj(_) => match it.get_value(host, &input, "url")? {
+                Value::Undefined => string(it, host, &input)?,
+                u => string(it, host, &u)?,
+            },
+            v => string(it, host, v)?,
+        };
+        let get = |it: &mut Interp, host: &mut dyn Host, k: &str| -> Result<Value, Ctrl> {
+            if init.is_nullish() {
+                Ok(Value::Undefined)
+            } else {
+                it.get_value(host, &init, k)
+            }
+        };
+        let method = match get(it, host, "method")? {
+            Value::Undefined => "GET".to_string(),
+            m => string(it, host, &m)?.to_ascii_uppercase(),
+        };
+        let headers = get(it, host, "headers")?;
+        let mut headers = clean_headers(header_pairs(it, host, &headers)?);
+        let body = match get(it, host, "body")? {
+            v if v.is_nullish() => None,
+            v => Some(string(it, host, &v)?),
+        };
+        if body.is_some() && !headers.iter().any(|(k, _)| k == "content-type") {
+            headers.push(("content-type".into(), "text/plain;charset=UTF-8".into()));
+        }
+        let promise = it.new_promise()?;
+        let request = Request {
+            url,
+            method,
+            headers,
+            body,
+        };
+        if !start_request(it, host, request, Pending::Fetch(promise)) {
+            let e = it.make_error("TypeError", "Failed to fetch")?;
+            it.settle(promise, false, e);
+        }
+        Ok(Value::Obj(promise))
+    });
+
+    // Headers
+    let hp = it.alloc(Some(it.protos.object), Kind::Plain).unwrap_or(0);
+    constructor(
+        it,
+        "Headers",
+        |it, host, this, args| {
+            let pairs = header_pairs(it, host, &arg(args, 0))?;
+            let made = headers_object(it, &pairs)?;
+            if let (Value::Obj(t), Value::Obj(m)) = (&this, &made) {
+                if let Some(list) = it.get_own(*m, "__pairs") {
+                    it.set_own(*t, "__pairs", list);
+                    return Ok(this);
+                }
+            }
+            Ok(made)
+        },
+        hp,
+    );
+    it.method(hp, "get", |it, host, this, args| {
+        let list = header_list(it, &this)?;
+        let name = string(it, host, &arg(args, 0))?.to_ascii_lowercase();
+        let mut found: Vec<String> = Vec::new();
+        for pair in it.iterate(host, &Value::Obj(list))? {
+            let kv = it.iterate(host, &pair)?;
+            if string(it, host, &arg(&kv, 0))? == name {
+                found.push(string(it, host, &arg(&kv, 1))?);
+            }
+        }
+        Ok(if found.is_empty() {
+            Value::Null
+        } else {
+            Value::str(&found.join(", "))
+        })
+    });
+    it.method(hp, "has", |it, host, this, args| {
+        let get = it.get_value(host, &this, "get")?;
+        let v = it.call(host, &get, this, args)?;
+        Ok(Value::Bool(!matches!(v, Value::Null)))
+    });
+    for (name, replace) in [("set", true), ("append", false)] {
+        let f: crate::interp::NativeFn = if replace {
+            |it, host, this, args| header_put(it, host, &this, args, true)
+        } else {
+            |it, host, this, args| header_put(it, host, &this, args, false)
+        };
+        it.method(hp, name, f);
+    }
+    it.method(hp, "delete", |it, host, this, args| {
+        let list = header_list(it, &this)?;
+        let name = string(it, host, &arg(args, 0))?.to_ascii_lowercase();
+        let pairs = it.iterate(host, &Value::Obj(list))?;
+        let mut keep = Vec::new();
+        for pair in pairs {
+            let kv = it.iterate(host, &pair)?;
+            if string(it, host, &arg(&kv, 0))? != name {
+                keep.push(pair);
+            }
+        }
+        if let Kind::Array(items) = &mut it.objects[list as usize].kind {
+            *items = keep;
+        }
+        Ok(Value::Undefined)
+    });
+    it.method(hp, "forEach", |it, host, this, args| {
+        let f = callback(it, args)?;
+        let list = header_list(it, &this)?;
+        for pair in it.iterate(host, &Value::Obj(list))? {
+            let kv = it.iterate(host, &pair)?;
+            it.call(
+                host,
+                &f,
+                Value::Undefined,
+                &[arg(&kv, 1), arg(&kv, 0), this.clone()],
+            )?;
+        }
+        Ok(Value::Undefined)
+    });
+    it.method(hp, "entries", |it, host, this, _| {
+        let list = header_list(it, &this)?;
+        let all = it.iterate(host, &Value::Obj(list))?;
+        it.new_array(all)
+    });
+    if let Some(f) = it.get_own(hp, "entries") {
+        it.set_own(hp, "@@iterator", f);
+    }
+
+    // Response
+    let rp = it.alloc(Some(it.protos.object), Kind::Plain).unwrap_or(0);
+    constructor(
+        it,
+        "Response",
+        |it, host, this, args| {
+            let body = match arg(args, 0) {
+                v if v.is_nullish() => String::new(),
+                v => string(it, host, &v)?,
+            };
+            let reply = Reply {
+                status: 200,
+                body,
+                ..Reply::default()
+            };
+            let made = response(it, &reply)?;
+            let _ = this;
+            Ok(made)
+        },
+        rp,
+    );
+    it.method(rp, "text", |it, host, this, _| {
+        let body = response_body(it, &this)?;
+        Ok(Value::Obj(it.promise_resolved(host, body)?))
+    });
+    it.method(rp, "json", |it, host, this, _| {
+        let body = response_body(it, &this)?;
+        let result = it.new_promise()?;
+        let json = it.get_value(host, &Value::Obj(it.global), "JSON")?;
+        let parse = it.get_value(host, &json, "parse")?;
+        match it.call(host, &parse, json, &[body]) {
+            Ok(v) => it.resolve_promise(host, result, v)?,
+            Err(Ctrl::Throw(e)) => it.settle(result, false, e),
+            Err(abort) => return Err(abort),
+        }
+        Ok(Value::Obj(result))
+    });
+    it.method(rp, "clone", |it, _, this, _| {
+        let Value::Obj(o) = this else {
+            return it.type_error("not a Response");
+        };
+        let props = it.objects[o as usize].props.clone();
+        let proto = it.objects[o as usize].proto;
+        let c = it.alloc(proto, Kind::Plain)?;
+        it.objects[c as usize].props = props;
+        Ok(Value::Obj(c))
+    });
+    for name in ["arrayBuffer", "blob", "formData"] {
+        it.method(rp, name, |it, _, _, _| {
+            let p = it.new_promise()?;
+            let e = it.make_error("TypeError", "only text and JSON bodies are supported")?;
+            it.settle(p, false, e);
+            Ok(Value::Obj(p))
+        });
+    }
+
+    // XMLHttpRequest
+    let xp = it.alloc(Some(it.protos.object), Kind::Plain).unwrap_or(0);
+    let xc = constructor(
+        it,
+        "XMLHttpRequest",
+        |it, _, this, _| {
+            let Value::Obj(o) = this else {
+                return it.type_error("XMLHttpRequest needs new");
+            };
+            for (k, v) in [
+                ("readyState", Value::Num(0.0)),
+                ("status", Value::Num(0.0)),
+                ("statusText", Value::str("")),
+                ("responseText", Value::str("")),
+                ("response", Value::str("")),
+                ("responseType", Value::str("")),
+                ("responseURL", Value::str("")),
+                ("withCredentials", Value::Bool(false)),
+                ("timeout", Value::Num(0.0)),
+            ] {
+                it.set_own(o, k, v);
+            }
+            Ok(this)
+        },
+        xp,
+    );
+    for (i, name) in ["UNSENT", "OPENED", "HEADERS_RECEIVED", "LOADING", "DONE"]
+        .into_iter()
+        .enumerate()
+    {
+        it.set_own(xp, name, Value::Num(i as f64));
+        it.set_own(xc, name, Value::Num(i as f64));
+    }
+    it.method(xp, "open", |it, host, this, args| {
+        let method = string(it, host, &arg(args, 0))?.to_ascii_uppercase();
+        let url = string(it, host, &arg(args, 1))?;
+        it.put(host, &this, "__method", Value::str(&method))?;
+        it.put(host, &this, "__url", Value::str(&url))?;
+        let empty = it.new_array(Vec::new())?;
+        it.put(host, &this, "__headers", empty)?;
+        it.put(host, &this, "readyState", Value::Num(1.0))?;
+        Ok(Value::Undefined)
+    });
+    it.method(xp, "setRequestHeader", |it, host, this, args| {
+        let list = it.get_value(host, &this, "__headers")?;
+        let Value::Obj(list) = list else {
+            return Err(it.throw_error("InvalidStateError", "open() first"));
+        };
+        let pair = it.new_array(vec![arg(args, 0), arg(args, 1)])?;
+        if let Kind::Array(items) = &mut it.objects[list as usize].kind {
+            items.push(pair);
+        }
+        Ok(Value::Undefined)
+    });
+    it.method(xp, "send", |it, host, this, args| {
+        let Value::Obj(x) = this else {
+            return it.type_error("not an XMLHttpRequest");
+        };
+        let method = it.get_value(host, &this, "__method")?;
+        let method = string(it, host, &method)?;
+        let url = it.get_value(host, &this, "__url")?;
+        let url = string(it, host, &url)?;
+        let headers = it.get_value(host, &this, "__headers")?;
+        let mut headers = clean_headers(header_pairs(it, host, &headers)?);
+        let body = match arg(args, 0) {
+            v if v.is_nullish() || matches!(method.as_str(), "GET" | "HEAD") => None,
+            v => Some(string(it, host, &v)?),
+        };
+        if body.is_some() && !headers.iter().any(|(k, _)| k == "content-type") {
+            headers.push(("content-type".into(), "text/plain;charset=UTF-8".into()));
+        }
+        let request = Request {
+            url,
+            method,
+            headers,
+            body,
+        };
+        if !start_request(it, host, request, Pending::Xhr(x)) {
+            xhr_done(it, host, x, Err("refused".into()))?;
+        }
+        Ok(Value::Undefined)
+    });
+    it.method(xp, "abort", |it, host, this, _| {
+        if let Value::Obj(x) = this {
+            it.requests
+                .retain(|_, p| !matches!(p, Pending::Xhr(o) if *o == x));
+        }
+        it.put(host, &this, "readyState", Value::Num(0.0))?;
+        Ok(Value::Undefined)
+    });
+    it.method(xp, "getResponseHeader", |it, host, this, args| {
+        let h = it.get_value(host, &this, "__response_headers")?;
+        if h.is_nullish() {
+            return Ok(Value::Null);
+        }
+        let get = it.get_value(host, &h, "get")?;
+        it.call(host, &get, h, args)
+    });
+    it.method(xp, "getAllResponseHeaders", |it, host, this, _| {
+        let h = it.get_value(host, &this, "__response_headers")?;
+        if h.is_nullish() {
+            return Ok(Value::str(""));
+        }
+        let pairs = header_pairs(it, host, &h)?;
+        let text: String = pairs.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect();
+        Ok(Value::str(&text))
+    });
+    it.method(xp, "addEventListener", |it, host, this, args| {
+        let kind = string(it, host, &arg(args, 0))?;
+        let key = format!("__on_{kind}");
+        let list = match it.get_value(host, &this, &key)? {
+            Value::Obj(l) => l,
+            _ => {
+                let l = it.new_array(Vec::new())?;
+                it.put(host, &this, &key, l.clone())?;
+                let Value::Obj(l) = l else { unreachable!() };
+                l
+            }
+        };
+        if let Kind::Array(items) = &mut it.objects[list as usize].kind {
+            items.push(arg(args, 1));
+        }
+        Ok(Value::Undefined)
+    });
+    it.method(xp, "removeEventListener", |it, host, this, args| {
+        let kind = string(it, host, &arg(args, 0))?;
+        if let Value::Obj(l) = it.get_value(host, &this, &format!("__on_{kind}"))? {
+            let f = arg(args, 1);
+            let same = |it: &Interp, v: &Value| it.strict_equals(v, &f);
+            let keep: Vec<Value> = match &it.objects[l as usize].kind {
+                Kind::Array(items) => items.iter().filter(|v| !same(it, v)).cloned().collect(),
+                _ => Vec::new(),
+            };
+            if let Kind::Array(items) = &mut it.objects[l as usize].kind {
+                *items = keep;
+            }
+        }
+        Ok(Value::Undefined)
+    });
+}
+
+fn header_put(
+    it: &mut Interp,
+    host: &mut dyn Host,
+    this: &Value,
+    args: &[Value],
+    replace: bool,
+) -> Result<Value, Ctrl> {
+    let list = header_list(it, this)?;
+    let name = string(it, host, &arg(args, 0))?.to_ascii_lowercase();
+    let value = string(it, host, &arg(args, 1))?;
+    if replace {
+        let pairs = it.iterate(host, &Value::Obj(list))?;
+        let mut keep = Vec::new();
+        for pair in pairs {
+            let kv = it.iterate(host, &pair)?;
+            if string(it, host, &arg(&kv, 0))? != name {
+                keep.push(pair);
+            }
+        }
+        if let Kind::Array(items) = &mut it.objects[list as usize].kind {
+            *items = keep;
+        }
+    }
+    let pair = it.new_array(vec![Value::str(&name), Value::str(&value)])?;
+    if let Kind::Array(items) = &mut it.objects[list as usize].kind {
+        items.push(pair);
+    }
+    Ok(Value::Undefined)
+}
+
+fn response(it: &mut Interp, reply: &Reply) -> Result<Value, Ctrl> {
+    let proto = constructor_proto(it, "Response");
+    let o = it.alloc(Some(proto), Kind::Plain)?;
+    let headers = headers_object(it, &reply.headers)?;
+    for (k, v) in [
+        ("status", Value::Num(f64::from(reply.status))),
+        ("ok", Value::Bool((200..300).contains(&reply.status))),
+        ("statusText", Value::str(reason(reply.status))),
+        ("url", Value::str(&reply.url)),
+        ("redirected", Value::Bool(false)),
+        ("type", Value::str("basic")),
+        ("headers", headers),
+        ("__body", Value::str(&reply.body)),
+    ] {
+        it.set_own(o, k, v);
+    }
+    Ok(Value::Obj(o))
+}
+
+fn response_body(it: &mut Interp, this: &Value) -> Result<Value, Ctrl> {
+    match this {
+        Value::Obj(o) => Ok(it.get_own(*o, "__body").unwrap_or(Value::str(""))),
+        _ => it.type_error("not a Response"),
+    }
+}
+
+fn reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        304 => "Not Modified",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        _ => "",
+    }
+}
+
+/// An `XMLHttpRequest` finished (or failed): set what it read and fire its events.
+fn xhr_done(
+    it: &mut Interp,
+    host: &mut dyn Host,
+    x: ObjId,
+    result: Result<Reply, String>,
+) -> Result<(), Ctrl> {
+    let xv = Value::Obj(x);
+    let events: &[&str] = match &result {
+        Ok(reply) => {
+            let kind = it.get_value(host, &xv, "responseType")?;
+            let kind = string(it, host, &kind)?;
+            let response = if kind == "json" {
+                let json = it.get_value(host, &Value::Obj(it.global), "JSON")?;
+                let parse = it.get_value(host, &json, "parse")?;
+                it.call(host, &parse, json, &[Value::str(&reply.body)])
+                    .unwrap_or(Value::Null)
+            } else {
+                Value::str(&reply.body)
+            };
+            let headers = headers_object(it, &reply.headers)?;
+            for (k, v) in [
+                ("status", Value::Num(f64::from(reply.status))),
+                ("statusText", Value::str(reason(reply.status))),
+                ("responseText", Value::str(&reply.body)),
+                ("response", response),
+                ("responseURL", Value::str(&reply.url)),
+                ("__response_headers", headers),
+            ] {
+                it.set_own(x, k, v);
+            }
+            &["readystatechange", "load", "loadend"]
+        }
+        Err(_) => {
+            it.set_own(x, "status", Value::Num(0.0));
+            &["readystatechange", "error", "loadend"]
+        }
+    };
+    it.set_own(x, "readyState", Value::Num(4.0));
+    for kind in events {
+        let event = it.new_object()?;
+        it.put(host, &event, "type", Value::str(kind))?;
+        it.put(host, &event, "target", xv.clone())?;
+        let handler = it.get_value(host, &xv, &format!("on{kind}"))?;
+        if it.is_callable(&handler) {
+            it.call(host, &handler, xv.clone(), std::slice::from_ref(&event))?;
+        }
+        if let Value::Obj(l) = it.get_value(host, &xv, &format!("__on_{kind}"))? {
+            let listeners = match &it.objects[l as usize].kind {
+                Kind::Array(items) => items.clone(),
+                _ => Vec::new(),
+            };
+            for f in listeners {
+                if it.is_callable(&f) {
+                    it.call(host, &f, xv.clone(), std::slice::from_ref(&event))?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The answer to request `id`.
+pub fn deliver(
+    it: &mut Interp,
+    host: &mut dyn Host,
+    id: u32,
+    result: Result<Reply, String>,
+) -> Result<(), Ctrl> {
+    match it.requests.remove(&id) {
+        Some(Pending::Fetch(promise)) => match result {
+            Ok(reply) => {
+                let r = response(it, &reply)?;
+                it.resolve_promise(host, promise, r)
+            }
+            Err(_) => {
+                let e = it.make_error("TypeError", "Failed to fetch")?;
+                it.settle(promise, false, e);
+                Ok(())
+            }
+        },
+        Some(Pending::Xhr(x)) => xhr_done(it, host, x, result),
+        None => Ok(()),
+    }
 }
 
 /// `Promise` and `queueMicrotask`. Reactions run at the microtask checkpoint after each task.
@@ -2646,7 +3254,7 @@ pub fn element_get(
             opt(find_document_child(host, tag), it)?
         }
         "readyState" if n == 0 => Value::str("complete"),
-        "cookie" if n == 0 => Value::str(""),
+        "cookie" if n == 0 => Value::str(&host.cookie()),
         "URL" | "documentURI" if n == 0 => Value::str(&host.url()),
         "location" if n == 0 => it.get_value(host, &Value::Obj(it.global), "location")?,
         "defaultView" if n == 0 => Value::Obj(it.global),
@@ -2676,6 +3284,10 @@ pub fn element_set(
     value: &Value,
 ) -> Result<bool, Ctrl> {
     match key {
+        "cookie" if n == 0 => {
+            let s = string(it, host, value)?;
+            host.set_cookie(&s);
+        }
         "textContent" | "innerText" | "nodeValue" | "data" => {
             let s = if value.is_nullish() {
                 String::new()

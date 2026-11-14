@@ -196,6 +196,16 @@ pub struct Interp {
     aggregates: Vec<asyncs::Aggregate>,
     /// Promises rejected while nothing reacted to them.
     unhandled: Vec<ObjId>,
+    /// Requests waiting for an answer, by the id the host gave them.
+    pub requests: HashMap<u32, Pending>,
+}
+
+/// What waits for a request's answer.
+pub enum Pending {
+    /// The promise `fetch` returned.
+    Fetch(ObjId),
+    /// An `XMLHttpRequest`.
+    Xhr(ObjId),
 }
 
 pub fn number_to_string(v: f64) -> String {
@@ -281,6 +291,7 @@ impl Interp {
             slots: HashMap::new(),
             aggregates: Vec::new(),
             unhandled: Vec::new(),
+            requests: HashMap::new(),
         };
         let object = it.raw_alloc(None, Kind::Plain);
         let mut proto = |kind| it.raw_alloc(Some(object), kind);

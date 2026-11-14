@@ -174,7 +174,13 @@ casts), not taken from binding crates. Ask before proposing any dependency.
   address; the AST is shared through `Arc`, so addresses stay put); statements without `await` run whole on
   the recursive evaluator. A paused call's scopes are pinned. The microtask queue drains at the end of every
   task (`Runtime::checkpoint`), bounded by `MICROTASK_LIMIT`.
-- **Scripts see no cookies, cannot fetch or navigate, and store nothing on disk.** Widen this only on purpose.
+- **Scripts fetch only through `scriptnet`** (#28): same-origin rules and CORS (preflight for anything not
+  simple), the profile's jar under `net::Context::subresource` (never another site's cookies, never another
+  profile's), at most 6 running and 1000 per page, 8 MB per response. Requests wait until the browser shows
+  the page and arms it with the jar (`ScriptNet::arm`): the CLI and pages being built never send any, and a
+  page that goes away drops its answers. `document.cookie` never shows or replaces `HttpOnly` cookies.
+  Failures are logged by reason only, never with what a request carried.
+- **Scripts cannot navigate and store nothing on disk.** Widen this only on purpose.
 
 ### Compression invariants
 

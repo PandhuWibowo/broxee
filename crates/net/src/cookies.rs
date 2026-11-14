@@ -167,6 +167,64 @@ impl Cookies {
         Some(header)
     }
 
+    /// What `document.cookie` reads on a page at `url`: the cookies a request to it would
+    /// carry, without `HttpOnly` ones. Empty when there are none.
+    pub fn script_view(&self, url: &Url, context: &Context) -> String {
+        if !context.allows(url) || !matches!(url.scheme.as_str(), "http" | "https") {
+            return String::new();
+        }
+        let now = now();
+        let path = url.path.split('?').next().unwrap_or("/");
+        let jar = self.jar();
+        let mut matching: Vec<&Cookie> = jar
+            .iter()
+            .filter(|c| {
+                !c.http_only
+                    && c.expires.is_none_or(|e| e > now)
+                    && domain_matches(&url.host, c)
+                    && path_matches(path, &c.path)
+                    && (!c.secure || url.scheme == "https")
+            })
+            .collect();
+        matching.sort_by(|a, b| {
+            b.path
+                .len()
+                .cmp(&a.path.len())
+                .then(a.created.cmp(&b.created))
+        });
+        let parts: Vec<String> = matching
+            .iter()
+            .map(|c| {
+                if c.name.is_empty() {
+                    c.value.clone()
+                } else {
+                    format!("{}={}", c.name, c.value)
+                }
+            })
+            .collect();
+        parts.join("; ")
+    }
+
+    /// `document.cookie = "…"` on a page at `url`: stored as a `Set-Cookie` would be, except
+    /// that a script can neither set an `HttpOnly` cookie nor replace one.
+    pub fn store_from_script(&self, url: &Url, text: &str, context: &Context) {
+        let Some(cookie) = parse(url, text, now()) else {
+            return;
+        };
+        if cookie.http_only {
+            return;
+        }
+        let protected = self.jar().iter().any(|c| {
+            c.http_only
+                && c.name == cookie.name
+                && c.domain == cookie.domain
+                && c.path == cookie.path
+        });
+        if !protected {
+            self.store(url, text, context);
+        }
+    }
+
     /// Store a `Set-Cookie` header received from `url`. Invalid or forbidden cookies are
     /// ignored, as browsers do.
     pub fn store(&self, url: &Url, set_cookie: &str, context: &Context) {
@@ -522,6 +580,25 @@ mod tests {
 
     fn top() -> Context {
         Context::top_level(true)
+    }
+
+    #[test]
+    fn scripts_read_and_write_their_sites_cookies_but_not_http_only_ones() {
+        let jar = Cookies::new();
+        let page = Url::parse("http://127.0.0.1:8080/app").unwrap();
+        let ctx = Context::subresource(&page);
+        jar.store(&page, "sid=secret; HttpOnly; Path=/", &ctx);
+        jar.store_from_script(&page, "theme=dark; path=/", &ctx);
+        jar.store_from_script(&page, "sid=stolen; path=/", &ctx);
+        jar.store_from_script(&page, "x=1; HttpOnly", &ctx);
+        assert_eq!(jar.script_view(&page, &ctx), "theme=dark");
+        assert_eq!(
+            jar.header(&page, &ctx).as_deref(),
+            Some("sid=secret; theme=dark"),
+            "the HttpOnly cookie is still sent, unchanged"
+        );
+        let other = Url::parse("http://localhost:8080/").unwrap();
+        assert_eq!(jar.header(&other, &ctx), None, "never to another site");
     }
 
     #[test]
