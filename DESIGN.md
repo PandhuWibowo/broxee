@@ -138,7 +138,10 @@ Sentence case everywhere. No uppercase tracked labels. Numbers use tabular figur
 ## 5. Shape and depth
 
 - Radius: 6px for tab rows, inputs and buttons; 10px for menus, the ⌘K palette and dialogs. Nothing is pill-shaped.
-- Shadow: only on things that float above the page (menus, ⌘K, dialogs), one soft shadow. Everything else is flat
+- Shadow: only on things that float above the page (menus, ⌘K, dialogs, a select's dropdown), one soft shadow.
+  A select's dropdown is a menu panel under its control (above it when there is no room), at least 160px
+  wide, ten rows before it scrolls: group labels as section labels, disabled options in `muted`, the current
+  choice in semibold (not marked by color alone), the highlighted row on `selected`. Everything else is flat
   and separated by `line` hairlines.
 - Panes in a split are separated by a 1px `line` hairline and a 6px drag handle (`text-2`) that only shows on
   hover. A tab shown in a pane carries a 16px outlined box with the pane's number (`text-2`) in its sidebar

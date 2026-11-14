@@ -336,6 +336,8 @@ enum Drag {
     OntoPane { tab: usize, pane: usize },
     /// The handle between panes, resizing them.
     Splitting(Axis),
+    /// A press inside the field being edited: dragging selects its text.
+    InField,
 }
 
 /// Which divider between panes: the one between columns, or (with four) between rows.
@@ -352,6 +354,70 @@ struct SavedPanes {
     panes: Vec<(usize, usize)>,
     focused: usize,
     split: (f32, f32),
+}
+
+/// A dropdown row, owned, so drawing can borrow it while the browser is busy painting.
+struct DropLine {
+    text: String,
+    label: bool,
+    disabled: bool,
+    chosen: bool,
+}
+
+fn drop_rows(lines: &[DropLine]) -> Vec<chrome::DropRow<'_>> {
+    lines
+        .iter()
+        .map(|l| {
+            if l.label {
+                chrome::DropRow::Label(&l.text)
+            } else {
+                chrome::DropRow::Item {
+                    text: &l.text,
+                    disabled: l.disabled,
+                    chosen: l.chosen,
+                }
+            }
+        })
+        .collect()
+}
+
+/// Where an open dropdown sits, without its rows.
+struct DropPlace {
+    x: f32,
+    top: f32,
+    below: f32,
+    width: f32,
+    height: f32,
+    highlight: usize,
+    first: usize,
+}
+
+impl DropPlace {
+    fn view<'a>(&self, rows: &'a [chrome::DropRow<'a>]) -> chrome::DropdownView<'a> {
+        chrome::DropdownView {
+            x: self.x,
+            top: self.top,
+            below: self.below,
+            width: self.width,
+            height: self.height,
+            rows,
+            highlight: Some(self.highlight),
+            first: self.first,
+        }
+    }
+}
+
+/// A select's open dropdown.
+struct Dropdown {
+    control: usize,
+    rows: Vec<forms::OptionRow>,
+    /// The row Enter would choose.
+    highlight: usize,
+    /// The first row shown (the list scrolls past `chrome::DROPDOWN_ROWS`).
+    first: usize,
+    /// Typed to jump to an option, and when the last key came.
+    typed: String,
+    typed_at: Instant,
 }
 
 /// Find in page (⌘F): the query, its matches and the one Enter moved to.
@@ -508,15 +574,90 @@ struct Field {
     cursor: usize,
     /// The whole text is selected: typing replaces it (as when the field opens).
     all_selected: bool,
+    /// Where a selection started (a byte offset); the selection runs to `cursor`.
+    anchor: Option<usize>,
 }
 
 impl Field {
+    /// The selected byte range, when something is selected.
+    fn selection(&self) -> Option<(usize, usize)> {
+        if self.all_selected && !self.text.is_empty() {
+            return Some((0, self.text.len()));
+        }
+        let a = self.anchor?;
+        (a != self.cursor).then(|| (a.min(self.cursor), a.max(self.cursor)))
+    }
+
+    fn selected_text(&self) -> Option<&str> {
+        self.selection().map(|(a, b)| &self.text[a..b])
+    }
+
+    /// Remove the selection; returns whether there was one.
+    fn delete_selection(&mut self) -> bool {
+        let Some((a, b)) = self.selection() else {
+            self.anchor = None;
+            self.all_selected = false;
+            return false;
+        };
+        self.text.replace_range(a..b, "");
+        self.cursor = a;
+        self.anchor = None;
+        self.all_selected = false;
+        true
+    }
+
+    fn select_all(&mut self) {
+        self.anchor = Some(0);
+        self.cursor = self.text.len();
+    }
+
+    /// Move the caret to `to`; with `extend`, the selection grows to it.
+    fn move_to(&mut self, to: usize, extend: bool) {
+        if extend {
+            if self.all_selected {
+                self.all_selected = false;
+                self.anchor = Some(0);
+            }
+            self.anchor.get_or_insert(self.cursor);
+        } else {
+            self.anchor = None;
+            self.all_selected = false;
+        }
+        self.cursor = to.min(self.text.len());
+    }
+
+    fn prev(&self) -> usize {
+        self.text[..self.cursor]
+            .char_indices()
+            .last()
+            .map_or(0, |(i, _)| i)
+    }
+
+    fn next(&self) -> usize {
+        self.text[self.cursor..]
+            .chars()
+            .next()
+            .map_or(self.cursor, |c| self.cursor + c.len_utf8())
+    }
+
+    /// Shift+← / Shift+→.
+    fn extend_left(&mut self) {
+        let to = self.prev();
+        self.move_to(to, true);
+    }
+
+    fn extend_right(&mut self) {
+        let to = self.next();
+        self.move_to(to, true);
+    }
+
     fn insert(&mut self, s: &str) {
         if self.all_selected {
             self.text.clear();
             self.cursor = 0;
             self.all_selected = false;
         }
+        self.delete_selection();
         self.text.insert_str(self.cursor, s);
         self.cursor += s.len();
     }
@@ -528,6 +669,9 @@ impl Field {
             self.all_selected = false;
             return;
         }
+        if self.delete_selection() {
+            return;
+        }
         if let Some((prev, _)) = self.text[..self.cursor].char_indices().last() {
             self.text.replace_range(prev..self.cursor, "");
             self.cursor = prev;
@@ -537,17 +681,23 @@ impl Field {
     fn left(&mut self) {
         if std::mem::take(&mut self.all_selected) {
             self.cursor = 0;
+        } else if let Some((a, _)) = self.selection() {
+            self.cursor = a;
         } else if let Some((prev, _)) = self.text[..self.cursor].char_indices().last() {
             self.cursor = prev;
         }
+        self.anchor = None;
     }
 
     fn right(&mut self) {
         if std::mem::take(&mut self.all_selected) {
             self.cursor = self.text.len();
+        } else if let Some((_, b)) = self.selection() {
+            self.cursor = b;
         } else if let Some(c) = self.text[self.cursor..].chars().next() {
             self.cursor += c.len_utf8();
         }
+        self.anchor = None;
     }
 }
 
@@ -596,6 +746,10 @@ struct Browser<S: Screen> {
     /// Text selected in the page.
     selection: Option<Selection>,
     find: Option<Find>,
+    dropdown: Option<Dropdown>,
+    /// How far the edited field's text is scrolled left, applied to its runs since the
+    /// last layout.
+    field_shift: f32,
     /// The last press on the page, for double and triple clicks: when, where, the count.
     last_press: Option<(Instant, f32, f32, u8)>,
     list: SidebarList,
@@ -684,6 +838,8 @@ impl<S: Screen> Browser<S> {
             drag: None,
             selection: None,
             find: None,
+            dropdown: None,
+            field_shift: 0.0,
             last_press: None,
             list: SidebarList::Tabs,
             bookmark_row: None,
@@ -1038,6 +1194,9 @@ impl<S: Screen> Browser<S> {
                 self.sidebar_scroll = (self.sidebar_scroll - dy as f32).clamp(0.0, max);
                 self.sidebar_scroll != before
             }
+            Event::Scroll { dy, x, y } if self.dropdown.is_some() => {
+                self.scroll_dropdown(dy as f32, x as f32 - self.pane_left(), y as f32)
+            }
             Event::Scroll { dy, .. } => self.scroll_by(-(dy as f32)),
             Event::Drag { x, y } => self.drag_to(x as f32, y as f32),
             Event::ShiftClick { x, y } => self.shift_click(x as f32, y as f32),
@@ -1070,8 +1229,12 @@ impl<S: Screen> Browser<S> {
                 }
                 let control = self.focused_control();
                 if let (Some(field), Some(i)) = (self.editing.as_mut(), control) {
+                    let before = (field.text.clone(), field.cursor);
                     field.insert(line);
-                    let text = field.text.clone();
+                    if self.keep_field_rules(i, before) {
+                        return true;
+                    }
+                    let text = self.editing.as_ref().expect("checked").text.clone();
                     if let Some(page) = self.page.as_mut() {
                         page.forms.set_value(&mut page.dom, i, &text);
                     }
@@ -1164,7 +1327,16 @@ impl<S: Screen> Browser<S> {
             _ => return Ok(event),
         };
         // The sidebar, and drags that started there, keep window coordinates.
-        let sidebar_drag = self.drag.is_some() && self.drag != Some(Drag::Selecting);
+        let sidebar_drag = matches!(
+            self.drag,
+            Some(
+                Drag::Pressed { .. }
+                    | Drag::Moving { .. }
+                    | Drag::Resizing
+                    | Drag::OntoPane { .. }
+                    | Drag::Splitting(_)
+            )
+        );
         if sidebar_drag || x < self.sidebar_edge() {
             return Ok(event);
         }
@@ -1324,9 +1496,11 @@ impl<S: Screen> Browser<S> {
     /// Lay the page out again for a new pane size.
     fn relayout(&mut self) {
         let settings = self.settings();
+        self.unshift_field();
         if let Some(page) = self.page.as_mut() {
             engine::relayout(page, settings, &self.fonts);
         }
+        self.scroll_field();
         self.clamp_scroll();
         // The focused link moved with the layout.
         if let Some(node) = self.link_focus.take().map(|l| l.node) {
@@ -1357,6 +1531,20 @@ impl<S: Screen> Browser<S> {
     fn click(&mut self, x: f32, y: f32) -> bool {
         let left = self.pane_left();
         let pane_width = self.pane_width();
+        if self.dropdown.is_some() {
+            let hit = self.dropdown_view().and_then(|(lines, place)| {
+                let rows = drop_rows(&lines);
+                chrome::dropdown_hit(&place.view(&rows), pane_width, x - left, y)
+            });
+            return match hit {
+                Some(Some(row)) => self.pick_dropdown_row(row),
+                Some(None) => false,
+                None => {
+                    self.dropdown = None;
+                    true
+                }
+            };
+        }
         if let Some(menu) = &self.menu {
             let hit = (x >= left)
                 .then(|| chrome::menu_hit(x - left, y, pane_width, menu.items.len()))
@@ -1479,8 +1667,36 @@ impl<S: Screen> Browser<S> {
             }
         }
         if let Some(i) = self.control_at(x, y - HEADER_HEIGHT) {
+            let (enabled, file) = self.page.as_ref().map_or((false, false), |p| {
+                let node = p.forms.controls[i].node;
+                (
+                    p.forms.focusable(&p.dom, i),
+                    p.dom
+                        .attr(node, "type")
+                        .is_some_and(|t| t.eq_ignore_ascii_case("file")),
+                )
+            });
+            if !enabled {
+                return was_editing;
+            }
+            if file {
+                self.tell_at_control(i, "Broxee can't upload files yet.");
+                return true;
+            }
             self.focus_control(i);
             self.press_control(i);
+            if self.editing.is_some() {
+                let fonts = Arc::clone(&self.fonts);
+                let metrics = self.page.as_ref().map(|p| p.metrics(&fonts));
+                let at = metrics
+                    .as_ref()
+                    .and_then(|m| self.field_offset_at(m, x, y - HEADER_HEIGHT));
+                if let (Some(at), Some(field)) = (at, self.editing.as_mut()) {
+                    field.move_to(at, false);
+                }
+                self.drag = Some(Drag::InField);
+                self.relayout_page();
+            }
             return true;
         }
         if let Some(url) = self.link_at(x, y - HEADER_HEIGHT) {
@@ -1567,10 +1783,54 @@ impl<S: Screen> Browser<S> {
         self.extend_selection(x - left, y - HEADER_HEIGHT)
     }
 
+    /// Whether the field being edited is a password: its text never reaches the clipboard.
+    fn editing_password(&self) -> bool {
+        let i = self.focused_control();
+        self.page
+            .as_ref()
+            .zip(i)
+            .is_some_and(|(p, i)| p.forms.controls[i].kind == forms::Kind::Password)
+    }
+
+    /// ⌘X in a page field: its selection to the clipboard, and out of the field.
+    fn cut_field(&mut self) -> bool {
+        let readonly = self
+            .focused_control()
+            .zip(self.page.as_ref())
+            .is_some_and(|(i, p)| p.dom.attr(p.forms.controls[i].node, "readonly").is_some());
+        if self.editing_password() || readonly {
+            return false;
+        }
+        let Some(i) = self.focused_control() else {
+            return false;
+        };
+        let Some(field) = self.editing.as_mut() else {
+            return false;
+        };
+        let Some(text) = field.selected_text().map(str::to_string) else {
+            return false;
+        };
+        field.delete_selection();
+        let value = field.text.clone();
+        self.window.copy(&text);
+        if let Some(page) = self.page.as_mut() {
+            page.forms.set_value(&mut page.dom, i, &value);
+        }
+        self.relayout_page();
+        self.typed_into(i);
+        true
+    }
+
     /// ⌘C: the selected page text (or the whole address being edited) to the clipboard.
     fn copy_selection(&mut self) -> bool {
         if let Some(field) = self.field.as_ref() {
             self.window.copy(&field.text);
+            return false;
+        }
+        if let Some(field) = self.editing.as_ref() {
+            if let Some(text) = field.selected_text().filter(|_| !self.editing_password()) {
+                self.window.copy(text);
+            }
             return false;
         }
         let (Some(page), Some(sel)) = (self.page.as_ref(), self.selection) else {
@@ -1598,6 +1858,7 @@ impl<S: Screen> Browser<S> {
                         text: String::new(),
                         cursor: 0,
                         all_selected: false,
+                        anchor: None,
                     },
                     matches: Vec::new(),
                     current: 0,
@@ -1741,11 +2002,74 @@ impl<S: Screen> Browser<S> {
         if let Some(sel) = self.selection {
             add(sel, MarkKind::Selection);
         }
+        // A selection inside the field being edited, one mark per line it covers.
+        if let Some((a, b)) = self.editing.as_ref().and_then(Field::selection) {
+            let text = &self.editing.as_ref().expect("checked").text;
+            let mut start = a;
+            while start <= b {
+                let end = text[start..b].find('\n').map_or(b, |n| start + n);
+                if let (Some(p0), Some(p1)) = (
+                    self.field_point(metrics, start),
+                    self.field_point(metrics, end),
+                ) {
+                    out.push((
+                        p0.0,
+                        p0.1,
+                        (p1.0 - p0.0).max(2.0),
+                        p0.2,
+                        MarkKind::Selection,
+                    ));
+                }
+                start = end + 1;
+            }
+        }
         out
+    }
+
+    /// The byte offset of the edited field's text nearest (x, y) in pane points (y relative
+    /// to the page area).
+    fn field_offset_at(&self, metrics: &dyn font::TextMetrics, x: f32, y: f32) -> Option<usize> {
+        let field = self.editing.as_ref()?;
+        let mut best: Option<(f32, usize)> = None;
+        let boundaries = field
+            .text
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain(std::iter::once(field.text.len()));
+        for offset in boundaries {
+            let (px, top, h) = self.field_point(metrics, offset)?;
+            let dy = if y < top {
+                top - y
+            } else if y > top + h {
+                y - top - h
+            } else {
+                0.0
+            };
+            let d = dy * 1000.0 + (px - x).abs();
+            if best.is_none_or(|(bd, _)| d < bd) {
+                best = Some((d, offset));
+            }
+        }
+        best.map(|(_, o)| o)
     }
 
     /// Where the caret of the focused field is: x, top and height in page-area points.
     fn caret(&self, metrics: &dyn font::TextMetrics) -> Option<(f32, f32, f32)> {
+        let field = self.editing.as_ref()?;
+        if field.selection().is_some() {
+            // The selection is drawn instead (`page_marks`).
+            return None;
+        }
+        self.field_point(metrics, field.cursor)
+    }
+
+    /// Where byte `offset` of the edited field's text is drawn: (x, top, height) in pane
+    /// points (top relative to the page area).
+    fn field_point(
+        &self,
+        metrics: &dyn font::TextMetrics,
+        offset: usize,
+    ) -> Option<(f32, f32, f32)> {
         let field = self.editing.as_ref()?;
         let i = self.focused_control()?;
         let page = self.page.as_ref()?;
@@ -1772,7 +2096,7 @@ impl<S: Screen> Browser<S> {
             r.x + edge,
             r.y + style.border_width[0].to_f32() + 1.0 + ascent,
         ));
-        let before = &field.text[..field.cursor];
+        let before = &field.text[..offset.min(field.text.len())];
         let line = before.matches('\n').count() as f32;
         let tail = before.rsplit('\n').next().unwrap_or("");
         let width: f32 = if c.kind == forms::Kind::Password {
@@ -1958,6 +2282,7 @@ impl<S: Screen> Browser<S> {
             text: c.value.clone(),
             cursor: c.value.len(),
             all_selected: false,
+            anchor: None,
         });
         self.focus_link(node, true);
     }
@@ -1969,7 +2294,10 @@ impl<S: Screen> Browser<S> {
         };
         let changed = match page.forms.controls[i].kind {
             forms::Kind::Checkbox | forms::Kind::Radio => page.forms.toggle(&mut page.dom, i),
-            forms::Kind::Select => page.forms.choose(&mut page.dom, i, 1),
+            forms::Kind::Select => {
+                self.open_dropdown(i);
+                return;
+            }
             forms::Kind::Submit => {
                 self.submit(i);
                 return;
@@ -1985,6 +2313,330 @@ impl<S: Screen> Browser<S> {
         }
     }
 
+    /// Show `message` under control `i`, as a tooltip that the next input hides.
+    fn tell_at_control(&mut self, i: usize, message: &str) {
+        let Some(page) = self.page.as_ref() else {
+            return;
+        };
+        let node = page.forms.controls[i].node;
+        let layout = &page.layout;
+        let Some(b) = (0..layout.boxes.len()).find(|&k| layout.boxes[k].node == node) else {
+            return;
+        };
+        let r = layout.boxes[b].rect;
+        let scroll = if layout.box_is_fixed(b) {
+            0.0
+        } else {
+            self.scroll
+        };
+        self.hover = Some(Hover {
+            at: (
+                self.pane_left() + r.x,
+                HEADER_HEIGHT + r.y + r.height - scroll,
+            ),
+            text: message.to_string(),
+            since: Instant::now(),
+            shown: true,
+        });
+    }
+
+    /// Undo the last edit of field `i` (from `before`) when it is `readonly` or the edit
+    /// went past its `maxlength`. Returns whether it was undone.
+    fn keep_field_rules(&mut self, i: usize, before: (String, usize)) -> bool {
+        let Some(page) = self.page.as_ref() else {
+            return false;
+        };
+        let node = page.forms.controls[i].node;
+        let readonly = page.dom.attr(node, "readonly").is_some();
+        let max = page
+            .dom
+            .attr(node, "maxlength")
+            .and_then(|m| m.trim().parse::<usize>().ok());
+        let Some(field) = self.editing.as_mut() else {
+            return false;
+        };
+        let grew = field.text.chars().count() > before.0.chars().count();
+        let too_long = max.is_some_and(|m| grew && field.text.chars().count() > m);
+        if (readonly && field.text != before.0) || too_long {
+            field.text = before.0;
+            field.cursor = before.1;
+            field.anchor = None;
+            return true;
+        }
+        false
+    }
+
+    /// Open select `i`'s dropdown, its current choice highlighted.
+    fn open_dropdown(&mut self, i: usize) {
+        let Some(page) = self.page.as_ref() else {
+            return;
+        };
+        let rows = page.forms.option_rows(&page.dom, i);
+        if rows.is_empty() {
+            return;
+        }
+        let chosen = page.forms.controls[i].selected;
+        let highlight = rows
+            .iter()
+            .position(|r| matches!(r, forms::OptionRow::Choice { index, .. } if *index == chosen))
+            .unwrap_or(0);
+        let first = highlight.saturating_sub(chrome::DROPDOWN_ROWS - 1);
+        self.dropdown = Some(Dropdown {
+            control: i,
+            rows,
+            highlight,
+            first,
+            typed: String::new(),
+            typed_at: Instant::now(),
+        });
+    }
+
+    /// The open dropdown's rows and where it sits (pane points), from its control's box.
+    fn dropdown_view(&self) -> Option<(Vec<DropLine>, DropPlace)> {
+        let d = self.dropdown.as_ref()?;
+        let page = self.page.as_ref()?;
+        let node = page.forms.controls.get(d.control)?.node;
+        let layout = &page.layout;
+        let b = (0..layout.boxes.len()).find(|&k| layout.boxes[k].node == node)?;
+        let r = layout.boxes[b].rect;
+        let scroll = if layout.box_is_fixed(b) {
+            0.0
+        } else {
+            self.scroll
+        };
+        let top = HEADER_HEIGHT + r.y - scroll;
+        let chosen = page.forms.controls[d.control].selected;
+        let rows = d
+            .rows
+            .iter()
+            .map(|row| match row {
+                forms::OptionRow::Group(label) => DropLine {
+                    text: label.clone(),
+                    label: true,
+                    disabled: false,
+                    chosen: false,
+                },
+                forms::OptionRow::Choice {
+                    label,
+                    index,
+                    disabled,
+                } => DropLine {
+                    text: label.clone(),
+                    label: false,
+                    disabled: *disabled,
+                    chosen: *index == chosen,
+                },
+            })
+            .collect();
+        Some((
+            rows,
+            DropPlace {
+                x: r.x,
+                top,
+                below: top + r.height,
+                width: r.width,
+                height: self.pane_rect().3,
+                highlight: d.highlight,
+                first: d.first,
+            },
+        ))
+    }
+
+    /// Choose the option on dropdown row `row`; group labels and disabled options do nothing.
+    fn pick_dropdown_row(&mut self, row: usize) -> bool {
+        let Some(d) = self.dropdown.as_ref() else {
+            return false;
+        };
+        let (control, choice) = match d.rows.get(row) {
+            Some(forms::OptionRow::Choice {
+                index,
+                disabled: false,
+                ..
+            }) => (d.control, *index),
+            _ => return false,
+        };
+        self.dropdown = None;
+        let Some(page) = self.page.as_mut() else {
+            return true;
+        };
+        let node = page.forms.controls[control].node;
+        if page.forms.choose_index(&mut page.dom, control, choice) {
+            self.relayout_page();
+            self.dispatch_page(node, "input");
+            self.dispatch_page(node, "change");
+        }
+        true
+    }
+
+    /// Keys while a dropdown is open: ↑ ↓ move, Enter or Space chooses, Esc or Tab closes,
+    /// letters jump to the option starting with what was typed.
+    fn dropdown_key(&mut self, k: KeyEvent) -> bool {
+        let Some(d) = self.dropdown.as_mut() else {
+            return false;
+        };
+        let choosable = |r: &forms::OptionRow| {
+            matches!(
+                r,
+                forms::OptionRow::Choice {
+                    disabled: false,
+                    ..
+                }
+            )
+        };
+        match k.key {
+            Key::Up | Key::Down => {
+                let step: isize = if k.key == Key::Up { -1 } else { 1 };
+                let mut at = d.highlight as isize;
+                loop {
+                    at += step;
+                    if at < 0 || at >= d.rows.len() as isize {
+                        break;
+                    }
+                    if choosable(&d.rows[at as usize]) {
+                        d.highlight = at as usize;
+                        break;
+                    }
+                }
+            }
+            Key::Enter | Key::Char(' ') if d.typed.is_empty() || k.key == Key::Enter => {
+                let row = d.highlight;
+                return self.pick_dropdown_row(row);
+            }
+            Key::Escape | Key::Tab => {
+                self.dropdown = None;
+                return true;
+            }
+            Key::Char(c) => {
+                if d.typed_at.elapsed() > Duration::from_secs(1) {
+                    d.typed.clear();
+                }
+                d.typed_at = Instant::now();
+                d.typed.extend(c.to_lowercase());
+                let typed = d.typed.clone();
+                if let Some(at) = d.rows.iter().position(|r| {
+                    choosable(r)
+                        && matches!(r, forms::OptionRow::Choice { label, .. }
+                            if label.to_lowercase().starts_with(&typed))
+                }) {
+                    d.highlight = at;
+                }
+            }
+            _ => return false,
+        }
+        // Keep the highlighted row in view.
+        if d.highlight < d.first {
+            d.first = d.highlight;
+        } else if d.highlight >= d.first + chrome::DROPDOWN_ROWS {
+            d.first = d.highlight + 1 - chrome::DROPDOWN_ROWS;
+        }
+        true
+    }
+
+    /// The wheel over an open dropdown scrolls its rows; anywhere else it closes it.
+    fn scroll_dropdown(&mut self, dy: f32, x: f32, y: f32) -> bool {
+        let pane_width = self.pane_width();
+        let over = self.dropdown_view().is_some_and(|(lines, place)| {
+            let rows = drop_rows(&lines);
+            chrome::dropdown_hit(&place.view(&rows), pane_width, x, y).is_some()
+        });
+        let Some(d) = self.dropdown.as_mut() else {
+            return false;
+        };
+        if !over {
+            self.dropdown = None;
+            return self.scroll_by(-dy) | true;
+        }
+        let max = d.rows.len().saturating_sub(chrome::DROPDOWN_ROWS);
+        let before = d.first;
+        let rows = (dy.abs() / 30.0).ceil() as usize;
+        d.first = if dy > 0.0 {
+            d.first.saturating_sub(rows)
+        } else {
+            (d.first + rows).min(max)
+        };
+        d.first != before
+    }
+
+    /// Put the edited field's runs back where layout placed them.
+    fn unshift_field(&mut self) {
+        if self.field_shift == 0.0 {
+            return;
+        }
+        let shift = std::mem::take(&mut self.field_shift);
+        let (Some(i), Some(page)) = (self.focused_control(), self.page.as_mut()) else {
+            return;
+        };
+        let (shown, placeholder) = page.forms.text_nodes(i);
+        for k in 0..page.layout.texts.len() {
+            let n = Some(page.layout.texts[k].node);
+            if n == shown || n == placeholder {
+                page.layout.texts[k].x += shift;
+            }
+        }
+    }
+
+    /// Keep the caret of the field being edited inside it: its text runs move left by as
+    /// much as the text before the caret overflows the field (one-line fields only).
+    fn scroll_field(&mut self) {
+        let (Some(field), Some(i)) = (self.editing.as_ref(), self.focused_control()) else {
+            self.field_shift = 0.0;
+            return;
+        };
+        let fonts = Arc::clone(&self.fonts);
+        let Some(page) = self.page.as_mut() else {
+            return;
+        };
+        let c = &page.forms.controls[i];
+        if !matches!(c.kind, forms::Kind::Text | forms::Kind::Password) {
+            return;
+        }
+        let (shown, placeholder) = page.forms.text_nodes(i);
+        let layout = &page.layout;
+        let Some(b) = (0..layout.boxes.len()).find(|&k| layout.boxes[k].node == c.node) else {
+            return;
+        };
+        let r = layout.boxes[b].rect;
+        let runs: Vec<usize> = (0..layout.texts.len())
+            .filter(|&k| {
+                Some(layout.texts[k].node) == shown || Some(layout.texts[k].node) == placeholder
+            })
+            .collect();
+        let Some(&first) = runs.first() else {
+            self.field_shift = 0.0;
+            return;
+        };
+        let style = page.styles.style(c.node);
+        let (size, key) = (style.font_size.to_f32(), layout::font_key(style));
+        let edge = style.border_width[3].to_f32() + 2.0;
+        let metrics = page.metrics(&fonts);
+        let before = &field.text[..field.cursor];
+        let width: f32 = if c.kind == forms::Kind::Password {
+            before.chars().count() as f32 * font::TextMetrics::advance_em(&metrics, '•', key) * size
+        } else {
+            before
+                .chars()
+                .map(|ch| font::TextMetrics::advance_em(&metrics, ch, key) * size)
+                .sum()
+        };
+        // Where the caret would be with nothing scrolled.
+        let start = layout.texts[first].x + self.field_shift;
+        let caret = start + width;
+        let (left, right) = (r.x + edge, r.x + r.width - edge);
+        let mut shift = self.field_shift;
+        if caret - shift > right {
+            shift = caret - right;
+        } else if caret - shift < left {
+            shift = (caret - left).max(0.0);
+        }
+        let delta = shift - self.field_shift;
+        if delta != 0.0 {
+            for k in runs {
+                page.layout.texts[k].x -= delta;
+            }
+            self.field_shift = shift;
+        }
+    }
+
     /// Style and lay the page out again after a control or script changed what it shows.
     fn relayout_page(&mut self) {
         self.update_page(false);
@@ -1995,9 +2647,12 @@ impl<S: Screen> Browser<S> {
     fn update_page(&mut self, states_changed: bool) {
         let node = self.link_focus.as_ref().map(|l| l.node);
         let settings = self.settings();
+        // The layout engine sees the field's runs where it put them; the shift comes back after.
+        self.unshift_field();
         if let Some(page) = self.page.as_mut() {
             engine::update(page, settings, &self.fonts, states_changed);
         }
+        self.scroll_field();
         self.clamp_scroll();
         // The focused link moved with the layout.
         self.link_focus = None;
@@ -2011,6 +2666,12 @@ impl<S: Screen> Browser<S> {
         let Some(page) = &self.page else {
             return;
         };
+        if let Some((j, message)) = page.forms.invalid(&page.dom, i) {
+            // Not sent: the control that stops it gets focus and says why.
+            self.focus_control(j);
+            self.tell_at_control(j, message);
+            return;
+        }
         let Some(sent) = page.forms.submission(&page.dom, i, &page.url) else {
             return;
         };
@@ -2023,14 +2684,41 @@ impl<S: Screen> Browser<S> {
     /// Keys for the focused control `i`. `None` lets the key do what it does elsewhere.
     fn control_key(&mut self, i: usize, k: KeyEvent) -> Option<bool> {
         let kind = self.page.as_ref()?.forms.controls[i].kind;
+        if let (Key::Up | Key::Down, Some(page)) = (k.key, self.page.as_ref()) {
+            if let Some(v) = page.forms.stepped(&page.dom, i, k.key == Key::Up) {
+                let readonly = page
+                    .dom
+                    .attr(page.forms.controls[i].node, "readonly")
+                    .is_some();
+                if readonly {
+                    return Some(false);
+                }
+                if let Some(field) = self.editing.as_mut() {
+                    field.cursor = v.len();
+                    field.anchor = None;
+                    field.text = v.clone();
+                }
+                let page = self.page.as_mut()?;
+                page.forms.set_value(&mut page.dom, i, &v);
+                self.relayout_page();
+                self.typed_into(i);
+                return Some(true);
+            }
+        }
+        let before = self.editing.as_ref().map(|f| (f.text.clone(), f.cursor));
         if let Some(field) = self.editing.as_mut() {
             match k.key {
                 Key::Char(c) => field.insert(c.encode_utf8(&mut [0; 4])),
                 Key::Backspace => field.backspace(),
+                Key::Left if k.shift => field.extend_left(),
+                Key::Right if k.shift => field.extend_right(),
                 Key::Left => field.left(),
                 Key::Right => field.right(),
-                Key::Home | Key::Up => field.cursor = 0,
-                Key::End | Key::Down => field.cursor = field.text.len(),
+                Key::Home | Key::Up => field.move_to(0, k.shift),
+                Key::End | Key::Down => {
+                    let end = field.text.len();
+                    field.move_to(end, k.shift);
+                }
                 Key::Enter if kind == forms::Kind::TextArea => field.insert("\n"),
                 Key::Enter => {
                     self.submit(i);
@@ -2043,7 +2731,12 @@ impl<S: Screen> Browser<S> {
                 }
                 _ => return None,
             }
-            let text = field.text.clone();
+            if let Some(before) = before {
+                if self.keep_field_rules(i, before) {
+                    return Some(true);
+                }
+            }
+            let text = self.editing.as_ref()?.text.clone();
             let page = self.page.as_mut()?;
             page.forms.set_value(&mut page.dom, i, &text);
             self.relayout_page();
@@ -2063,7 +2756,8 @@ impl<S: Screen> Browser<S> {
                 changed.then(|| self.relayout_page());
                 Some(changed)
             }
-            (_, Key::Char(' ')) | (forms::Kind::Submit | forms::Kind::Reset, Key::Enter) => {
+            (_, Key::Char(' '))
+            | (forms::Kind::Submit | forms::Kind::Reset | forms::Kind::Select, Key::Enter) => {
                 self.press_control(i);
                 Some(true)
             }
@@ -2076,6 +2770,12 @@ impl<S: Screen> Browser<S> {
     }
 
     fn key(&mut self, k: KeyEvent) -> bool {
+        if self.dropdown.is_some() {
+            if !k.command {
+                return self.dropdown_key(k);
+            }
+            self.dropdown = None;
+        }
         if self.menu.is_some() {
             if !k.command {
                 return self.menu_key(k.key);
@@ -2133,6 +2833,12 @@ impl<S: Screen> Browser<S> {
                         self.header_change = true;
                         true
                     }
+                    None if self.editing.is_some() => {
+                        if let Some(field) = self.editing.as_mut() {
+                            field.select_all();
+                        }
+                        true
+                    }
                     None => match self.find.as_mut().filter(|f| f.focused) {
                         Some(find) => {
                             find.field.all_selected = true;
@@ -2147,6 +2853,7 @@ impl<S: Screen> Browser<S> {
                     },
                 },
                 Key::Char('c') => self.copy_selection(),
+                Key::Char('x') => self.cut_field(),
                 Key::Char('f') => self.open_find(),
                 Key::Char('g') => self.find_step(!k.shift),
                 _ => false,
@@ -2518,6 +3225,7 @@ impl<S: Screen> Browser<S> {
                 cursor: text.len(),
                 text,
                 all_selected: i == 0,
+                anchor: None,
             })
             .collect();
         self.dialog = Some(Dialog {
@@ -2901,6 +3609,21 @@ impl<S: Screen> Browser<S> {
         if self.drag == Some(Drag::Selecting) {
             return self.extend_selection(x - self.pane_left(), y - HEADER_HEIGHT);
         }
+        if self.drag == Some(Drag::InField) {
+            let fonts = Arc::clone(&self.fonts);
+            let at = self.page.as_ref().and_then(|p| {
+                let metrics = p.metrics(&fonts);
+                self.field_offset_at(&metrics, x - self.pane_left(), y - HEADER_HEIGHT)
+            });
+            let Some((at, field)) = at.zip(self.editing.as_mut()) else {
+                return false;
+            };
+            if at == field.cursor {
+                return false;
+            }
+            field.move_to(at, true);
+            return true;
+        }
         if let Some(Drag::Splitting(axis)) = self.drag {
             let x0 = self.sidebar_edge();
             let f = match axis {
@@ -2967,6 +3690,10 @@ impl<S: Screen> Browser<S> {
 
     /// The button came up: finish a resize or a move.
     fn release(&mut self, _x: f32, _y: f32) -> bool {
+        if self.drag == Some(Drag::InField) {
+            self.drag = None;
+            return self.set_states(|s| s.active = None);
+        }
         if self.drag == Some(Drag::Selecting) {
             self.drag = None;
             // A press without a drag selects nothing.
@@ -3355,6 +4082,7 @@ impl<S: Screen> Browser<S> {
             cursor: text.len(),
             text,
             all_selected: true,
+            anchor: None,
         });
         true
     }
@@ -3865,6 +4593,8 @@ impl<S: Screen> Browser<S> {
         self.page = Some(page);
         // Positions are node ids of the page they were made on.
         self.selection = None;
+        self.dropdown = None;
+        self.field_shift = 0.0;
         if self.find.take().is_some() {
             self.header_change = true;
         }
@@ -3873,6 +4603,16 @@ impl<S: Screen> Browser<S> {
         self.loading = None;
         self.scroll = scroll;
         self.clamp_scroll();
+        // `autofocus`: the first such control takes focus (not when coming back to a page).
+        let auto = self.page.as_ref().and_then(|p| {
+            (0..p.forms.controls.len()).find(|&i| {
+                p.dom.attr(p.forms.controls[i].node, "autofocus").is_some()
+                    && p.forms.focusable(&p.dom, i)
+            })
+        });
+        if let (Some(i), true) = (auto, scroll == 0.0) {
+            self.focus_control(i);
+        }
         self.painter.trim(GLYPH_CACHE_LIMIT);
         self.painter.forget_images();
         // Loading freed a lot (the previous page, stylesheet text, parse scratch): hand it back
@@ -4204,6 +4944,12 @@ impl<S: Screen> Browser<S> {
         let menu_items: Vec<&str> = self.menu.as_ref().map_or(Vec::new(), |m| {
             m.items.iter().map(|(label, _)| label.as_str()).collect()
         });
+        let dropdown = self.dropdown_view();
+        let dropdown_rows = dropdown.as_ref().map(|(lines, _)| drop_rows(lines));
+        let dropdown_view = dropdown
+            .as_ref()
+            .zip(dropdown_rows.as_ref())
+            .map(|((_, place), rows)| place.view(rows));
         let menu_view = self.menu.as_ref().map(|m| MenuView {
             items: &menu_items,
             selected: m.selected,
@@ -4378,6 +5124,16 @@ impl<S: Screen> Browser<S> {
                         scale,
                     };
                     chrome.draw_palette(painter, frame, &fonts.ui(), palette);
+                }
+                if let Some(view) = &dropdown_view {
+                    let frame = Frame {
+                        pixels: &mut *pane_rows,
+                        stride,
+                        left: pane_x,
+                        width: pane_px,
+                        scale,
+                    };
+                    chrome.draw_dropdown(painter, frame, &fonts.ui(), view);
                 }
                 if let Some(menu) = &menu_view {
                     let frame = Frame {
@@ -6370,6 +7126,247 @@ mod tests {
         assert_eq!(p.dom.text_content(keys), "keys 2");
     }
 
+    #[test]
+    fn select_dropdown_lists_groups_and_chooses_by_key_and_mouse() {
+        let page = page_file(
+            "dropdown",
+            "<!doctype html><select id=s><option>Apple</option><optgroup label=Stone>\
+             <option>Cherry</option><option disabled>Damson</option><option>Peach</option>\
+             </optgroup><option>Zucchini</option></select><p id=out></p><script>\
+             document.getElementById('s').addEventListener('change', e => \
+             document.getElementById('out').textContent = 'changed ' + e.target.value)</script>",
+        );
+        let mut b = browser(&page);
+        // Options: Apple 0, Cherry 1, Damson 2, Peach 3, Zucchini 4.
+        let chosen = |b: &Browser<FakeScreen>| b.page.as_ref().unwrap().forms.controls[0].selected;
+        assert!(click_control(&mut b, 0));
+        let d = b.dropdown.as_ref().expect("a click opens the list");
+        assert_eq!(d.rows.len(), 6, "five options and a group label");
+        assert!(matches!(&d.rows[1], forms::OptionRow::Group(g) if g == "Stone"));
+        assert_eq!(d.highlight, 0, "the chosen option");
+
+        // Down skips the label and the disabled option.
+        act(&mut b, key(Key::Down));
+        assert_eq!(b.dropdown.as_ref().unwrap().highlight, 2, "Cherry");
+        act(&mut b, key(Key::Down));
+        assert_eq!(
+            b.dropdown.as_ref().unwrap().highlight,
+            4,
+            "Peach, past Damson"
+        );
+        act(&mut b, key(Key::Enter));
+        assert!(b.dropdown.is_none());
+        assert_eq!(chosen(&b), 3, "Peach");
+        let out = |b: &Browser<FakeScreen>| {
+            let p = b.page.as_ref().unwrap();
+            p.dom.text_content(p.dom.find_first("p").unwrap())
+        };
+        assert_eq!(out(&b), "changed Peach", "scripts hear the change");
+
+        // Typing jumps to an option; Esc closes without choosing.
+        click_control(&mut b, 0);
+        type_text(&mut b, "zu");
+        assert_eq!(b.dropdown.as_ref().unwrap().highlight, 5);
+        act(&mut b, key(Key::Escape));
+        assert!(b.dropdown.is_none());
+        assert_eq!(chosen(&b), 3, "still Peach");
+
+        // A click on a row chooses it; a click outside closes the list.
+        click_control(&mut b, 0);
+        let (lines, place) = b.dropdown_view().unwrap();
+        let rows = drop_rows(&lines);
+        let (x, y, _, _) = chrome::dropdown_rect(&place.view(&rows), b.pane_width());
+        let row_y = |row: f32| f64::from(y + 6.0 + 30.0 * row + 15.0);
+        let at = f64::from(x + 20.0 + b.pane_left());
+        assert!(
+            !act(
+                &mut b,
+                Event::Click {
+                    x: at,
+                    y: row_y(1.0)
+                }
+            ),
+            "a label is not a choice"
+        );
+        assert!(b.dropdown.is_some());
+        act(
+            &mut b,
+            Event::Click {
+                x: at,
+                y: row_y(2.0),
+            },
+        );
+        assert!(b.dropdown.is_none());
+        assert_eq!(chosen(&b), 1, "Cherry");
+        click_control(&mut b, 0);
+        act(&mut b, Event::Click { x: 630.0, y: 290.0 });
+        assert!(b.dropdown.is_none(), "a click outside closes it");
+        b.render();
+    }
+
+    #[test]
+    fn a_long_value_scrolls_to_the_caret() {
+        let mut b = browser(&page_file(
+            "field-scroll",
+            "<!doctype html><input style='width: 100px'>",
+        ));
+        assert!(click_control(&mut b, 0));
+        type_text(&mut b, "a value much longer than the field is wide");
+        assert!(b.field_shift > 0.0, "the text moved left");
+        let metrics = b.page.as_ref().unwrap().metrics(&b.fonts);
+        let (cx, _, _) = b.caret(&metrics).unwrap();
+        let p = b.page.as_ref().unwrap();
+        let node = p.forms.controls[0].node;
+        let r = p.layout.boxes.iter().find(|x| x.node == node).unwrap().rect;
+        assert!(cx > r.x && cx < r.x + r.width, "the caret stays inside");
+        act(&mut b, key(Key::Home));
+        assert_eq!(b.field_shift, 0.0, "back at the start");
+    }
+
+    #[test]
+    fn fields_select_copy_cut_and_paste() {
+        let mut b = browser(&page_file(
+            "field-select",
+            "<!doctype html><input style='width: 200px'><input type=password>",
+        ));
+        let shift = |key: Key| {
+            Event::Key(KeyEvent {
+                key,
+                command: false,
+                shift: true,
+                option: false,
+            })
+        };
+        let value = |b: &Browser<FakeScreen>, i: usize| {
+            b.page.as_ref().unwrap().forms.controls[i].value.clone()
+        };
+        assert!(click_control(&mut b, 0));
+        type_text(&mut b, "hello world");
+        for _ in 0..5 {
+            act(&mut b, shift(Key::Left));
+        }
+        assert_eq!(b.editing.as_ref().unwrap().selected_text(), Some("world"));
+        {
+            let metrics = b.page.as_ref().unwrap().metrics(&b.fonts);
+            assert_eq!(
+                b.page_marks(&metrics)
+                    .iter()
+                    .filter(|m| m.4 == MarkKind::Selection)
+                    .count(),
+                1,
+                "the selection is drawn"
+            );
+            assert!(b.caret(&metrics).is_none(), "no caret over a selection");
+        }
+        act(&mut b, command('c'));
+        assert_eq!(b.window.clipboard.borrow().as_str(), "world");
+        type_text(&mut b, "there");
+        assert_eq!(value(&b, 0), "hello there", "typing replaces the selection");
+
+        act(&mut b, command('a'));
+        act(&mut b, command('x'));
+        assert_eq!(b.window.clipboard.borrow().as_str(), "hello there");
+        assert_eq!(value(&b, 0), "", "⌘X cuts");
+        act(&mut b, Event::Paste("pasted".into()));
+        act(&mut b, shift(Key::Home));
+        act(&mut b, Event::Paste("again".into()));
+        assert_eq!(value(&b, 0), "again", "paste replaces the selection");
+        act(&mut b, shift(Key::Home));
+        act(&mut b, key(Key::Backspace));
+        assert_eq!(value(&b, 0), "", "Backspace deletes it");
+
+        // A press places the caret; a drag selects.
+        type_text(&mut b, "drag me");
+        let ((x0, _, _), (x4, top, h)) = {
+            let metrics = b.page.as_ref().unwrap().metrics(&b.fonts);
+            (
+                b.field_point(&metrics, 0).unwrap(),
+                b.field_point(&metrics, 4).unwrap(),
+            )
+        };
+        let y = f64::from(top + h / 2.0 + HEADER_HEIGHT);
+        let left = f64::from(b.pane_left());
+        act(
+            &mut b,
+            Event::Click {
+                x: f64::from(x0) + left + 1.0,
+                y,
+            },
+        );
+        act(
+            &mut b,
+            Event::Drag {
+                x: f64::from(x4) + left,
+                y,
+            },
+        );
+        act(
+            &mut b,
+            Event::Release {
+                x: f64::from(x4) + left,
+                y,
+            },
+        );
+        assert_eq!(b.editing.as_ref().unwrap().selected_text(), Some("drag"));
+
+        // Passwords never reach the clipboard.
+        click_control(&mut b, 1);
+        type_text(&mut b, "secret");
+        act(&mut b, command('a'));
+        b.window.copy("before");
+        act(&mut b, command('c'));
+        act(&mut b, command('x'));
+        assert_eq!(b.window.clipboard.borrow().as_str(), "before");
+        assert_eq!(value(&b, 1), "secret");
+    }
+
+    #[test]
+    fn required_blocks_sending_and_fields_keep_their_rules() {
+        let mut b = browser(&page_file(
+            "validate",
+            "<!doctype html><form action=/s><input name=q required>\
+             <input name=m maxlength=3><input name=r readonly value=fixed>\
+             <input type=number name=n value=2 autofocus><input type=file name=f>\
+             <input name=d disabled><button>Go</button></form>",
+        ));
+        let value = |b: &Browser<FakeScreen>, i: usize| {
+            b.page.as_ref().unwrap().forms.controls[i].value.clone()
+        };
+        assert_eq!(b.focused_control(), Some(3), "autofocus");
+        act(&mut b, key(Key::Up));
+        act(&mut b, key(Key::Up));
+        assert_eq!(value(&b, 3), "4", "↑ steps a number field");
+
+        click_control(&mut b, 1);
+        type_text(&mut b, "abcdef");
+        assert_eq!(value(&b, 1), "abc", "maxlength");
+        click_control(&mut b, 2);
+        type_text(&mut b, "x");
+        act(&mut b, key(Key::Backspace));
+        assert_eq!(value(&b, 2), "fixed", "readonly");
+        assert!(
+            !click_control(&mut b, 5) || b.focused_control() != Some(5),
+            "disabled"
+        );
+
+        click_control(&mut b, 4);
+        assert_eq!(
+            b.hover.as_ref().map(|h| h.text.as_str()),
+            Some("Broxee can't upload files yet.")
+        );
+
+        // Enter in the empty required field: not sent, it says why.
+        click_control(&mut b, 0);
+        act(&mut b, key(Key::Enter));
+        assert!(b.load.is_none(), "nothing was sent");
+        assert_eq!(b.focused_control(), Some(0));
+        assert_eq!(
+            b.hover.as_ref().map(|h| h.text.as_str()),
+            Some("Please fill in this field.")
+        );
+        b.render();
+    }
+
     fn form_server() -> String {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -6743,6 +7740,9 @@ mod tests {
                 .collect();
             (boxes, texts, l.clips.clone(), l.height)
         };
+        // The field scrolled to its caret: compare where layout put its runs.
+        b.unshift_field();
+        let page = b.page.as_ref().unwrap();
         let incremental = fields(&page.layout);
         let settings = b.settings();
         let started = std::time::Instant::now();
@@ -7866,6 +8866,7 @@ mod tests {
             text: "https://a.com".into(),
             cursor: 13,
             all_selected: true,
+            anchor: None,
         };
         f.insert("e");
         assert_eq!(

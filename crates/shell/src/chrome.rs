@@ -346,6 +346,74 @@ pub fn menu_hit(x: f32, y: f32, pane_width: f32, items: usize) -> Option<Option<
     Some((row >= 0.0 && (row as usize) < items).then_some(row as usize))
 }
 
+/// How a row of a floating list reads.
+#[derive(Clone, Copy, PartialEq)]
+enum RowStyle {
+    Plain,
+    /// A select's current choice: semibold, so it is not marked by color alone.
+    Chosen,
+    Disabled,
+    /// An `<optgroup>` label: 12px semibold `muted`, not choosable.
+    Label,
+}
+
+/// Rows a dropdown shows at once; the list scrolls past that.
+pub const DROPDOWN_ROWS: usize = 10;
+
+pub enum DropRow<'a> {
+    Label(&'a str),
+    Item {
+        text: &'a str,
+        disabled: bool,
+        chosen: bool,
+    },
+}
+
+/// A select's dropdown, in pane points: under the control (`below` is its bottom edge), or
+/// above it (`top`) when there is no room below.
+pub struct DropdownView<'a> {
+    pub x: f32,
+    pub top: f32,
+    pub below: f32,
+    pub width: f32,
+    /// The pane's height in points, to choose below or above.
+    pub height: f32,
+    pub rows: &'a [DropRow<'a>],
+    pub highlight: Option<usize>,
+    /// The first row shown.
+    pub first: usize,
+}
+
+/// Where a dropdown is drawn: (x, y, width, height) in pane points.
+pub fn dropdown_rect(view: &DropdownView, pane_width: f32) -> (f32, f32, f32, f32) {
+    let shown = view
+        .rows
+        .len()
+        .saturating_sub(view.first)
+        .min(DROPDOWN_ROWS);
+    let h = 2.0 * MENU_PAD + MENU_ROW * shown as f32;
+    let w = view.width.max(160.0).min(pane_width - 8.0);
+    let x = view.x.clamp(4.0, (pane_width - w - 4.0).max(4.0));
+    let y = if view.below + 4.0 + h <= view.height || view.top - 4.0 - h < HEADER_HEIGHT {
+        view.below + 4.0
+    } else {
+        view.top - 4.0 - h
+    };
+    (x, y, w, h)
+}
+
+/// The dropdown row at (x, y): `Some(Some(row))` on a row (an index into `view.rows`),
+/// `Some(None)` on the panel's edge, `None` outside it.
+pub fn dropdown_hit(view: &DropdownView, pane_width: f32, x: f32, y: f32) -> Option<Option<usize>> {
+    let (rx, ry, w, h) = dropdown_rect(view, pane_width);
+    if x < rx || x > rx + w || y < ry || y > ry + h {
+        return None;
+    }
+    let k = ((y - ry - MENU_PAD) / MENU_ROW).floor();
+    let row = view.first + k.max(0.0) as usize;
+    Some((k >= 0.0 && row < view.rows.len() && k < DROPDOWN_ROWS as f32).then_some(row))
+}
+
 pub struct MenuView<'a> {
     pub items: &'a [&'a str],
     pub selected: Option<usize>,
@@ -1657,10 +1725,64 @@ impl Chrome {
         metrics: &dyn TextMetrics,
         view: &MenuView,
     ) {
+        let s = frame.scale;
+        let rect = menu_rect(frame.width as f32 / s, view.items.len());
+        let rows: Vec<(&str, RowStyle)> =
+            view.items.iter().map(|i| (*i, RowStyle::Plain)).collect();
+        self.draw_panel_list(painter, frame, metrics, rect, &rows, view.selected);
+    }
+
+    /// A select's dropdown: its options under their group labels, the chosen one in
+    /// semibold, the highlighted one on `selected`, as the menus look (DESIGN.md).
+    pub fn draw_dropdown(
+        &mut self,
+        painter: &mut Painter,
+        frame: Frame,
+        metrics: &dyn TextMetrics,
+        view: &DropdownView,
+    ) {
+        let s = frame.scale;
+        let rect = dropdown_rect(view, frame.width as f32 / s);
+        let shown = view
+            .rows
+            .len()
+            .saturating_sub(view.first)
+            .min(DROPDOWN_ROWS);
+        let rows: Vec<(&str, RowStyle)> = view.rows[view.first..view.first + shown]
+            .iter()
+            .map(|r| match r {
+                DropRow::Label(t) => (*t, RowStyle::Label),
+                DropRow::Item {
+                    text,
+                    disabled: true,
+                    ..
+                } => (*text, RowStyle::Disabled),
+                DropRow::Item {
+                    text, chosen: true, ..
+                } => (*text, RowStyle::Chosen),
+                DropRow::Item { text, .. } => (*text, RowStyle::Plain),
+            })
+            .collect();
+        let highlight = view
+            .highlight
+            .and_then(|h| h.checked_sub(view.first))
+            .filter(|&h| h < shown);
+        self.draw_panel_list(painter, frame, metrics, rect, &rows, highlight);
+    }
+
+    /// A floating panel at `rect` (frame points) listing `rows`, row `selected` highlighted.
+    fn draw_panel_list(
+        &mut self,
+        painter: &mut Painter,
+        frame: Frame,
+        metrics: &dyn TextMetrics,
+        (x, y, w, h): (f32, f32, f32, f32),
+        rows: &[(&str, RowStyle)],
+        selected: Option<usize>,
+    ) {
         let t = self.theme;
         let s = frame.scale;
         let px = |v: f32| (v * s).round() as i32;
-        let (x, y, w, h) = menu_rect(frame.width as f32 / s, view.items.len());
         let hair = px(1.0).max(1);
         let panel = (px(w) as u32, px(h) as u32);
         let inner = (panel.0 - 2 * hair as u32, panel.1 - 2 * hair as u32);
@@ -1691,7 +1813,7 @@ impl Chrome {
                 color: t.surface,
             },
         ];
-        if let Some(i) = view.selected.filter(|&i| i < view.items.len()) {
+        if let Some(i) = selected.filter(|&i| i < rows.len()) {
             shapes.push(Op::Mask {
                 x: px(x + MENU_PAD),
                 y: px(y + MENU_PAD + MENU_ROW * i as f32 + 1.0),
@@ -1700,21 +1822,29 @@ impl Chrome {
             });
         }
         let room = (w - 2.0 * MENU_PAD - 20.0) * s;
-        let fitted: Vec<Cow<str>> = view
-            .items
+        let fitted: Vec<Cow<str>> = rows
             .iter()
-            .map(|item| fit(item, room, 13.0 * s, metrics))
+            .map(|(item, _)| fit(item, room, 13.0 * s, metrics))
             .collect();
         let text: Vec<Op> = fitted
             .iter()
+            .zip(rows)
             .enumerate()
-            .map(|(i, item)| Op::Text {
-                x: px(x + MENU_PAD + 10.0) as f32,
-                baseline: px(y + MENU_PAD + MENU_ROW * i as f32 + 19.5) as f32,
-                text: item,
-                size: 13.0 * s,
-                font: FontKey::UI,
-                color: t.text,
+            .map(|(i, (item, (_, style)))| {
+                let (size, font, color, indent) = match style {
+                    RowStyle::Plain => (13.0, FontKey::UI, t.text, 10.0),
+                    RowStyle::Chosen => (13.0, FontKey::UI_SEMIBOLD, t.text, 10.0),
+                    RowStyle::Disabled => (13.0, FontKey::UI, t.muted, 10.0),
+                    RowStyle::Label => (12.0, FontKey::UI_SEMIBOLD, t.muted, 4.0),
+                };
+                Op::Text {
+                    x: px(x + MENU_PAD + indent) as f32,
+                    baseline: px(y + MENU_PAD + MENU_ROW * i as f32 + 19.5) as f32,
+                    text: item,
+                    size: size * s,
+                    font,
+                    color,
+                }
             })
             .collect();
         let (stride, left, width) = (frame.stride, frame.left, frame.width);

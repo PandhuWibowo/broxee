@@ -269,6 +269,9 @@ time something reads it (most theme variables never are). A `var()` value is sub
 
 | 2026-11-14 | Split view: panes saved with the session, numbered badges on tabs in panes, drag a tab onto a pane, resize panes (#31) | 3.6 MB (unchanged, 3,617,808 bytes) | 49.8 MB peak painted at 2x | Window with GitHub, Wikipedia, HN and example.com in 4 panes (`footprint`): 29 MB idle, 61 MB peak, the same as `main`. It was 31 MB idle and 45 MB peak at #7: pages now run scripts and load web fonts while the panes fill |
 
+| 2026-11-14 | Forms: selection, copy, cut and paste in fields; validation; multipart (part of #32) | 3.7 MB (3,634,352 → 3,650,896 bytes, +16.5 KB) | 49.9 MB peak painted at 2x | Messages are tooltips under the control that stops a form; an edit that breaks `readonly` or `maxlength` is undone in one place, for typing, paste and cut alike |
+| 2026-11-14 | Forms: select dropdown, fields that scroll to the caret (part of #32) | 3.6 MB (3,617,808 → 3,634,352 bytes, +16.5 KB) | 49.8 MB peak painted at 2x | The dropdown is the menus' panel (one list painter for both); a field's runs shift left after layout and back before the next, so incremental layout never sees them moved |
+
 Other pages after the layout milestone: GitHub home 22.7 MB peak (8,170 rules); Hacker News 11.5 MB.
 
 GitHub after custom properties: 39 MB peak, 24 ms cascade, 24,822 rules. Rules that only declare or use
@@ -370,11 +373,16 @@ Where data lives, and what compression does for it (measured 2026-11-07):
 - Profiles start as Personal and Work; up to 12, each with its own folder in `profiles/` (named by a fixed
   id, so renaming moves nothing). Four colors exist (emerald, amber, rose, violet), so profiles past four
   share them; their names always tell them apart.
-- Forms: text fields, passwords, text areas, checkboxes, radio buttons, selects (↑ ↓ or a click steps
-  through the options; no dropdown list yet) and buttons; GET and POST as
-  `application/x-www-form-urlencoded` (multipart and file uploads are not sent). Long values are clipped at
-  the field's edge instead of scrolling. Typed values live with the page: a tab that sleeps forgets them, and
-  passwords are never written to disk.
+- Forms: text fields, passwords, text areas, checkboxes, radio buttons, selects and buttons. A select opens
+  a dropdown (groups, disabled options, ↑ ↓ Enter Esc, typing to jump, the wheel past ten rows) and its
+  page hears `input` and `change`; ↑ ↓ on a closed select still step. One-line fields scroll to keep the
+  caret in view, and select with Shift+arrows, a drag or ⌘A; ⌘C, ⌘X and paste work on the selection
+  (never on passwords). `required`, `type=email`, `url` and `number` (with `min`/`max`) stop a form from
+  being sent and say why under the control (`novalidate` skips it); `maxlength`, `readonly`, `disabled` and
+  `autofocus` are kept; ↑ ↓ step a number field. GET and POST as `application/x-www-form-urlencoded` or
+  `multipart/form-data`; file inputs cannot pick files yet (they say so, and send an empty part). No
+  `multiple` or `size` lists yet. Typed values live with the page: a tab that sleeps forgets them, and
+  passwords are never written to disk or copied.
 - JavaScript: classic scripts (inline and `src`) run, with classes (fields, `static`, `extends`, `super`,
   `#private` names read as plain properties), getters and setters, the iterator protocol (`for…of` and spread
   over Maps, Sets and `[Symbol.iterator]()`), regex lookaround and backreferences. `Symbol` values are unique
