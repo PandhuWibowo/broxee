@@ -4,10 +4,20 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod cache;
 mod cookies;
 mod psl;
 
+pub use cache::Cache;
 pub use cookies::{Context, Cookie, Cookies, SameSite};
+
+/// Bytes of response bodies read from the network (not from a cache or a file), as they
+/// arrived (compressed or not).
+static RECEIVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn bytes_received() -> u64 {
+    RECEIVED.load(std::sync::atomic::Ordering::Relaxed)
+}
 pub use psl::site;
 
 use rustls::pki_types::ServerName;
@@ -415,14 +425,57 @@ pub fn send_with(
     let mut url = url.clone();
     let mut body = body;
     let mut extra = extra;
+    let cache = cookies.and_then(|(jar, _)| jar.cache());
     for _ in 0..MAX_REDIRECTS {
+        // A plain GET (no body, no credentials of its own) may come from the cache.
+        let cacheable = body.is_none()
+            && matches!(url.scheme.as_str(), "http" | "https")
+            && extra.is_none_or(|e| {
+                e.method == "GET"
+                    && !e
+                        .headers
+                        .iter()
+                        .any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+            });
+        let stored = cache.filter(|_| cacheable).and_then(|c| c.get(&url));
+        if stored.as_ref().is_some_and(|e| e.fresh(cache::now())) {
+            return stored.expect("checked above").into_response(&url);
+        }
+        // A stale entry asks whether it still holds.
+        let conditional;
+        let ask = match &stored {
+            Some(entry) if entry.etag.is_some() || entry.last_modified.is_some() => {
+                let mut headers = extra.map(|e| e.headers.clone()).unwrap_or_default();
+                if let Some(tag) = &entry.etag {
+                    headers.push(("If-None-Match".into(), tag.replace(['\r', '\n'], "")));
+                }
+                if let Some(date) = &entry.last_modified {
+                    headers.push(("If-Modified-Since".into(), date.replace(['\r', '\n'], "")));
+                }
+                conditional = Extra {
+                    method: "GET".into(),
+                    headers,
+                };
+                Some(&conditional)
+            }
+            _ => extra,
+        };
         let header = cookies.and_then(|(jar, context)| jar.header(&url, context));
-        let resp = match fetch_once(&url, header.as_deref(), body, extra) {
+        let resp = match fetch_once(&url, header.as_deref(), body, ask) {
             Err(FetchError::Retryable(_)) if body.is_none() => {
-                fetch_once(&url, header.as_deref(), None, extra)?
+                fetch_once(&url, header.as_deref(), None, ask)?
             }
             other => other?,
         };
+        if let (Some(c), Some(entry)) = (cache, stored) {
+            if resp.status == 304 {
+                return c.refresh(&url, entry, &resp.headers).into_response(&url);
+            }
+            c.remove(&url);
+        }
+        if let (Some(c), true) = (cache, cacheable) {
+            c.put(&url, &resp);
+        }
         if let Some((jar, context)) = cookies {
             for (name, value) in &resp.headers {
                 if name.eq_ignore_ascii_case("set-cookie") {
@@ -467,12 +520,21 @@ fn fetch_once(
         Some(conn) => (conn, true),
         None => (Conn::open(url)?, false),
     };
+    let counted = |resp: Response| {
+        let n = if resp.wire.bytes.is_empty() {
+            resp.body.len()
+        } else {
+            resp.wire.bytes.len()
+        };
+        RECEIVED.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        resp
+    };
     match request(&mut conn, url, cookie, body, extra) {
         Ok((resp, reusable)) => {
             if reusable {
                 put_idle(key, conn);
             }
-            Ok(resp)
+            Ok(counted(resp))
         }
         // A pooled connection the server already closed: not the server's answer.
         Err(FetchError::Retryable(_)) if reused => {
@@ -481,7 +543,7 @@ fn fetch_once(
             if reusable {
                 put_idle(key, conn);
             }
-            Ok(resp)
+            Ok(counted(resp))
         }
         Err(e) => Err(e),
     }
@@ -881,6 +943,153 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server answering `answer(path, request head)` with (status, headers, body), counting
+    /// the requests it gets.
+    fn cache_server(
+        answer: impl Fn(&str, &str) -> (u16, String, String) + Send + 'static,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                counter.fetch_add(1, Ordering::SeqCst);
+                let path = head.split(' ').nth(1).unwrap_or("").to_string();
+                let (status, headers, body) = answer(&path, &head);
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\n{headers}Connection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), hits)
+    }
+
+    #[test]
+    fn caches_per_profile_with_freshness_revalidation_and_no_store() {
+        use std::sync::atomic::Ordering;
+        let (base, hits) = cache_server(|path, head| match path {
+            "/fresh" => (
+                200,
+                "Cache-Control: max-age=600\r\n".into(),
+                "fresh body".into(),
+            ),
+            "/etag" if head.contains("If-None-Match: \"v1\"") => (
+                304,
+                "ETag: \"v1\"\r\nCache-Control: no-cache\r\n".into(),
+                String::new(),
+            ),
+            "/etag" => (
+                200,
+                "ETag: \"v1\"\r\nCache-Control: no-cache\r\n".into(),
+                "tagged body".into(),
+            ),
+            "/secret" => (
+                200,
+                "Cache-Control: no-store, max-age=600\r\n".into(),
+                "secret".into(),
+            ),
+            "/cookie" => (
+                200,
+                "Cache-Control: max-age=600\r\nSet-Cookie: s=1\r\n".into(),
+                "cookie".into(),
+            ),
+            _ => (404, String::new(), String::new()),
+        });
+        let root = std::env::temp_dir().join(format!("broxee-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let work = Cookies::new();
+        work.attach_cache(Cache::open(root.join("work"), 1 << 20));
+        let personal = Cookies::new();
+        personal.attach_cache(Cache::open(root.join("personal"), 1 << 20));
+        let page = Url::parse(&format!("{base}/")).unwrap();
+        let ctx = Context::subresource(&page);
+        let get = |jar: &Cookies, path: &str| {
+            let url = Url::parse(&format!("{base}{path}")).unwrap();
+            let r = fetch_in(&url, Some((jar, &ctx))).unwrap();
+            (r.status, String::from_utf8(r.body).unwrap())
+        };
+        let count = || hits.load(Ordering::SeqCst);
+
+        assert_eq!(get(&work, "/fresh"), (200, "fresh body".into()));
+        assert_eq!(count(), 1);
+        assert_eq!(get(&work, "/fresh"), (200, "fresh body".into()));
+        assert_eq!(count(), 1, "a fresh entry makes no request");
+        assert_eq!(get(&personal, "/fresh"), (200, "fresh body".into()));
+        assert_eq!(count(), 2, "the other profile has its own cache");
+
+        assert_eq!(get(&work, "/etag"), (200, "tagged body".into()));
+        assert_eq!(
+            get(&work, "/etag"),
+            (200, "tagged body".into()),
+            "304 gives the stored body"
+        );
+        assert_eq!(count(), 4, "no-cache revalidates every time");
+
+        for path in ["/secret", "/cookie"] {
+            get(&work, path);
+            get(&work, path);
+        }
+        assert_eq!(count(), 8, "no-store and Set-Cookie are never reused");
+        let files = |dir: &str| {
+            std::fs::read_dir(root.join(dir))
+                .map(|d| d.flatten().count())
+                .unwrap_or(0)
+        };
+        assert_eq!(files("work"), 2, "only /fresh and /etag were written");
+        assert_eq!(files("personal"), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let entry = std::fs::read_dir(root.join("work"))
+                .unwrap()
+                .flatten()
+                .next()
+                .unwrap();
+            assert_eq!(
+                entry.metadata().unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        // Without a profile (the command line), nothing is cached.
+        let url = Url::parse(&format!("{base}/fresh")).unwrap();
+        fetch(&url).unwrap();
+        assert_eq!(count(), 9);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn evicts_the_least_recently_used_past_its_limit() {
+        let (base, _) = cache_server(|path, _| {
+            (
+                200,
+                "Cache-Control: max-age=600\r\n".into(),
+                format!("{path}{}", "x".repeat(400)),
+            )
+        });
+        let root = std::env::temp_dir().join(format!("broxee-cache-lru-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let jar = Cookies::new();
+        jar.attach_cache(Cache::open(root.clone(), 1500));
+        let page = Url::parse(&format!("{base}/")).unwrap();
+        let ctx = Context::subresource(&page);
+        for path in ["/a", "/b", "/c", "/d"] {
+            let url = Url::parse(&format!("{base}{path}")).unwrap();
+            fetch_in(&url, Some((&jar, &ctx))).unwrap();
+        }
+        let size = jar.cache().unwrap().size();
+        assert!(size <= 1500, "{size} bytes stored");
+        assert!(size > 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn parses_urls() {

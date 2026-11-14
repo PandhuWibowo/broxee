@@ -116,6 +116,10 @@ casts), not taken from binding crates. Ask before proposing any dependency.
   same DOM, so `NodeId`s in the stored `ImageStore` stay valid. Do not store anything derived (styles, layout).
 - **Image ids in the painter are per page.** `Painter::forget_images` runs whenever the page changes (show,
   sleep); skipping it shows another page's pixels.
+- **Each profile has its own HTTP cache** (`profiles/<id>/cache`, 0600 files, 200 MB, least recently used out),
+  attached to its cookie jar (`Cookies::attach_cache`) so every fetch for its pages uses it and no other
+  profile's. Nothing that sets cookies, says `no-store`, carries `Authorization` or varies on more than
+  `Accept-Encoding` is written. Fetches without a jar (the CLI without `--cache`) are not cached.
 - **Switching profile calls `net::forget_sessions`.** Nothing that could link profiles (connections, TLS
   tickets, and cookies once they exist) may be shared between them.
 - **Split view keeps one live page.** Only the focused pane has a `Loaded`; the others are pixels copied from

@@ -30,7 +30,7 @@ use engine::{FontStore, Settings};
 
 const USAGE: &str =
     "usage: broxee [<url-or-file>...] [--window | --png FILE | --paint] [--tree | --styles | --layout] \
-                     [--depth N] [--width PX] [--height PX] [--scale N] [--no-css-fetch] [--panes 1|2|4]";
+                     [--depth N] [--width PX] [--height PX] [--scale N] [--no-css-fetch] [--panes 1|2|4] [--cache DIR]";
 
 #[derive(Clone)]
 struct Options {
@@ -50,6 +50,8 @@ struct Options {
     fetch_css: bool,
     /// Panes the window opens with (1, 2 or 4), showing the addresses given.
     panes: usize,
+    /// An HTTP cache folder for this run (the window uses each profile's own).
+    cache: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -71,6 +73,7 @@ fn main() -> ExitCode {
         scale: 1.0,
         fetch_css: true,
         panes: 1,
+        cache: None,
     };
 
     let mut args = std::env::args().skip(1);
@@ -89,6 +92,7 @@ fn main() -> ExitCode {
             "--window" => opts.window = true,
             "--no-css-fetch" => opts.fetch_css = false,
             "--png" => opts.png = args.next(),
+            "--cache" => opts.cache = args.next(),
             "--width" => opts.width = number(&mut args, 100.0, 8000.0, opts.width),
             "--height" => opts.height = number(&mut args, 100.0, 8000.0, opts.height),
             "--scale" => opts.scale = number(&mut args, 0.5, 4.0, opts.scale),
@@ -190,7 +194,17 @@ fn run(opts: &Options) -> Result<(), String> {
         dark: false,
         fetch_css: opts.fetch_css,
     };
-    let page = engine::load(&url, settings, &fonts, None, &mut |_| true)?;
+    // With --cache, a jar of its own carries the cache (and keeps this run's cookies).
+    let jar = opts.cache.as_ref().map(|dir| {
+        let jar = net::Cookies::new();
+        jar.attach_cache(net::Cache::open(dir.into(), 1 << 30));
+        jar
+    });
+    let jar = jar.as_ref().map(|cookies| engine::Jar {
+        cookies,
+        same_site_initiator: true,
+    });
+    let page = engine::load(&url, settings, &fonts, jar, &mut |_| true)?;
 
     if opts.layout {
         let mut out = String::new();
@@ -236,6 +250,10 @@ fn run(opts: &Options) -> Result<(), String> {
         page.dom.element_count()
     );
     println!("fetch     {:.1} ms", page.fetch_ms);
+    println!(
+        "network   {:.1} KB received",
+        net::bytes_received() as f64 / 1024.0
+    );
     println!("parse     {:.2} ms", page.parse_ms);
     println!(
         "css       {} sheets ({} fetched, {} failed), {rules} rules ({skipped} skipped: no match possible), {:.1} ms wall ({:.1} ms parsing across threads)",
