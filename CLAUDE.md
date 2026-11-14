@@ -41,7 +41,8 @@ crates/
            transforms), faces.rs (FontKey, matching by family/weight/style, per-character fallback),
            figtree/ (the interface font, OFL, as data)
   layout/  block + inline layout into BoxFragment / TextFragment lists, one shared text buffer;
-           flex.rs (flex containers, intrinsic widths), grid.rs (grid containers), table.rs (tables)
+           flex.rs (flex containers, intrinsic widths), grid.rs (grid containers), table.rs (tables),
+           incremental.rs (laying out one box again after DOM changes)
   image/   PNG, JPEG, GIF, WebP (vp8.rs lossy, vp8l.rs lossless, vp8_tables.rs from RFC 6386) decoders
            that scale while decoding; svg.rs (XML subset, flattened paths, scanline rasterizer)
   js/      JavaScript, written here: lexer.rs, parser.rs (syntax tree), interp.rs (arena heap, scopes,
@@ -139,6 +140,14 @@ casts), not taken from binding crates. Ask before proposing any dependency.
   machine; keystrokes can land in another app. Drive `Browser` through `FakeScreen` in `browser.rs` tests with
   local files, and render PNGs from it when a visual check is needed.
 
+### Change invariants
+
+- **Every DOM mutation records a `html::Change`** (text, an element's attributes or tag, a node's children),
+  read once per task by `engine::update`. A new mutating `Dom` method must record one; boxes the cascade
+  generates (`show_generated`) do not. Past `MAX_CHANGES` the log gives up and the page is rebuilt whole.
+- **`engine::update` handles a whole task's changes at once** (a handler, a timer run, a keystroke): one
+  cascade at most, compared with the old styles by value (`StyleMap::changed_since`), then one relayout.
+
 ### Script invariants
 
 - **JavaScript is written here** (`crates/js`), not taken from an engine crate: the owner's rule, and it keeps
@@ -201,6 +210,16 @@ casts), not taken from binding crates. Ask before proposing any dependency.
   check costs nothing on pages without floats, keep it that way.
 - **Inline layout reuses `Engine::items`/`words`.** Anything that lays out a box while a line is being collected
   (`collect_inline_block`) or measures one (`measure_inline`) must save and restore them.
+- **Incremental layout rebuilds one anchor** (`Layout::relayout`, `incremental.rs`): a box that clips its
+  overflow, is static and not floated, built where it is (`Place::Flow`) or moved once onto its line
+  (`Place::Line`), with only block containers and inline boxes in normal flow above it. It is rebuilt from the
+  arguments recorded when it was built and kept only if its size and baseline come out the same. Anything that
+  moves or resizes a box after building it must go through `shift_range` or call `Engine::moved`, which drops
+  the anchors in that range. The randomized test in `incremental.rs` checks the result equals a full pass,
+  fragment for fragment; run it after touching layout.
+- **Clipped content does not reach the scrollable height**: a clipping box restores `Engine::bottom` after its
+  content (except the root element and `<body>`, whose overflow belongs to the viewport). Incremental layout
+  depends on it: nothing inside an anchor can change the page's height.
 
 ### CSS invariants
 

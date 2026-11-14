@@ -41,9 +41,102 @@ pub struct StyleMap {
     /// Every compound that looks at a state, with its states and `:not()` taken out, and
     /// the states it looks at: what decides whether a state change can restyle anything.
     state_compounds: Vec<(Compound, u8)>,
+    reads_text: bool,
 }
 
 impl StyleMap {
+    /// Whether changing text can change a style (a selector uses `:empty`). When not, a
+    /// page whose only changes are text keeps its styles.
+    pub fn reads_text(&self) -> bool {
+        self.reads_text
+    }
+
+    /// The nodes whose style differs from `old` (by value: interned ids differ between
+    /// cascades), and the elements whose `::before`/`::after` boxes do, in document order.
+    /// Nodes `old` did not have count as changed.
+    pub fn changed_since(&self, old: &StyleMap) -> Vec<NodeId> {
+        let mut known: HashMap<(u32, u32), bool, FastBuildHasher> = HashMap::default();
+        let mut out: Vec<NodeId> = Vec::new();
+        for (node, &new) in self.node_style.iter().enumerate() {
+            let same = match old.node_style.get(node) {
+                Some(&was) => *known
+                    .entry((new, was))
+                    .or_insert_with(|| self.same_style(new, old, was)),
+                None => false,
+            };
+            if !same {
+                out.push(node as NodeId);
+            }
+        }
+        fn boxes(map: &StyleMap) -> Vec<(NodeId, bool, u32, &str)> {
+            let mut list: Vec<(NodeId, bool, u32, &str)> = map
+                .generated
+                .iter()
+                .map(|g| (g.owner, g.after, g.style, &*g.text))
+                .collect();
+            list.sort_unstable_by_key(|g| (g.0, g.1));
+            list
+        }
+        let (now, was) = (boxes(self), boxes(old));
+        let (mut i, mut j) = (0, 0);
+        while i < now.len() || j < was.len() {
+            match (now.get(i), was.get(j)) {
+                (Some(a), Some(b)) if (a.0, a.1) == (b.0, b.1) => {
+                    if a.3 != b.3 || !self.same_style(a.2, old, b.2) {
+                        out.push(a.0);
+                    }
+                    i += 1;
+                    j += 1;
+                }
+                (Some(a), Some(b)) if (a.0, a.1) < (b.0, b.1) => {
+                    out.push(a.0);
+                    i += 1;
+                }
+                (Some(a), None) => {
+                    out.push(a.0);
+                    i += 1;
+                }
+                (_, Some(b)) => {
+                    out.push(b.0);
+                    j += 1;
+                }
+                (None, None) => break,
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Whether style `a` here and style `b` of `other` hold the same values.
+    fn same_style(&self, a: u32, other: &StyleMap, b: u32) -> bool {
+        let (x, y) = (&self.styles[a as usize], &other.styles[b as usize]);
+        let lists_match = self.families.list.get(usize::from(x.font_family))
+            == other.families.list.get(usize::from(y.font_family))
+            && self.grids.templates.get(x.grid as usize)
+                == other.grids.templates.get(y.grid as usize)
+            && self.grids.placements.get(x.grid_item as usize)
+                == other.grids.placements.get(y.grid_item as usize)
+            && self.radii.get(x.radii) == other.radii.get(y.radii)
+            && self.shadows.get(x.box_shadow) == other.shadows.get(y.box_shadow)
+            && self.backgrounds.get(x.background_image)
+                == other.backgrounds.get(y.background_image)
+            && self.transforms.get(x.transform) == other.transforms.get(y.transform);
+        let bare = |s: &ComputedStyle| ComputedStyle {
+            font_family: 0,
+            grid: 0,
+            grid_item: 0,
+            // Custom properties are already resolved into the values compared.
+            custom: 0,
+            radii: 0,
+            box_shadow: 0,
+            background_image: 0,
+            transform: 0,
+            ..s.clone()
+        };
+        lists_match && bare(x) == bare(y)
+    }
+
     pub fn style(&self, node: NodeId) -> &ComputedStyle {
         &self.styles[self.node_style[node as usize] as usize]
     }
@@ -202,6 +295,8 @@ struct RuleIndex<'a> {
     sibling_dependent: bool,
     /// Some rule styles `::before` or `::after`.
     has_pseudo: bool,
+    /// Some selector reads text (`:empty`): a text change can restyle.
+    reads_text: bool,
     /// `::before` / `::after` rules without `content`, kept out of the buckets: they style a
     /// box only once a rule with `content` made one, so they are matched only then.
     /// (`::before, ::after { box-sizing: inherit }` would otherwise be tried on every element.)
@@ -222,6 +317,7 @@ impl<'a> RuleIndex<'a> {
             root: Vec::new(),
             sibling_dependent: false,
             has_pseudo: false,
+            reads_text: false,
             pseudo_styling: Vec::new(),
             state_compounds: Vec::new(),
         };
@@ -242,6 +338,7 @@ impl<'a> RuleIndex<'a> {
                         .collect();
                     index.sibling_dependent |= selector.depends_on_siblings();
                     index.has_pseudo |= selector.pseudo != Pseudo::None;
+                    index.reads_text |= selector.parts.iter().any(|(c, _)| c.reads_text());
                     for (compound, _) in &selector.parts {
                         let uses = compound.all_states();
                         if uses != 0 {
@@ -1301,6 +1398,7 @@ pub fn cascade_with(
         transforms: styler.transforms,
         generated,
         state_compounds: index.state_compounds,
+        reads_text: index.reads_text,
     }
 }
 
@@ -1937,6 +2035,41 @@ const RADIUS_PROPS: [Prop; 4] = [
 mod tests {
     use super::*;
     use crate::{parse_stylesheet, user_agent_stylesheet};
+
+    #[test]
+    fn finds_the_styles_a_change_touched() {
+        let sheet = parse_stylesheet(
+            ".on { color: red } .on p { font-family: Figtree, serif; box-shadow: 0 1px red }
+             div::before { content: attr(data-x) }",
+        );
+        let sheets = [(Origin::Author, &sheet)];
+        let media = Media::default();
+        let mut dom = html::parse("<div><p>one</p><p>two</p></div><span>three</span>");
+        let old = cascade(&dom, &sheets, &media);
+        assert!(!old.reads_text(), "no :empty, text changes keep styles");
+        let again = cascade(&dom, &sheets, &media);
+        assert_eq!(again.changed_since(&old), Vec::<NodeId>::new());
+
+        let div = dom.find_first("div").unwrap();
+        let span = dom.find_first("span").unwrap();
+        let ps: Vec<NodeId> = dom.children(div).collect();
+        dom.set_attr(div, "class", "on");
+        let new = cascade(&dom, &sheets, &media);
+        let changed = new.changed_since(&old);
+        assert!(changed.contains(&div) && ps.iter().all(|p| changed.contains(p)));
+        assert!(!changed.contains(&span), "{changed:?}");
+
+        dom.set_attr(div, "data-x", "*");
+        let generated = cascade(&dom, &sheets, &media);
+        assert_eq!(
+            generated.changed_since(&new),
+            [div],
+            "only the ::before text changed"
+        );
+
+        let empty = parse_stylesheet("p:not(:empty) { color: red }");
+        assert!(cascade(&dom, &[(Origin::Author, &empty)], &media).reads_text());
+    }
 
     fn styled_with(html_src: &str, css: &str, media: &Media) -> (Dom, StyleMap) {
         let dom = html::parse(html_src);

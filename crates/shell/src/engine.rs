@@ -178,6 +178,9 @@ pub struct Loaded {
     /// How many times the page was styled and laid out again after loading.
     #[cfg_attr(not(test), allow(dead_code))] // read by tests
     pub restyles: u32,
+    /// How many of those were laid out inside one box (`Layout::relayout`).
+    #[cfg_attr(not(test), allow(dead_code))] // read by tests
+    pub in_place: u32,
     pub fetch_ms: f64,
     pub parse_ms: f64,
     pub cascade_ms: f64,
@@ -438,6 +441,8 @@ fn finish(
     // Join stage 1 before layout, the first stage that measures text.
     let fonts_wait_ms = fonts.ready();
     let states = css::States::default();
+    // The first cascade sees everything controls and scripts did so far.
+    dom.take_changes();
     let (styles, cascade_ms) = cascade(&mut dom, &css, &states, settings);
     // Fonts and background images are found from the styles, so they load between the
     // cascade and layout, at the same time.
@@ -474,6 +479,7 @@ fn finish(
         layout,
         states,
         restyles: 0,
+        in_place: 0,
         fetch_ms: source.fetch_ms,
         parse_ms: source.parse_ms,
         cascade_ms,
@@ -486,6 +492,7 @@ fn finish(
 /// change, so the cascade reruns as well.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
 pub fn relayout(page: &mut Loaded, settings: Settings, fonts: &FontStore) {
+    page.dom.take_changes();
     let (styles, cascade_ms) = cascade(&mut page.dom, &page.css, &page.states, settings);
     page.webfonts.plan(&styles, fonts);
     let (layout, layout_ms) = lay_out(
@@ -501,6 +508,83 @@ pub fn relayout(page: &mut Loaded, settings: Settings, fonts: &FontStore) {
     page.cascade_ms = cascade_ms;
     page.layout = layout;
     page.layout_ms = layout_ms;
+}
+
+/// Bring the page up to date after controls or scripts changed its DOM (`Dom::take_changes`),
+/// or after `:hover`/`:focus` changed when `states_changed`. Everything changed since the last
+/// update is handled at once. The cascade is skipped when only text changed and no rule reads
+/// text; layout is redone only inside the smallest box around the changed nodes that can be
+/// laid out alone (`Layout::relayout`), and in full when there is none.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
+pub fn update(page: &mut Loaded, settings: Settings, fonts: &FontStore, states_changed: bool) {
+    let Some(changes) = page.dom.take_changes() else {
+        return relayout(page, settings, fonts);
+    };
+    if changes.is_empty() && !states_changed {
+        return;
+    }
+    let dom = &page.dom;
+    // Where content changed: the parent of a changed text node or element, or the element
+    // whose children changed. Detached nodes are not drawn.
+    let mut changed: Vec<NodeId> = changes
+        .iter()
+        .filter_map(|c| match *c {
+            html::Change::Text(n) | html::Change::Element(n) => dom.parent(n),
+            html::Change::Children(n) => Some(n),
+        })
+        .filter(|&n| in_document(dom, n))
+        .collect();
+    let text_only = changes.iter().all(|c| matches!(c, html::Change::Text(_)));
+    if states_changed || !text_only || page.styles.reads_text() {
+        let (styles, cascade_ms) = cascade(&mut page.dom, &page.css, &page.states, settings);
+        let dom = &page.dom;
+        changed.extend(
+            styles
+                .changed_since(&page.styles)
+                .into_iter()
+                .filter_map(|n| dom.parent(n))
+                .filter(|&n| in_document(dom, n)),
+        );
+        page.webfonts.plan(&styles, fonts);
+        page.styles = styles;
+        page.cascade_ms = cascade_ms;
+    } else {
+        page.cascade_ms = 0.0;
+    }
+    changed.sort_unstable();
+    changed.dedup();
+    page.restyles += 1;
+    if changed.is_empty() {
+        page.layout_ms = 0.0;
+        return;
+    }
+    let started = Instant::now();
+    let metrics = page.webfonts.metrics(fonts);
+    let images = &page.images;
+    let natural = |node: NodeId| images.natural_size(node);
+    let done = page
+        .layout
+        .relayout(&page.dom, &page.styles, &metrics, &natural, &changed);
+    if done {
+        page.layout_ms = millis(started);
+        page.in_place += 1;
+    } else {
+        let (layout, layout_ms) = lay_out(
+            &page.dom,
+            &page.styles,
+            &page.images,
+            &page.webfonts,
+            settings,
+            fonts,
+        );
+        page.layout = layout;
+        page.layout_ms = layout_ms;
+    }
+}
+
+/// Whether `node` is in the document (not detached by a script).
+fn in_document(dom: &Dom, node: NodeId) -> bool {
+    std::iter::successors(Some(node), |&n| dom.parent(n)).last() == Some(Dom::ROOT)
 }
 
 fn cascade(

@@ -973,7 +973,7 @@ impl<S: Screen> Browser<S> {
             .state_change_matters(&page.dom, &page.states, &new);
         page.states = new;
         if matters {
-            self.relayout_page();
+            self.update_page(true);
         }
         matters
     }
@@ -1513,10 +1513,22 @@ impl<S: Screen> Browser<S> {
         }
     }
 
-    /// Lay the page out again after a control changed what it shows.
+    /// Style and lay the page out again after a control or script changed what it shows.
     fn relayout_page(&mut self) {
+        self.update_page(false);
+    }
+
+    /// Bring the page up to date with its DOM changes, and with a change of `:hover` or
+    /// `:focus` when `states_changed` (`engine::update`).
+    fn update_page(&mut self, states_changed: bool) {
         let node = self.link_focus.as_ref().map(|l| l.node);
-        self.relayout();
+        let settings = self.settings();
+        if let Some(page) = self.page.as_mut() {
+            engine::update(page, settings, &self.fonts, states_changed);
+        }
+        self.clamp_scroll();
+        // The focused link moved with the layout.
+        self.link_focus = None;
         if let Some(node) = node {
             self.focus_link(node, false);
         }
@@ -5751,6 +5763,67 @@ mod tests {
         std::thread::sleep(Duration::from_millis(40));
         assert!(b.run_page_timers());
         assert!(node_text(&b, "p").ends_with("and later"));
+    }
+
+    #[test]
+    fn typing_on_a_long_page_lays_out_only_the_field() {
+        let (key, whole) = typing_cost(3000);
+        eprintln!("typing: {key:.3} ms per key, full restyle and layout {whole:.1} ms");
+    }
+
+    /// The budget's stress page with a field at the top (release build, `--ignored`): what
+    /// README records.
+    #[test]
+    #[ignore]
+    fn typing_cost_on_the_stress_page() {
+        let (key, whole) = typing_cost(20_000);
+        eprintln!("stress page: {key:.3} ms per key, full restyle and layout {whole:.1} ms");
+    }
+
+    /// Type into a field above `rows` rows of the budget's stress page. Checks every key was
+    /// laid out in place and gave the layout a full pass gives; returns the milliseconds per
+    /// key and of one full restyle and layout.
+    fn typing_cost(rows: usize) -> (f64, f64) {
+        let mut html = String::from(
+            "<!doctype html><style>.row h2 { font-size: 20px } div > p a { color: #0369a1 } \
+             ul li { margin: 2px 0 } .r7 span { font-weight: bold }</style>\
+             <p>Search <input name=q> here</p>",
+        );
+        for i in 1..=rows {
+            html.push_str(&format!(
+                "<div class=\"row r{i}\"><h2>Item {i}</h2><p>Text &amp; more \
+                 <a href=\"/p/{i}\">link</a> <span>x</span></p><ul><li>a<li>b<li>c</ul></div>"
+            ));
+        }
+        let mut b = browser(&page_file(&format!("typing-{rows}"), &html));
+        assert!(click_control(&mut b, 0));
+        let before = b.page.as_ref().unwrap().in_place;
+        let typed = "hello world, a longer query than the field is wide";
+        let started = std::time::Instant::now();
+        type_text(&mut b, typed);
+        let keys = typed.chars().count() as u32;
+        let per_key = started.elapsed().as_secs_f64() * 1000.0 / f64::from(keys);
+        let page = b.page.as_ref().unwrap();
+        assert_eq!(page.in_place - before, keys, "every key laid out in place");
+        assert_eq!(page.cascade_ms, 0.0, "text alone keeps the styles");
+
+        // The same as laying the whole page out.
+        let fields = |l: &layout::Layout| {
+            let boxes: Vec<_> = l.boxes.iter().map(|b| (b.node, b.rect)).collect();
+            let texts: Vec<_> = l
+                .texts
+                .iter()
+                .map(|t| (t.node, t.x, t.baseline, l.text(t).to_string()))
+                .collect();
+            (boxes, texts, l.clips.clone(), l.height)
+        };
+        let incremental = fields(&page.layout);
+        let settings = b.settings();
+        let started = std::time::Instant::now();
+        engine::relayout(b.page.as_mut().unwrap(), settings, &b.fonts);
+        let whole = started.elapsed().as_secs_f64() * 1000.0;
+        assert!(incremental == fields(&b.page.as_ref().unwrap().layout));
+        (per_key, whole)
     }
 
     fn type_text(b: &mut Browser<FakeScreen>, text: &str) {
