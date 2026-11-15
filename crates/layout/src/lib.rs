@@ -200,7 +200,7 @@ pub fn transform_of(rect: Rect, ops: &[css::TransformOp]) -> Affine {
             Op::Translate(x, y) => Affine::translate(len(x, rect.width), len(y, rect.height)),
             Op::Scale(x, y) => Affine::scale(x as f32 / 10000.0, y as f32 / 10000.0),
             Op::Rotate(a) => {
-                let (sin, cos) = (a as f32 / 100.0).to_radians().sin_cos();
+                let (sin, cos) = math::sin_cos((a as f32 / 100.0).to_radians());
                 Affine {
                     a: cos,
                     b: sin,
@@ -211,8 +211,8 @@ pub fn transform_of(rect: Rect, ops: &[css::TransformOp]) -> Affine {
                 }
             }
             Op::Skew(x, y) => Affine {
-                c: (x as f32 / 100.0).to_radians().tan(),
-                b: (y as f32 / 100.0).to_radians().tan(),
+                c: math::tan((x as f32 / 100.0).to_radians()),
+                b: math::tan((y as f32 / 100.0).to_radians()),
                 ..Affine::IDENTITY
             },
             Op::Matrix([a, b, c, d], e, f) => Affine {

@@ -10,3 +10,4 @@ font = { path = "../font" }
 layout = { path = "../layout" }
 flate = { path = "../flate" }
 image = { path = "../image" }
+math = { path = "../math" }

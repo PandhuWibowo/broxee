@@ -63,6 +63,7 @@ version = "0.1.1"
 dependencies = [
  "css",
  "flate",
+ "math",
 ]
 
 [[package]]
@@ -76,6 +77,7 @@ dependencies = [
  "css",
  "font",
  "html",
+ "math",
 ]
 
 [[package]]
@@ -83,6 +85,10 @@ name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+
+[[package]]
+name = "math"
+version = "0.1.1"
 
 [[package]]
 name = "net"
@@ -109,6 +115,7 @@ dependencies = [
  "html",
  "image",
  "layout",
+ "math",
 ]
 
 [[package]]

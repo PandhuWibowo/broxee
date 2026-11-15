@@ -34,6 +34,7 @@ styles or layout with timings and peak RAM. On Linux only the CLI exists (no win
 | Path | What lives there |
 |---|---|
 | `crates/flate` | DEFLATE, zlib, gzip, Brotli, CRC-32, Adler-32 |
+| `crates/math` | sin, cos, tan, atan2, exp giving the same bits on every platform (renders must not depend on libm) |
 | `crates/net` | URLs, HTTP/1.1, TLS, keep-alive pool, redirects, `file://`, cookies, Public Suffix List |
 | `crates/html` | tokenizer, entities, tree builder, arena DOM, the shared fast hasher |
 | `crates/css` | parser, `@media`, selectors, cascade, computed values, grid templates, UA and quirks sheets |

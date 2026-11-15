@@ -8,3 +8,4 @@ edition.workspace = true
 [dependencies]
 css = { path = "../css" }
 flate = { path = "../flate" }
+math = { path = "../math" }

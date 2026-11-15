@@ -1,0 +1,8 @@
+[package]
+name = "math"
+version.workspace = true
+edition.workspace = true
+
+# Written here: sine, cosine, tangent, arctangent and exp that give the same bits on every
+# platform, so a page renders the same everywhere (scripts/sites.sh compares exact pixels).
+[dependencies]
