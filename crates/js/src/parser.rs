@@ -3,7 +3,7 @@
 //! spread, optional chaining, classes, getters and setters. Generators and modules are not
 //! parsed yet; a script using them fails to parse and is skipped as a whole.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::lexer::{tokenize, Tok, Token};
 
@@ -105,7 +105,7 @@ pub struct Param {
 pub struct Func {
     pub name: Option<Name>,
     pub params: Vec<Param>,
-    pub body: Body,
+    pub body: FnBody,
     pub arrow: bool,
     /// `async`: a call returns a promise and `await` pauses the body.
     pub is_async: bool,
@@ -122,6 +122,62 @@ pub enum VarKind {
 
 /// A list of statements, shared so a paused `async` function can hold its place in it.
 pub type Body = Arc<[Stmt]>;
+
+/// A function's statements. Functions written in a script are parsed the first time they
+/// are called: until then they keep only where their body is in the script's source, which
+/// they share. Bundles define far more functions than a page calls, and a parsed body costs
+/// about ten times its source.
+pub struct FnBody {
+    parsed: OnceLock<Result<Body, String>>,
+    later: Option<Later>,
+}
+
+struct Later {
+    src: Arc<str>,
+    start: u32,
+    end: u32,
+    generator: bool,
+}
+
+impl FnBody {
+    pub fn ready(body: Body) -> FnBody {
+        let parsed = OnceLock::new();
+        let _ = parsed.set(Ok(body));
+        FnBody {
+            parsed,
+            later: None,
+        }
+    }
+
+    /// The statements, parsed now if they were not yet; a syntax error found then.
+    pub fn get(&self) -> Result<&Body, String> {
+        self.parsed
+            .get_or_init(|| {
+                let Some(l) = &self.later else {
+                    return Ok(Vec::new().into());
+                };
+                let text = l
+                    .src
+                    .get(l.start as usize..l.end as usize)
+                    .ok_or("a function body outside its source")?;
+                let mut p = Parser::new(text, Some((Arc::clone(&l.src), l.start)))?;
+                p.in_generator = l.generator;
+                p.block()
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+}
+
+impl std::fmt::Debug for FnBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.parsed.get(), &self.later) {
+            (Some(Ok(b)), _) => write!(f, "{} statements", b.len()),
+            (_, Some(l)) => write!(f, "bytes {}..{} not parsed yet", l.start, l.end),
+            _ => write!(f, "invalid"),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum Stmt {
@@ -159,20 +215,30 @@ struct Parser {
     next_generator: bool,
     /// Inside a generator's body, where `yield` is an operator.
     in_generator: bool,
+    /// The whole script and where these tokens start in it, for bodies parsed later.
+    src: Option<(Arc<str>, u32)>,
 }
 
 const NESTING_LIMIT: usize = 300;
 
+impl Parser {
+    fn new(text: &str, src: Option<(Arc<str>, u32)>) -> Result<Parser, String> {
+        Ok(Parser {
+            toks: tokenize(text)?,
+            pos: 0,
+            no_in: false,
+            depth: 0,
+            next_async: false,
+            next_generator: false,
+            in_generator: false,
+            src,
+        })
+    }
+}
+
 pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
-    let mut p = Parser {
-        toks: tokenize(src)?,
-        pos: 0,
-        no_in: false,
-        depth: 0,
-        next_async: false,
-        next_generator: false,
-        in_generator: false,
-    };
+    let shared: Arc<str> = src.into();
+    let mut p = Parser::new(src, Some((shared, 0)))?;
     let mut out = Vec::new();
     while !p.at_eof() {
         out.push(p.statement()?);
@@ -352,7 +418,7 @@ impl Parser {
             if !RESERVED.contains(&w.as_str()) {
                 self.pos += 2;
                 let body = self.statement()?;
-                return Ok(Stmt::Labeled(w.as_str().into(), Arc::new(body)));
+                return Ok(Stmt::Labeled(w.name(), Arc::new(body)));
             }
         }
         match word.as_deref() {
@@ -417,7 +483,7 @@ impl Parser {
                 self.pos += 1;
                 let label = match self.peek() {
                     Tok::Ident(l) if !self.toks[self.pos].newline_before => {
-                        let l: Name = l.as_str().into();
+                        let l: Name = l.name();
                         self.pos += 1;
                         Some(l)
                     }
@@ -655,10 +721,10 @@ impl Parser {
     fn property_key(&mut self) -> Result<(Expr, Option<Name>), String> {
         match self.next() {
             Tok::Ident(n) => {
-                let name: Name = n.as_str().into();
+                let name: Name = n.name();
                 Ok((Expr::Str(name.clone()), Some(name)))
             }
-            Tok::Str(s) => Ok((Expr::Str(s.as_str().into()), None)),
+            Tok::Str(s) => Ok((Expr::Str(s.name()), None)),
             Tok::Num(v) => Ok((Expr::Str(crate::interp::number_to_string(v).into()), None)),
             Tok::Punct("[") => {
                 let e = self.assignment()?;
@@ -667,7 +733,7 @@ impl Parser {
             }
             // Private names (`#x`) are plain properties, as `obj.#x` reads them.
             Tok::Punct("#") => match self.next() {
-                Tok::Ident(n) => Ok((Expr::Str(n.as_str().into()), None)),
+                Tok::Ident(n) => Ok((Expr::Str(n.name()), None)),
                 _ => {
                     self.pos -= 1;
                     self.error("expected a property name")
@@ -712,12 +778,49 @@ impl Parser {
         }))
     }
 
-    /// A function's body, where `yield` is an operator when it is a generator.
-    fn body(&mut self, generator: bool) -> Result<Body, String> {
-        let outer = std::mem::replace(&mut self.in_generator, generator);
-        let body = self.block();
-        self.in_generator = outer;
-        body
+    /// A function's body, where `yield` is an operator when it is a generator: its place in
+    /// the source, to be parsed when the function is first called (`FnBody`).
+    fn body(&mut self, generator: bool) -> Result<FnBody, String> {
+        let Some((src, base)) = self.src.clone() else {
+            let outer = std::mem::replace(&mut self.in_generator, generator);
+            let body = self.block();
+            self.in_generator = outer;
+            return body.map(FnBody::ready);
+        };
+        if !self.is("{") {
+            return self.error("expected `{`");
+        }
+        let open = self.pos;
+        let mut depth = 0usize;
+        let mut k = open;
+        loop {
+            match &self.toks[k].tok {
+                Tok::Punct("{") => depth += 1,
+                Tok::Punct("}") => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                Tok::Eof => {
+                    self.pos = k;
+                    return self.error("expected `}`");
+                }
+                _ => {}
+            }
+            k += 1;
+        }
+        let (start, end) = (self.toks[open].start, self.toks[k].end);
+        self.pos = (k + 1).min(self.toks.len() - 1);
+        Ok(FnBody {
+            parsed: OnceLock::new(),
+            later: Some(Later {
+                src,
+                start: base + start,
+                end: base + end,
+                generator,
+            }),
+        })
     }
 
     /// After `class`: a name (required for a declaration), `extends`, and the body.
@@ -921,7 +1024,7 @@ impl Parser {
             self.no_in = false;
             let e = self.assignment();
             self.no_in = saved;
-            vec![Stmt::Return(Some(e?))].into()
+            FnBody::ready(vec![Stmt::Return(Some(e?))].into())
         };
         Ok(Expr::Function(Arc::new(Func {
             name: None,
@@ -1114,7 +1217,7 @@ impl Parser {
 
     fn member_name(&mut self) -> Result<Expr, String> {
         match self.next() {
-            Tok::Ident(n) => Ok(Expr::Str(n.as_str().into())),
+            Tok::Ident(n) => Ok(Expr::Str(n.name())),
             // Private names (`#x`) read as plain properties.
             Tok::Punct("#") => self.member_name(),
             _ => {
@@ -1255,15 +1358,9 @@ impl Parser {
                         }
                     }
                     quasis.push(std::mem::take(&mut text).into());
-                    let mut inner = Parser {
-                        next_async: false,
-                        next_generator: false,
-                        in_generator: false,
-                        toks: tokenize(&raw[start..end])?,
-                        pos: 0,
-                        no_in: false,
-                        depth: self.depth + 1,
-                    };
+                    // Template substitutions are short: functions in them are parsed now.
+                    let mut inner = Parser::new(&raw[start..end], None)?;
+                    inner.depth = self.depth + 1;
                     exprs.push(inner.expression()?);
                 }
                 c => text.push(c),
@@ -1276,7 +1373,7 @@ impl Parser {
     fn primary(&mut self) -> Result<Expr, String> {
         match self.next() {
             Tok::Num(v) => Ok(Expr::Num(v)),
-            Tok::Str(s) => Ok(Expr::Str(s.as_str().into())),
+            Tok::Str(s) => Ok(Expr::Str(s.name())),
             Tok::Regex(r) => Ok(Expr::Regex(r.as_str().into())),
             Tok::Template(raw) => {
                 let (quasis, exprs) = self.template_parts(&raw)?;
@@ -1425,7 +1522,7 @@ impl Parser {
                     self.pos -= 1;
                     self.error("unexpected keyword")
                 }
-                _ => Ok(Expr::Ident(w.as_str().into())),
+                _ => Ok(Expr::Ident(w.name())),
             },
             _ => {
                 self.pos -= 1;

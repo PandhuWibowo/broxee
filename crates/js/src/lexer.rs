@@ -1,16 +1,82 @@
 //! Tokens of JavaScript source. Regular expression literals are recognised from context
 //! (after something that cannot end an expression) so that `/` divides everywhere else.
 
+use std::collections::HashSet;
+use std::sync::Arc;
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Tok {
     Num(f64),
-    Str(String),
+    Str(Word),
     /// A template literal's raw text between the backticks; the parser splits `${…}`.
     Template(String),
     Regex(String),
-    Ident(String),
+    Ident(Word),
     Punct(&'static str),
     Eof,
+}
+
+/// A name or string literal, shared: within a script, equal words are one allocation.
+/// Minified bundles repeat `e`, `t`, `n` tens of thousands of times, and every syntax tree
+/// node naming one holds this same `Arc` (the parser takes it with `name()`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Word(Arc<str>);
+
+impl Word {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The shared text, for the syntax tree.
+    pub fn name(&self) -> Arc<str> {
+        Arc::clone(&self.0)
+    }
+}
+
+impl std::ops::Deref for Word {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialEq<str> for Word {
+    fn eq(&self, other: &str) -> bool {
+        &*self.0 == other
+    }
+}
+
+impl PartialEq<&str> for Word {
+    fn eq(&self, other: &&str) -> bool {
+        &*self.0 == *other
+    }
+}
+
+impl From<&str> for Word {
+    fn from(s: &str) -> Word {
+        Word(s.into())
+    }
+}
+
+impl From<Word> for Arc<str> {
+    fn from(w: Word) -> Arc<str> {
+        w.0
+    }
+}
+
+/// One allocation per distinct word of a script.
+#[derive(Default)]
+struct Words(HashSet<Arc<str>>);
+
+impl Words {
+    fn get(&mut self, s: &str) -> Word {
+        if let Some(w) = self.0.get(s) {
+            return Word(Arc::clone(w));
+        }
+        let w: Arc<str> = s.into();
+        self.0.insert(Arc::clone(&w));
+        Word(w)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -19,6 +85,9 @@ pub struct Token {
     /// A line break came before this token (for automatic semicolons).
     pub newline_before: bool,
     pub line: u32,
+    /// Its bytes in the source: where lazily parsed function bodies start and end.
+    pub start: u32,
+    pub end: u32,
 }
 
 const PUNCTS: &[&str] = &[
@@ -30,6 +99,7 @@ const PUNCTS: &[&str] = &[
 
 pub fn tokenize(src: &str) -> Result<Vec<Token>, String> {
     let b = src.as_bytes();
+    let mut words = Words::default();
     let mut out: Vec<Token> = Vec::new();
     let mut i = 0;
     let mut line = 1u32;
@@ -94,7 +164,7 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, String> {
             let (s, end, lines) = string(src, i)?;
             line += lines;
             i = end;
-            Tok::Str(s)
+            Tok::Str(words.get(&s))
         } else if c == b'`' {
             let mut j = i + 1;
             let mut depth = 0usize;
@@ -160,7 +230,7 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, String> {
                     src[i..].chars().next()
                 ));
             }
-            let name = src[i..j].to_string();
+            let name = words.get(&src[i..j]);
             i = j;
             Tok::Ident(name)
         } else {
@@ -173,17 +243,20 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, String> {
             i += p.len();
             Tok::Punct(p)
         };
-        let _ = start;
         out.push(Token {
             tok,
             newline_before: std::mem::take(&mut newline),
             line,
+            start: start as u32,
+            end: i as u32,
         });
     }
     out.push(Token {
         tok: Tok::Eof,
         newline_before: true,
         line,
+        start: b.len() as u32,
+        end: b.len() as u32,
     });
     Ok(out)
 }

@@ -4379,25 +4379,24 @@ impl<S: Screen> Browser<S> {
     /// Fit the sleeping tabs' files in their budget, removing those seen longest ago first.
     fn trim_snapshots(&mut self) {
         let mut sleeping: Vec<(u64, usize, usize)> = Vec::new();
-        let mut total = 0;
         for (p, profile) in self.profiles.iter().enumerate() {
             for (t, tab) in profile.tabs.iter().enumerate() {
-                if let Some(stored) = &tab.snapshot {
+                if tab.snapshot.is_some() {
                     sleeping.push((tab.seen, p, t));
-                    total += stored.bytes;
                 }
             }
         }
         sleeping.sort_unstable_by_key(|s| s.0);
+        // Shared blobs count once, so removing a tab frees only what no other tab uses.
         for (_, p, t) in sleeping {
-            if total <= self.snapshot_budget {
+            let Some(store) = &mut self.store else {
+                break;
+            };
+            if store.used() <= self.snapshot_budget {
                 break;
             }
             if let Some(stored) = self.profiles[p].tabs[t].snapshot.take() {
-                total -= stored.bytes;
-                if let Some(store) = &self.store {
-                    store.remove(stored);
-                }
+                store.remove(stored);
             }
         }
     }
@@ -4409,7 +4408,7 @@ impl<S: Screen> Browser<S> {
         let stored = tab.snapshot.take();
         let entry = tab.entry().cloned();
         let title = tab.title().to_string();
-        let snapshot = match (stored, &self.store) {
+        let snapshot = match (stored, &mut self.store) {
             (Some(stored), Some(store)) => store.take(stored).ok(),
             _ => None,
         };

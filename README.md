@@ -273,6 +273,10 @@ time something reads it (most theme variables never are). A `var()` value is sub
 | 2026-11-14 | Forms: selection, copy, cut and paste in fields; validation; multipart (part of #32) | 3.7 MB (3,634,352 → 3,650,896 bytes, +16.5 KB) | 49.9 MB peak painted at 2x | Messages are tooltips under the control that stops a form; an edit that breaks `readonly` or `maxlength` is undone in one place, for typing, paste and cut alike |
 | 2026-11-14 | Forms: select dropdown, fields that scroll to the caret (part of #32) | 3.6 MB (3,617,808 → 3,634,352 bytes, +16.5 KB) | 49.8 MB peak painted at 2x | The dropdown is the menus' panel (one list painter for both); a field's runs shift left after layout and back before the next, so incremental layout never sees them moved |
 
+| 2026-11-15 | Function bodies parsed on their first call (#51) | 3.7 MB (3,650,896 → 3,667,440 bytes, +16.5 KB) | 49.9 MB peak painted at 2x | singapay.id (868 KB of Next.js script): 40.3 → 27.0 MB peak on the CLI; in a window 63 → 52 MB peak and 46 → 33 MB idle. Four panes with singapay.id, GitHub, Wikipedia and HN: 51 MB peak; GitHub, Wikipedia, HN and example.com: 47 MB (measured from an empty home folder). Names in scripts are shared per script (−2 MB on singapay.id). The 61 MB of #51 came from a heavy page woken from the session at start-up, not from the panes |
+
+| 2026-11-15 | Sleeping tabs share stylesheets, scripts, fonts and images (#51) | 3.7 MB | 49.9 MB peak painted at 2x | Disk: six tabs (three Wikipedia articles, two GitHub repositories, example.com) sleep in 1.7 MB instead of 2.9 MB; GitHub's 428 KB of stylesheets is stored once |
+
 Other pages after the layout milestone: GitHub home 22.7 MB peak (8,170 rules); Hacker News 11.5 MB.
 
 GitHub after custom properties: 39 MB peak, 24 ms cascade, 24,822 rules. Rules that only declare or use
@@ -367,8 +371,7 @@ Where data lives, and what compression does for it (measured 2026-11-07):
 - Sidebar rows have no keyboard focus of their own: tabs are reached with ⌘1 … ⌘9 and the palette, which
   also runs every sidebar action. Dragging needs the mouse.
 - Split view: a pane that has not had focus since the layout changed (or since its divider moved) shows its
-  tab's title until it is clicked. With four panes on GitHub, Wikipedia, HN and example.com the window peaks
-  at 61 MB while the pages load (29 MB idle), on `main` as on this change: over the 60 MB budget.
+  tab's title until it is clicked.
 - A tooltip can stay on screen when the pointer leaves the window over it, until the next input: the
   window does not track the pointer leaving yet.
 - Profiles start as Personal and Work; up to 12, each with its own folder in `profiles/` (named by a fixed
