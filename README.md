@@ -43,6 +43,7 @@ cargo run --release -- https://example.com --styles    # the tree with computed 
 cargo run --release -- https://example.com --layout    # every box and line with its position
 cargo run --release -- page.html --width 400           # local files, any viewport width
 cargo test
+./scripts/sites.sh                                     # site regression suite (below)
 ```
 
 Every run prints fetch, parse, CSS, cascade, layout and paint timings plus peak RAM, so budget regressions show
@@ -276,6 +277,7 @@ time something reads it (most theme variables never are). A `var()` value is sub
 | 2026-11-15 | Function bodies parsed on their first call (#51) | 3.7 MB (3,650,896 → 3,667,440 bytes, +16.5 KB) | 49.9 MB peak painted at 2x | singapay.id (868 KB of Next.js script): 40.3 → 27.0 MB peak on the CLI; in a window 63 → 52 MB peak and 46 → 33 MB idle. Four panes with singapay.id, GitHub, Wikipedia and HN: 51 MB peak; GitHub, Wikipedia, HN and example.com: 47 MB (measured from an empty home folder). Names in scripts are shared per script (−2 MB on singapay.id). The 61 MB of #51 came from a heavy page woken from the session at start-up, not from the panes |
 
 | 2026-11-15 | Sleeping tabs share stylesheets, scripts, fonts and images (#51) | 3.7 MB | 49.9 MB peak painted at 2x | Disk: six tabs (three Wikipedia articles, two GitHub repositories, example.com) sleep in 1.7 MB instead of 2.9 MB; GitHub's 428 KB of stylesheets is stored once |
+| 2026-11-15 | Site regression suite: `--record`/`--replay`, `--tiles`, 22 saved pages in CI (#148) | 3.7 MB (3,667,456 → 3,684,032 bytes, +16.6 KB) | 49.9 MB peak painted at 2x (unchanged) | Replays are exact and agree between macOS arm64 and Linux x86_64. Peak RAM over the 22 pages 26.7 to 38.7 MB (rust-std-vec, 1x at 1280x2400); the 44 renders take about 3 s once built. A 1 px change of the UA list indent fails 6 pages |
 
 Other pages after the layout milestone: GitHub home 22.7 MB peak (8,170 rules); Hacker News 11.5 MB.
 
@@ -342,6 +344,36 @@ and 3.3 MB of CSS arrives as about a sixth of that.
 Timings taken right after network waits are inflated: on Apple Silicon the CPU clocks down while idle, so
 GitHub's cascade measures 10 ms just after its stylesheets download and 2.8 ms when warm (same code, same
 rules). Compare warm numbers when hunting regressions.
+
+## Site regression suite
+
+`./scripts/sites.sh` (CI runs it on Linux and macOS) renders the 22 pages in `testdata/sites` at 1x
+(1280x2400) and 2x (1280x800) and compares each frame with the stored one, then prints parse, cascade,
+layout, composite and peak RAM per page. 12 are saved copies of openly licensed sites (Wikipedia, MDN,
+rust-lang.org, the Rust book and `std` docs, Python and Go docs, SQLite, WHATWG, ArchWiki, GNU,
+Bootstrap); 10 are pages written to exercise one area each (floats, flex, grid, tables, positioning,
+inline text, effects, images, forms, scripts).
+
+- **Saved, not live.** `broxee URL --record DIR` writes every response the page loads into `DIR`
+  (`net::archive`); `--replay DIR` answers every request from it and never opens a connection.
+- **Exact.** A replay uses the bundled Figtree for every page and freezes the scripts' clock at the
+  recording time, so a render is the same bytes on every run and on both CI systems (macOS arm64 and
+  Linux x86_64 agree). Any change is a real one: no threshold to tune.
+- **Small.** Each frame is stored as one hash per 64 CSS px tile (`--tiles`, a few KB), not as a PNG: our
+  PNG writer stores pixels uncompressed, about 9 MB a frame, so 44 reference images would be 400 MB in the
+  repository. `--base REV` builds REV beside the current tree, renders the changed pages with both and
+  writes the new frame faded with every differing pixel in red (`target/sites/diff`). On a CI failure the
+  renders of changed pages are uploaded with the run.
+
+A one-pixel change of the UA list indent (`padding-left: 40px` → `41px`) fails 6 of the 22 pages; the diffs
+show the list items moved.
+
+| Command | What it does |
+|---|---|
+| `./scripts/sites.sh` | check every page (`--only NAME` for one) |
+| `./scripts/sites.sh --base main` | also draw what moved since `main` |
+| `./scripts/sites.sh --update` | store the current renders as the reference |
+| `./scripts/sites.sh --record NAME URL LICENSE` | save a page and everything it loads |
 
 ## Compression
 

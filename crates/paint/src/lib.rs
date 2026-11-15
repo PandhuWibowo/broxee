@@ -4,6 +4,7 @@
 //! it needs is rasterized into the cache (sequential, the only writer), then the framebuffer
 //! is composited in horizontal bands on scoped threads that only read the list and the cache.
 
+pub mod compare;
 pub mod png;
 mod raster;
 mod shape;

@@ -4,6 +4,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+pub mod archive;
 mod cache;
 mod cookies;
 mod psl;
@@ -515,6 +516,9 @@ fn fetch_once(
             wire: Wire::default(),
         });
     }
+    if let Some(saved) = archive::answer(url) {
+        return Ok(saved?);
+    }
     let key = (url.scheme.clone(), url.host.clone(), url.port);
     let (mut conn, reused) = match take_idle(&key) {
         Some(conn) => (conn, true),
@@ -527,6 +531,7 @@ fn fetch_once(
             resp.wire.bytes.len()
         };
         RECEIVED.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        archive::keep(url, &resp);
         resp
     };
     match request(&mut conn, url, cookie, body, extra) {

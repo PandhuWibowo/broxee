@@ -76,7 +76,16 @@ static NO_FACES: OnceLock<SystemFaces> = OnceLock::new();
 impl FontStore {
     pub fn start() -> FontStore {
         FontStore {
-            pending: Mutex::new(Some(std::thread::spawn(load_fonts))),
+            pending: Mutex::new(Some(std::thread::spawn(|| load_fonts(false)))),
+            loaded: OnceLock::new(),
+        }
+    }
+
+    /// Only the bundled Figtree, for pages too: text renders the same on every machine,
+    /// whatever fonts it has installed (`--replay`, the site regression suite).
+    pub fn bundled() -> FontStore {
+        FontStore {
+            pending: Mutex::new(Some(std::thread::spawn(|| load_fonts(true)))),
             loaded: OnceLock::new(),
         }
     }
@@ -116,10 +125,15 @@ impl FontStore {
     }
 }
 
-fn load_fonts() -> ProcessFonts {
+fn load_fonts(bundled_only: bool) -> ProcessFonts {
     let mut faces = Vec::new();
     let mut name = String::new();
-    for (regular, bold) in FONT_CANDIDATES {
+    let installed = if bundled_only {
+        &[][..]
+    } else {
+        &FONT_CANDIDATES[..]
+    };
+    for &(regular, bold) in installed {
         if let Ok(font) = Font::load(Path::new(regular)) {
             faces.push((SystemFace::Ready(Box::new(font)), Role::Page, 400));
             if let Ok(bold) = Font::load(Path::new(bold)) {
@@ -143,7 +157,12 @@ fn load_fonts() -> ProcessFonts {
         };
         faces.push((SystemFace::Lazy(Box::new(load)), Role::Ui, weight));
     }
-    for path in SYMBOL_FONTS {
+    let symbols = if bundled_only {
+        &[][..]
+    } else {
+        &SYMBOL_FONTS[..]
+    };
+    for &path in symbols {
         if Path::new(path).exists() {
             let load = move || Font::load(Path::new(path)).ok();
             faces.push((SystemFace::Lazy(Box::new(load)), Role::Symbols, 400));
