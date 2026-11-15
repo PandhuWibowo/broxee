@@ -284,7 +284,10 @@ impl DeviceGradient {
                 let (dx, dy) = match g.kind {
                     GradientKind::Linear(angle) => {
                         let a = (angle as f32 / 100.0).to_radians();
-                        (a.sin(), -a.cos())
+                        {
+                            let (s, c) = math::sin_cos(a);
+                            (s, -c)
+                        }
                     }
                     GradientKind::LinearCorner(cx, cy) => {
                         // Perpendicular to the diagonal between the other two corners.
@@ -571,7 +574,7 @@ fn erf(x: f32) -> f32 {
         - (((((1.061_405_4 * t - 1.453_152_1) * t) + 1.421_413_7) * t - 0.284_496_74) * t
             + 0.254_829_6)
             * t
-            * (-x * x).exp();
+            * math::exp(-x * x);
     y.copysign(x)
 }
 

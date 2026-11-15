@@ -28,6 +28,7 @@ and macOS.
 crates/
   flate/   DEFLATE, zlib, gzip and Brotli decoding (brotli.rs; RFC 7932 dictionary and tables as
            data, CRC-checked in tests), CRC-32, Adler-32
+  math/    sin, cos, tan, atan2, exp with the same bits on every platform (no libm)
   net/     URL parse + join, HTTP/1.1 over TCP, TLS (rustls), keep-alive pool, chunked bodies, gzip,
            redirects, file://, cookies.rs (per-profile jars), psl.rs (Public Suffix List, as data)
   html/    tokenizer.rs (byte-oriented, raw-text elements), entities.rs, lib.rs (tree builder + arena DOM,
@@ -158,6 +159,9 @@ casts), not taken from binding crates. Ask before proposing any dependency.
   the bundled Figtree for every page, a clock frozen at the recording time). macOS arm64 and Linux x86_64
   agree, so one set of `1x.tiles` / `2x.tiles` serves both. Anything that makes a render depend on the
   machine (installed fonts, the time, thread count, hash seeds) breaks the suite; keep it out of replays.
+- **Engine code uses `math::sin_cos`, `tan`, `atan2`, `exp`, never `f32::sin` and friends.** The system libm
+  differs in the last bit between macOS and Linux, and one bit moved pixels of SVG arcs (#148). `sqrt`,
+  `round` and arithmetic are exact everywhere and fine. The chrome may use libm; it is not in the suite.
 - **A changed tile is a change.** Look at it (`./scripts/sites.sh --base main` writes red-on-faded diffs to
   `target/sites/diff`), then either fix the regression or `--update` and commit the tiles with the change.
 - **Only openly licensed pages are saved** (each `site` file names its license), or pages written for the

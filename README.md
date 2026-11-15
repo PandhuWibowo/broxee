@@ -358,7 +358,9 @@ inline text, effects, images, forms, scripts).
   (`net::archive`); `--replay DIR` answers every request from it and never opens a connection.
 - **Exact.** A replay uses the bundled Figtree for every page and freezes the scripts' clock at the
   recording time, so a render is the same bytes on every run and on both CI systems (macOS arm64 and
-  Linux x86_64 agree). Any change is a real one: no threshold to tune.
+  Linux x86_64 agree). Any change is a real one: no threshold to tune. For that the engine computes sine,
+  cosine, tangent, arctangent and `exp` itself (`crates/math`, f64 series rounded once): Apple's libm and
+  glibc differ in the last bit, which moved a few pixels of SVG arcs between the two systems.
 - **Small.** Each frame is stored as one hash per 64 CSS px tile (`--tiles`, a few KB), not as a PNG: our
   PNG writer stores pixels uncompressed, about 9 MB a frame, so 44 reference images would be 400 MB in the
   repository. `--base REV` builds REV beside the current tree, renders the changed pages with both and

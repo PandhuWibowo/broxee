@@ -514,7 +514,7 @@ static COS: std::sync::LazyLock<[[f32; 8]; 8]> = std::sync::LazyLock::new(|| {
             } else {
                 1.0
             };
-            *v = c * (((2 * x + 1) as f32 * u as f32 * std::f32::consts::PI) / 16.0).cos() / 2.0;
+            *v = c * math::cos(((2 * x + 1) as f32 * u as f32 * std::f32::consts::PI) / 16.0) / 2.0;
         }
     }
     t
@@ -598,9 +598,9 @@ static COS_SCALED: std::sync::LazyLock<[Vec<f32>; 4]> = std::sync::LazyLock::new
                 } else {
                     1.0
                 };
-                t[x * k + u] = c
-                    * (((2 * x + 1) * u) as f32 * std::f32::consts::PI / (2 * k) as f32).cos()
-                    / 2.0;
+                t[x * k + u] =
+                    c * math::cos(((2 * x + 1) * u) as f32 * std::f32::consts::PI / (2 * k) as f32)
+                        / 2.0;
             }
         }
         t
