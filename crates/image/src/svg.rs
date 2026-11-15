@@ -276,7 +276,7 @@ fn parse_transform(s: &str) -> Transform {
             ("scale", 1) => Transform([g(0), 0.0, 0.0, g(0), 0.0, 0.0]),
             ("scale", 2) => Transform([g(0), 0.0, 0.0, g(1), 0.0, 0.0]),
             ("rotate", 1 | 3) => {
-                let (s, c) = g(0).to_radians().sin_cos();
+                let (s, c) = math::sin_cos(g(0).to_radians());
                 let r = Transform([c, s, -s, c, 0.0, 0.0]);
                 if v.len() == 3 {
                     Transform([1.0, 0.0, 0.0, 1.0, -g(1), -g(2)])
@@ -286,8 +286,8 @@ fn parse_transform(s: &str) -> Transform {
                     r
                 }
             }
-            ("skewX", 1) => Transform([1.0, 0.0, g(0).to_radians().tan(), 1.0, 0.0, 0.0]),
-            ("skewY", 1) => Transform([1.0, g(0).to_radians().tan(), 0.0, 1.0, 0.0, 0.0]),
+            ("skewX", 1) => Transform([1.0, 0.0, math::tan(g(0).to_radians()), 1.0, 0.0, 0.0]),
+            ("skewY", 1) => Transform([1.0, math::tan(g(0).to_radians()), 0.0, 1.0, 0.0, 0.0]),
             _ => return Transform::IDENTITY,
         };
         // Listed transforms apply right to left: the last one touches the shape first.
@@ -466,7 +466,7 @@ impl Path {
             return;
         }
         // Endpoint to center parameterization (SVG 1.1, appendix F.6).
-        let (s, c) = angle.to_radians().sin_cos();
+        let (s, c) = math::sin_cos(angle.to_radians());
         let dx = (from.0 - to.0) / 2.0;
         let dy = (from.1 - to.1) / 2.0;
         let x1 = c * dx + s * dy;
@@ -486,7 +486,7 @@ impl Path {
         let cy1 = -k * ry * x1 / rx;
         let cx = c * cx1 - s * cy1 + (from.0 + to.0) / 2.0;
         let cy = s * cx1 + c * cy1 + (from.1 + to.1) / 2.0;
-        let angle_of = |ux: f32, uy: f32| uy.atan2(ux);
+        let angle_of = |ux: f32, uy: f32| math::atan2(uy, ux);
         let t1 = angle_of((x1 - cx1) / rx, (y1 - cy1) / ry);
         let t2 = angle_of((-x1 - cx1) / rx, (-y1 - cy1) / ry);
         let mut dt = t2 - t1;
@@ -500,7 +500,7 @@ impl Path {
         let n = ((dt.abs() * (r / tolerance).sqrt()).ceil() as usize).clamp(1, 512);
         for i in 1..=n {
             let t = t1 + dt * i as f32 / n as f32;
-            let (st, ct) = t.sin_cos();
+            let (st, ct) = math::sin_cos(t);
             let (x, y) = (rx * ct, ry * st);
             self.line_to((c * x - s * y + cx, s * x + c * y + cy));
         }
@@ -801,7 +801,7 @@ fn circle(c: (f32, f32), r: f32) -> Vec<(f32, f32)> {
     let n = ((r * 2.0).sqrt() * 4.0).ceil().clamp(8.0, 64.0) as usize;
     (0..n)
         .map(|i| {
-            let (s, co) = (i as f32 / n as f32 * std::f32::consts::TAU).sin_cos();
+            let (s, co) = math::sin_cos(i as f32 / n as f32 * std::f32::consts::TAU);
             (c.0 + r * co, c.1 + r * s)
         })
         .collect()
