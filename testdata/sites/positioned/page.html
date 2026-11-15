@@ -1,0 +1,20 @@
+<!doctype html><html><head><title>Positioning</title><style>
+body { margin: 0; font: 14px/1.4 sans-serif }
+header { position: fixed; top: 0; left: 0; right: 0; height: 48px; background: #263238; color: #fff; padding: 0 16px; line-height: 48px; z-index: 10 }
+main { padding: 64px 16px 16px }
+.rel { position: relative; height: 160px; background: #eceff1; margin-bottom: 16px }
+.abs { position: absolute; width: 80px; height: 50px; background: #8e24aa; color: #fff }
+.tl { top: 8px; left: 8px } .br { bottom: 8px; right: 8px } .mid { top: 50%; left: 50%; margin: -25px 0 0 -40px }
+.shift { position: relative; top: 10px; left: 30px; background: #ffe082; display: inline-block }
+.clip { width: 300px; height: 80px; overflow: hidden; border: 1px solid #555; margin-bottom: 16px }
+.clip p { margin: 0 } .badge { position: absolute; top: -8px; right: -8px; background: #d32f2f; color: #fff; border-radius: 10px; padding: 0 6px; font-size: 11px }
+.btn { position: relative; display: inline-block; padding: 8px 16px; background: #1976d2; color: #fff; margin: 12px }
+.hidden { visibility: hidden } .none { display: none }
+</style></head><body>
+<header>Fixed header over the page</header>
+<main>
+<div class="rel"><div class="abs tl">top left</div><div class="abs br">bottom right</div><div class="abs mid">middle</div></div>
+<p>Text with a <span class="shift">relatively shifted</span> span that keeps its place in the line.</p>
+<div class="clip"><p>Overflow hidden cuts this text off after a few lines. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris.</p></div>
+<span class="btn">Inbox<span class="badge">12</span></span><span class="btn">Hidden: <span class="hidden">invisible</span>|</span><span class="btn">None:<span class="none">gone</span>|</span>
+</main></body></html>

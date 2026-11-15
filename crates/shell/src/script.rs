@@ -30,11 +30,22 @@ pub struct PageScript {
     epoch_ms: f64,
 }
 
+/// A clock that stands still at this time (ms since 1970) for every page of the process:
+/// `--replay` sets it to when the site was saved, so `Date` and `Math.random` give the same
+/// values on every run.
+static FROZEN_AT: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+
+pub fn freeze_clock(epoch_ms: f64) {
+    let _ = FROZEN_AT.set(epoch_ms);
+}
+
 impl PageScript {
     fn new(page: &net::Url) -> PageScript {
-        let epoch_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0.0, |d| d.as_secs_f64() * 1000.0);
+        let epoch_ms = FROZEN_AT.get().copied().unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0.0, |d| d.as_secs_f64() * 1000.0)
+        });
         PageScript {
             runtime: js::Runtime::new(),
             net: crate::scriptnet::ScriptNet::new(page.clone()),
@@ -44,7 +55,10 @@ impl PageScript {
     }
 
     fn tick(&mut self) {
-        let now = self.started.elapsed().as_secs_f64() * 1000.0;
+        let now = match FROZEN_AT.get() {
+            Some(_) => 0.0,
+            None => self.started.elapsed().as_secs_f64() * 1000.0,
+        };
         self.runtime.set_time(now, self.epoch_ms);
     }
 

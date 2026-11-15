@@ -5967,6 +5967,7 @@ mod tests {
             styles: false,
             layout: false,
             png: None,
+            tiles: None,
             paint: false,
             window: true,
             depth: 8,
@@ -5976,6 +5977,8 @@ mod tests {
             fetch_css: false,
             panes: 1,
             cache: None,
+            record: None,
+            replay: None,
         };
         let mut b = Browser::new(opts, FakeScreen::default(), session, Some(store));
         b.start();

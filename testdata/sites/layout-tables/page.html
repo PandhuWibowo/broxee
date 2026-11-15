@@ -1,0 +1,19 @@
+<!doctype html><html><head><title>Tables</title><style>
+body { margin: 16px; font: 14px/1.4 sans-serif }
+table { border-collapse: collapse; margin-bottom: 20px }
+td, th { border: 1px solid #777; padding: 4px 8px }
+th { background: #dde; text-align: left } caption { font-weight: bold; padding: 4px }
+.num { text-align: right } tr:nth-child(even) td { background: #f5f5f5 }
+.fixed { width: 600px; table-layout: fixed } .sep { border-collapse: separate; border-spacing: 6px }
+</style></head><body>
+<table><caption>Sales by quarter</caption>
+<tr><th>Region</th><th>Q1</th><th>Q2</th><th>Q3</th><th>Q4</th></tr>
+<tr><td>North</td><td class="num">1,204</td><td class="num">1,350</td><td class="num">998</td><td class="num">1,722</td></tr>
+<tr><td>South with a long name</td><td class="num">88</td><td class="num">102</td><td class="num">131</td><td class="num">96</td></tr>
+<tr><td rowspan="2">East</td><td colspan="2">merged two quarters</td><td class="num">7</td><td class="num">8</td></tr>
+<tr><td class="num">1</td><td class="num">2</td><td class="num">3</td><td class="num">4</td></tr>
+</table>
+<table class="fixed"><tr><td>fixed layout</td><td>columns share the width</td><td>whatever the content is, even a verylongwordthatdoesnotbreak</td></tr></table>
+<table class="sep"><tr><td>separate</td><td>borders</td></tr><tr><td>with</td><td>spacing</td></tr></table>
+<table border="1" cellpadding="6" width="300" bgcolor="#ffffe0"><tr><td align="center">presentational</td><td valign="top">attributes<br>two lines</td></tr></table>
+</body></html>

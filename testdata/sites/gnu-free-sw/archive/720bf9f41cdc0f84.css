@@ -1,0 +1,163 @@
+div#top { border-top: 0; }
+#top p { margin: 0 0; }
+#fundraiser
+{
+  background: #0065ff;
+  position: relative;
+  height: 230px;
+  overflow: hidden;
+}
+
+#fundraiser a { text-decoration: none; }
+
+#fundraiser .progress
+{
+  height: 18px;
+  line-height: 18px;
+}
+
+#fundraiser .progress-bar
+{
+  background: #fd9e38;
+
+  position: absolute;
+  min-width: 40px;
+  top: 0;
+  left: 0;
+
+}
+
+#fundraiser .progress-bar span
+{
+  position: relative;
+  left: 10px;
+  padding-left: 100%;
+  white-space: nowrap;
+}
+
+#fundraiser div.message
+{
+  height: 200px;
+}
+#fundraiser .message p.headline
+{
+  padding: 10px;
+}
+#fundraiser .message p.headline b
+{
+  font-size: 30px;
+  color: #fd9e38;
+}
+#fundraiser .message .button a
+{
+  font-weight: bold;
+  color: #1b0c3d;
+  background: #fd9e38;
+  padding-bottom: 2px;
+  display: inline;
+  margin-left: 3em;
+}
+
+#fundraiser .button a
+{
+  border-radius: 20px;
+  -moz-border-radius: 20px;
+  -khtml-border-radius: 20px;
+  -webkit-border-radius: 20px;
+  -opera-border-radius: 20px;
+}
+
+#fundraiser .message
+{
+  margin: 5px;
+  padding: 10px;
+  background: #1b0c3d;
+  text-align: center;
+}
+
+#fundraiser .message p
+{
+  margin-top: 0;
+  margin-bottom: 0;
+}
+#fundraiser .message p a
+{
+  font-size: 19px;
+  color: white;
+}
+
+#fundraiser .message p.button
+{
+  position: absolute;
+  top: 145px;
+  width: 100%;
+  margin-right: 8%;
+  padding-top: 30px;
+  text-align: center;
+  padding-bottom: 10px;
+  font-size: 21px;
+}
+
+#fundraiser .progress
+{
+  color: white;
+  position: absolute;
+  bottom: 0;
+  padding-right: 0;
+  padding-left: 0;
+  height: 18px;
+  width: 100%;
+  font-family: monospace;
+  font-weight: bold;
+  height: 18px;
+  background: #0065ff;
+}
+
+#fundraiser .goal
+{
+  position: absolute;
+  right: 1em;
+}
+@media (max-width: 900px)
+{
+  #fundraiser .message p.headline
+  {
+    padding-top: 0;
+  }
+  #fundraiser .message p a
+  {
+    font-size: 15px;
+  }
+  #fundraiser .message p.headline b
+  {
+    font-size: 19px;
+  }
+  #fundraiser .message p.button
+  {
+    font-size: 17px;
+    top: 150px;
+  }
+  #fundraiser .progress { font-size: 8px; }
+}
+@media (max-width: 550px)
+{
+  #fundraiser .message p.headline
+  {
+    padding-bottom: 8px;
+  }
+  #fundraiser .message p
+  {
+    line-height: 19px;
+  }
+  #fundraiser .message p a
+  {
+    font-size: 13px;
+  }
+  #fundraiser .progress { font-size: 6px; }
+}
+
+@media (max-width: 430px)
+{
+  /* We don't need to display a banner at this size.  */
+  #fundraiser { display: none; }
+}

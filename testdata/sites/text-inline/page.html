@@ -1,0 +1,30 @@
+<!doctype html><html><head><title>Inline text</title><style>
+body { margin: 16px; font: 15px/1.5 sans-serif; max-width: 700px }
+h1 { font-size: 32px; margin: 0 0 8px } h2 { font-size: 20px; border-bottom: 1px solid #ccc }
+.big { font-size: 26px } .small { font-size: 11px } mark { background: #ff0 }
+code { font-family: monospace; background: #eee; padding: 1px 4px; border-radius: 3px }
+pre { background: #263238; color: #eceff1; padding: 10px; white-space: pre; overflow: hidden }
+.center { text-align: center } .right { text-align: right } .justify { text-align: justify }
+.pill { display: inline-block; padding: 2px 10px; border-radius: 10px; background: #1565c0; color: #fff; font-size: 12px }
+.sup { vertical-align: super; font-size: 10px } .lh { line-height: 2.2 }
+q::before { content: "« "; color: #c00 } q::after { content: " »"; color: #c00 }
+.req::after { content: " *"; color: red } .nowrap { white-space: nowrap }
+ul { padding-left: 24px } blockquote { border-left: 4px solid #90a4ae; margin: 8px 0; padding-left: 12px; color: #455a64 }
+</style></head><body>
+<h1>Inline formatting</h1>
+<p>Mixed <b>bold</b>, <i>italic</i>, <u>underlined</u>, <s>struck</s>, <mark>marked</mark>, <code>code()</code>, <span class="big">big</span> and <span class="small">small</span> text on one line, with a footnote<span class="sup">1</span> and a <a href="#">link that wraps across the end of the line</a> to show inline boxes split over lines.</p>
+<p class="center">Centered text, with a <span class="pill">pill</span> inline block.</p>
+<p class="right">Right aligned.</p>
+<p class="justify">Justified text spreads words to fill each line except the last. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua, ut enim ad minim veniam.</p>
+<p class="lh">Tall line height. Tall line height. Tall line height. Tall line height. Tall line height. Tall line height. Tall line height.</p>
+<p>Generated content: <q>quoted</q>, and a required field label<span class="req">Name</span>. <span class="nowrap">This part never wraps, however narrow the line gets, it keeps going</span>.</p>
+<pre>fn main() {
+    let v = vec![1, 2, 3];   // spaces kept
+    println!("{v:?}");
+}</pre>
+<h2>Lists and quotes</h2>
+<ul><li>First item</li><li>Second item with <b>bold</b><ul><li>Nested</li></ul></li><li>Third</li></ul>
+<ol><li>One</li><li>Two</li><li>Three</li></ol>
+<blockquote>A blockquote with a left border, for quoting someone at some length so that it wraps onto another line.</blockquote>
+<p>Entities: &amp; &lt; &gt; &copy; &mdash; &hellip; &nbsp;non&nbsp;breaking. Accents: café, naïve, Zürich, São Paulo.</p>
+</body></html>

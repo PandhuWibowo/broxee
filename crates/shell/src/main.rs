@@ -30,7 +30,8 @@ use engine::{FontStore, Settings};
 
 const USAGE: &str =
     "usage: broxee [<url-or-file>...] [--window | --png FILE | --paint] [--tree | --styles | --layout] \
-                     [--depth N] [--width PX] [--height PX] [--scale N] [--no-css-fetch] [--panes 1|2|4] [--cache DIR]";
+                     [--tiles FILE] [--depth N] [--width PX] [--height PX] [--scale N] [--no-css-fetch] [--panes 1|2|4] [--cache DIR] \
+                     [--record DIR | --replay DIR]";
 
 #[derive(Clone)]
 struct Options {
@@ -41,6 +42,8 @@ struct Options {
     styles: bool,
     layout: bool,
     png: Option<String>,
+    /// One hash per 64 CSS px square of the painted frame (`paint::compare::tiles`).
+    tiles: Option<String>,
     paint: bool,
     window: bool,
     depth: usize,
@@ -52,6 +55,10 @@ struct Options {
     panes: usize,
     /// An HTTP cache folder for this run (the window uses each profile's own).
     cache: Option<String>,
+    /// Save every response of this run into a folder (`net::archive`).
+    record: Option<String>,
+    /// Answer every request from a saved folder, with the bundled font and a frozen clock.
+    replay: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -65,6 +72,7 @@ fn main() -> ExitCode {
         styles: false,
         layout: false,
         png: None,
+        tiles: None,
         paint: false,
         window: false,
         depth: 8,
@@ -74,6 +82,8 @@ fn main() -> ExitCode {
         fetch_css: true,
         panes: 1,
         cache: None,
+        record: None,
+        replay: None,
     };
 
     let mut args = std::env::args().skip(1);
@@ -92,7 +102,10 @@ fn main() -> ExitCode {
             "--window" => opts.window = true,
             "--no-css-fetch" => opts.fetch_css = false,
             "--png" => opts.png = args.next(),
+            "--tiles" => opts.tiles = args.next(),
             "--cache" => opts.cache = args.next(),
+            "--record" => opts.record = args.next(),
+            "--replay" => opts.replay = args.next(),
             "--width" => opts.width = number(&mut args, 100.0, 8000.0, opts.width),
             "--height" => opts.height = number(&mut args, 100.0, 8000.0, opts.height),
             "--scale" => opts.scale = number(&mut args, 0.5, 4.0, opts.scale),
@@ -120,7 +133,12 @@ fn main() -> ExitCode {
     // Opened from Finder (double-clicked, or Broxee.app from the .dmg) there are no arguments:
     // open the window instead of printing the usage and exiting at once. Anything that asks
     // for CLI output keeps the CLI.
-    let cli_output = opts.png.is_some() || opts.paint || opts.tree || opts.styles || opts.layout;
+    let cli_output = opts.png.is_some()
+        || opts.tiles.is_some()
+        || opts.paint
+        || opts.tree
+        || opts.styles
+        || opts.layout;
     if cfg!(target_os = "macos") && targets.is_empty() && !cli_output {
         opts.window = true;
     }
@@ -141,6 +159,10 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     opts.target = target;
+    if opts.record.is_some() && opts.replay.is_some() {
+        eprintln!("--record and --replay cannot be used together\n{USAGE}");
+        return ExitCode::from(2);
+    }
     match run(&opts) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -185,8 +207,21 @@ fn run_window(_opts: Options) -> ExitCode {
 }
 
 fn run(opts: &Options) -> Result<(), String> {
+    if let Some(dir) = &opts.record {
+        net::archive::record(std::path::Path::new(dir))?;
+    }
+    let replayed_at = match &opts.replay {
+        Some(dir) => Some(net::archive::replay(std::path::Path::new(dir))?),
+        None => None,
+    };
+    if let Some(at) = replayed_at {
+        script::freeze_clock(at as f64 * 1000.0);
+    }
     // Fonts start loading now and overlap the page request (stage 1 of docs/pipeline.md).
-    let fonts = FontStore::start();
+    let fonts = match replayed_at {
+        Some(_) => FontStore::bundled(),
+        None => FontStore::start(),
+    };
     let url = engine::to_url(&opts.target)?;
     let settings = Settings {
         width: opts.width,
@@ -218,7 +253,7 @@ fn run(opts: &Options) -> Result<(), String> {
         println!("{}", page.dom.dump(opts.depth));
     }
 
-    let painted = (opts.paint || opts.png.is_some()).then(|| {
+    let painted = (opts.paint || opts.png.is_some() || opts.tiles.is_some()).then(|| {
         let metrics = page.metrics(&fonts);
         let view = engine::page_view(&page, &metrics);
         let viewport = Viewport {
@@ -232,6 +267,11 @@ fn run(opts: &Options) -> Result<(), String> {
     if let (Some(path), Some((frame, _))) = (&opts.png, &painted) {
         let png = paint::png::encode(frame.width, frame.height, &frame.pixels);
         std::fs::write(path, png).map_err(|e| format!("{path}: {e}"))?;
+    }
+    if let (Some(path), Some((frame, _))) = (&opts.tiles, &painted) {
+        let tile = (64.0 * opts.scale).round() as usize;
+        let text = paint::compare::tiles(frame.width, frame.height, &frame.pixels, tile);
+        std::fs::write(path, text).map_err(|e| format!("{path}: {e}"))?;
     }
 
     let css = &page.css;

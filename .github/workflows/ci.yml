@@ -31,3 +31,12 @@ jobs:
         run: cargo test
       - name: 60 MB budget
         run: ./scripts/budget.sh
+      - name: Site regressions
+        run: ./scripts/sites.sh
+      - name: Upload site renders
+        if: failure()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: sites-${{ matrix.os }}
+          path: target/sites
+          if-no-files-found: ignore

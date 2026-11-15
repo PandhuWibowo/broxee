@@ -1,0 +1,23 @@
+# recorded 1794745844
+301	text/html	https://rust-lang.org/	977a7a211687778f.html	https://www.rust-lang.org/
+200	text/html; charset=utf-8		bfeed0fc476b6684.html	https://rust-lang.org/
+200	application/javascript; charset=utf-8		f9df431362bd371a.js	https://rust-lang.org/static/scripts/highlight.pack.js
+200	application/javascript; charset=utf-8		fabc093fcf7c77b9.js	https://rust-lang.org/static/scripts/init.js
+200	application/javascript; charset=utf-8		74ce9bff4ea529d2.js	https://rust-lang.org/static/scripts/languages.js
+200	text/css; charset=utf-8		1f03a94b5be309e0.css	https://rust-lang.org/static/styles/a11y-dark.css
+200	image/svg+xml		aece778cc333d904.svg	https://rust-lang.org/static/images/webassembly.svg
+200	image/svg+xml		53fd7be819a39ba2.svg	https://rust-lang.org/static/images/rust-logo-blk.svg
+200	image/svg+xml		937a37d3bc85d628.svg	https://rust-lang.org/static/images/cli.svg
+200	text/css; charset=utf-8		7831e9812301ad84.css	https://rust-lang.org/static/styles/fonts_8049871103083011125.css
+200	text/css; charset=utf-8		67cef7244a56a2bd.css	https://rust-lang.org/static/styles/app_17774143076088586802.css
+200	image/svg+xml		dc57f1b2e9df1814.svg	https://rust-lang.org/static/images/embedded.svg
+200	image/svg+xml		60cc4432e67b9dd5.svg	https://rust-lang.org/static/images/mastodon.svg
+200	image/svg+xml		057e7e4fc04ec7ff.svg	https://rust-lang.org/static/images/bluesky.svg
+200	image/svg+xml		3d35ae441826c9cb.svg	https://rust-lang.org/static/images/youtube.svg
+200	image/svg+xml		811f0b9eaaa70c1d.svg	https://rust-lang.org/static/images/github.svg
+200	text/css; charset=utf-8		d08f44269d3f83fd.css	https://rust-lang.org/static/styles/vendor_10880690442070639967.css
+200	image/svg+xml		eefa73a2680d80e4.svg	https://rust-lang.org/static/images/networking.svg
+200	font/woff2		68ab1d7d0dfeaa9a.woff2	https://rust-lang.org/static/fonts/woff2/FiraSans-SemiBold.latin.woff2
+200	font/woff2		ffae16c88213b9a9.woff2	https://rust-lang.org/static/fonts/woff2/FiraSans-Regular.latin.woff2
+200	font/woff2		75ac21c45217af38.woff2	https://rust-lang.org/static/fonts/woff2/FiraSans-ExtraBold.latin.woff2
+200	font/woff2		6a4ea35074b1d420.woff2	https://rust-lang.org/static/fonts/woff2/AlfaSlabOne-Regular.latin.woff2

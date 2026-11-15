@@ -1,0 +1,16 @@
+<!doctype html><html><head><title>Forms</title><style>
+body { margin: 16px; font: 14px/1.4 sans-serif } label { display: block; margin: 8px 0 2px }
+fieldset { width: 420px; margin-bottom: 12px } .row { display: flex; gap: 8px; align-items: center }
+</style></head><body>
+<form action="/submit" method="post"><fieldset><legend>Account</legend>
+<label for="n">Name</label><input id="n" name="name" value="Ada Lovelace">
+<label>Email</label><input type="email" name="email" placeholder="you@example.com">
+<label>Password</label><input type="password" name="pw" value="secret">
+<label>Plan</label><select name="plan"><option>Free</option><option selected>Pro</option><option>Team</option></select>
+<label>Notes</label><textarea name="notes" rows="3" cols="40">Two lines
+of notes</textarea>
+<div class="row"><input type="checkbox" checked id="c"><label for="c" style="display:inline">Remember me</label><input type="radio" name="r" checked> A <input type="radio" name="r"> B</div>
+<label>Colors</label><select multiple size="3"><option>Red</option><option selected>Green</option><option>Blue</option><option>Black</option></select>
+<div class="row"><button type="submit">Save</button><input type="reset" value="Reset"><input type="submit" value="Send" disabled></div>
+</fieldset></form>
+</body></html>

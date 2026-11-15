@@ -59,6 +59,8 @@ crates/
            pool.rs (fetch pool), webfonts.rs (`@font-face`: which faces the text uses, fetching)
 scripts/
   budget.sh  60 MB check: binary size + peak RAM on a generated 2.6 MB page with a <style> block
+  sites.sh   site regression suite over testdata/sites: replays saved pages (net::archive), compares
+             tile hashes of each render (paint::compare), reports timings and peak RAM per page
 ```
 
 Concurrency (what is sequential, parallel, main-thread only) is defined in `docs/pipeline.md`. Read it before
@@ -149,6 +151,17 @@ casts), not taken from binding crates. Ask before proposing any dependency.
 - **Never send synthetic input to the real desktop** (osascript keystrokes, clicks). The owner works on this
   machine; keystrokes can land in another app. Drive `Browser` through `FakeScreen` in `browser.rs` tests with
   local files, and render PNGs from it when a visual check is needed.
+
+### Site regression suite
+
+- **A page in `testdata/sites` renders exactly the same bytes every run** (`--replay`: saved responses only,
+  the bundled Figtree for every page, a clock frozen at the recording time). macOS arm64 and Linux x86_64
+  agree, so one set of `1x.tiles` / `2x.tiles` serves both. Anything that makes a render depend on the
+  machine (installed fonts, the time, thread count, hash seeds) breaks the suite; keep it out of replays.
+- **A changed tile is a change.** Look at it (`./scripts/sites.sh --base main` writes red-on-faded diffs to
+  `target/sites/diff`), then either fix the regression or `--update` and commit the tiles with the change.
+- **Only openly licensed pages are saved** (each `site` file names its license), or pages written for the
+  suite. Record with `./scripts/sites.sh --record NAME URL LICENSE`.
 
 ### Change invariants
 
