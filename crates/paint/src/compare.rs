@@ -21,7 +21,7 @@ pub fn tiles(width: usize, height: usize, rgba: &[u8], tile: usize) -> String {
                 let start = col * tile * 4;
                 let end = ((col + 1) * tile).min(width) * 4;
                 // FNV-1a over 4-byte pixels: a pixel either matches or it does not.
-                for px in line[start..end].chunks_exact(4) {
+                for px in line[start..end].as_chunks::<4>().0 {
                     let v = u32::from_le_bytes([px[0], px[1], px[2], px[3]]);
                     *hash = (*hash ^ u64::from(v)).wrapping_mul(0x0100_0000_01b3);
                 }
@@ -75,7 +75,13 @@ pub fn diff(width: usize, height: usize, old: &[u8], new: &[u8]) -> Diff {
     let mut image = Vec::with_capacity(width * height * 4);
     let mut pixels = 0;
     let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0, 0);
-    for (i, (a, b)) in old.chunks_exact(4).zip(new.chunks_exact(4)).enumerate() {
+    for (i, (a, b)) in old
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(new.as_chunks::<4>().0)
+        .enumerate()
+    {
         if a == b {
             // Faded toward white, so the red stands out.
             image.extend(b[..3].iter().map(|&c| 192 + c / 4));
