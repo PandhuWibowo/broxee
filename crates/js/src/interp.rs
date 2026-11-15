@@ -1780,7 +1780,7 @@ impl Interp {
             Arc::new(Func {
                 name: class.name.clone(),
                 params: Vec::new(),
-                body: Vec::new().into(),
+                body: crate::parser::FnBody::ready(Vec::new().into()),
                 arrow: false,
                 is_async: false,
                 is_generator: false,
@@ -2144,6 +2144,14 @@ impl Interp {
         }
     }
 
+    /// A function's statements, parsed on its first call; a syntax error in them is thrown.
+    pub(crate) fn body_of(&mut self, func: &Func) -> Result<crate::parser::Body, Ctrl> {
+        match func.body.get() {
+            Ok(body) => Ok(Arc::clone(body)),
+            Err(e) => Err(self.throw_error("SyntaxError", &e)),
+        }
+    }
+
     /// Bind `arguments`, the function's own name and its parameters, and hoist its body.
     fn enter_body(
         &mut self,
@@ -2184,7 +2192,8 @@ impl Interp {
             };
             self.bind(host, env, pattern, v, Some(VarKind::Let))?;
         }
-        self.hoist(env, &func.body)?;
+        let body = self.body_of(func)?;
+        self.hoist(env, &body)?;
         Ok(())
     }
 
@@ -2197,7 +2206,8 @@ impl Interp {
         callee: ObjId,
     ) -> Result<(), Ctrl> {
         self.enter_body(host, env, func, args, callee)?;
-        for s in func.body.iter() {
+        let body = self.body_of(func)?;
+        for s in body.iter() {
             self.exec(host, env, s)?;
         }
         Ok(())
@@ -2259,7 +2269,7 @@ impl Interp {
                 default: None,
                 rest: false,
             }],
-            body: program.into(),
+            body: crate::parser::FnBody::ready(program.into()),
             arrow: false,
             is_async: false,
             is_generator: false,

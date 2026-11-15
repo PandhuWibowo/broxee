@@ -741,7 +741,7 @@ impl Interp {
         let n = self.free_slot()?;
         self.coros[n] = Slot::Paused(Coro {
             frames: vec![Frame::Seq {
-                list: Stmts::Many(func.body.clone()),
+                list: Stmts::Many(self.body_of(func)?),
                 next: 0,
                 env,
                 label: None,
@@ -760,7 +760,7 @@ impl Interp {
         let n = self.free_slot()?;
         self.coros[n] = Slot::Paused(Coro {
             frames: vec![Frame::Seq {
-                list: Stmts::Many(func.body.clone()),
+                list: Stmts::Many(self.body_of(func)?),
                 next: 0,
                 env,
                 label: None,

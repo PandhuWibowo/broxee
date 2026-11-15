@@ -95,6 +95,8 @@ casts), not taken from binding crates. Ask before proposing any dependency.
 - **AppKit calls happen on the main thread only.** The engine thread hands work over with `dispatch_async_f`.
 - **Paint into the window's `IOSurface`, never into a separate buffer that is then copied.** At most two
   surfaces per window; the spare one is released when idle (`Window::release_spare`).
+- **Measure the window from an empty home folder** (`HOME=$(mktemp -d) broxee --window …`) as well as with the
+  real session: the session wakes its own visible tab at start-up, which changes the peak.
 - **Window memory is measured with `footprint <pid>` on a real window** (idle and `phys_footprint_peak`), not
   only with the CLI: frame surfaces (16 MB each at Retina) and AppKit are on top of the page. Measure a
   sequence of heavy pages too, not only one page: freed memory left behind by earlier pages is what pushed the
@@ -114,6 +116,10 @@ casts), not taken from binding crates. Ask before proposing any dependency.
   They are found after the cascade, for displayed elements only, and stored with a sleeping tab.
 - **A snapshot holds only what the page was built from**, as it arrived (`net::Wire`): rebuilding must give the
   same DOM, so `NodeId`s in the stored `ImageStore` stay valid. Do not store anything derived (styles, layout).
+- **Sleeping tabs share their large parts** (`hibernate.rs`): every part of 4 KB or more is a blob named by
+  its hash and length, reused only when its bytes are equal in full, counted by the tabs using it and removed
+  with the last one. A tab file may only read blobs it stored itself. The snapshot budget counts disk use with
+  each blob once (`TabStore::used`).
 - **Image ids in the painter are per page.** `Painter::forget_images` runs whenever the page changes (show,
   sleep); skipping it shows another page's pixels.
 - **Each profile has its own HTTP cache** (`profiles/<id>/cache`, 0600 files, 200 MB, least recently used out),
@@ -156,6 +162,10 @@ casts), not taken from binding crates. Ask before proposing any dependency.
 
 - **JavaScript is written here** (`crates/js`), not taken from an engine crate: the owner's rule, and it keeps
   memory in our hands. Decided for #12; recorded in README.
+- **Function bodies are parsed on their first call** (`parser::FnBody`): the parser only finds a body's closing
+  brace and keeps its byte range in the script's shared source; `Interp::body_of` parses it once, and a syntax
+  error in it is thrown then. Bundles define far more functions than a page calls, and a parsed body costs
+  about ten times its source (singapay.id: −13 MB). Names and strings in a script are one shared `Word` each.
 - **A page's heap is an arena dropped with the page.** No collector: objects have a ceiling (`OBJECT_LIMIT`),
   scopes of calls that made no closure are popped, every entry (script, handler, timer) has a step limit.
   Past a limit the page's scripts stop for good; the page keeps working without them.

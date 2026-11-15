@@ -705,6 +705,33 @@ mod tests {
     }
 
     #[test]
+    fn parses_function_bodies_when_first_called() {
+        big_stack(|| {
+            let cases = [
+                ("function unused() { this is not javascript } 'the script runs'", "the script runs"),
+                ("function broken() { a b } var r; try { broken() } catch (e) { r = e instanceof SyntaxError } r", "true"),
+                ("function outer(x) { function inner(y) { return () => { return x + y } } return inner(2)() } outer(1)", "3"),
+                ("const o = { m() { return [...(function* () { yield 1; yield 2 })()] } }; o.m()", "[1, 2]"),
+                ("class A { get v() { return 'v' } static s() { return { k: `t${1 + 1}` } } } [new A().v, A.s().k]", "[\"v\", \"t2\"]"),
+                ("function named(a, b) {} [named.length, named.name]", "[2, \"named\"]"),
+            ];
+            for (src, want) in cases {
+                assert_eq!(eval(src), want, "{src}");
+            }
+        });
+        let program =
+            parser::parse("function f() { return 1 } var g = () => { return 2 }").unwrap();
+        let parser::Stmt::Function(f) = &program[0] else {
+            panic!("a function declaration")
+        };
+        assert!(
+            format!("{:?}", f.body).contains("not parsed yet"),
+            "a body waits for its first call"
+        );
+        assert_eq!(f.body.get().unwrap().len(), 1);
+    }
+
+    #[test]
     fn timers_and_logs() {
         let mut host = Bare::default();
         let mut rt = Runtime::new();
