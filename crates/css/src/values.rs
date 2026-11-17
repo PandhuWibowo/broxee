@@ -495,6 +495,9 @@ pub enum Value {
     Underline(bool),
     Position(Position),
     Visible(bool),
+    /// `clip: rect()` leaving at most one pixel either way: the "visually hidden" pattern of
+    /// skip links and screen-reader text. Other rectangles are not applied.
+    ClipHides(bool),
     /// `overflow`: whether it clips, and whether it is anything but `visible`.
     Overflow {
         clips: bool,
@@ -546,6 +549,8 @@ pub enum Prop {
     Visibility,
     Overflow,
     Opacity,
+    /// `clip: rect(...)`, only as far as whether it hides the box (`Value::ClipHides`).
+    Clip,
     BoxSizing,
     FlexDirection,
     FlexWrap,

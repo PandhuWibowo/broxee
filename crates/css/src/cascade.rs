@@ -1858,6 +1858,11 @@ fn compute(
         Some(Value::Initial) => s.visible = true,
         _ => {}
     }
+    // `clip` applies to absolutely positioned boxes only; a rectangle of a pixel or less
+    // hides the box and what is in it, like `opacity: 0` (laid out, not drawn or clicked).
+    if let Some(Value::ClipHides(true)) = get(Prop::Clip) {
+        s.transparent |= matches!(s.position, Position::Absolute | Position::Fixed);
+    }
     if let Some(Value::Number(n)) = get(Prop::Opacity) {
         s.transparent |= n <= 0.01;
         s.opacity = (n * 255.0).round().clamp(0.0, 255.0) as u8;
@@ -2787,6 +2792,23 @@ mod tests {
             first(&dom, &map, "b").transparent,
             "a child cannot undo its parent's opacity: 0"
         );
+        {
+            // The visually hidden pattern: a 1px clip on an absolute box hides it and its content.
+            let (dom, map) = styled(
+                "<a id=skip><b>Skip</b></a><i>static</i><u>wide</u>",
+                "a, u { position: absolute } a, i { clip: rect(1px, 1px, 1px, 1px) } \
+                 u { clip: rect(0 100px 20px 0) }",
+            );
+            assert!(first(&dom, &map, "a").transparent && first(&dom, &map, "b").transparent);
+            assert!(
+                !first(&dom, &map, "i").transparent,
+                "clip applies to absolute boxes only"
+            );
+            assert!(
+                !first(&dom, &map, "u").transparent,
+                "a real rectangle is not a hiding one"
+            );
+        }
         let is = all(&dom, "i");
         assert_eq!(
             map.style(is[0]).custom,
