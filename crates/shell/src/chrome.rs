@@ -1005,6 +1005,15 @@ impl Chrome {
                     pane,
                     ..
                 } => {
+                    // The row's background first: the pane badge's outline goes over it.
+                    if selected {
+                        list.push(Op::Mask {
+                            x: px(ROW_INSET),
+                            y: px(row_top(i) + 1.0),
+                            mask: &masks[&(Shape::Rounded, row_w, row_h)],
+                            color: t.selected,
+                        });
+                    }
                     if let Some(n) = pane {
                         // A small outlined box with the pane's number, left of the close
                         // button's place.
@@ -1036,14 +1045,6 @@ impl Chrome {
                             size: 11.0 * s,
                             font: FontKey::UI_SEMIBOLD,
                             color: t.text_2,
-                        });
-                    }
-                    if selected {
-                        list.push(Op::Mask {
-                            x: px(ROW_INSET),
-                            y: px(row_top(i) + 1.0),
-                            mask: &masks[&(Shape::Rounded, row_w, row_h)],
-                            color: t.selected,
                         });
                     }
                     if *closable {

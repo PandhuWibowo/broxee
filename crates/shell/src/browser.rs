@@ -6190,6 +6190,7 @@ mod tests {
         /// Full frames and header-only frames painted.
         frames: std::cell::Cell<usize>,
         headers: std::cell::Cell<usize>,
+        dark: std::cell::Cell<bool>,
     }
 
     const PAD: usize = 16;
@@ -6204,7 +6205,7 @@ mod tests {
         }
 
         fn dark(&self) -> bool {
-            false
+            self.dark.get()
         }
 
         fn set_title(&self, title: &str) {
@@ -9745,5 +9746,254 @@ mod tests {
         let (at, to) = b.refresh.clone().expect("the header's refresh waits");
         assert!(at > Instant::now() + Duration::from_secs(2));
         assert_eq!(to.unwrap().path, "/next");
+    }
+
+    #[test]
+    fn the_active_tab_row_keeps_its_pane_badge_outline() {
+        let (a, _) = site("badge");
+        let mut b = browser(&a);
+        act(&mut b, command('t'));
+        b.close_palette();
+        act(&mut b, command('1'));
+        act(&mut b, command_shift('2'));
+        b.render();
+        let theme = b.chrome.theme();
+        let line = [theme.text_2.b, theme.text_2.g, theme.text_2.r, 255];
+        // Outline pixels in the badge's place (left of the close button) on each tab row.
+        // Rows with a close button (the active one) keep its place free.
+        let outline = |b: &Browser<FakeScreen>, row: usize, closable: bool| {
+            let top = chrome::LIST_TOP as usize + row * chrome::TAB_ROW as usize;
+            let right = SIDEBAR_WIDTH as usize - 8 - if closable { 24 } else { 8 };
+            (top..top + chrome::TAB_ROW as usize)
+                .flat_map(|y| (right - 18..right + 2).map(move |x| (x, y)))
+                .filter(|&(x, y)| b.window.pixel(x, y) == line)
+                .count()
+        };
+        let active = b.profiles[b.profile].active;
+        assert!(
+            outline(&b, active, true) >= 40,
+            "the selected row draws the box over its background"
+        );
+        assert!(outline(&b, 1 - active, false) >= 40);
+    }
+
+    /// Not a check: renders the window in many states to PNGs for a person to look at.
+    /// `UI_TOUR=dir cargo test -p shell -- --ignored ui_tour`
+    #[test]
+    #[ignore]
+    fn ui_tour() {
+        let Ok(dir) = std::env::var("UI_TOUR") else {
+            return;
+        };
+        for dark in [false, true] {
+            tour(&dir, dark);
+        }
+    }
+
+    fn tour(dir: &str, dark: bool) {
+        let mode = if dark { "dark" } else { "light" };
+        let page = page_file(
+            &format!("tour-{mode}"),
+            ("<title>Tour page</title><style>body { font: 16px/1.5 sans-serif; margin: 24px }</style>\
+             <h1>A heading for the tour</h1>\
+             <p>Some <a href=\"page.html#a\">link text</a> in a paragraph, and <b>bold</b> and \
+             <a href=\"https://example.com/a/very/long/path/that/goes/on/and/on?with=query&and=more\">\
+             a long link</a>.</p>\
+             <form><p><input name=q placeholder=\"Search here\"> <button>Send</button></p>\
+             <p><select name=s><option>First option<option>Second option<option>Third</select>\
+             <label><input type=checkbox checked> Check</label> \
+             <label><input type=radio name=r> Radio</label></p>\
+             <p><textarea rows=3 cols=30>Text area</textarea></p></form>"
+                .to_string()
+                + &"<p>More text to scroll through on the page.</p>".repeat(30))
+                .as_str(),
+        );
+        let root = std::env::temp_dir().join(format!("broxee-tour-{}-{mode}", std::process::id()));
+        let store = TabStore::open(&root).expect("a folder for sleeping tabs");
+        let opts = Options {
+            target: page.display().to_string(),
+            more: Vec::new(),
+            tree: false,
+            styles: false,
+            layout: false,
+            png: None,
+            tiles: None,
+            paint: false,
+            window: true,
+            depth: 8,
+            width: 1100.0,
+            height: 700.0,
+            scale: 2.0,
+            fetch_css: false,
+            panes: 1,
+            cache: None,
+            record: None,
+            replay: None,
+        };
+        let screen = FakeScreen::default();
+        screen.dark.set(dark);
+        let mut b = Browser::new(opts, screen, None, Some(store));
+        b.start();
+        b.wait_for_load();
+        b.handle(Event::Resize {
+            width: 1100.0,
+            height: 700.0,
+            scale: 2.0,
+        });
+        let shot = |b: &mut Browser<FakeScreen>, name: &str| {
+            b.render();
+            let frame = b.window.frame.borrow();
+            let stride = frame.0 * 4 + PAD;
+            let rgba: Vec<u8> = (0..frame.1)
+                .flat_map(|y| {
+                    frame.2[y * stride..y * stride + frame.0 * 4]
+                        .chunks(4)
+                        .flat_map(|p| [p[2], p[1], p[0], 255])
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let path = format!("{dir}/{mode}-{name}.png");
+            std::fs::write(path, paint::png::encode(frame.0, frame.1, &rgba)).unwrap();
+        };
+        shot(&mut b, "01-page");
+        // Hover a link: preview at the bottom.
+        let (x, y) = link_point(&b, "a long link");
+        b.handle(Event::Hover { x, y });
+        shot(&mut b, "02-link-preview");
+        // Tooltip on back button.
+        b.handle(Event::Hover {
+            x: f64::from(SIDEBAR_WIDTH) + 14.0,
+            y: 18.0,
+        });
+        if let Some(h) = b.hover.as_mut() {
+            h.shown = true;
+        }
+        shot(&mut b, "03-tooltip");
+        act(&mut b, key(Key::Escape));
+        // Address field.
+        act(&mut b, command('l'));
+        shot(&mut b, "04-address");
+        act(&mut b, key(Key::Escape));
+        // Find.
+        act(&mut b, command('f'));
+        type_text(&mut b, "text");
+        shot(&mut b, "05-find");
+        act(&mut b, key(Key::Escape));
+        // Selection.
+        act(&mut b, command('a'));
+        shot(&mut b, "06-select-all");
+        act(&mut b, key(Key::Escape));
+        // Field focused and typing.
+        let field = box_or_control(&b, 0);
+        act(
+            &mut b,
+            Event::Click {
+                x: field.0,
+                y: field.1,
+            },
+        );
+        type_text(&mut b, "typed");
+        shot(&mut b, "07-field");
+        act(&mut b, key(Key::Escape));
+        // Dropdown.
+        let sel = box_or_control(&b, 2);
+        act(&mut b, Event::Click { x: sel.0, y: sel.1 });
+        shot(&mut b, "08-dropdown");
+        act(&mut b, key(Key::Escape));
+        // More menu.
+        b.open_menu(false);
+        shot(&mut b, "09-menu");
+        b.close_menu();
+        // Bookmark dialog.
+        act(&mut b, command('d'));
+        shot(&mut b, "10-bookmark-dialog");
+        act(&mut b, key(Key::Enter));
+        // Bookmarks panel.
+        act(
+            &mut b,
+            Event::Key(KeyEvent {
+                key: Key::Char('b'),
+                command: true,
+                shift: false,
+                option: true,
+            }),
+        );
+        shot(&mut b, "11-bookmarks-panel");
+        act(
+            &mut b,
+            Event::Key(KeyEvent {
+                key: Key::Char('b'),
+                command: true,
+                shift: false,
+                option: true,
+            }),
+        );
+        // Several tabs, one pinned, one grouped.
+        for _ in 0..3 {
+            let (x, y) = link_point(&b, "link text");
+            act(
+                &mut b,
+                Event::OpenClick {
+                    x,
+                    y,
+                    foreground: false,
+                },
+            );
+        }
+        shot(&mut b, "12-tabs");
+        // Palette with and without a query.
+        act(&mut b, command('k'));
+        shot(&mut b, "13-palette");
+        type_text(&mut b, "tour");
+        shot(&mut b, "14-palette-query");
+        act(&mut b, key(Key::Escape));
+        // New tab.
+        act(&mut b, command('t'));
+        shot(&mut b, "15-new-tab");
+        act(&mut b, key(Key::Escape));
+        act(&mut b, command('w'));
+        // Split views.
+        act(&mut b, command_shift('2'));
+        shot(&mut b, "16-split-2");
+        act(&mut b, command_shift('4'));
+        shot(&mut b, "17-split-4");
+        act(&mut b, command_shift('1'));
+        // New profile dialog.
+        b.run_command(Command::NewProfile);
+        shot(&mut b, "18-profile-dialog");
+        act(&mut b, key(Key::Escape));
+        // Error page.
+        b.open_input("file:///no/such/broxee/page.html");
+        b.wait_for_load();
+        shot(&mut b, "19-error");
+        // Sidebar hidden.
+        act(&mut b, command('\\'));
+        shot(&mut b, "20-no-sidebar");
+        act(&mut b, command('\\'));
+        // Narrow window.
+        b.handle(Event::Resize {
+            width: 520.0,
+            height: 600.0,
+            scale: 2.0,
+        });
+        act(&mut b, command('['));
+        shot(&mut b, "21-narrow");
+    }
+
+    /// The middle of form control `i`, in window points.
+    fn box_or_control(b: &Browser<FakeScreen>, i: usize) -> (f64, f64) {
+        let p = b.page.as_ref().unwrap();
+        let node = p.forms.controls[i].node;
+        let layout = &p.layout;
+        let r = layout
+            .boxes
+            .iter()
+            .find(|bx| bx.node == node)
+            .map(|bx| bx.rect)
+            .expect("the control is laid out");
+        (
+            f64::from(b.pane_left() + r.x + r.width / 2.0),
+            f64::from(r.y + r.height / 2.0 - b.scroll + HEADER_HEIGHT),
+        )
     }
 }
