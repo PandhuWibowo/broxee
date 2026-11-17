@@ -39,6 +39,45 @@ pub fn freeze_clock(epoch_ms: f64) {
     let _ = FROZEN_AT.set(epoch_ms);
 }
 
+/// `location`'s parts of a page address.
+fn location_of(url: &net::Url) -> js::Location {
+    let default_port = matches!(
+        (url.scheme.as_str(), url.port),
+        ("http", 80) | ("https", 443) | ("file", _)
+    );
+    let port = if default_port {
+        String::new()
+    } else {
+        url.port.to_string()
+    };
+    let host = if port.is_empty() {
+        url.host.clone()
+    } else {
+        format!("{}:{port}", url.host)
+    };
+    let (pathname, search) = match url.path.split_once('?') {
+        Some((p, q)) if !q.is_empty() => (p.to_string(), format!("?{q}")),
+        Some((p, _)) => (p.to_string(), String::new()),
+        None => (url.path.clone(), String::new()),
+    };
+    let origin = if url.scheme == "file" {
+        "null".to_string()
+    } else {
+        format!("{}://{host}", url.scheme)
+    };
+    js::Location {
+        href: url.to_string(),
+        origin,
+        protocol: format!("{}:", url.scheme),
+        host,
+        hostname: url.host.clone(),
+        port,
+        pathname,
+        search,
+        hash: String::new(),
+    }
+}
+
 /// The system time zone's offset at UTC time `t` (ms since 1970), in milliseconds to add:
 /// `localtime_r` knows the zone's rules, daylight saving included.
 fn system_offset(t: f64) -> f64 {
@@ -92,6 +131,7 @@ impl PageScript {
                 .map_or(0.0, |d| d.as_secs_f64() * 1000.0)
         });
         let mut runtime = js::Runtime::new();
+        runtime.set_location(&location_of(page));
         // Replays keep UTC: a saved page renders the same in every time zone.
         if FROZEN_AT.get().is_none() {
             runtime.set_time_zone(system_offset);
@@ -661,5 +701,38 @@ mod tests {
             assert_eq!(off % (15.0 * 60_000.0), 0.0, "{off}");
         }
         assert_eq!(system_offset(f64::NAN), 0.0);
+    }
+
+    #[test]
+    fn location_splits_the_address() {
+        let url = net::Url::parse("https://www.bing.com:8443/search?q=meta&x=1").unwrap();
+        let l = location_of(&url);
+        assert_eq!(l.href, "https://www.bing.com:8443/search?q=meta&x=1");
+        assert_eq!(l.origin, "https://www.bing.com:8443");
+        assert_eq!(
+            (l.protocol.as_str(), l.host.as_str()),
+            ("https:", "www.bing.com:8443")
+        );
+        assert_eq!(
+            (l.hostname.as_str(), l.port.as_str()),
+            ("www.bing.com", "8443")
+        );
+        assert_eq!(
+            (l.pathname.as_str(), l.search.as_str()),
+            ("/search", "?q=meta&x=1")
+        );
+        let plain = location_of(&net::Url::parse("https://e.com/a").unwrap());
+        assert_eq!(
+            (
+                plain.port.as_str(),
+                plain.search.as_str(),
+                plain.host.as_str()
+            ),
+            ("", "", "e.com")
+        );
+        assert_eq!(
+            location_of(&net::Url::parse("file:///tmp/a.html").unwrap()).origin,
+            "null"
+        );
     }
 }

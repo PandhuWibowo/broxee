@@ -2905,6 +2905,15 @@ fn install_window(it: &mut Interp) {
     let timing = it.alloc(Some(it.protos.object), Kind::Plain).unwrap_or(0);
     it.set_own(perf, "timing", Value::Obj(timing));
     set_time_origin(it);
+    // Broxee records no performance entries: the lists are empty, marks are not kept.
+    let none: crate::interp::NativeFn = |it, _, _, _| it.new_array(Vec::new());
+    for name in ["getEntries", "getEntriesByType", "getEntriesByName"] {
+        it.method(perf, name, none);
+    }
+    let nothing: crate::interp::NativeFn = |_, _, _, _| Ok(Value::Undefined);
+    for name in ["mark", "measure", "clearMarks", "clearMeasures"] {
+        it.method(perf, name, nothing);
+    }
 
     let navigator = it.alloc(Some(it.protos.object), Kind::Plain).unwrap_or(0);
     it.set_own(g, "navigator", Value::Obj(navigator));
@@ -2918,6 +2927,25 @@ fn install_window(it: &mut Interp) {
     it.set_own(navigator, "language", Value::str("en-US"));
     it.set_own(navigator, "onLine", Value::Bool(true));
     it.set_own(navigator, "cookieEnabled", Value::Bool(false));
+    let (platform, app_version) = if cfg!(target_os = "macos") {
+        (
+            "MacIntel",
+            "5.0 (Macintosh; Intel Mac OS X 10_15_7) Broxee/0.1",
+        )
+    } else {
+        ("Linux x86_64", "5.0 (X11; Linux x86_64) Broxee/0.1")
+    };
+    it.set_own(navigator, "platform", Value::str(platform));
+    it.set_own(navigator, "appVersion", Value::str(app_version));
+    it.set_own(navigator, "appName", Value::str("Netscape"));
+    it.set_own(navigator, "appCodeName", Value::str("Mozilla"));
+    it.set_own(navigator, "product", Value::str("Gecko"));
+    it.set_own(navigator, "vendor", Value::str(""));
+    it.set_own(navigator, "maxTouchPoints", Value::Num(0.0));
+    let languages = it
+        .new_array(vec![Value::str("en-US"), Value::str("en")])
+        .unwrap_or(Value::Undefined);
+    it.set_own(navigator, "languages", languages);
 
     // Storage that lives as long as the page: nothing is written to disk.
     for name in ["localStorage", "sessionStorage"] {
@@ -3181,6 +3209,8 @@ pub fn element_get(
         "readyState" if n == 0 => Value::str("complete"),
         "cookie" if n == 0 => Value::str(&host.cookie()),
         "URL" | "documentURI" if n == 0 => Value::str(&host.url()),
+        // Broxee does not tell pages where the visitor came from.
+        "referrer" if n == 0 => Value::str(""),
         "location" if n == 0 => it.get_value(host, &Value::Obj(it.global), "location")?,
         "defaultView" if n == 0 => Value::Obj(it.global),
         _ if key.starts_with("on") && key.len() > 2 => {
@@ -4171,5 +4201,26 @@ pub(crate) fn set_time_origin(it: &mut Interp) {
         "loadEventEnd",
     ] {
         it.set_own(timing, name, Value::Num(started));
+    }
+}
+
+/// Fill `location` with the page's address, split as `URL` splits it.
+pub(crate) fn set_location(it: &mut Interp, l: &crate::Location) {
+    let g = it.global;
+    let Some(Value::Obj(location)) = it.get_own(g, "location") else {
+        return;
+    };
+    for (name, value) in [
+        ("href", &l.href),
+        ("origin", &l.origin),
+        ("protocol", &l.protocol),
+        ("host", &l.host),
+        ("hostname", &l.hostname),
+        ("port", &l.port),
+        ("pathname", &l.pathname),
+        ("search", &l.search),
+        ("hash", &l.hash),
+    ] {
+        it.set_own(location, name, Value::str(value));
     }
 }

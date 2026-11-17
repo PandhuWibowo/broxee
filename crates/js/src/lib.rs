@@ -87,6 +87,21 @@ pub struct Reply {
     pub body: String,
 }
 
+/// A page's address as `location` shows it: `href` whole, then its parts as the URL
+/// standard splits them (`protocol` ends with `:`, `search` starts with `?` or is empty).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Location {
+    pub href: String,
+    pub origin: String,
+    pub protocol: String,
+    pub host: String,
+    pub hostname: String,
+    pub port: String,
+    pub pathname: String,
+    pub search: String,
+    pub hash: String,
+}
+
 /// The scripts of one page.
 pub struct Runtime {
     interp: Interp,
@@ -111,6 +126,11 @@ impl Runtime {
     /// Whether the page's scripts were stopped, and why.
     pub fn stopped(&self) -> Option<&str> {
         self.interp.stopped.as_deref()
+    }
+
+    /// The page's address, for `location` (scripts read it; they cannot change it).
+    pub fn set_location(&mut self, location: &Location) {
+        builtins::set_location(&mut self.interp, location);
     }
 
     /// The local time zone `Date` uses: milliseconds to add to a UTC time. UTC until set,
@@ -479,6 +499,36 @@ mod tests {
     }
 
     #[test]
+    fn location_and_navigator_answer_as_strings() {
+        let mut rt = Runtime::new();
+        rt.set_location(&Location {
+            href: "https://e.com/a?b=1".into(),
+            origin: "https://e.com".into(),
+            protocol: "https:".into(),
+            host: "e.com".into(),
+            hostname: "e.com".into(),
+            port: String::new(),
+            pathname: "/a".into(),
+            search: "?b=1".into(),
+            hash: String::new(),
+        });
+        let mut host = Bare::default();
+        for (src, want) in [
+            ("location.href.indexOf('?')", "15"),
+            ("location.search.match(/b=(\\d)/)[1]", "1"),
+            ("window.location.pathname + location.hash", "/a"),
+            ("document.location.origin", "https://e.com"),
+            ("typeof document.referrer", "string"),
+            (
+                "navigator.languages[0] + ' ' + typeof navigator.platform",
+                "en-US string",
+            ),
+        ] {
+            assert_eq!(rt.eval_to_string(&mut host, src), want, "{src}");
+        }
+    }
+
+    #[test]
     fn dates_work_in_local_time_and_utc() {
         let cases = [
             ("new Date().getTime()", "1794923640000"),
@@ -543,6 +593,7 @@ mod tests {
             ("typeof Date()", "string"),
             ("performance.timing.navigationStart", "1794923639750"),
             ("performance.timeOrigin", "1794923639750"),
+            ("performance.getEntriesByType('navigation').length", "0"),
             // ToPrimitive: numbers ask valueOf first, strings toString, `+` valueOf except
             // for a Date.
             ("({ valueOf() { return 5 } }) * 2", "10"),

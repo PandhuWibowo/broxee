@@ -10570,14 +10570,22 @@ mod tests {
             x: 600.0,
             y: 300.0,
         });
-        b.run_page_timers();
+        // Two seconds of the page's life: its timers, requests and late images.
+        let until = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < until {
+            b.run_page_timers();
+            b.poll_page_requests();
+            b.poll_images();
+            std::thread::sleep(Duration::from_millis(20));
+        }
         b.render();
         let p = b.page.as_ref().unwrap();
         eprintln!(
-            "scroll {} of {} (page height {})",
+            "scroll {} of {} (page height {}), {} images kept",
             b.scroll,
             b.max_scroll(),
-            p.layout.height
+            p.layout.height,
+            p.images.len()
         );
         let frame = b.window.frame.borrow();
         let stride = frame.0 * 4 + PAD;
