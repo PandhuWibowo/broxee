@@ -375,14 +375,15 @@ pub fn load_with(
 /// What a load gave: the built page, or, once it was sent to the background, what the page
 /// is built from (a partial snapshot) and its title.
 pub enum Outcome {
-    Page(Loaded),
-    Downloaded(Snapshot, Option<String>),
+    /// Both boxed: the two are large, and different in size.
+    Page(Box<Loaded>),
+    Downloaded(Box<Snapshot>, Option<String>),
 }
 
 impl Outcome {
     fn page(self) -> Option<Loaded> {
         match self {
-            Outcome::Page(page) => Some(page),
+            Outcome::Page(page) => Some(*page),
             Outcome::Downloaded(..) => None,
         }
     }
@@ -564,7 +565,7 @@ fn finish(
     if downloading() {
         let title = dom.title();
         return Some(Outcome::Downloaded(
-            Snapshot {
+            Box::new(Snapshot {
                 url: source.url,
                 status: source.status,
                 sources: Sources {
@@ -575,7 +576,7 @@ fn finish(
                     partial: true,
                 },
                 images,
-            },
+            }),
             title,
         ));
     }
@@ -607,7 +608,7 @@ fn finish(
     webfonts.plan(&styles, fonts);
     let (layout, layout_ms) = lay_out(&dom, &styles, &images, &webfonts, settings, fonts);
     progress(0.95);
-    Some(Outcome::Page(Loaded {
+    Some(Outcome::Page(Box::new(Loaded {
         url: source.url,
         base,
         refresh_header: None,
@@ -636,7 +637,7 @@ fn finish(
         cascade_ms,
         fonts_wait_ms,
         layout_ms,
-    }))
+    })))
 }
 
 /// Cascade and lay out again, for a new viewport size or color scheme. `@media` rules can

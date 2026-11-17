@@ -4132,6 +4132,15 @@ impl<S: Screen> Browser<S> {
             });
         }
         items.extend(palette::rank(&query, self.palette_candidates()));
+        // With matches, searching the web stays one row away; with none, Enter does it.
+        if !items.is_empty() && parse_input(&query).is_err() && !query.trim().is_empty() {
+            items.push(palette::Item {
+                title: format!("Search the web for \"{}\"", query.trim()),
+                detail: "Bing".into(),
+                hint: Hint::Label(String::new()),
+                action: Action::Open(search_url(query.trim())),
+            });
+        }
         if let Some(p) = self.palette.as_mut() {
             p.items = items;
             p.selected = 0;
@@ -4262,6 +4271,17 @@ impl<S: Screen> Browser<S> {
             Key::Tab => step(p, if k.shift { -1 } else { 1 }),
             Key::PageDown => step(p, rows as isize),
             Key::PageUp => step(p, -(rows as isize)),
+            Key::Enter if p.items.is_empty() => {
+                // Nothing matches: Enter searches the web (DESIGN.md, section 9).
+                let query = p.query.text.trim().to_string();
+                if query.is_empty() {
+                    return false;
+                }
+                self.close_palette();
+                self.save_scroll();
+                self.navigate(search_url(&query), Destination::Push);
+                return true;
+            }
             Key::Enter => {
                 let selected = p.selected;
                 return self.activate(selected);
@@ -4367,15 +4387,21 @@ impl<S: Screen> Browser<S> {
         self.navigate(url, Destination::Entry(index));
     }
 
-    /// What the user typed in the address field.
+    /// What the user typed in the address field: an address, or else words to search for.
+    /// Several addresses pasted together are neither.
     fn open_input(&mut self, input: &str) {
-        match parse_input(input) {
-            Ok(url) => {
-                self.save_scroll();
-                self.navigate(url, Destination::Push);
+        let url = match parse_input(input) {
+            Ok(url) => url,
+            Err(_) if engine::several_addresses(input.trim()).is_ok() => {
+                if input.trim().is_empty() {
+                    return;
+                }
+                search_url(input.trim())
             }
-            Err(message) => self.show_message("Broxee can't search yet", &message),
-        }
+            Err(message) => return self.show_message("Broxee can't open that", &message),
+        };
+        self.save_scroll();
+        self.navigate(url, Destination::Push);
     }
 
     /// Start loading `url` on its own thread; `to` says where it goes in the history when it
@@ -4514,9 +4540,9 @@ impl<S: Screen> Browser<S> {
         }
         // Sent to the background and brought back after it stopped building: build it now.
         let result = match result {
-            Ok(engine::Outcome::Page(page)) => Ok(page),
+            Ok(engine::Outcome::Page(page)) => Ok(*page),
             Ok(engine::Outcome::Downloaded(snapshot, _)) => {
-                return self.build_downloaded(snapshot, load.to);
+                return self.build_downloaded(*snapshot, load.to);
             }
             Err(e) => Err(e),
         };
@@ -4635,7 +4661,7 @@ impl<S: Screen> Browser<S> {
     /// The visible tab is being left while it loads: its load goes on downloading in the
     /// background, unless it posts a form or `BACKGROUND_LOADS` are running (the oldest
     /// stops).
-    fn to_background(&mut self) {
+    fn send_load_to_background(&mut self) {
         let Some(load) = self.load.take() else {
             return;
         };
@@ -4735,10 +4761,10 @@ impl<S: Screen> Browser<S> {
         let (url, title, snapshot) = match result {
             Ok(engine::Outcome::Page(page)) => {
                 let title = page.dom.title();
-                (page.url.clone(), title, Some(engine::snapshot(page)))
+                (page.url.clone(), title, Some(engine::snapshot(*page)))
             }
             Ok(engine::Outcome::Downloaded(snapshot, title)) => {
-                (snapshot.url.clone(), title, Some(snapshot))
+                (snapshot.url.clone(), title, Some(*snapshot))
             }
             Err(_) => (load.url.clone(), None, None),
         };
@@ -4782,7 +4808,7 @@ impl<S: Screen> Browser<S> {
 
     /// Put the visible tab to sleep: keep what rebuilds its page, drop the page.
     fn sleep(&mut self) {
-        self.to_background();
+        self.send_load_to_background();
         self.refresh = None;
         self.offline_retry = None;
         self.save_scroll();
@@ -5422,10 +5448,9 @@ impl<S: Screen> Browser<S> {
             cursor: p.query.cursor,
             rows: &palette_rows,
             selected: (!p.items.is_empty()).then(|| p.selected - p.first),
-            // Honest until a search engine is chosen (DESIGN.md asks for web search).
             empty: nothing
                 .as_deref()
-                .map(|line| (line, "Broxee can't search the web yet.")),
+                .map(|line| (line, "Press Enter to search the web.")),
         });
         // The focused link's rectangles in page-area points.
         let ring: Vec<(f32, f32, f32, f32)> = self.link_focus.as_ref().map_or(Vec::new(), |l| {
@@ -6290,6 +6315,15 @@ fn link_rects(
 }
 
 /// Typed text to a URL: full URLs as they are, `example.com` as https.
+/// The search engine's results for `query`. Bing answers without JavaScript, which Google's
+/// results page needs; DuckDuckGo is blocked on some networks (Indonesia). A choice of
+/// engine belongs in settings once they exist.
+fn search_url(query: &str) -> net::Url {
+    let q = forms::urlencode(&[("q".to_string(), query.to_string())]);
+    net::Url::parse(&format!("https://www.bing.com/search?{q}"))
+        .expect("an encoded query is a valid address")
+}
+
 fn parse_input(input: &str) -> Result<net::Url, String> {
     let input = input.trim();
     engine::several_addresses(input)?;
@@ -7059,12 +7093,14 @@ mod tests {
             .text_content(html::Dom::ROOT)
             .contains("Try again"));
 
+        // Two addresses pasted together are neither an address nor a search.
         act(&mut b, command('l'));
-        for c in "what is rust".chars() {
-            act(&mut b, key(Key::Char(c)));
-        }
+        act(
+            &mut b,
+            Event::Paste("https://a.com/x https://b.com/".into()),
+        );
         act(&mut b, key(Key::Enter));
-        assert_eq!(title(&b), "Broxee can't search yet");
+        assert_eq!(title(&b), "Broxee can't open that");
     }
 
     #[test]
@@ -8598,8 +8634,20 @@ mod tests {
         type_text(&mut b, "zzqx");
         assert!(results(&b).is_empty());
         b.render();
-        assert!(!act(&mut b, key(Key::Enter)), "nothing to open");
-        assert!(b.palette.is_some());
+        // Enter would search the web (no network in tests): only check where it goes.
+        assert_eq!(
+            search_url("zzqx").to_string(),
+            "https://www.bing.com/search?q=zzqx"
+        );
+        // A query that matches something keeps search as its last row.
+        for _ in 0..4 {
+            act(&mut b, key(Key::Backspace));
+        }
+        type_text(&mut b, "page");
+        assert_eq!(
+            results(&b).last().map(String::as_str),
+            Some("Search the web for \"page\"")
+        );
 
         for _ in 0..4 {
             act(&mut b, key(Key::Backspace));
@@ -9541,6 +9589,14 @@ mod tests {
             "https://a.com/my%20page"
         );
         assert!(parse_input("").is_err());
+    }
+
+    #[test]
+    fn searches_encode_the_words() {
+        assert_eq!(
+            search_url("rust & c++ 100%").to_string(),
+            "https://www.bing.com/search?q=rust+%26+c%2B%2B+100%25"
+        );
     }
 
     #[test]
