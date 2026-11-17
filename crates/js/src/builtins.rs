@@ -2963,7 +2963,13 @@ fn install_window(it: &mut Interp) {
 
     let navigator = it.alloc(Some(it.protos.object), Kind::Plain).unwrap_or(0);
     it.set_own(g, "navigator", Value::Obj(navigator));
-    it.set_own(navigator, "userAgent", Value::str("Mozilla/5.0 Broxee"));
+    // The same as the User-Agent header (`net::USER_AGENT`); js does not depend on net.
+    let agent = if cfg!(target_os = "macos") {
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Broxee/0.1"
+    } else {
+        "Mozilla/5.0 (X11; Linux x86_64) Broxee/0.1"
+    };
+    it.set_own(navigator, "userAgent", Value::str(agent));
     it.set_own(navigator, "language", Value::str("en-US"));
     it.set_own(navigator, "onLine", Value::Bool(true));
     it.set_own(navigator, "cookieEnabled", Value::Bool(false));

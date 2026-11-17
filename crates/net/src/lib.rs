@@ -26,7 +26,14 @@ pub use psl::site;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
-const USER_AGENT: &str = "Broxee/0.1";
+/// How Broxee names itself to servers. It starts like every browser's (`Mozilla/5.0` and the
+/// platform) because some sites treat anything else as a robot: Bing answered `Broxee/0.1`
+/// with unrelated results. It claims no other engine (no WebKit, Safari or Chrome), so sites
+/// do not send code written for one. `navigator.userAgent` says the same (js `builtins.rs`).
+#[cfg(target_os = "macos")]
+pub const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Broxee/0.1";
+#[cfg(not(target_os = "macos"))]
+pub const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) Broxee/0.1";
 const MAX_REDIRECTS: usize = 10;
 
 #[derive(Debug, Clone, PartialEq)]
