@@ -189,6 +189,9 @@ struct Tab {
     pinned: bool,
     /// The tab group it belongs to, by name.
     group: Option<String>,
+    /// Opened in the background from a link on another site and not loaded yet: its first
+    /// load does not carry SameSite=Strict cookies, as if the link had been followed.
+    cross_site_start: bool,
 }
 
 impl Default for Tab {
@@ -204,6 +207,7 @@ impl Default for Tab {
             focused_link: None,
             pinned: false,
             group: None,
+            cross_site_start: false,
         }
     }
 }
@@ -773,6 +777,13 @@ struct Browser<S: Screen> {
     /// Window size, header rows, sidebar edge and pane count of the last full frame: a
     /// header alone, or a pane's old pixels, can be reused only while these hold.
     frame_geometry: Option<Geometry>,
+    /// The address of the link under the pointer, shown at the bottom of the pane.
+    link_preview: Option<String>,
+    /// Where the pointer last rested over the focused pane (pane-relative, as `route` gives).
+    last_pointer: Option<(f32, f32)>,
+    /// Tabs opened from links of one tab in a row (its id, how many): the next one goes
+    /// after them, so links open in the order they were clicked.
+    opened: (u64, usize),
 }
 
 impl<S: Screen> Browser<S> {
@@ -836,6 +847,9 @@ impl<S: Screen> Browser<S> {
             handle_hover: None,
             sidebar_scroll: 0.0,
             drag: None,
+            link_preview: None,
+            last_pointer: None,
+            opened: (0, 0),
             selection: None,
             find: None,
             dropdown: None,
@@ -1219,6 +1233,9 @@ impl<S: Screen> Browser<S> {
                 true
             }
             Event::Click { x, y } => self.click(x as f32, y as f32),
+            Event::OpenClick { x, y, foreground } => {
+                self.open_click(x as f32, y as f32, foreground)
+            }
             Event::Key(key) => self.key(key),
             Event::Paste(text) => {
                 let line = text.trim().lines().next().unwrap_or_default();
@@ -1320,6 +1337,7 @@ impl<S: Screen> Browser<S> {
         let (x, y) = match event {
             Event::Click { x, y }
             | Event::ShiftClick { x, y }
+            | Event::OpenClick { x, y, .. }
             | Event::Hover { x, y }
             | Event::Drag { x, y }
             | Event::Release { x, y }
@@ -1349,8 +1367,10 @@ impl<S: Screen> Browser<S> {
         };
         if j != self.focused.min(rects.len() - 1) {
             return Err(match event {
-                Event::Click { .. } => self.focus_pane(j),
-                Event::Hover { .. } => self.hover.take().is_some_and(|h| h.shown),
+                Event::Click { .. } | Event::OpenClick { .. } => self.focus_pane(j),
+                Event::Hover { .. } => {
+                    self.hover.take().is_some_and(|h| h.shown) | self.link_preview.take().is_some()
+                }
                 _ => false,
             });
         }
@@ -1358,6 +1378,11 @@ impl<S: Screen> Browser<S> {
         Ok(match event {
             Event::Click { x, y } => Event::Click { x, y: y - top },
             Event::ShiftClick { x, y } => Event::ShiftClick { x, y: y - top },
+            Event::OpenClick { x, y, foreground } => Event::OpenClick {
+                x,
+                y: y - top,
+                foreground,
+            },
             Event::Hover { x, y } => Event::Hover { x, y: y - top },
             Event::Drag { x, y } => Event::Drag { x, y: y - top },
             Event::Release { x, y } => Event::Release { x, y: y - top },
@@ -1419,6 +1444,7 @@ impl<S: Screen> Browser<S> {
             self.close_palette();
         }
         self.hover = None;
+        self.link_preview = None;
         self.focused = j;
         let pane = self.panes[j];
         let profile = pane.profile.min(self.profiles.len() - 1);
@@ -1716,8 +1742,12 @@ impl<S: Screen> Browser<S> {
             }
             return true;
         }
-        if let Some(url) = self.link_at(x, y - HEADER_HEIGHT) {
-            self.follow(url);
+        if let Some((url, blank)) = self.link_hit(x, y - HEADER_HEIGHT) {
+            if blank {
+                self.open_in_tab(url, true);
+            } else {
+                self.follow(url);
+            }
             return true;
         }
         if let Some(find) = self.find.as_mut() {
@@ -2886,6 +2916,7 @@ impl<S: Screen> Browser<S> {
                         }
                     },
                 },
+                Key::Up | Key::Down | Key::Left | Key::Right => self.command_arrow(k.key, k.shift),
                 Key::Char('c') => self.copy_selection(),
                 Key::Char('x') => self.cut_field(),
                 Key::Char('f') => self.open_find(),
@@ -2999,6 +3030,42 @@ impl<S: Screen> Browser<S> {
             Key::Home => self.scroll_to(0.0),
             Key::End => self.scroll_to(f32::MAX),
             _ => false,
+        }
+    }
+
+    /// ⌘ with an arrow. In a text field (the address, find, or a form field) it moves the caret
+    /// to the start or end, extending the selection with Shift; on the page ⌘↑ / ⌘↓ go to its
+    /// top and bottom and ⌘← / ⌘→ go back and forward, as in Safari.
+    fn command_arrow(&mut self, key: Key, shift: bool) -> bool {
+        let to_start = matches!(key, Key::Up | Key::Left);
+        let header_field = match self.find.as_mut().filter(|f| f.focused) {
+            Some(find) => Some(&mut find.field),
+            None => self.field.as_mut(),
+        };
+        if let Some(field) = header_field {
+            let to = if to_start { 0 } else { field.text.len() };
+            field.move_to(to, shift);
+            self.header_change = true;
+            return true;
+        }
+        if let Some(i) = self.focused_control() {
+            if self.editing.is_none() {
+                // A select or a button: arrows are its own.
+                return false;
+            }
+            let k = KeyEvent {
+                key: if to_start { Key::Home } else { Key::End },
+                command: false,
+                shift,
+                option: false,
+            };
+            return self.control_key(i, k).unwrap_or(false);
+        }
+        match key {
+            Key::Up => self.scroll_to(0.0),
+            Key::Down => self.scroll_to(f32::MAX),
+            Key::Left => self.back(),
+            _ => self.forward(),
         }
     }
 
@@ -3123,6 +3190,71 @@ impl<S: Screen> Browser<S> {
             .map(|p| net::site(&p.url.host).to_string());
         let same_site = from.is_none_or(|from| from == net::site(&url.host));
         self.navigate_from(url, Destination::Push, same_site);
+    }
+
+    /// ⌘-click or middle click: a link under the pointer opens in a new tab, in the background
+    /// unless `foreground`. Anywhere else it is a plain click.
+    fn open_click(&mut self, x: f32, y: f32, foreground: bool) -> bool {
+        let left = self.pane_left();
+        let overlay = self.dropdown.is_some()
+            || self.menu.is_some()
+            || self.dialog.is_some()
+            || self.palette.is_some();
+        if !overlay && x >= left && y >= HEADER_HEIGHT {
+            if let Some(url) = self.link_at(x - left, y - HEADER_HEIGHT) {
+                self.open_in_tab(url, foreground);
+                return true;
+            }
+        }
+        self.click(x, y)
+    }
+
+    /// Open `url`, a link of the visible page, in a new tab after the visible one (and after
+    /// the tabs already opened from it). A background tab is only its history until selected.
+    fn open_in_tab(&mut self, url: net::Url, foreground: bool) {
+        let cross_site = self
+            .page
+            .as_ref()
+            .is_some_and(|p| net::site(&p.url.host) != net::site(&url.host));
+        let p = &self.profiles[self.profile];
+        let source = &p.tabs[p.active];
+        let count = if self.opened.0 == source.id {
+            self.opened.1
+        } else {
+            0
+        };
+        let group = source.group.clone().filter(|_| !source.pinned);
+        let tab = Tab {
+            history: vec![Entry {
+                url: url.clone(),
+                scroll: 0.0,
+                title: String::new(),
+            }],
+            title: host_of(&url),
+            group,
+            cross_site_start: cross_site,
+            ..Tab::default()
+        };
+        let id = tab.id;
+        self.opened = (source.id, count + 1);
+        let at = (p.active + 1 + count).min(p.tabs.len());
+        if foreground {
+            self.sleep();
+        }
+        let p = &mut self.profiles[self.profile];
+        p.tabs.insert(at, tab);
+        if at <= p.active {
+            p.active += 1;
+        }
+        p.normalize();
+        if foreground {
+            let p = &mut self.profiles[self.profile];
+            p.active = p.tabs.iter().position(|t| t.id == id).unwrap_or(p.active);
+            self.wake();
+            self.reveal_active_tab();
+        } else {
+            self.save_session();
+        }
     }
 
     /// Run a command, from its shortcut or the palette.
@@ -3559,10 +3691,27 @@ impl<S: Screen> Browser<S> {
         Some(text.to_string())
     }
 
+    /// The address of the link under the pointer, for the preview at the bottom of the pane.
+    fn preview_at(&self, x: f32, y: f32) -> Option<String> {
+        let left = self.pane_left();
+        if x < left || y < HEADER_HEIGHT || self.drag.is_some() {
+            return None;
+        }
+        if self.menu.is_some() || self.palette.is_some() || self.dialog.is_some() {
+            return None;
+        }
+        self.link_at(x - left, y - HEADER_HEIGHT)
+            .map(|url| url.to_string())
+    }
+
     /// The pointer moved: start waiting for a new tooltip, or hide the one shown.
     fn hover_at(&mut self, x: f32, y: f32) -> bool {
         let hovered = self.state_target(x, y, css::HOVER);
         let restyled = self.set_states(|s| s.hover = hovered);
+        let preview = self.preview_at(x, y);
+        self.last_pointer = Some((x, y));
+        let restyled = restyled | (preview != self.link_preview);
+        self.link_preview = preview;
         let text = self.tooltip_at(x, y);
         let same = self.hover.as_ref().map(|h| &h.text) == text.as_ref();
         if same {
@@ -4427,8 +4576,10 @@ impl<S: Screen> Browser<S> {
         }
         match entry {
             Some(entry) => {
-                let index = self.tab().index;
-                self.navigate(entry.url, Destination::Entry(index));
+                let tab = self.tab_mut();
+                let index = tab.index;
+                let same_site = !std::mem::take(&mut tab.cross_site_start);
+                self.navigate_from(entry.url, Destination::Entry(index), same_site);
             }
             None => {
                 // A new tab: the palette over an empty pane (DESIGN.md, section 7).
@@ -4632,6 +4783,7 @@ impl<S: Screen> Browser<S> {
             self.header_change = true;
         }
         self.link_focus = None;
+        self.link_preview = None;
         self.editing = None;
         self.loading = None;
         self.scroll = scroll;
@@ -4660,7 +4812,13 @@ impl<S: Screen> Browser<S> {
     /// topmost fragment wins: later layers paint over earlier ones, and fixed layers do not
     /// scroll. Hidden fragments cannot be clicked.
     fn link_at(&self, x: f32, y_view: f32) -> Option<net::Url> {
+        self.link_hit(x, y_view).map(|(url, _)| url)
+    }
+
+    /// `link_at`, saying too whether the link asks for a new tab (`target=_blank`).
+    fn link_hit(&self, x: f32, y_view: f32) -> Option<(net::Url, bool)> {
         let page = self.page.as_ref()?;
+        let hit = |node| link_for(page, node).map(|url| (url, opens_new_tab(page, node)));
         let layout = &page.layout;
         let metrics = page.metrics(&self.fonts);
         let doc_y = |fixed: bool| if fixed { y_view } else { y_view + self.scroll };
@@ -4680,7 +4838,7 @@ impl<S: Screen> Browser<S> {
                 && (t.x..=t.x + t.width).contains(&x)
                 && (top..=bottom).contains(&y)
             {
-                return link_for(page, t.node);
+                return hit(t.node);
             }
         }
         // Innermost boxes come last in document order; an outer <a> can still wrap them.
@@ -4693,7 +4851,7 @@ impl<S: Screen> Browser<S> {
                 let st = page.styles.style(layout.boxes[i].node);
                 st.visible && !st.transparent
             })
-            .then(|| link_for(page, layout.boxes[i].node))
+            .then(|| hit(layout.boxes[i].node))
             .flatten()
         })
     }
@@ -5019,6 +5177,12 @@ impl<S: Screen> Browser<S> {
                 }
             }
         });
+        // The pointer, in the page area's points, so the preview can move out of its way.
+        let preview = self.link_preview.as_deref();
+        let pane_left = self.pane_left();
+        let preview_at = self
+            .last_pointer
+            .map(|(x, y)| (x - pane_left, y - HEADER_HEIGHT));
         let (painter, chrome) = (&mut self.painter, &mut self.chrome);
         let blank = chrome.theme().surface;
         let line = chrome.theme().line;
@@ -5129,6 +5293,16 @@ impl<S: Screen> Browser<S> {
                         scale,
                     };
                     chrome.draw_caret(painter, frame, caret);
+                }
+                if let (Some(url), true) = (preview, page_rows > 0) {
+                    let frame = Frame {
+                        pixels: &mut *bottom,
+                        stride,
+                        left: pane_x,
+                        width: pane_px,
+                        scale,
+                    };
+                    chrome.draw_link_preview(painter, frame, &fonts.ui(), preview_at, url);
                 }
                 let frame = Frame {
                     pixels: top,
@@ -5699,6 +5873,22 @@ fn link_for(page: &Loaded, node: NodeId) -> Option<net::Url> {
         current = page.dom.parent(id);
     }
     None
+}
+
+/// Whether the link around `node` asks to open in a new tab: `target="_blank"`. Other
+/// names would open in a window of that name; Broxee follows those in place.
+fn opens_new_tab(page: &Loaded, node: NodeId) -> bool {
+    let mut current = Some(node);
+    while let Some(id) = current {
+        if page.dom.tag_name(id) == Some("a") {
+            return page
+                .dom
+                .attr(id, "target")
+                .is_some_and(|t| t.trim().eq_ignore_ascii_case("_blank"));
+        }
+        current = page.dom.parent(id);
+    }
+    false
 }
 
 /// The links Tab can reach, in document order: `<a href>` elements that are visible and have
@@ -8997,5 +9187,215 @@ mod tests {
             escape("<a href=\"x\">&"),
             "&lt;a href=&quot;x&quot;&gt;&amp;"
         );
+    }
+
+    fn command_key(key: Key, shift: bool) -> Event {
+        Event::Key(KeyEvent {
+            key,
+            command: true,
+            shift,
+            option: false,
+        })
+    }
+
+    #[test]
+    fn keyboard_scrolls_the_page_and_command_arrows_reach_its_ends() {
+        let (a, _) = site("keyboard-scrolling");
+        let mut b = browser(&a);
+        let max = b.max_scroll();
+        assert!(max > 0.0, "page A is taller than the pane");
+        let page = b.page_height() - PAGE_OVERLAP;
+
+        act(&mut b, key(Key::Down));
+        assert_eq!(b.scroll, LINE_STEP);
+        act(&mut b, key(Key::Char(' ')));
+        assert_eq!(b.scroll, LINE_STEP + page);
+        act(
+            &mut b,
+            Event::Key(KeyEvent {
+                key: Key::Char(' '),
+                command: false,
+                shift: true,
+                option: false,
+            }),
+        );
+        assert_eq!(b.scroll, LINE_STEP);
+        act(&mut b, key(Key::PageDown));
+        assert_eq!(b.scroll, LINE_STEP + page);
+        act(&mut b, key(Key::Home));
+        assert_eq!(b.scroll, 0.0);
+        act(&mut b, key(Key::End));
+        assert_eq!(b.scroll, max);
+
+        act(&mut b, command_key(Key::Up, false));
+        assert_eq!(b.scroll, 0.0, "⌘↑ goes to the top");
+        act(&mut b, command_key(Key::Down, false));
+        assert_eq!(b.scroll, max, "⌘↓ goes to the bottom");
+        act(&mut b, command_key(Key::Up, false));
+
+        // ⌘← and ⌘→ go back and forward on the page...
+        click_text(&mut b, "Go to B");
+        assert_eq!(title(&b), "Page B");
+        act(&mut b, command_key(Key::Left, false));
+        assert_eq!(title(&b), "Page A");
+        act(&mut b, command_key(Key::Right, false));
+        assert_eq!(title(&b), "Page B");
+
+        // ...and move the caret in a field instead.
+        act(&mut b, command('l'));
+        act(&mut b, key(Key::Char('x')));
+        act(&mut b, command_key(Key::Left, false));
+        assert_eq!(b.field.as_ref().map(|f| f.cursor), Some(0));
+        act(&mut b, command_key(Key::Right, true));
+        let field = b.field.as_ref().unwrap();
+        assert_eq!(field.cursor, field.text.len());
+        assert_eq!(field.selection(), Some((0, 1)), "⌘⇧→ selects to the end");
+        assert_eq!(title(&b), "Page B", "the caret moved, the page did not");
+    }
+
+    fn link_point(b: &Browser<FakeScreen>, text: &str) -> (f64, f64) {
+        let page = b.page.as_ref().expect("a page is loaded");
+        let run = page
+            .layout
+            .texts
+            .iter()
+            .find(|t| page.layout.text(t).contains(text))
+            .expect("text on the page");
+        (
+            f64::from(SIDEBAR_WIDTH + run.x + run.width / 2.0),
+            f64::from(run.baseline - 4.0 - b.scroll + HEADER_HEIGHT),
+        )
+    }
+
+    fn links_page(name: &str) -> PathBuf {
+        let page = page_file(
+            name,
+            "<title>Links</title><style>body { margin: 0 } p { margin: 0; line-height: 20px }
+             </style><p><a href=\"one.html\">One</a></p><p><a href=\"two.html\">Two</a></p>
+             <p><a href=\"three.html\">Three</a></p><p><a href=\"new.html\" target=\"_BLANK\">
+             New</a></p><p>Plain text</p>",
+        );
+        let dir = page.parent().unwrap();
+        for name in ["one", "two", "three", "new"] {
+            std::fs::write(
+                dir.join(format!("{name}.html")),
+                format!("<title>Page {name}</title>"),
+            )
+            .unwrap();
+        }
+        page
+    }
+
+    #[test]
+    fn command_and_middle_clicks_open_links_in_background_tabs() {
+        let page = links_page("open-click");
+        let mut b = browser(&page);
+        for text in ["One", "Two", "Three"] {
+            let (x, y) = link_point(&b, text);
+            assert!(act(
+                &mut b,
+                Event::OpenClick {
+                    x,
+                    y,
+                    foreground: false
+                }
+            ));
+        }
+        assert_eq!(
+            tab_titles(&b),
+            ["Links", "one.html", "two.html", "three.html"],
+            "in the order they were clicked, after the page"
+        );
+        assert_eq!(b.profiles[b.profile].active, 0);
+        assert_eq!(title(&b), "Links", "the page stays");
+        assert!(b.load.is_none(), "background tabs load when selected");
+
+        act(&mut b, command('3'));
+        assert_eq!(title(&b), "Page two");
+        act(&mut b, command('1'));
+
+        // ⌘⇧-click (and Shift with the middle button) opens in front.
+        let (x, y) = link_point(&b, "Three");
+        act(
+            &mut b,
+            Event::OpenClick {
+                x,
+                y,
+                foreground: true,
+            },
+        );
+        assert_eq!(title(&b), "Page three");
+        assert_eq!(b.profiles[b.profile].active, 4);
+
+        // Not on a link, it is a plain click.
+        act(&mut b, command('1'));
+        let tabs = b.profiles[b.profile].tabs.len();
+        let (x, y) = link_point(&b, "Plain");
+        act(
+            &mut b,
+            Event::OpenClick {
+                x,
+                y,
+                foreground: false,
+            },
+        );
+        assert_eq!(b.profiles[b.profile].tabs.len(), tabs);
+        assert_eq!(title(&b), "Links");
+    }
+
+    #[test]
+    fn target_blank_opens_a_new_tab_in_front() {
+        let page = links_page("target-blank");
+        let mut b = browser(&page);
+        let (x, y) = link_point(&b, "New");
+        act(&mut b, Event::Click { x, y });
+        assert_eq!(tab_titles(&b), ["Links", "Page new"]);
+        assert_eq!(b.profiles[b.profile].active, 1);
+        act(&mut b, command('['));
+        assert_eq!(
+            title(&b),
+            "Page new",
+            "a new tab has no history to go back to"
+        );
+    }
+
+    #[test]
+    fn hovering_a_link_previews_its_address_at_the_bottom_of_the_pane() {
+        let page = links_page("link-preview");
+        let mut b = browser(&page);
+        b.render();
+        // The panel's outline, left of the pane's bottom edge.
+        let (px, py) = (SIDEBAR_WIDTH as usize + 14, 300 - 4 - 24);
+        let page_bg = b.window.pixel(px, py);
+
+        let (x, y) = link_point(&b, "Two");
+        assert!(act(&mut b, Event::Hover { x, y }), "a preview appears");
+        let url = b.link_preview.clone().expect("a preview");
+        assert!(
+            url.starts_with("file://") && url.ends_with("/two.html"),
+            "{url}"
+        );
+        b.render();
+        let line = b.chrome.theme().line;
+        assert_eq!(b.window.pixel(px, py), [line.b, line.g, line.r, 255]);
+
+        let (x, y) = link_point(&b, "Plain");
+        assert!(act(&mut b, Event::Hover { x, y }), "it goes away");
+        assert_eq!(b.link_preview, None);
+        b.render();
+        assert_eq!(b.window.pixel(px, py), page_bg);
+    }
+
+    #[test]
+    fn long_addresses_are_shortened_in_the_middle() {
+        let width = |t: &str| t.chars().count() as f32;
+        assert_eq!(chrome::fit_middle("short", 10.0, width), "short");
+        let fit = chrome::fit_middle("https://example.com/a/very/long/path", 16.0, width);
+        assert_eq!(fit.chars().count(), 16);
+        assert!(
+            fit.starts_with("https://ex") && fit.ends_with("path"),
+            "{fit}"
+        );
+        assert!(fit.contains('…'));
     }
 }

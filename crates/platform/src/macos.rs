@@ -613,14 +613,43 @@ extern "C" fn scroll_wheel(this: Id, _sel: Sel, event: Id) {
 
 extern "C" fn mouse_down(this: Id, _sel: Sel, event: Id) {
     const SHIFT: u64 = 1 << 17;
+    const COMMAND: u64 = 1 << 20;
     let (x, y) = location(this, event);
     // SAFETY: `event` is the NSEvent passed to mouseDown:; -modifierFlags returns NSUInteger.
     let flags = unsafe { send!(u64; event, c"modifierFlags") };
-    if flags & SHIFT != 0 {
+    if flags & COMMAND != 0 {
+        emit(Event::OpenClick {
+            x,
+            y,
+            foreground: flags & SHIFT != 0,
+        });
+    } else if flags & SHIFT != 0 {
         emit(Event::ShiftClick { x, y });
     } else {
         emit(Event::Click { x, y });
     }
+}
+
+/// The middle button (button 2) opens links in new tabs; other extra buttons do nothing.
+extern "C" fn other_mouse_down(this: Id, _sel: Sel, event: Id) {
+    const SHIFT: u64 = 1 << 17;
+    // SAFETY: `event` is the NSEvent passed to otherMouseDown:; -buttonNumber returns
+    // NSInteger and -modifierFlags NSUInteger.
+    let (button, flags) = unsafe {
+        (
+            send!(i64; event, c"buttonNumber"),
+            send!(u64; event, c"modifierFlags"),
+        )
+    };
+    if button != 2 {
+        return;
+    }
+    let (x, y) = location(this, event);
+    emit(Event::OpenClick {
+        x,
+        y,
+        foreground: flags & SHIFT != 0,
+    });
 }
 
 extern "C" fn mouse_dragged(this: Id, _sel: Sel, event: Id) {
@@ -823,6 +852,11 @@ pub fn run_app(
                 ),
                 (c"scrollWheel:", scroll_wheel as *const c_void, c"v@:@"),
                 (c"mouseDown:", mouse_down as *const c_void, c"v@:@"),
+                (
+                    c"otherMouseDown:",
+                    other_mouse_down as *const c_void,
+                    c"v@:@",
+                ),
                 (c"mouseDragged:", mouse_dragged as *const c_void, c"v@:@"),
                 (c"mouseUp:", mouse_up as *const c_void, c"v@:@"),
                 (c"mouseMoved:", mouse_moved as *const c_void, c"v@:@"),
