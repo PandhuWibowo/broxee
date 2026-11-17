@@ -4,7 +4,13 @@ Broxee is a web browser with its own engine, written in Rust. Hard budget: **und
 
 ## Screenshots
 
-Rendered by Broxee itself with `--png` at 1280x800 (fonts: DejaVu Sans on Linux), no other browser involved.
+The window (macOS), with its tab sidebar and pane header around Hacker News. Every pixel, chrome included, is
+drawn by Broxee:
+
+![Broxee's window: the tab sidebar, the pane header and Hacker News](docs/screenshots/history/2026-11-17-window.webp)
+
+Pages rendered by Broxee itself with `--png` at 1280x800 (fonts: DejaVu Sans on Linux), no other browser
+involved.
 
 | Wikipedia (15.7 MB peak RAM) | Hacker News (14.0 MB peak RAM) |
 |---|---|
@@ -14,6 +20,30 @@ Rendered by Broxee itself with `--png` at 1280x800 (fonts: DejaVu Sans on Linux)
 cargo run --release -- https://en.wikipedia.org/wiki/Web_browser --png docs/screenshots/wikipedia.png --width 1280 --height 800 --scale 1
 cargo run --release -- https://news.ycombinator.com --png docs/screenshots/hacker-news.png --width 1280 --height 800 --scale 1
 ```
+
+### Progress over time
+
+The same page, Hacker News on 2026-11-17, rendered by Broxee as it was at each milestone: every commit below was
+built and run with `--png --width 1280 --height 800 --scale 1` on the same day, so only the engine changes.
+
+| Date | Commit | What changed on this page |
+|---|---|---|
+| 2026-11-07 | `24de485`, the first commit | Text, links and colours; no table layout yet, so every row is centred |
+| 2026-11-08 | `46198f6` | Tables and presentational attributes (`cd25b52`): the orange bar, columns and cream background. The "Y" logo is a GIF, which Broxee cannot decode yet |
+| 2026-11-10 | `89e603e` (#22) | GIF decoding: the logo appears |
+| 2026-11-14 | `f65c7d1` | CSS background images: the vote arrows |
+| 2026-11-17 | `c1268cf` (#154, #155) | This page draws as on 2026-11-15; the work since is around it (links in background tabs, link preview, search, background loads) |
+
+| 2026-11-07 | 2026-11-08 |
+|---|---|
+| ![Hacker News rendered by Broxee on 2026-11-07](docs/screenshots/history/2026-11-07-hacker-news.webp) | ![Hacker News rendered by Broxee on 2026-11-08](docs/screenshots/history/2026-11-08-hacker-news.webp) |
+| **2026-11-10** | **2026-11-14** |
+| ![Hacker News rendered by Broxee on 2026-11-10](docs/screenshots/history/2026-11-10-hacker-news.webp) | ![Hacker News rendered by Broxee on 2026-11-14](docs/screenshots/history/2026-11-14-hacker-news.webp) |
+| **2026-11-17** | **2026-11-17, the window** |
+| ![Hacker News rendered by Broxee on 2026-11-17](docs/screenshots/history/2026-11-17-hacker-news.webp) | ![Broxee's window on 2026-11-17](docs/screenshots/history/2026-11-17-window.webp) |
+
+The [Screenshot History](https://github.com/PandhuWibowo/broxee/wiki/Screenshot-History) wiki page tells the
+story behind each step.
 
 ## Download
 
@@ -394,11 +424,13 @@ Where data lives, and what compression does for it (measured 2026-11-07):
 
 ## Known issues
 
-- No table layout and no presentational attributes (`bgcolor`, `align`): Hacker News renders centred without its
-  orange bar.
 - Searching uses Bing (words typed in the address field, or Enter in ⌘K when nothing matches), with no
-  setting to choose another engine yet. Google's results page needs scripts to navigate, which Broxee does
-  not allow; DuckDuckGo is blocked on some networks.
+  setting to choose another engine yet. Google's results page needs far more JavaScript than Broxee runs;
+  DuckDuckGo is blocked on some networks.
+- A page appears only once every image has arrived: image-heavy pages are slow to show (singapay.id about
+  6 s, of which Broxee's own work is under 0.2 s).
+- The parser does not add `<html>`, `<head>` or `<body>` when a page leaves them out, so such pages miss
+  `body` rules and the default 8px margin.
 - Figtree has no ⌘ ⇧ ⌥: they come from the system's symbol font, and the chrome draws them as icons on systems
   without one.
 - Bookmarks cannot be imported from other browsers yet, and folders are flat (no folders inside folders).
