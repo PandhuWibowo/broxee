@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use crate::date;
 use crate::interp::{
     Ctrl, Handler, Interp, Kind, Mode, ObjId, Pending, Resume, Target, Timer, Value,
 };
@@ -2896,70 +2897,14 @@ fn install_window(it: &mut Interp) {
     it.method(g, "decodeURIComponent", decode);
     it.method(g, "decodeURI", decode);
 
-    let date = it.alloc(Some(it.protos.object), Kind::Plain).unwrap_or(0);
-    let c = constructor(
-        it,
-        "Date",
-        |it, host, _, args| {
-            let proto = constructor_proto(it, "Date");
-            let o = Value::Obj(it.alloc(Some(proto), Kind::Plain)?);
-            let t = match arg(args, 0) {
-                Value::Num(n) => n,
-                Value::Undefined => it.epoch_ms + it.now,
-                _ => f64::NAN,
-            };
-            it.put(host, &o, "__time", Value::Num(t))?;
-            Ok(o)
-        },
-        date,
-    );
-    let f = it.native(|it, host, this, args| {
-        let ctor = it.get_own(it.global, "Date").unwrap_or(Value::Undefined);
-        let _ = this;
-        let Value::Obj(c) = ctor else {
-            return it.new_object();
-        };
-        let make = it.get_own(c, "__make").unwrap_or(Value::Undefined);
-        it.call(host, &make, Value::Undefined, args)
-    });
-    let make = it.native(|it, host, _, args| {
-        let proto = constructor_proto(it, "Date");
-        let o = Value::Obj(it.alloc(Some(proto), Kind::Plain)?);
-        let t = match arg(args, 0) {
-            Value::Num(n) => n,
-            Value::Undefined => it.epoch_ms + it.now,
-            _ => f64::NAN,
-        };
-        it.put(host, &o, "__time", Value::Num(t))?;
-        Ok(o)
-    });
-    it.set_own(c, "__make", Value::Obj(make));
-    it.set_own(c, "__construct", Value::Obj(f));
-    it.method(c, "now", |it, _, _, _| {
-        Ok(Value::Num((it.epoch_ms + it.now).floor()))
-    });
-    let time: crate::interp::NativeFn = |it, host, this, _| it.get_value(host, &this, "__time");
-    it.method(date, "getTime", time);
-    it.method(date, "valueOf", time);
-    it.method(date, "getFullYear", |it, host, this, _| {
-        let t = it.get_value(host, &this, "__time")?;
-        let t = it.to_number(host, &t)?;
-        Ok(Value::Num((1970.0 + t / 31_556_952_000.0).floor()))
-    });
-    it.method(date, "toISOString", |it, host, this, _| {
-        let t = it.get_value(host, &this, "__time")?;
-        let t = it.to_number(host, &t)?;
-        Ok(Value::str(&iso_date(t)))
-    });
-    it.method(date, "toString", |it, host, this, _| {
-        let t = it.get_value(host, &this, "__time")?;
-        let t = it.to_number(host, &t)?;
-        Ok(Value::str(&iso_date(t)))
-    });
+    install_date(it);
 
     let perf = it.alloc(Some(it.protos.object), Kind::Plain).unwrap_or(0);
     it.set_own(g, "performance", Value::Obj(perf));
     it.method(perf, "now", |it, _, _, _| Ok(Value::Num(it.now)));
+    let timing = it.alloc(Some(it.protos.object), Kind::Plain).unwrap_or(0);
+    it.set_own(perf, "timing", Value::Obj(timing));
+    set_time_origin(it);
 
     let navigator = it.alloc(Some(it.protos.object), Kind::Plain).unwrap_or(0);
     it.set_own(g, "navigator", Value::Obj(navigator));
@@ -3014,32 +2959,6 @@ fn install_window(it: &mut Interp) {
             Ok(Value::Undefined)
         });
     }
-}
-
-fn iso_date(t: f64) -> String {
-    if !t.is_finite() {
-        return "Invalid Date".into();
-    }
-    let ms = t.rem_euclid(1000.0) as u64;
-    let secs = (t / 1000.0).floor() as i64;
-    let days = secs.div_euclid(86_400);
-    let rem = secs.rem_euclid(86_400);
-    // Civil date from days since 1970 (Howard Hinnant's algorithm).
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    format!(
-        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{ms:03}Z",
-        rem / 3600,
-        rem / 60 % 60,
-        rem % 60
-    )
 }
 
 fn encode(s: &str, keep: &[u8]) -> String {
@@ -3955,4 +3874,302 @@ pub fn dispatch_window(it: &mut Interp, host: &mut dyn Host, kind: &str) -> Resu
         }
     }
     Ok(())
+}
+
+/// The time a `Date` holds (`NaN` when invalid).
+fn time_of(it: &mut Interp, host: &mut dyn Host, this: &Value) -> Result<f64, Ctrl> {
+    if !matches!(this, Value::Obj(_)) {
+        return it.type_error("this is not a Date");
+    }
+    let t = it.get_value(host, this, "__time")?;
+    it.to_number(host, &t)
+}
+
+/// A new `Date` holding `t` (clipped to the range a date holds).
+fn new_date(it: &mut Interp, host: &mut dyn Host, t: f64) -> Result<Value, Ctrl> {
+    let proto = constructor_proto(it, "Date");
+    let o = Value::Obj(it.alloc(Some(proto), Kind::Plain)?);
+    it.put(host, &o, "__time", Value::Num(date::clip(t)))?;
+    Ok(o)
+}
+
+/// The fields of `this` in local time (`local`) or UTC, or `None` for an invalid date.
+fn date_fields(
+    it: &mut Interp,
+    host: &mut dyn Host,
+    this: &Value,
+    local: bool,
+) -> Result<Option<date::Fields>, Ctrl> {
+    let t = time_of(it, host, this)?;
+    if t.is_nan() {
+        return Ok(None);
+    }
+    let shift = if local { (it.offset)(t) } else { 0.0 };
+    Ok(Some(date::fields(t + shift)))
+}
+
+/// A setter: replaces fields from `first` (0 year … 6 ms) with up to `count` arguments, in
+/// local time or UTC, and returns the new time. An invalid date stays invalid, except that
+/// setting the year starts from +0.
+fn set_date_fields(
+    it: &mut Interp,
+    host: &mut dyn Host,
+    this: &Value,
+    args: &[Value],
+    (first, count, local): (usize, usize, bool),
+) -> Result<Value, Ctrl> {
+    let t = time_of(it, host, this)?;
+    let base = match (t.is_nan(), first) {
+        (false, _) => t,
+        (true, 0) => 0.0,
+        (true, _) => {
+            // Arguments are still converted, for their side effects.
+            for i in 0..count.min(args.len()) {
+                num(it, host, args, i)?;
+            }
+            return Ok(Value::Num(f64::NAN));
+        }
+    };
+    let shift = if local && !t.is_nan() {
+        (it.offset)(base)
+    } else {
+        0.0
+    };
+    let mut f = date::fields(base + shift).to_array();
+    let given = args.len().clamp(1, count);
+    for i in 0..given {
+        f[first + i] = num(it, host, args, i)?;
+    }
+    let made = date::make(f);
+    let utc = if local {
+        date::local_to_utc(made, it.offset)
+    } else {
+        made
+    };
+    let t = date::clip(utc);
+    it.put(host, this, "__time", Value::Num(t))?;
+    Ok(Value::Num(t))
+}
+
+/// The time a `new Date(...)` with several arguments names: year, month[, day, hours,
+/// minutes, seconds, ms] in local time (or UTC for `Date.UTC`); years 0 to 99 are 19xx.
+fn date_from_args(
+    it: &mut Interp,
+    host: &mut dyn Host,
+    args: &[Value],
+    local: bool,
+) -> Result<f64, Ctrl> {
+    let mut f = [f64::NAN, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+    for (i, slot) in f.iter_mut().enumerate().take(args.len().min(7)) {
+        *slot = num(it, host, args, i)?;
+    }
+    if (0.0..=99.0).contains(&f[0].trunc()) {
+        f[0] = 1900.0 + f[0].trunc();
+    }
+    let made = date::make(f);
+    Ok(if local {
+        date::local_to_utc(made, it.offset)
+    } else {
+        made
+    })
+}
+
+fn install_date(it: &mut Interp) {
+    let proto = it.alloc(Some(it.protos.object), Kind::Plain).unwrap_or(0);
+    // `Date()` called as a function: the time now as text.
+    let c = constructor(
+        it,
+        "Date",
+        |it, _, _, _| {
+            let now = (it.epoch_ms + it.now).floor();
+            Ok(Value::str(&date::to_text(now, it.offset)))
+        },
+        proto,
+    );
+    // `new Date(...)`.
+    let make = it.native(|it, host, _, args| {
+        let t = match args.len() {
+            0 => (it.epoch_ms + it.now).floor(),
+            1 => {
+                let v = arg(args, 0);
+                // Another date is copied; text is parsed; anything else is a time.
+                let copied = match &v {
+                    Value::Obj(_) => {
+                        let t = it.get_value(host, &v, "__time")?;
+                        matches!(t, Value::Num(_))
+                            .then(|| it.to_number(host, &t))
+                            .transpose()?
+                    }
+                    _ => None,
+                };
+                match (copied, &v) {
+                    (Some(t), _) => t,
+                    (None, Value::Str(s)) => date::parse(s, it.offset),
+                    _ => it.to_number(host, &v)?,
+                }
+            }
+            _ => date_from_args(it, host, args, true)?,
+        };
+        new_date(it, host, t)
+    });
+    it.set_own(c, "__construct", Value::Obj(make));
+    it.method(c, "now", |it, _, _, _| {
+        Ok(Value::Num((it.epoch_ms + it.now).floor()))
+    });
+    it.method(c, "parse", |it, host, _, args| {
+        let text = it.to_string(host, &arg(args, 0))?;
+        Ok(Value::Num(date::parse(&text, it.offset)))
+    });
+    it.method(c, "UTC", |it, host, _, args| {
+        let t = date_from_args(it, host, args, false)?;
+        Ok(Value::Num(date::clip(t)))
+    });
+
+    let time: crate::interp::NativeFn =
+        |it, host, this, _| Ok(Value::Num(time_of(it, host, &this)?));
+    it.method(proto, "getTime", time);
+    it.method(proto, "valueOf", time);
+    it.method(proto, "getTimezoneOffset", |it, host, this, _| {
+        let t = time_of(it, host, &this)?;
+        Ok(Value::Num(if t.is_nan() {
+            f64::NAN
+        } else {
+            -(it.offset)(t) / 60_000.0
+        }))
+    });
+
+    macro_rules! getter {
+        ($name:literal, $local:literal, $field:ident) => {
+            it.method(proto, $name, |it, host, this, _| {
+                Ok(Value::Num(
+                    date_fields(it, host, &this, $local)?.map_or(f64::NAN, |f| f.$field),
+                ))
+            });
+        };
+    }
+    getter!("getFullYear", true, year);
+    getter!("getMonth", true, month);
+    getter!("getDate", true, day);
+    getter!("getDay", true, weekday);
+    getter!("getHours", true, hours);
+    getter!("getMinutes", true, minutes);
+    getter!("getSeconds", true, seconds);
+    getter!("getMilliseconds", true, ms);
+    getter!("getUTCFullYear", false, year);
+    getter!("getUTCMonth", false, month);
+    getter!("getUTCDate", false, day);
+    getter!("getUTCDay", false, weekday);
+    getter!("getUTCHours", false, hours);
+    getter!("getUTCMinutes", false, minutes);
+    getter!("getUTCSeconds", false, seconds);
+    getter!("getUTCMilliseconds", false, ms);
+    it.method(proto, "getYear", |it, host, this, _| {
+        Ok(Value::Num(
+            date_fields(it, host, &this, true)?.map_or(f64::NAN, |f| f.year - 1900.0),
+        ))
+    });
+
+    macro_rules! setter {
+        ($name:literal, $first:literal, $count:literal, $local:literal) => {
+            it.method(proto, $name, |it, host, this, args| {
+                set_date_fields(it, host, &this, args, ($first, $count, $local))
+            });
+        };
+    }
+    setter!("setFullYear", 0, 3, true);
+    setter!("setMonth", 1, 2, true);
+    setter!("setDate", 2, 1, true);
+    setter!("setHours", 3, 4, true);
+    setter!("setMinutes", 4, 3, true);
+    setter!("setSeconds", 5, 2, true);
+    setter!("setMilliseconds", 6, 1, true);
+    setter!("setUTCFullYear", 0, 3, false);
+    setter!("setUTCMonth", 1, 2, false);
+    setter!("setUTCDate", 2, 1, false);
+    setter!("setUTCHours", 3, 4, false);
+    setter!("setUTCMinutes", 4, 3, false);
+    setter!("setUTCSeconds", 5, 2, false);
+    setter!("setUTCMilliseconds", 6, 1, false);
+    it.method(proto, "setTime", |it, host, this, args| {
+        time_of(it, host, &this)?;
+        let t = date::clip(num(it, host, args, 0)?);
+        it.put(host, &this, "__time", Value::Num(t))?;
+        Ok(Value::Num(t))
+    });
+
+    it.method(proto, "toISOString", |it, host, this, _| {
+        let t = time_of(it, host, &this)?;
+        match date::to_iso(t) {
+            Some(text) => Ok(Value::str(&text)),
+            None => Err(it.throw_error("RangeError", "Invalid time value")),
+        }
+    });
+    it.method(proto, "toJSON", |it, host, this, _| {
+        let t = time_of(it, host, &this)?;
+        Ok(date::to_iso(t).map_or(Value::Null, |text| Value::str(&text)))
+    });
+    it.method(proto, "toString", |it, host, this, _| {
+        let t = time_of(it, host, &this)?;
+        Ok(Value::str(&date::to_text(t, it.offset)))
+    });
+    let utc_text: crate::interp::NativeFn = |it, host, this, _| {
+        let t = time_of(it, host, &this)?;
+        Ok(Value::str(&date::to_utc_text(t)))
+    };
+    it.method(proto, "toUTCString", utc_text);
+    it.method(proto, "toGMTString", utc_text);
+
+    macro_rules! local_text {
+        ($name:literal, |$t:ident, $off:ident| $body:expr) => {
+            it.method(proto, $name, |it, host, this, _| {
+                let $t = time_of(it, host, &this)?;
+                if $t.is_nan() {
+                    return Ok(Value::str("Invalid Date"));
+                }
+                let $off = (it.offset)($t);
+                Ok(Value::str(&$body))
+            });
+        };
+    }
+    local_text!("toDateString", |t, off| date::date_text(t + off));
+    local_text!("toTimeString", |t, off| date::time_text(t + off, off));
+    local_text!("toLocaleDateString", |t, off| date::locale_date(t + off));
+    local_text!("toLocaleTimeString", |t, off| date::locale_time(t + off));
+    local_text!("toLocaleString", |t, off| format!(
+        "{}, {}",
+        date::locale_date(t + off),
+        date::locale_time(t + off)
+    ));
+}
+
+/// `performance.timeOrigin` and the `performance.timing` marks: when the page started on the
+/// wall clock (`performance.now` counts from it). Every mark is that moment: Broxee does not
+/// time the stages separately. Set again once the embedder sets the clock.
+pub(crate) fn set_time_origin(it: &mut Interp) {
+    let g = it.global;
+    let Some(Value::Obj(perf)) = it.get_own(g, "performance") else {
+        return;
+    };
+    // `epoch_ms` is when the page started; the wall clock is `epoch_ms + now`.
+    let started = it.epoch_ms.floor();
+    it.set_own(perf, "timeOrigin", Value::Num(started));
+    let Some(Value::Obj(timing)) = it.get_own(perf, "timing") else {
+        return;
+    };
+    for name in [
+        "navigationStart",
+        "fetchStart",
+        "requestStart",
+        "responseStart",
+        "responseEnd",
+        "domLoading",
+        "domInteractive",
+        "domContentLoadedEventStart",
+        "domContentLoadedEventEnd",
+        "domComplete",
+        "loadEventStart",
+        "loadEventEnd",
+    ] {
+        it.set_own(timing, name, Value::Num(started));
+    }
 }

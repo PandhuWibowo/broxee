@@ -39,6 +39,51 @@ pub fn freeze_clock(epoch_ms: f64) {
     let _ = FROZEN_AT.set(epoch_ms);
 }
 
+/// The system time zone's offset at UTC time `t` (ms since 1970), in milliseconds to add:
+/// `localtime_r` knows the zone's rules, daylight saving included.
+fn system_offset(t: f64) -> f64 {
+    #[cfg(unix)]
+    {
+        use std::os::raw::{c_char, c_int, c_long};
+        /// `struct tm` from <time.h>: the same fields in the same order on macOS and Linux.
+        #[repr(C)]
+        struct Tm {
+            sec: c_int,
+            min: c_int,
+            hour: c_int,
+            mday: c_int,
+            mon: c_int,
+            year: c_int,
+            wday: c_int,
+            yday: c_int,
+            isdst: c_int,
+            gmtoff: c_long,
+            zone: *const c_char,
+        }
+        extern "C" {
+            fn localtime_r(time: *const i64, out: *mut Tm) -> *mut Tm;
+        }
+        if !t.is_finite() {
+            return 0.0;
+        }
+        let secs = (t / 1000.0).floor() as i64;
+        let mut tm = std::mem::MaybeUninit::<Tm>::zeroed();
+        // SAFETY: localtime_r(const time_t *, struct tm *) fills `tm` and returns it, or null
+        // on failure; time_t is 64-bit on both systems, and `Tm` matches their struct tm.
+        let filled = unsafe { localtime_r(&secs, tm.as_mut_ptr()) };
+        if filled.is_null() {
+            return 0.0;
+        }
+        // SAFETY: localtime_r returned non-null, so it wrote every field.
+        unsafe { tm.assume_init() }.gmtoff as f64 * 1000.0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = t;
+        0.0
+    }
+}
+
 impl PageScript {
     fn new(page: &net::Url, base: &net::Url) -> PageScript {
         let epoch_ms = FROZEN_AT.get().copied().unwrap_or_else(|| {
@@ -46,8 +91,13 @@ impl PageScript {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0.0, |d| d.as_secs_f64() * 1000.0)
         });
+        let mut runtime = js::Runtime::new();
+        // Replays keep UTC: a saved page renders the same in every time zone.
+        if FROZEN_AT.get().is_none() {
+            runtime.set_time_zone(system_offset);
+        }
         PageScript {
-            runtime: js::Runtime::new(),
+            runtime,
             net: crate::scriptnet::ScriptNet::new(page.clone(), base.clone()),
             started: Instant::now(),
             epoch_ms,
@@ -600,5 +650,16 @@ mod tests {
     fn pages_without_scripts_have_none() {
         let (_, _, script) = page("<p>x</p><script type=application/json>{}</script>");
         assert!(script.is_none());
+    }
+
+    #[test]
+    fn the_system_time_zone_is_a_real_offset() {
+        // Whatever zone the machine is in: within ±14 hours, in whole quarter hours.
+        for t in [0.0, 1_794_923_640_000.0, 1_782_000_000_000.0] {
+            let off = system_offset(t);
+            assert!(off.abs() <= 14.0 * 3_600_000.0, "{off}");
+            assert_eq!(off % (15.0 * 60_000.0), 0.0, "{off}");
+        }
+        assert_eq!(system_offset(f64::NAN), 0.0);
     }
 }

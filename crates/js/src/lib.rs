@@ -8,6 +8,7 @@
 //! neither hang the browser nor spend its memory budget.
 
 mod builtins;
+pub mod date;
 mod interp;
 mod lexer;
 mod parser;
@@ -112,10 +113,20 @@ impl Runtime {
         self.interp.stopped.as_deref()
     }
 
+    /// The local time zone `Date` uses: milliseconds to add to a UTC time. UTC until set,
+    /// which replays keep so a saved page renders the same on every machine.
+    pub fn set_time_zone(&mut self, offset: date::Offset) {
+        self.interp.offset = offset;
+    }
+
     /// Advance the page's clock: milliseconds since the page started, and the wall clock.
     pub fn set_time(&mut self, now_ms: f64, epoch_ms: f64) {
+        let first = self.interp.epoch_ms == 0.0;
         self.interp.now = now_ms;
         self.interp.epoch_ms = epoch_ms;
+        if first {
+            builtins::set_time_origin(&mut self.interp);
+        }
     }
 
     fn finish(&mut self, host: &mut dyn Host, r: Result<Value, Ctrl>, what: &str) -> Value {
@@ -453,6 +464,107 @@ mod tests {
             .expect("spawn")
             .join()
             .expect("the test passed");
+    }
+
+    /// Evaluate in a page in Jakarta (UTC+7) whose clock reads 2026-11-17T13:54:00Z.
+    fn eval_in_jakarta(src: &str) -> String {
+        fn jakarta(_: f64) -> f64 {
+            7.0 * 3_600_000.0
+        }
+        let mut rt = Runtime::new();
+        rt.set_time_zone(jakarta);
+        // The page started 250 ms before.
+        rt.set_time(250.0, 1_794_923_639_750.0);
+        rt.eval_to_string(&mut Bare::default(), src)
+    }
+
+    #[test]
+    fn dates_work_in_local_time_and_utc() {
+        let cases = [
+            ("new Date().getTime()", "1794923640000"),
+            ("Date.now()", "1794923640000"),
+            ("new Date(0).toISOString()", "1970-01-01T00:00:00.000Z"),
+            (
+                "new Date().getHours() + ' ' + new Date().getUTCHours()",
+                "20 13",
+            ),
+            ("new Date().getTimezoneOffset()", "-420"),
+            (
+                "new Date().getDay() + ' ' + new Date().getMonth() + ' ' + new Date().getDate()",
+                "2 10 17",
+            ),
+            ("new Date(2024, 1, 29).getDate()", "29"),
+            ("new Date(2023, 1, 29).getMonth()", "2"),
+            ("new Date(99, 0).getFullYear()", "1999"),
+            ("new Date(2026, 10, 17, 20, 54).getTime()", "1794923640000"),
+            ("Date.UTC(2026, 10, 17, 13, 54)", "1794923640000"),
+            ("new Date('2026-11-17').getUTCDate()", "17"),
+            (
+                "Date.parse('Tue, 17 Nov 2026 13:54:00 GMT')",
+                "1794923640000",
+            ),
+            ("new Date('nonsense').getTime()", "NaN"),
+            ("String(new Date('nonsense'))", "Invalid Date"),
+            ("new Date(0).toUTCString()", "Thu, 01 Jan 1970 00:00:00 GMT"),
+            ("new Date(0).toGMTString()", "Thu, 01 Jan 1970 00:00:00 GMT"),
+            (
+                "new Date(0).toString()",
+                "Thu Jan 01 1970 07:00:00 GMT+0700",
+            ),
+            ("new Date().toLocaleDateString()", "11/17/2026"),
+            ("new Date().toLocaleTimeString()", "8:54:00 PM"),
+            (
+                "JSON.stringify({d: new Date(0)})",
+                "{\"d\":\"1970-01-01T00:00:00.000Z\"}",
+            ),
+            (
+                "var d = new Date(0); d.setFullYear(2000); d.getFullYear()",
+                "2000",
+            ),
+            (
+                "var d = new Date(0); d.setUTCHours(25); d.toISOString()",
+                "1970-01-02T01:00:00.000Z",
+            ),
+            (
+                "var d = new Date(0); d.setDate(d.getDate() + 31); d.getMonth()",
+                "1",
+            ),
+            (
+                "var d = new Date(0); d.setTime(86400000); d.getUTCDate()",
+                "2",
+            ),
+            ("var a = new Date(0); var b = new Date(a); b.getTime()", "0"),
+            ("new Date(1000) - new Date(0)", "1000"),
+            ("new Date(8.64e15 + 1).getTime()", "NaN"),
+            (
+                "var e; try { new Date(NaN).toISOString() } catch (x) { e = x.name } e",
+                "RangeError",
+            ),
+            ("typeof Date()", "string"),
+            ("performance.timing.navigationStart", "1794923639750"),
+            ("performance.timeOrigin", "1794923639750"),
+            // ToPrimitive: numbers ask valueOf first, strings toString, `+` valueOf except
+            // for a Date.
+            ("({ valueOf() { return 5 } }) * 2", "10"),
+            (
+                "var o = { valueOf() { return 1 }, toString() { return 'x' } }; o + ''",
+                "1",
+            ),
+            (
+                "var o = { valueOf() { return 1 }, toString() { return 'x' } }; `${o}`",
+                "x",
+            ),
+            ("new Date(0) + ''", "Thu Jan 01 1970 07:00:00 GMT+0700"),
+            ("new Date(5) > new Date(3)", "true"),
+            ("[1, 2] + ''", "1,2"),
+            (
+                "var e; try { Object.create(null) + '' } catch (x) { e = x.name } e",
+                "TypeError",
+            ),
+        ];
+        for (src, want) in cases {
+            assert_eq!(eval_in_jakarta(src), want, "{src}");
+        }
     }
 
     #[test]
