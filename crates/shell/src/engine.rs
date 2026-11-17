@@ -177,6 +177,10 @@ pub struct Loaded {
     /// What relative URLs resolve against: the first `<base href>`, or `url`
     /// (`document_base`).
     pub base: net::Url,
+    /// `<img>` sources the page names that are not loaded yet (added or changed by scripts
+    /// after loading): the window fetches them and lays the page out again.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
+    pub pending_images: Vec<String>,
     /// The response's `Refresh` header, when it had one (a woken tab has none).
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
     pub refresh_header: Option<String>,
@@ -588,6 +592,9 @@ fn finish(
     let (styles, cascade_ms) = cascade(&mut dom, &css, &states, settings);
     // Fonts and background images are found from the styles, so they load between the
     // cascade and layout, at the same time.
+    // `<img>` elements scripts added, or whose source they set: found by source, and
+    // fetched with the backgrounds.
+    let added = images.bind(&dom, &base, images::img_nodes(&dom, Dom::ROOT));
     let ((mut webfonts, font_files), backgrounds) = std::thread::scope(|scope| {
         let backgrounds = scope.spawn(|| {
             backgrounds::load(
@@ -596,12 +603,15 @@ fn finish(
                 (&source.url, &base),
                 background_from,
                 &images,
+                added,
             )
         });
         let fonts = webfonts::load(&dom, &styles, &css.sheets, &source.url, font_from, fonts);
         (fonts, backgrounds.join().unwrap_or_default())
     });
     images.add_backgrounds(backgrounds);
+    // What is still missing (a woken page whose scripts named other files) loads later.
+    let pending_images = images.bind(&dom, &base, images::img_nodes(&dom, Dom::ROOT));
     if !progress(0.85) {
         return None;
     }
@@ -611,6 +621,7 @@ fn finish(
     Some(Outcome::Page(Box::new(Loaded {
         url: source.url,
         base,
+        pending_images,
         refresh_header: None,
         status: source.status,
         bytes: source.bytes,
@@ -686,6 +697,23 @@ pub fn update(page: &mut Loaded, settings: Settings, fonts: &FontStore, states_c
         })
         .filter(|&n| in_document(dom, n))
         .collect();
+    // `<img>` elements added, or whose attributes changed: shown with the file of their
+    // current source, or asked for.
+    let mut imgs: Vec<NodeId> = Vec::new();
+    for change in &changes {
+        match *change {
+            html::Change::Element(n) if dom.tag_name(n) == Some("img") => imgs.push(n),
+            html::Change::Children(n) => imgs.extend(images::img_nodes(dom, n)),
+            _ => {}
+        }
+    }
+    if !imgs.is_empty() {
+        for url in page.images.bind(&page.dom, &page.base, imgs) {
+            if !page.pending_images.contains(&url) {
+                page.pending_images.push(url);
+            }
+        }
+    }
     let text_only = changes.iter().all(|c| matches!(c, html::Change::Text(_)));
     if states_changed || !text_only || page.styles.reads_text() {
         let (styles, cascade_ms) = cascade(&mut page.dom, &page.css, &page.states, settings);
@@ -995,7 +1023,8 @@ fn load_subresources(
     } else {
         Default::default()
     };
-    jobs.extend(image_sources.into_iter().map(Job::Image));
+    let image_keys: Vec<String> = image_sources.iter().map(|(k, _)| k.clone()).collect();
+    jobs.extend(image_sources.into_iter().map(|(_, s)| Job::Image(s)));
 
     // Rules that need names this document lacks are dropped while parsing, unless scripts
     // can add those names later.
@@ -1042,7 +1071,7 @@ fn load_subresources(
     }
     let images = match stored_images {
         Some(images) => images,
-        None => ImageStore::new(fetched_images, image_uses),
+        None => ImageStore::new(image_keys, fetched_images, image_uses),
     };
     (loaded, images, wires)
 }

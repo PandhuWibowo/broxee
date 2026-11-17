@@ -797,6 +797,9 @@ struct Browser<S: Screen> {
     frame_geometry: Option<Geometry>,
     /// The address of the link under the pointer, shown at the bottom of the pane.
     link_preview: Option<String>,
+    /// Images the visible page named after it loaded (`Loaded::pending_images`), being
+    /// fetched on their own thread: (source, bytes or `None`) for each.
+    image_fetch: Option<Receiver<Vec<(String, Option<Vec<u8>>)>>>,
     /// Loads of tabs that are no longer visible, downloading without building
     /// (`BACKGROUND_LOADS` at most). Each ends as its tab's sleeping file.
     background: Vec<Load>,
@@ -878,6 +881,7 @@ impl<S: Screen> Browser<S> {
             drag: None,
             link_preview: None,
             background: Vec::new(),
+            image_fetch: None,
             refresh: None,
             offline_retry: None,
             online: net::online,
@@ -1054,7 +1058,10 @@ impl<S: Screen> Browser<S> {
                 wait = wait.min(at.saturating_duration_since(Instant::now()));
             }
             // Answers to the page's requests arrive on their own channel: look each frame.
-            if self.page_requests_busy() || !self.background.is_empty() {
+            if self.page_requests_busy()
+                || !self.background.is_empty()
+                || self.image_fetch.is_some()
+            {
                 wait = wait.min(LOAD_POLL);
             }
             let mut repaint = Repaint::Nothing;
@@ -1077,6 +1084,7 @@ impl<S: Screen> Browser<S> {
                 | self.run_page_timers()
                 | self.poll_page_requests()
                 | self.poll_background()
+                | self.poll_images()
             {
                 repaint = Repaint::Frame;
             }
@@ -2744,6 +2752,7 @@ impl<S: Screen> Browser<S> {
         if let Some(page) = self.page.as_mut() {
             engine::update(page, settings, &self.fonts, states_changed);
         }
+        self.fetch_images();
         self.scroll_field();
         self.clamp_scroll();
         // The focused link moved with the layout.
@@ -4719,6 +4728,71 @@ impl<S: Screen> Browser<S> {
         self.render();
     }
 
+    /// Start fetching the images the visible page named and has not got, with its profile's
+    /// cookies for its own site (one batch at a time, `FETCH_WORKERS` at once).
+    fn fetch_images(&mut self) {
+        if self.image_fetch.is_some() {
+            return;
+        }
+        let Some(page) = self.page.as_mut() else {
+            return;
+        };
+        if page.pending_images.is_empty() {
+            return;
+        }
+        let urls = std::mem::take(&mut page.pending_images);
+        let page_url = page.url.clone();
+        let cookies = Arc::clone(&self.profiles[self.profile].cookies);
+        let (sender, receiver) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("images".into())
+            .spawn(move || {
+                let context = net::Context::subresource(&page_url);
+                let bytes = crate::pool::map_ordered(urls.clone(), 6, |url| {
+                    let url = net::Url::parse(&url).ok()?;
+                    let resp = net::fetch_in(&url, Some((&cookies, &context))).ok()?;
+                    (resp.status == 200).then_some(resp.body)
+                });
+                let _ = sender.send(urls.into_iter().zip(bytes).collect());
+            });
+        if spawned.is_ok() {
+            self.image_fetch = Some(receiver);
+        }
+    }
+
+    /// Images the visible page asked for have arrived: keep them, show them in every
+    /// `<img>` naming them, and lay those out again. Returns whether to repaint.
+    fn poll_images(&mut self) -> bool {
+        let Some(receiver) = &self.image_fetch else {
+            return false;
+        };
+        let arrived = match receiver.try_recv() {
+            Ok(arrived) => arrived,
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => {
+                self.image_fetch = None;
+                return false;
+            }
+        };
+        self.image_fetch = None;
+        let Some(page) = self.page.as_mut() else {
+            return false;
+        };
+        let keys: Vec<String> = arrived.iter().map(|(k, _)| k.clone()).collect();
+        page.images.add_backgrounds(arrived);
+        let nodes: Vec<NodeId> = crate::images::img_nodes(&page.dom, html::Dom::ROOT)
+            .filter(|&n| {
+                crate::images::key_of(&page.dom, &page.base, n).is_some_and(|k| keys.contains(&k))
+            })
+            .collect();
+        for &n in &nodes {
+            page.dom.touch(n);
+        }
+        page.images.bind(&page.dom, &page.base, nodes);
+        self.update_page(false);
+        true
+    }
+
     /// Collect what background loads have finished. Returns whether the sidebar changed.
     fn poll_background(&mut self) -> bool {
         let mut changed = false;
@@ -5129,6 +5203,8 @@ impl<S: Screen> Browser<S> {
         }
         self.link_focus = None;
         self.link_preview = None;
+        // Answers for the last page's images are not this page's.
+        self.image_fetch = None;
         self.refresh = None;
         self.offline_retry = None;
         self.editing = None;
@@ -5145,6 +5221,7 @@ impl<S: Screen> Browser<S> {
         if let (Some(i), true) = (auto, scroll == 0.0) {
             self.focus_control(i);
         }
+        self.fetch_images();
         self.painter.trim(GLYPH_CACHE_LIMIT);
         self.painter.forget_images();
         // Loading freed a lot (the previous page, stylesheet text, parse scratch): hand it back
@@ -10108,6 +10185,89 @@ mod tests {
         assert_eq!(b.background.len(), 1);
         act(&mut b, command_shift('p'));
         assert!(b.background.is_empty(), "profiles share no connections");
+    }
+
+    /// Poll the visible page's image fetches until none is running or waiting.
+    fn wait_for_images(b: &mut Browser<FakeScreen>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            b.poll_images();
+            let waiting = b
+                .page
+                .as_ref()
+                .is_some_and(|p| !p.pending_images.is_empty());
+            if b.image_fetch.is_none() && !waiting {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("images still loading");
+    }
+
+    fn png_file(path: &Path, (w, h): (usize, usize)) {
+        std::fs::write(path, paint::png::encode(w, h, &vec![200; w * h * 4])).unwrap();
+    }
+
+    fn natural_of(b: &Browser<FakeScreen>, id: &str) -> Option<(f32, f32)> {
+        let p = b.page.as_ref().unwrap();
+        let node = (0..p.dom.len() as NodeId).find(|&n| p.dom.attr(n, "id") == Some(id))?;
+        p.images.natural_size(node)
+    }
+
+    #[test]
+    fn images_scripts_add_or_repoint_are_fetched_and_laid_out() {
+        let page = page_file(
+            "script-images",
+            "<html><body><img id=lazy src=small.png data-src=big.png>\
+             <script>var i = document.createElement('img'); i.setAttribute('id', 'added');\
+             i.setAttribute('src', 'big.png'); document.body.appendChild(i);\
+             setTimeout(function () { var l = document.getElementById('lazy');\
+             l.setAttribute('src', l.getAttribute('data-src')); }, 10);</script></body></html>",
+        );
+        let dir = page.parent().unwrap();
+        png_file(&dir.join("small.png"), (7, 5));
+        png_file(&dir.join("big.png"), (20, 10));
+        let mut b = browser(&page);
+        wait_for_images(&mut b);
+        assert_eq!(
+            natural_of(&b, "added"),
+            Some((20.0, 10.0)),
+            "added by a script"
+        );
+        assert_eq!(natural_of(&b, "lazy"), Some((7.0, 5.0)));
+        let added_width = |b: &Browser<FakeScreen>| {
+            let p = b.page.as_ref().unwrap();
+            let node = (0..p.dom.len() as NodeId)
+                .find(|&n| p.dom.attr(n, "id") == Some("added"))
+                .unwrap();
+            p.layout
+                .boxes
+                .iter()
+                .find(|bx| bx.node == node)
+                .map(|bx| bx.rect.width)
+        };
+        assert_eq!(
+            added_width(&b),
+            Some(20.0),
+            "laid out at its size once it arrived"
+        );
+
+        // The timer points the lazy image at the big file: shown once kept (already is).
+        std::thread::sleep(Duration::from_millis(20));
+        b.run_page_timers();
+        wait_for_images(&mut b);
+        assert_eq!(natural_of(&b, "lazy"), Some((20.0, 10.0)), "its new source");
+
+        // A woken tab finds them by source, without the network.
+        act(&mut b, command('t'));
+        b.close_palette();
+        std::fs::remove_file(dir.join("big.png")).unwrap();
+        act(&mut b, command('1'));
+        assert_eq!(
+            natural_of(&b, "added"),
+            Some((20.0, 10.0)),
+            "from its sleeping file"
+        );
     }
 
     #[test]

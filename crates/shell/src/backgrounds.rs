@@ -22,24 +22,38 @@ pub enum BackgroundFrom<'a> {
     Inline,
 }
 
-/// The background files the page needs and does not have, as (URL as the style holds it,
-/// bytes or `None`).
+/// The background files the page needs and does not have, and the `<img>` sources in
+/// `extra` (absolute URLs: images scripts added), as (key, bytes or `None`). Backgrounds are
+/// keyed by the URL as the style holds it.
 pub fn load(
     dom: &Dom,
     styles: &StyleMap,
     (page_url, base): (&net::Url, &net::Url),
     from: BackgroundFrom,
     store: &ImageStore,
+    extra: Vec<String>,
 ) -> Vec<(String, Option<Vec<u8>>)> {
     if matches!(from, BackgroundFrom::Stored) {
         return Vec::new();
     }
+    // Without the network only `data:` backgrounds load; `<img>` sources stay pending for
+    // the window to fetch, rather than being kept as failed.
+    let extra = if matches!(from, BackgroundFrom::Network(_)) {
+        extra
+    } else {
+        Vec::new()
+    };
     let room = MAX_IMAGES.saturating_sub(store.len());
-    let wanted: Vec<String> = wanted(dom, styles)
+    let mut wanted: Vec<String> = wanted(dom, styles)
         .into_iter()
         .filter(|u| !store.has_background(u))
-        .take(room)
         .collect();
+    for url in extra {
+        if !wanted.contains(&url) {
+            wanted.push(url);
+        }
+    }
+    wanted.truncate(room);
     if wanted.is_empty() {
         return Vec::new();
     }

@@ -113,10 +113,15 @@ casts), not taken from binding crates. Ask before proposing any dependency.
 
 - **Only the visible tab is a live page** (`Browser::page`). Every other tab is a file in `TabStore` or just
   its history. Never keep a second `Loaded` around: a heavy page is 10 to 20 MB live.
-- **CSS background images are kept by URL** in the page's `ImageStore` (beside `<img>` files by `NodeId`,
-  within the same budget), keyed by the URL as the computed style holds it: stylesheets' URLs are made absolute
-  after parsing (`Stylesheet::resolve_urls`), `style` attributes' stay relative and are fetched against the page.
-  They are found after the cascade, for displayed elements only, and stored with a sleeping tab.
+- **Every image file is kept by its source** in the page's `ImageStore`, within one budget. CSS backgrounds by
+  the URL as the computed style holds it (stylesheets' URLs are made absolute after parsing,
+  `Stylesheet::resolve_urls`; `style` attributes' stay relative and are fetched against the page), found after
+  the cascade for displayed elements only. `<img>` files by `images::key_of` (absolute URL, or a hash of a
+  `data:` URL), and an `<img>` shows the file of its *current* source (`ImageStore::bind`): images scripts add,
+  or whose `src` they set later (lazy loading), are fetched by source, at load with the backgrounds or later
+  by the window (`Loaded::pending_images`, `Browser::fetch_images`), which lays them out when they arrive
+  (`Dom::touch`). A source that failed is not asked for again. All are stored with a sleeping tab, so a waking
+  tab finds them by source whatever ids its scripts' nodes get.
 - **A snapshot holds only what the page was built from**, as it arrived (`net::Wire`): rebuilding must give the
   same DOM, so `NodeId`s in the stored `ImageStore` stay valid. Do not store anything derived (styles, layout).
 - **Sleeping tabs share their large parts** (`hibernate.rs`): every part of 4 KB or more is a blob named by
@@ -193,8 +198,8 @@ casts), not taken from binding crates. Ask before proposing any dependency.
 - **Script work runs on a large-stack thread** (`script::on_script_stack`, `js::STACK_SIZE`): the interpreter
   recurses. The runtime is `Send` (`Arc`, not `Rc`) so a `Loaded` can still cross from the loader thread.
 - **Scripts run before styles**, after form controls are prepared; later DOM changes (events, timers) restyle
-  and lay out the page again. Image ids come from parser nodes only, so a waking tab finds them again even if
-  its scripts behave differently the second time.
+  and lay out the page again. Images are found by source, not node id (see the tab invariants), so a waking tab
+  finds them again even if its scripts behave differently the second time.
 - **Accessors and classes live in the same arena.** A getter/setter pair is a `Kind::Accessor` object in the
   property slot; `get` calls the getter, and `put` looks up the prototype chain for a setter only once the page
   has made an accessor (`Interp::accessors`). A class is its constructor function plus a `ClassRec` (fields,
