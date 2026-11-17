@@ -97,6 +97,16 @@ mod sys {
         family: u16,
     }
 
+    #[cfg(target_os = "macos")]
+    fn family_of(addr: &SockAddr) -> u16 {
+        u16::from(addr.family)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn family_of(addr: &SockAddr) -> u16 {
+        addr.family
+    }
+
     const IFF_UP: c_uint = 0x1;
     const IFF_LOOPBACK: c_uint = 0x8;
     const IFF_RUNNING: c_uint = 0x40;
@@ -125,7 +135,7 @@ mod sys {
                 let ifa = &*at;
                 let up = ifa.flags & (IFF_UP | IFF_RUNNING) == IFF_UP | IFF_RUNNING;
                 if up && ifa.flags & IFF_LOOPBACK == 0 && !ifa.addr.is_null() {
-                    let family = u16::from((*ifa.addr).family);
+                    let family = family_of(&*ifa.addr);
                     if family == AF_INET || family == AF_INET6 {
                         found = true;
                         break;
