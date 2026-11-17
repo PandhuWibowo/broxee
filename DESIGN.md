@@ -231,7 +231,8 @@ Every list and every page Broxee draws has its empty, loading and error state.
 |---|---|
 | Page loading | A 2px `accent` progress line under the pane header, only while loading. Reload becomes Stop. |
 | Sleeping tab | Title in `muted`. Tooltip: "Asleep to save memory. Select to wake." |
-| Network error | Broxee page: what failed in plain words ("Couldn't reach github.com: the connection was reset") and **Try again**. |
+| Network error | Broxee page: what failed in plain words, one title per cause ("Couldn't find github.com", "github.com refused the connection", "github.com took too long to answer", "github.com redirected too many times"), the address, and **Try again**. |
+| Offline | "You're offline". The tab reloads by itself once a network interface is back. |
 | Certificate error | "github.com's certificate isn't valid, so Broxee didn't open it." No click-through in the first version. |
 | Page Broxee can't render yet | "This page needs JavaScript, which Broxee doesn't run yet." Action: **Open in default browser**. |
 | No bookmarks | "No bookmarks yet. Press ⌘D on any page to save it here." |

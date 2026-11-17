@@ -37,6 +37,8 @@ use crate::Options;
 
 /// The shortest wait before a page's refresh is followed.
 const REFRESH_MIN: Duration = Duration::from_secs(1);
+/// How often an offline tab looks whether a network is back.
+const OFFLINE_CHECK: Duration = Duration::from_secs(2);
 /// Arrow keys scroll by this many points.
 const LINE_STEP: f32 = 40.0;
 /// Page Up/Down keep this much of the previous view visible.
@@ -786,6 +788,11 @@ struct Browser<S: Screen> {
     /// When the visible page asked to go somewhere by itself (`Refresh`, meta refresh), and
     /// where (`None`: reload). Any navigation or tab change drops it.
     refresh: Option<(Instant, Option<net::Url>)>,
+    /// The visible tab failed to load while the machine was offline: when to look again
+    /// whether a network is back, to reload it then.
+    offline_retry: Option<Instant>,
+    /// Whether a network interface is up (`net::online`; tests replace it).
+    online: fn() -> bool,
     /// Where the pointer last rested over the focused pane (pane-relative, as `route` gives).
     last_pointer: Option<(f32, f32)>,
     /// Tabs opened from links of one tab in a row (its id, how many): the next one goes
@@ -856,6 +863,8 @@ impl<S: Screen> Browser<S> {
             drag: None,
             link_preview: None,
             refresh: None,
+            offline_retry: None,
+            online: net::online,
             last_pointer: None,
             opened: (0, 0),
             selection: None,
@@ -1025,6 +1034,9 @@ impl<S: Screen> Browser<S> {
             if let Some((at, _)) = &self.refresh {
                 wait = wait.min(at.saturating_duration_since(Instant::now()));
             }
+            if let Some(at) = self.offline_retry {
+                wait = wait.min(at.saturating_duration_since(Instant::now()));
+            }
             // Answers to the page's requests arrive on their own channel: look each frame.
             if self.page_requests_busy() {
                 wait = wait.min(LOAD_POLL);
@@ -1049,6 +1061,7 @@ impl<S: Screen> Browser<S> {
                 repaint = Repaint::Frame;
             }
             self.run_refresh();
+            self.retry_if_online();
             if repaint != Repaint::Nothing {
                 self.repaint(repaint);
                 trimmed = false;
@@ -4368,6 +4381,7 @@ impl<S: Screen> Browser<S> {
     ) {
         self.stop_load();
         self.refresh = None;
+        self.offline_retry = None;
         self.editing = None;
         self.field = None;
         self.focus = None;
@@ -4472,10 +4486,13 @@ impl<S: Screen> Browser<S> {
             return;
         }
         let loaded = result.is_ok();
+        let mut offline = false;
         let mut page = result.unwrap_or_else(|e| {
+            // A file that is not there is not a network problem.
+            offline = url.scheme != "file" && !(self.online)();
             engine::page_from_html(
                 url.clone(),
-                &error_page(&url, &e, &self.chrome),
+                &error_page(&url, &e, offline, &self.chrome),
                 load.settings,
                 &self.fonts,
             )
@@ -4530,7 +4547,25 @@ impl<S: Screen> Browser<S> {
             let delay = Duration::from_secs_f32(seconds.clamp(0.0, 86_400.0)).max(REFRESH_MIN);
             (Instant::now() + delay, url)
         });
+        self.offline_retry = offline.then(|| Instant::now() + OFFLINE_CHECK);
         self.save_session();
+    }
+
+    /// While the visible tab shows the offline page, look every `OFFLINE_CHECK` whether a
+    /// network is back, and reload the tab when it is.
+    fn retry_if_online(&mut self) {
+        let Some(at) = self.offline_retry else {
+            return;
+        };
+        if Instant::now() < at || self.load.is_some() {
+            return;
+        }
+        if (self.online)() {
+            self.offline_retry = None;
+            self.reload();
+        } else {
+            self.offline_retry = Some(Instant::now() + OFFLINE_CHECK);
+        }
     }
 
     /// Follow the visible page's refresh once it is due. The new page takes the place of the
@@ -4565,6 +4600,7 @@ impl<S: Screen> Browser<S> {
     fn sleep(&mut self) {
         self.stop_load();
         self.refresh = None;
+        self.offline_retry = None;
         self.save_scroll();
         self.field = None;
         self.focus = None;
@@ -4683,6 +4719,7 @@ impl<S: Screen> Browser<S> {
     fn close_tab(&mut self) -> bool {
         self.stop_load();
         self.refresh = None;
+        self.offline_retry = None;
         self.save_scroll();
         self.page = None;
         self.page_is_entry = false;
@@ -4849,6 +4886,7 @@ impl<S: Screen> Browser<S> {
         self.link_focus = None;
         self.link_preview = None;
         self.refresh = None;
+        self.offline_retry = None;
         self.editing = None;
         self.loading = None;
         self.scroll = scroll;
@@ -6058,25 +6096,57 @@ fn host_of(url: &net::Url) -> String {
     }
 }
 
-fn error_page(url: &net::Url, error: &str, chrome: &Chrome) -> String {
+/// The page for a load that failed: what went wrong in plain words, the address, and Try
+/// again. `offline`: no network interface was up, whatever the error says.
+fn error_page(url: &net::Url, error: &str, offline: bool, chrome: &Chrome) -> String {
     let host = host_of(url);
-    let lower = error.to_ascii_lowercase();
-    let title = if lower.contains("certificate") {
-        format!("{host}'s certificate isn't valid, so Broxee didn't open it")
+    let kind = if offline {
+        None
     } else {
-        format!("Couldn't reach {host}")
+        Some(net::classify(error))
     };
-    message_page(&title, error, Some(url), chrome)
+    let (title, detail) = match kind {
+        None => (
+            "You're offline".to_string(),
+            "Broxee will open the page again when a network connection is back.".to_string(),
+        ),
+        Some(net::Failure::Dns) => (
+            format!("Couldn't find {host}"),
+            "No server answers to that name. Check the address for typos.".to_string(),
+        ),
+        Some(net::Failure::Refused) => (
+            format!("{host} refused the connection"),
+            "The site may be down, or not taking connections on this port.".to_string(),
+        ),
+        Some(net::Failure::TimedOut) => (
+            format!("{host} took too long to answer"),
+            "The site may be busy or down. Try again in a moment.".to_string(),
+        ),
+        Some(net::Failure::Unreachable) => (
+            format!("Couldn't reach {host}"),
+            "There is no route to the site's network from this connection.".to_string(),
+        ),
+        Some(net::Failure::Redirects) => (
+            format!("{host} redirected too many times"),
+            "The page keeps sending Broxee to another address. Clearing this profile's \
+             cookies can fix it."
+                .to_string(),
+        ),
+        Some(net::Failure::Certificate) => (
+            format!("{host}'s certificate isn't valid, so Broxee didn't open it"),
+            error.to_string(),
+        ),
+        Some(net::Failure::Other) => (format!("Couldn't reach {host}"), error.to_string()),
+    };
+    message_page(&title, &detail, Some(url), chrome)
 }
 
 /// A small page in Broxee's own style (DESIGN.md tokens), rendered by the engine itself.
 fn message_page(title: &str, detail: &str, retry: Option<&net::Url>, chrome: &Chrome) -> String {
     let t = chrome.theme();
     let action = retry.map_or(String::new(), |url| {
-        format!(
-            "<p><a href=\"{}\">Try again</a></p>",
-            escape(&url.to_string())
-        )
+        let url = escape(&url.to_string());
+        format!("<p class=url>{url}</p><p><a href=\"{url}\">Try again</a></p>")
     });
     format!(
         "<!doctype html><html><head><title>{title}</title><style>\
@@ -6085,6 +6155,7 @@ fn message_page(title: &str, detail: &str, retry: Option<&net::Url>, chrome: &Ch
          main {{ max-width: 32em; margin: 0 auto; padding: 120px 24px 0 }} \
          h1 {{ font-size: 20px; margin: 0 0 8px; line-height: 1.3 }} \
          p {{ margin: 0 0 16px; color: {text_2} }} \
+         .url {{ font-size: 12px; overflow-wrap: anywhere }} \
          a {{ color: {accent}; text-decoration: none; font-weight: bold }}\
          </style></head><body><main><h1>{title}</h1><p>{detail}</p>{action}</main></body></html>",
         title = escape(title),
@@ -9542,5 +9613,137 @@ mod tests {
             "its stylesheet is not fetched"
         );
         assert_eq!(p.images.len(), 0, "nor its image");
+    }
+
+    #[test]
+    fn error_pages_say_what_failed_in_plain_words() {
+        let chrome = Chrome::new(false);
+        let url = net::Url::parse("https://example.com/a?b").unwrap();
+        let page = |error: &str, offline: bool| error_page(&url, error, offline, &chrome);
+        let cases = [
+            (
+                "resolve example.com: failed to lookup",
+                "Couldn't find example.com",
+            ),
+            (
+                "connect example.com:443: connection refused",
+                "example.com refused the connection",
+            ),
+            (
+                "connect example.com:443: timed out",
+                "example.com took too long to answer",
+            ),
+            (
+                "too many redirects ending at https://example.com/",
+                "example.com redirected too many times",
+            ),
+            (
+                "invalid peer certificate: Expired",
+                "example.com's certificate isn't valid",
+            ),
+            ("connection closed mid-body", "Couldn't reach example.com"),
+        ];
+        for (error, title) in cases {
+            let html = page(error, false);
+            assert!(html.contains(title), "{error}: {html}");
+            assert!(
+                html.contains("https://example.com/a?b"),
+                "the address is shown"
+            );
+            assert!(html.contains(">Try again</a>"));
+        }
+        assert!(page("resolve example.com: x", true).contains("You're offline"));
+        assert!(
+            !page("<script>", false).contains("<script>"),
+            "errors are escaped"
+        );
+    }
+
+    /// A port nothing listens on (bound, then freed).
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    #[test]
+    fn a_refused_connection_shows_its_page() {
+        let (a, _) = site("refused");
+        let mut b = browser(&a);
+        b.online = || true;
+        b.open_input(&format!("http://127.0.0.1:{}/", free_port()));
+        b.wait_for_load();
+        assert_eq!(title(&b), "127.0.0.1 refused the connection");
+        assert!(b.offline_retry.is_none(), "online: no automatic retry");
+    }
+
+    #[test]
+    fn an_offline_tab_reloads_when_the_network_is_back() {
+        let (a, _) = site("offline");
+        let mut b = browser(&a);
+        b.online = || false;
+        let port = free_port();
+        b.open_input(&format!("http://127.0.0.1:{port}/"));
+        b.wait_for_load();
+        assert_eq!(title(&b), "You're offline");
+        assert!(b.offline_retry.is_some());
+
+        // Still offline: it looks again later.
+        b.offline_retry = Some(Instant::now());
+        b.retry_if_online();
+        assert!(b.load.is_none());
+        assert!(b.offline_retry.unwrap() > Instant::now());
+
+        // The network is back (and so is the server).
+        let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port)) else {
+            return; // Another test took the port meanwhile.
+        };
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let page = "<title>Back online</title>";
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
+                    page.len()
+                );
+            }
+        });
+        b.online = || true;
+        b.offline_retry = Some(Instant::now());
+        b.retry_if_online();
+        b.wait_for_load();
+        assert_eq!(title(&b), "Back online");
+        assert!(b.offline_retry.is_none());
+        assert_eq!(
+            b.tab().history.len(),
+            2,
+            "the reload kept the failed entry's place"
+        );
+    }
+
+    #[test]
+    fn the_refresh_header_counts_like_meta_refresh() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let port = http_server(Arc::clone(&seen), |_, path, _, _| match path {
+            "/" => (
+                200,
+                "Refresh: 3; url=/next\r\n".into(),
+                "<title>First</title>".into(),
+            ),
+            _ => (200, String::new(), "<title>Next</title>".into()),
+        });
+        let (a, _) = site("refresh-header");
+        let mut b = browser(&a);
+        b.open_input(&format!("http://127.0.0.1:{port}/"));
+        b.wait_for_load();
+        assert_eq!(title(&b), "First");
+        let (at, to) = b.refresh.clone().expect("the header's refresh waits");
+        assert!(at > Instant::now() + Duration::from_secs(2));
+        assert_eq!(to.unwrap().path, "/next");
     }
 }

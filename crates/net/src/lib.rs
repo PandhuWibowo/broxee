@@ -7,10 +7,12 @@ use std::time::{Duration, Instant};
 pub mod archive;
 mod cache;
 mod cookies;
+mod failure;
 mod psl;
 
 pub use cache::Cache;
 pub use cookies::{Context, Cookie, Cookies, SameSite};
+pub use failure::{classify, online, Failure};
 
 /// Bytes of response bodies read from the network (not from a cache or a file), as they
 /// arrived (compressed or not).
@@ -361,7 +363,7 @@ fn io_error(e: std::io::Error) -> FetchError {
         ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof => {
             FetchError::Retryable(e.to_string())
         }
-        _ => FetchError::Fatal(e.to_string()),
+        _ => FetchError::Fatal(failure::describe(&e)),
     }
 }
 
@@ -851,6 +853,7 @@ impl Conn {
                 |addr| match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
                     Ok(tcp) => Some(tcp),
                     Err(e) => {
+                        let e = failure::describe(&e);
                         last = format!("connect {}:{}: {e}", url.host, url.port);
                         None
                     }
