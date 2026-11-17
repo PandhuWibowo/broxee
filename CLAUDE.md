@@ -220,7 +220,12 @@ casts), not taken from binding crates. Ask before proposing any dependency.
   the page and arms it with the jar (`ScriptNet::arm`): the CLI and pages being built never send any, and a
   page that goes away drops its answers. `document.cookie` never shows or replaces `HttpOnly` cookies.
   Failures are logged by reason only, never with what a request carried.
-- **Scripts cannot navigate and store nothing on disk.** Widen this only on purpose.
+- **Scripts navigate only like a link the page followed.** `location.href = …`, `location = …`,
+  `document.location = …`, `assign` and `replace` (`Host::navigate`) are kept in `ScriptNet::navigation`
+  and followed after the task by `Browser::follow_script_navigation`: http, https and file only (never
+  `javascript:` or `data:`), a fragment stays on the page, the same-site cookie rule of links, and at most
+  `SCRIPT_HOPS` in a row until the person clicks or types (redirect loops stop). `replace` takes the page's
+  place in the history. No popups (`window.open`). Scripts store nothing on disk. Widen either only on purpose.
 
 ### Compression invariants
 

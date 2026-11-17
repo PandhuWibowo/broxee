@@ -52,6 +52,10 @@ pub trait Host {
     fn set_checked(&mut self, node: u32, checked: bool);
     fn url(&self) -> String;
     fn log(&mut self, line: &str);
+    /// A script asked to go to `url` (as written, relative to the page): `location.href = …`,
+    /// `assign`, or with `replace`, in place of the page in the history. The embedder decides
+    /// whether and when; nothing happens by default.
+    fn navigate(&mut self, _url: &str, _replace: bool) {}
     /// Start a request a script made. Its answer comes back through `Runtime::deliver` with
     /// the id returned; `None` refuses it (no network here, or too many requests).
     fn fetch(&mut self, _request: Request) -> Option<u32> {
@@ -391,6 +395,7 @@ mod tests {
     #[derive(Default)]
     struct Bare {
         log: Vec<String>,
+        navigations: Vec<(String, bool)>,
         requests: Vec<Request>,
         cookies: Vec<String>,
     }
@@ -448,6 +453,9 @@ mod tests {
         fn url(&self) -> String {
             "https://example.org/".into()
         }
+        fn navigate(&mut self, url: &str, replace: bool) {
+            self.navigations.push((url.to_string(), replace));
+        }
         fn log(&mut self, line: &str) {
             self.log.push(line.to_string());
         }
@@ -496,6 +504,41 @@ mod tests {
         // The page started 250 ms before.
         rt.set_time(250.0, 1_794_923_639_750.0);
         rt.eval_to_string(&mut Bare::default(), src)
+    }
+
+    #[test]
+    fn scripts_ask_the_host_to_navigate() {
+        let mut rt = Runtime::new();
+        let mut host = Bare::default();
+        for src in [
+            "location.href = 'a.html'",
+            "location = 'b.html'",
+            "window.location = 'c.html'",
+            "document.location = 'd.html'",
+            "location.assign('e.html')",
+            "location.replace('f.html')",
+            "location.hash = 'top'",
+        ] {
+            rt.eval_to_string(&mut host, src);
+        }
+        let want: Vec<(String, bool)> = [
+            ("a.html", false),
+            ("b.html", false),
+            ("c.html", false),
+            ("d.html", false),
+            ("e.html", false),
+            ("f.html", true),
+        ]
+        .iter()
+        .map(|&(u, r)| (u.to_string(), r))
+        .collect();
+        assert_eq!(host.navigations, want, "a hash change stays on the page");
+        assert_eq!(rt.eval_to_string(&mut host, "location.hash"), "#top");
+        assert_eq!(
+            rt.eval_to_string(&mut host, "typeof location.assign"),
+            "function",
+            "location keeps its methods after writes"
+        );
     }
 
     #[test]

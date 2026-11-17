@@ -3301,7 +3301,11 @@ pub fn element_set(
             };
             it.set_own(o, &format!("__{key}"), value.clone());
         }
-        "location" if n == 0 => {}
+        // `document.location = …` navigates like `location.href = …`.
+        "location" if n == 0 => {
+            let url = it.to_string(host, value)?;
+            host.navigate(&url, false);
+        }
         _ => return Ok(false),
     }
     Ok(true)
@@ -3323,13 +3327,22 @@ fn install_dom(it: &mut Interp) {
     it.method(location, "toString", |_, host, _, _| {
         Ok(Value::str(&host.url()))
     });
-    it.set_own(location, "__location", Value::Bool(true));
-    for name in ["reload", "assign", "replace"] {
-        it.method(location, name, |_, host, _, _| {
-            host.log("navigation from scripts is not supported");
-            Ok(Value::Undefined)
-        });
-    }
+    it.location = location;
+    it.method(location, "assign", |it, host, _, args| {
+        let url = it.to_string(host, &arg(args, 0))?;
+        host.navigate(&url, false);
+        Ok(Value::Undefined)
+    });
+    it.method(location, "replace", |it, host, _, args| {
+        let url = it.to_string(host, &arg(args, 0))?;
+        host.navigate(&url, true);
+        Ok(Value::Undefined)
+    });
+    it.method(location, "reload", |_, host, _, _| {
+        let url = host.url();
+        host.navigate(&url, true);
+        Ok(Value::Undefined)
+    });
     for name in [
         "Node",
         "Element",
@@ -4223,4 +4236,33 @@ pub(crate) fn set_location(it: &mut Interp, l: &crate::Location) {
     ] {
         it.set_own(location, name, Value::str(value));
     }
+}
+
+/// A write to `location` (or to the global `location` itself, `on_global`): `href` and the
+/// object itself navigate; `hash` changes only the fragment, which stays on the page. Other
+/// parts are kept as written. Returns whether the write was handled.
+pub(crate) fn location_set(
+    it: &mut Interp,
+    host: &mut dyn Host,
+    on_global: bool,
+    key: &str,
+    value: &Value,
+) -> Result<bool, Ctrl> {
+    if on_global || key == "href" {
+        let url = it.to_string(host, value)?;
+        host.navigate(&url, false);
+        return Ok(true);
+    }
+    if key == "hash" {
+        let hash = it.to_string(host, value)?;
+        let hash = if hash.is_empty() || hash.starts_with('#') {
+            hash.to_string()
+        } else {
+            format!("#{hash}")
+        };
+        let location = it.location;
+        it.set_own(location, "hash", Value::str(&hash));
+        return Ok(true);
+    }
+    Ok(false)
 }

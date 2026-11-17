@@ -35,6 +35,9 @@ use crate::palette::{self, Action, Command, Hint};
 use crate::selection::{self, Selection};
 use crate::Options;
 
+/// Pages may send the browser on by script this many times in a row without the person
+/// clicking or typing (a redirect chain); a page that loops is stopped there.
+const SCRIPT_HOPS: u32 = 10;
 /// Loads that may go on downloading after their tab is left; more stop the oldest.
 const BACKGROUND_LOADS: usize = 2;
 /// The shortest wait before a page's refresh is followed.
@@ -797,6 +800,8 @@ struct Browser<S: Screen> {
     frame_geometry: Option<Geometry>,
     /// The address of the link under the pointer, shown at the bottom of the pane.
     link_preview: Option<String>,
+    /// Script navigations in a row since the person last clicked or typed (`SCRIPT_HOPS`).
+    script_hops: u32,
     /// Images the visible page named after it loaded (`Loaded::pending_images`), being
     /// fetched on their own thread: (source, bytes or `None`) for each.
     image_fetch: Option<Receiver<crate::images::Fetched>>,
@@ -882,6 +887,7 @@ impl<S: Screen> Browser<S> {
             link_preview: None,
             background: Vec::new(),
             image_fetch: None,
+            script_hops: 0,
             refresh: None,
             offline_retry: None,
             online: net::online,
@@ -1249,6 +1255,13 @@ impl<S: Screen> Browser<S> {
             return self.hover_at(x as f32, y as f32) | handle_changed;
         }
         let from_key = matches!(event, Event::Key(_));
+        // The person acting: pages may navigate by script again.
+        if matches!(
+            event,
+            Event::Key(_) | Event::Click { .. } | Event::OpenClick { .. } | Event::Paste(_)
+        ) {
+            self.script_hops = 0;
+        }
         let focus_before = self.link_focus.as_ref().map(|l| l.node);
         // Anything else hides a tooltip, which needs a full frame.
         let hid = self.hover.take().is_some_and(|h| h.shown);
@@ -2284,6 +2297,7 @@ impl<S: Screen> Browser<S> {
         if r.0 {
             self.relayout_page();
         }
+        self.follow_script_navigation();
         r
     }
 
@@ -2307,7 +2321,7 @@ impl<S: Screen> Browser<S> {
         if changed {
             self.relayout_page();
         }
-        changed
+        self.follow_script_navigation() || changed
     }
 
     /// Whether the page's scripts wait for answers to requests.
@@ -2338,7 +2352,48 @@ impl<S: Screen> Browser<S> {
         if changed {
             self.relayout_page();
         }
-        changed
+        self.follow_script_navigation() || changed
+    }
+
+    /// Go where the visible page's scripts asked (`location.href = …`, `assign`, `replace`),
+    /// once their task is over: a link the page followed by itself, with the same cookie
+    /// rules. Only http, https and file addresses; a fragment of this page stays here. A page
+    /// that keeps sending the browser on is stopped after `SCRIPT_HOPS` in a row without the
+    /// person clicking or typing. Returns whether a load started.
+    fn follow_script_navigation(&mut self) -> bool {
+        let Some(page) = self.page.as_mut() else {
+            return false;
+        };
+        let Some((target, replace)) = page.script.as_mut().and_then(|s| s.net.navigation.take())
+        else {
+            return false;
+        };
+        let target = target.trim();
+        let lower = target.to_ascii_lowercase();
+        if lower.starts_with("javascript:") || lower.starts_with("data:") || target.starts_with('#')
+        {
+            return false;
+        }
+        let Ok(url) = page.base.join(target) else {
+            return false;
+        };
+        if !matches!(url.scheme.as_str(), "http" | "https" | "file") {
+            return false;
+        }
+        if self.script_hops >= SCRIPT_HOPS {
+            eprintln!("broxee: a page kept navigating by itself; stopped");
+            return false;
+        }
+        self.script_hops += 1;
+        let same_site = net::site(&page.url.host) == net::site(&url.host);
+        let to = if replace {
+            Destination::Replace
+        } else {
+            self.save_scroll();
+            Destination::Push
+        };
+        self.navigate_from(url, to, same_site);
+        true
     }
 
     /// The form control at (x, y) in pane points, if any.
@@ -4620,6 +4675,8 @@ impl<S: Screen> Browser<S> {
         });
         self.offline_retry = offline.then(|| Instant::now() + OFFLINE_CHECK);
         self.save_session();
+        // A page whose scripts navigated while it loaded (a redirect page) goes on now.
+        self.follow_script_navigation();
     }
 
     /// While the visible tab shows the offline page, look every `OFFLINE_CHECK` whether a
@@ -10268,6 +10325,65 @@ mod tests {
             Some((20.0, 10.0)),
             "from its sleeping file"
         );
+    }
+
+    #[test]
+    fn scripts_navigate_like_links_and_loops_stop() {
+        let (a, b_path) = site("script-nav");
+        let dir = a.parent().unwrap().to_path_buf();
+        let write = |name: &str, html: &str| {
+            std::fs::write(dir.join(name), html).unwrap();
+            dir.join(name)
+        };
+        // A redirect page (as search engines' result links are) takes its own place.
+        let redirect = write(
+            "redirect.html",
+            "<title>Moving</title><script>location.replace('b.html')</script>",
+        );
+        let mut b = browser(&a);
+        open(&mut b, &redirect);
+        b.wait_for_load();
+        assert_eq!(title(&b), "Page B");
+        assert_eq!(
+            b.tab().history.len(),
+            2,
+            "A, then B in the redirect's place"
+        );
+
+        // A click handler navigates, pushing an entry.
+        let clicky = write(
+            "click.html",
+            "<title>Clicky</title><p id=go onclick=\"location.href = 'a.html'\">Go there</p>",
+        );
+        open(&mut b, &clicky);
+        click_text(&mut b, "Go there");
+        b.wait_for_load();
+        assert_eq!(title(&b), "Page A");
+        act(&mut b, command('['));
+        assert_eq!(title(&b), "Clicky");
+
+        // Not to javascript: or data:, and not anywhere for a fragment.
+        let odd = write(
+            "odd.html",
+            "<title>Odd</title><script>location.href = 'javascript:alert(1)';\
+             location.assign('#part')</script>",
+        );
+        open(&mut b, &odd);
+        assert_eq!(title(&b), "Odd");
+        assert!(b.load.is_none());
+
+        // A page reloading itself forever is stopped.
+        let loop_page = write(
+            "loop.html",
+            "<title>Loop</title><script>location.replace('loop.html')</script>",
+        );
+        open(&mut b, &loop_page);
+        for _ in 0..SCRIPT_HOPS + 3 {
+            b.wait_for_load();
+        }
+        assert_eq!(title(&b), "Loop");
+        assert!(b.load.is_none(), "stopped after {SCRIPT_HOPS} hops");
+        let _ = b_path;
     }
 
     #[test]

@@ -22,6 +22,9 @@ const MAX_RESPONSE: usize = 8 << 20;
 type Answer = (u32, Result<js::Reply, String>);
 
 pub struct ScriptNet {
+    /// Where a script asked the page to go (as written) and whether in place of it: the
+    /// window follows it after the task (`Browser::follow_script_navigation`).
+    pub navigation: Option<(String, bool)>,
     page: net::Url,
     /// The document's base URL, which request URLs resolve against.
     base: net::Url,
@@ -40,6 +43,7 @@ impl ScriptNet {
     pub fn new(page: net::Url, base: net::Url) -> ScriptNet {
         let (sender, answers) = mpsc::channel();
         ScriptNet {
+            navigation: None,
             page,
             base,
             jar: None,

@@ -233,6 +233,13 @@ impl js::Host for DomHost<'_> {
         self.net.as_mut()?.request(request)
     }
 
+    fn navigate(&mut self, url: &str, replace: bool) {
+        // The last request in a task wins, as in browsers.
+        if let Some(net) = self.net.as_deref_mut() {
+            net.navigation = Some((url.to_string(), replace));
+        }
+    }
+
     fn cookie(&self) -> String {
         let Some(net) = self.net.as_deref() else {
             return String::new();
@@ -413,6 +420,18 @@ fn runs(dom: &Dom, node: NodeId) -> bool {
     }
 }
 
+/// Whether some element has an event handler attribute (`onclick`, `onsubmit`…).
+fn has_inline_handlers(dom: &Dom) -> bool {
+    dom.descendants(Dom::ROOT).any(|id| {
+        dom.element(id).is_some_and(|e| {
+            e.attrs().any(|(name, _)| {
+                let name = dom.atom_name(name);
+                name.len() > 2 && name.starts_with("on")
+            })
+        })
+    })
+}
+
 /// Run the page's scripts in document order, then `DOMContentLoaded` and `load`. Returns the
 /// live scripts (`None` when the page has none) and the external scripts as they arrived,
 /// for a sleeping tab.
@@ -430,6 +449,10 @@ pub fn run_page_scripts(
         })
         .take(MAX_SCRIPTS)
         .collect();
+    // Inline handlers (`onclick="…"`) need a runtime even on a page without <script>.
+    if nodes.is_empty() && run && has_inline_handlers(dom) {
+        return (Some(Box::new(PageScript::new(url, base))), Vec::new());
+    }
     if nodes.is_empty() {
         return (None, Vec::new());
     }

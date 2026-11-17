@@ -170,6 +170,9 @@ pub struct Interp {
     /// Scopes below this index are referenced by some closure and must stay.
     pinned: usize,
     pub global: ObjId,
+    /// The `location` object: writes to it navigate (`builtins::location_set`). 0 until the
+    /// DOM bindings are installed.
+    pub location: ObjId,
     pub global_env: EnvId,
     pub protos: Protos,
     pub elements: HashMap<u32, ObjId>,
@@ -288,6 +291,7 @@ impl Interp {
             steps: 0,
             depth: 0,
             now: 0.0,
+            location: 0,
             epoch_ms: 0.0,
             offset: crate::date::utc,
             stopped: None,
@@ -705,6 +709,13 @@ impl Interp {
             return Ok(());
         };
         let o = *o;
+        // `location.href = …`, `location = …`: one comparison per write, no accessor.
+        if (o == self.location && self.location != 0) || (o == self.global && key == "location") {
+            let on_global = o == self.global;
+            if crate::builtins::location_set(self, host, on_global, key, &value)? {
+                return Ok(());
+            }
+        }
         match &mut self.objects[o as usize].kind {
             Kind::Array(items) => {
                 if key == "length" {
