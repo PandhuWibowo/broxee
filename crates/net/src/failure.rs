@@ -198,7 +198,7 @@ mod tests {
             .unwrap()
             .port();
         let url = crate::Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
-        let error = crate::fetch(&url).err().expect("nothing listens");
+        let error = crate::fetch(&url).expect_err("nothing listens");
         assert_eq!(classify(&error), Failure::Refused, "{error}");
     }
 
