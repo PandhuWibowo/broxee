@@ -98,7 +98,7 @@ impl Recorder {
         let content_type = field("content-type");
         let file = format!("{:016x}.{}", key(&address), extension(&content_type));
         let err = |e: std::io::Error| format!("{}: {e}", self.dir.display());
-        std::fs::write(self.dir.join(&file), &resp.body).map_err(err)?;
+        std::fs::write(self.dir.join(&file), scrub(&resp.body)).map_err(err)?;
         let line = format!(
             "{}\t{content_type}\t{}\t{file}\t{address}\n",
             resp.status,
@@ -109,6 +109,34 @@ impl Recorder {
             .open(self.dir.join(INDEX))
             .and_then(|mut f| f.write_all(line.as_bytes()))
             .map_err(err)
+    }
+}
+
+/// A body with the credentials sites ship to every visitor blanked before it is saved: the
+/// folder is committed to a public repository, and secret scanners rightly flag a key whoever
+/// it belongs to (go.dev's survey script carries a Google API key). Google API keys
+/// (`AIza` and 35 more characters) become `AIza` and 35 `X`s, the same length, so nothing
+/// else in the file moves. Pages never need these keys to render.
+fn scrub(body: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    const PREFIX: &[u8] = b"AIza";
+    const REST: usize = 35;
+    let key_char = |b: u8| b.is_ascii_alphanumeric() || b == b'-' || b == b'_';
+    let mut out: Option<Vec<u8>> = None;
+    let mut i = 0;
+    while let Some(at) = body[i..].windows(PREFIX.len()).position(|w| w == PREFIX) {
+        let start = i + at + PREFIX.len();
+        let end = start + REST;
+        let whole = end <= body.len()
+            && body[start..end].iter().all(|&b| key_char(b))
+            && !body.get(end).is_some_and(|&b| key_char(b));
+        if whole {
+            out.get_or_insert_with(|| body.to_vec())[start..end].fill(b'X');
+        }
+        i = start;
+    }
+    match out {
+        Some(v) => std::borrow::Cow::Owned(v),
+        None => std::borrow::Cow::Borrowed(body),
     }
 }
 
@@ -304,5 +332,24 @@ mod tests {
         let ok = Url::parse("https://a.test/").unwrap();
         assert_eq!(replay.answer(&ok).unwrap().body, b"ok");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recorded_bodies_lose_google_api_keys() {
+        let key = format!("AIza{}", "Sy0123456789abcdefghijklmnopqrstu_-");
+        assert_eq!(key.len(), 39);
+        let body = format!("x = {{ apiKey: '{key}', other: 'AIzaShort' }}; y = '{key}9'");
+        let out = scrub(body.as_bytes());
+        let text = String::from_utf8(out.to_vec()).unwrap();
+        assert_eq!(
+            text.matches(&key[4..]).count(),
+            1,
+            "only the too-long one: {text}"
+        );
+        assert!(text.contains(&format!("'AIza{}'", "X".repeat(35))));
+        assert_eq!(text.len(), body.len(), "same length");
+        assert!(text.contains("AIzaShort"), "not a key: kept");
+        assert!(text.contains(&format!("{key}9")), "longer than a key: kept");
+        assert!(matches!(scrub(b"plain"), std::borrow::Cow::Borrowed(_)));
     }
 }

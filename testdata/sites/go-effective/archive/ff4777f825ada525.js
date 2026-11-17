@@ -31,7 +31,7 @@ function requestHaTs(cookieName, triggerId, bucketSample, promptSample) {
 
       tag.onload = function () {
         var helpApi = window.help.service.Lazy.create(0, {
-          apiKey: 'AIzaSyDfBPfajByU2G6RAjUf5sjkMSSLNTj7MMc',
+          apiKey: 'AIzaXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX',
           locale: 'en-US',
         });
 
