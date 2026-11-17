@@ -44,7 +44,10 @@ pub fn discover(dom: &Dom, base: &net::Url, limit: usize) -> (Vec<Source>, Vec<(
     let mut seen: HashMap<String, usize> = HashMap::new();
     let mut uses = Vec::new();
     for id in dom.descendants(Dom::ROOT) {
-        if dom.tag_name(id) != Some("img") || id as usize >= limit {
+        if dom.tag_name(id) != Some("img")
+            || id as usize >= limit
+            || crate::engine::in_noscript(dom, id)
+        {
             continue;
         }
         let Some(src) = image_src(dom, id) else {

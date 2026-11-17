@@ -40,7 +40,7 @@ pub fn freeze_clock(epoch_ms: f64) {
 }
 
 impl PageScript {
-    fn new(page: &net::Url) -> PageScript {
+    fn new(page: &net::Url, base: &net::Url) -> PageScript {
         let epoch_ms = FROZEN_AT.get().copied().unwrap_or_else(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -48,7 +48,7 @@ impl PageScript {
         });
         PageScript {
             runtime: js::Runtime::new(),
-            net: crate::scriptnet::ScriptNet::new(page.clone()),
+            net: crate::scriptnet::ScriptNet::new(page.clone(), base.clone()),
             started: Instant::now(),
             epoch_ms,
         }
@@ -330,11 +330,14 @@ pub fn run_page_scripts(
     dom: &mut Dom,
     forms: &mut Forms,
     url: &net::Url,
+    base: &net::Url,
     from: ScriptFrom,
 ) -> (Option<Box<PageScript>>, Vec<(String, net::Wire)>) {
     let nodes: Vec<NodeId> = dom
         .descendants(Dom::ROOT)
-        .filter(|&n| dom.tag_name(n) == Some("script") && runs(dom, n))
+        .filter(|&n| {
+            dom.tag_name(n) == Some("script") && runs(dom, n) && !crate::engine::in_noscript(dom, n)
+        })
         .take(MAX_SCRIPTS)
         .collect();
     if nodes.is_empty() {
@@ -347,7 +350,7 @@ pub fn run_page_scripts(
     let sources: Vec<Source> = nodes
         .iter()
         .filter_map(|&n| match dom.attr(n, "src") {
-            Some(src) => url.join(src.trim()).ok().map(Source::External),
+            Some(src) => base.join(src.trim()).ok().map(Source::External),
             None => Some(Source::Inline(dom.text_content(n))),
         })
         .collect();
@@ -393,7 +396,7 @@ pub fn run_page_scripts(
         }
         texts.push((name, text));
     }
-    let mut script = Box::new(PageScript::new(url));
+    let mut script = Box::new(PageScript::new(url, base));
     let page_url = url.to_string();
     let jar = match &from {
         ScriptFrom::Network(Some((jar, _))) => Some(*jar),
@@ -521,7 +524,7 @@ mod tests {
         let mut dom = html::parse(src);
         let mut forms = Forms::prepare(&mut dom);
         let url = net::Url::parse("https://example.org/").unwrap();
-        let (script, _) = run_page_scripts(&mut dom, &mut forms, &url, ScriptFrom::Inline);
+        let (script, _) = run_page_scripts(&mut dom, &mut forms, &url, &url, ScriptFrom::Inline);
         (dom, forms, script)
     }
 

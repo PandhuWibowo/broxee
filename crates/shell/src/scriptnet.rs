@@ -23,6 +23,8 @@ type Answer = (u32, Result<js::Reply, String>);
 
 pub struct ScriptNet {
     page: net::Url,
+    /// The document's base URL, which request URLs resolve against.
+    base: net::Url,
     jar: Option<Arc<net::Cookies>>,
     queued: Vec<(u32, js::Request)>,
     /// `document.cookie` writes made before the page had its profile's jar.
@@ -35,10 +37,11 @@ pub struct ScriptNet {
 }
 
 impl ScriptNet {
-    pub fn new(page: net::Url) -> ScriptNet {
+    pub fn new(page: net::Url, base: net::Url) -> ScriptNet {
         let (sender, answers) = mpsc::channel();
         ScriptNet {
             page,
+            base,
             jar: None,
             queued: Vec::new(),
             cookie_writes: Vec::new(),
@@ -114,11 +117,12 @@ impl ScriptNet {
         };
         while self.running < MAX_RUNNING && !self.queued.is_empty() {
             let (id, request) = self.queued.remove(0);
-            let (page, jar, sender) = (self.page.clone(), Arc::clone(jar), self.sender.clone());
+            let (page, base) = (self.page.clone(), self.base.clone());
+            let (jar, sender) = (Arc::clone(jar), self.sender.clone());
             let spawned = std::thread::Builder::new()
                 .name("script fetch".into())
                 .spawn(move || {
-                    let answer = perform(&page, &request, &jar);
+                    let answer = perform((&page, &base), &request, &jar);
                     // The page went away: nobody is waiting.
                     let _ = sender.send((id, answer));
                 });
@@ -186,13 +190,14 @@ fn listed(list: Option<&str>, item: &str) -> bool {
     })
 }
 
-/// Send `request` for a page at `page`: same-origin rules, CORS, the profile's cookies.
+/// Send `request` for a page at `page` (its URL resolved against `base`): same-origin rules,
+/// CORS, the profile's cookies.
 fn perform(
-    page: &net::Url,
+    (page, base): (&net::Url, &net::Url),
     request: &js::Request,
     jar: &net::Cookies,
 ) -> Result<js::Reply, String> {
-    let url = page.join(&request.url)?;
+    let url = base.join(&request.url)?;
     let same_origin = origin(&url) == origin(page);
     match url.scheme.as_str() {
         "http" | "https" => {}

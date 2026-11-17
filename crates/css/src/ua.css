@@ -19,7 +19,8 @@ col { display: table-column }
 colgroup { display: table-column-group }
 thead, tbody, tfoot, table > tr { vertical-align: middle }
 tr, td, th { vertical-align: inherit }
-head, script, style, title, meta, link, template, base, area, datalist, param, rp, [hidden] {
+head, script, style, title, meta, link, template, base, area, datalist, param, rp, noscript,
+[hidden] {
   display: none;
 }
 

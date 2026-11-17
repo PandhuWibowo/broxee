@@ -35,6 +35,8 @@ use crate::palette::{self, Action, Command, Hint};
 use crate::selection::{self, Selection};
 use crate::Options;
 
+/// The shortest wait before a page's refresh is followed.
+const REFRESH_MIN: Duration = Duration::from_secs(1);
 /// Arrow keys scroll by this many points.
 const LINE_STEP: f32 = 40.0;
 /// Page Up/Down keep this much of the previous view visible.
@@ -254,6 +256,8 @@ enum Destination {
     Push,
     /// This existing entry (back, forward, reload, waking), restoring its scroll position.
     Entry(usize),
+    /// In place of the current entry, at the top (a page refreshing to another address).
+    Replace,
 }
 
 enum LoadMessage {
@@ -779,6 +783,9 @@ struct Browser<S: Screen> {
     frame_geometry: Option<Geometry>,
     /// The address of the link under the pointer, shown at the bottom of the pane.
     link_preview: Option<String>,
+    /// When the visible page asked to go somewhere by itself (`Refresh`, meta refresh), and
+    /// where (`None`: reload). Any navigation or tab change drops it.
+    refresh: Option<(Instant, Option<net::Url>)>,
     /// Where the pointer last rested over the focused pane (pane-relative, as `route` gives).
     last_pointer: Option<(f32, f32)>,
     /// Tabs opened from links of one tab in a row (its id, how many): the next one goes
@@ -848,6 +855,7 @@ impl<S: Screen> Browser<S> {
             sidebar_scroll: 0.0,
             drag: None,
             link_preview: None,
+            refresh: None,
             last_pointer: None,
             opened: (0, 0),
             selection: None,
@@ -1014,6 +1022,9 @@ impl<S: Screen> Browser<S> {
             if let Some(due) = self.next_page_timer() {
                 wait = wait.min(due);
             }
+            if let Some((at, _)) = &self.refresh {
+                wait = wait.min(at.saturating_duration_since(Instant::now()));
+            }
             // Answers to the page's requests arrive on their own channel: look each frame.
             if self.page_requests_busy() {
                 wait = wait.min(LOAD_POLL);
@@ -1037,6 +1048,7 @@ impl<S: Screen> Browser<S> {
             if self.tick() | self.run_page_timers() | self.poll_page_requests() {
                 repaint = Repaint::Frame;
             }
+            self.run_refresh();
             if repaint != Repaint::Nothing {
                 self.repaint(repaint);
                 trimmed = false;
@@ -2719,7 +2731,7 @@ impl<S: Screen> Browser<S> {
             self.tell_at_control(j, message);
             return;
         }
-        let Some(sent) = page.forms.submission(&page.dom, i, &page.url) else {
+        let Some(sent) = page.forms.submission(&page.dom, i, &page.base) else {
             return;
         };
         self.editing = None;
@@ -4355,6 +4367,7 @@ impl<S: Screen> Browser<S> {
         same_site_initiator: bool,
     ) {
         self.stop_load();
+        self.refresh = None;
         self.editing = None;
         self.field = None;
         self.focus = None;
@@ -4492,16 +4505,66 @@ impl<S: Screen> Browser<S> {
                 tab.history[i].scroll
             }
             Destination::Entry(_) => 0.0,
+            Destination::Replace => {
+                let entry = Entry {
+                    url: page.url.clone(),
+                    scroll: 0.0,
+                    title: String::new(),
+                };
+                match tab.history.get_mut(tab.index) {
+                    Some(current) => *current = entry,
+                    None => {
+                        tab.history.push(entry);
+                        tab.index = tab.history.len() - 1;
+                    }
+                }
+                0.0
+            }
         };
+        let refresh = engine::refresh(&page).filter(|_| loaded);
         let title = self.show(page, scroll);
         self.set_tab_title(title);
         self.page_is_entry = loaded;
+        // Never sooner than a second: a page refreshing itself at 0 must not spin.
+        self.refresh = refresh.map(|(seconds, url)| {
+            let delay = Duration::from_secs_f32(seconds.clamp(0.0, 86_400.0)).max(REFRESH_MIN);
+            (Instant::now() + delay, url)
+        });
         self.save_session();
+    }
+
+    /// Follow the visible page's refresh once it is due. The new page takes the place of the
+    /// current history entry; a reload keeps it and its scroll position.
+    fn run_refresh(&mut self) {
+        let due = self
+            .refresh
+            .as_ref()
+            .is_some_and(|(at, _)| Instant::now() >= *at);
+        if !due || self.load.is_some() {
+            return;
+        }
+        let Some((_, to)) = self.refresh.take() else {
+            return;
+        };
+        match to {
+            Some(url) => {
+                let same_site = self
+                    .page
+                    .as_ref()
+                    .is_some_and(|p| net::site(&p.url.host) == net::site(&url.host));
+                self.navigate_from(url, Destination::Replace, same_site);
+            }
+            None => {
+                self.save_scroll();
+                self.reload();
+            }
+        }
     }
 
     /// Put the visible tab to sleep: keep what rebuilds its page, drop the page.
     fn sleep(&mut self) {
         self.stop_load();
+        self.refresh = None;
         self.save_scroll();
         self.field = None;
         self.focus = None;
@@ -4619,6 +4682,7 @@ impl<S: Screen> Browser<S> {
     /// Close the visible tab. The last tab of a profile is replaced by a new one.
     fn close_tab(&mut self) -> bool {
         self.stop_load();
+        self.refresh = None;
         self.save_scroll();
         self.page = None;
         self.page_is_entry = false;
@@ -4784,6 +4848,7 @@ impl<S: Screen> Browser<S> {
         }
         self.link_focus = None;
         self.link_preview = None;
+        self.refresh = None;
         self.editing = None;
         self.loading = None;
         self.scroll = scroll;
@@ -5867,7 +5932,7 @@ fn link_for(page: &Loaded, node: NodeId) -> Option<net::Url> {
             {
                 return None;
             }
-            let url = page.url.join(href).ok()?;
+            let url = page.base.join(href).ok()?;
             return matches!(url.scheme.as_str(), "http" | "https" | "file").then_some(url);
         }
         current = page.dom.parent(id);
@@ -5875,16 +5940,18 @@ fn link_for(page: &Loaded, node: NodeId) -> Option<net::Url> {
     None
 }
 
-/// Whether the link around `node` asks to open in a new tab: `target="_blank"`. Other
+/// Whether the link around `node` asks to open in a new tab: `target="_blank"`, its own or
+/// the `<base>`'s. Other
 /// names would open in a window of that name; Broxee follows those in place.
 fn opens_new_tab(page: &Loaded, node: NodeId) -> bool {
     let mut current = Some(node);
     while let Some(id) = current {
         if page.dom.tag_name(id) == Some("a") {
-            return page
+            let target = page
                 .dom
                 .attr(id, "target")
-                .is_some_and(|t| t.trim().eq_ignore_ascii_case("_blank"));
+                .or_else(|| engine::base_target(&page.dom));
+            return target.is_some_and(|t| t.trim().eq_ignore_ascii_case("_blank"));
         }
         current = page.dom.parent(id);
     }
@@ -9397,5 +9464,83 @@ mod tests {
             "{fit}"
         );
         assert!(fit.contains('…'));
+    }
+
+    #[test]
+    fn base_href_resolves_links_and_base_target_opens_tabs() {
+        let page = page_file(
+            "base-href",
+            "<title>Based</title><base href=\"sub/\"><p><a href=\"x.html\">Into sub</a></p>",
+        );
+        let sub = page.parent().unwrap().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("x.html"), "<title>Sub X</title>").unwrap();
+        let mut b = browser(&page);
+        assert!(b.page.as_ref().unwrap().base.to_string().ends_with("/sub/"));
+        click_text(&mut b, "Into sub");
+        assert_eq!(title(&b), "Sub X");
+
+        let page = page_file(
+            "base-target",
+            "<title>Targeted</title><base target=\"_blank\"><p><a href=\"page.html\">Me</a></p>",
+        );
+        let mut b = browser(&page);
+        click_text(&mut b, "Me");
+        assert_eq!(
+            b.profiles[b.profile].tabs.len(),
+            2,
+            "the base's target opens a tab"
+        );
+    }
+
+    #[test]
+    fn meta_refresh_goes_on_after_its_delay_in_place_of_the_page() {
+        let (a, _) = site("meta-refresh");
+        let page = page_file(
+            "meta-refresh-from",
+            &format!(
+                "<title>Moving</title><meta http-equiv=refresh content=\"0; URL='{}'\">",
+                a.display()
+            ),
+        );
+        let mut b = browser(&page);
+        assert_eq!(title(&b), "Moving");
+        let (at, to) = b.refresh.clone().expect("a refresh is waiting");
+        assert!(at >= Instant::now() + REFRESH_MIN - Duration::from_millis(100));
+        assert!(to.unwrap().to_string().ends_with("/a.html"));
+        // Not yet due: nothing happens.
+        b.run_refresh();
+        assert!(b.load.is_none());
+        b.refresh.as_mut().unwrap().0 = Instant::now();
+        b.run_refresh();
+        b.wait_for_load();
+        assert_eq!(title(&b), "Page A");
+        assert_eq!(b.tab().history.len(), 1, "the refresh replaced the entry");
+        assert!(b.refresh.is_none());
+
+        // Navigating away first drops it.
+        let mut b = browser(&page);
+        assert!(b.refresh.is_some());
+        act(&mut b, command('t'));
+        assert!(b.refresh.is_none());
+    }
+
+    #[test]
+    fn noscript_content_is_hidden_and_not_fetched() {
+        let page = page_file(
+            "noscript",
+            "<title>NS</title><noscript><link rel=stylesheet href=\"no.css\">\
+             <p>Turn on JavaScript</p><img src=\"no.png\"></noscript><p>Shown</p>",
+        );
+        let b = browser(&page);
+        let p = b.page.as_ref().unwrap();
+        let texts: Vec<&str> = p.layout.texts.iter().map(|t| p.layout.text(t)).collect();
+        assert!(texts.contains(&"Shown"));
+        assert!(!texts.iter().any(|t| t.contains("JavaScript")), "{texts:?}");
+        assert!(
+            p.sources.stylesheets.is_empty(),
+            "its stylesheet is not fetched"
+        );
+        assert_eq!(p.images.len(), 0, "nor its image");
     }
 }

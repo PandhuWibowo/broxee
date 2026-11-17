@@ -27,7 +27,7 @@ pub enum BackgroundFrom<'a> {
 pub fn load(
     dom: &Dom,
     styles: &StyleMap,
-    page_url: &net::Url,
+    (page_url, base): (&net::Url, &net::Url),
     from: BackgroundFrom,
     store: &ImageStore,
 ) -> Vec<(String, Option<Vec<u8>>)> {
@@ -56,10 +56,8 @@ pub fn load(
         if !network {
             return None;
         }
-        // A `style` attribute's URLs are relative to the page.
-        let absolute = net::Url::parse(&url)
-            .or_else(|_| page_url.join(&url))
-            .ok()?;
+        // A `style` attribute's URLs are relative to the document's base.
+        let absolute = net::Url::parse(&url).or_else(|_| base.join(&url)).ok()?;
         let resp = net::fetch_in(&absolute, jar).ok()?;
         (resp.status == 200).then_some(resp.body)
     });

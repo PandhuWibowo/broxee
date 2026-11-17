@@ -174,6 +174,12 @@ fn load_fonts(bundled_only: bool) -> ProcessFonts {
 /// Everything the engine produces for one page.
 pub struct Loaded {
     pub url: net::Url,
+    /// What relative URLs resolve against: the first `<base href>`, or `url`
+    /// (`document_base`).
+    pub base: net::Url,
+    /// The response's `Refresh` header, when it had one (a woken tab has none).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
+    pub refresh_header: Option<String>,
     pub status: u16,
     pub bytes: usize,
     pub dom: Dom,
@@ -342,6 +348,7 @@ pub fn load_with(
     let started = Instant::now();
     let dom = html::parse(&String::from_utf8_lossy(&resp.body));
     let parse_ms = millis(started);
+    let refresh_header = resp.header("refresh").map(str::to_string);
     let (response_url, status, bytes) = (resp.url, resp.status, resp.body.len());
     // The DOM holds everything later stages need. Keep the HTML only as it arrived: the
     // compressed bytes when there are some, otherwise the body itself.
@@ -379,6 +386,7 @@ pub fn load_with(
     )
     .ok_or(CANCELLED)?;
     page.sources.html = html;
+    page.refresh_header = refresh_header;
     Ok(page)
 }
 
@@ -442,6 +450,7 @@ fn finish(
     // Images are found among the parser's nodes only: nodes scripts add are not rebuilt the
     // same way when a sleeping tab wakes, and stored images refer to nodes by id.
     let parser_nodes = dom.len();
+    let base = document_base(&dom, &source.url);
     let context = net::Context::subresource(&source.url);
     let script_from = match &from {
         From::Network(cookies) => {
@@ -451,9 +460,14 @@ fn finish(
         From::Nowhere => crate::script::ScriptFrom::Inline,
     };
     let (script, scripts) =
-        crate::script::run_page_scripts(&mut dom, &mut forms, &source.url, script_from);
-    let (css, mut images, stylesheets) =
-        load_subresources(&dom, &source.url, from, script.is_some(), parser_nodes);
+        crate::script::run_page_scripts(&mut dom, &mut forms, &source.url, &base, script_from);
+    let (css, mut images, stylesheets) = load_subresources(
+        &dom,
+        (&source.url, &base),
+        from,
+        script.is_some(),
+        parser_nodes,
+    );
     if !progress(0.75) {
         return None;
     }
@@ -466,8 +480,15 @@ fn finish(
     // Fonts and background images are found from the styles, so they load between the
     // cascade and layout, at the same time.
     let ((mut webfonts, font_files), backgrounds) = std::thread::scope(|scope| {
-        let backgrounds =
-            scope.spawn(|| backgrounds::load(&dom, &styles, &source.url, background_from, &images));
+        let backgrounds = scope.spawn(|| {
+            backgrounds::load(
+                &dom,
+                &styles,
+                (&source.url, &base),
+                background_from,
+                &images,
+            )
+        });
         let fonts = webfonts::load(&dom, &styles, &css.sheets, &source.url, font_from, fonts);
         (fonts, backgrounds.join().unwrap_or_default())
     });
@@ -480,6 +501,8 @@ fn finish(
     progress(0.95);
     Some(Loaded {
         url: source.url,
+        base,
+        refresh_header: None,
         status: source.status,
         bytes: source.bytes,
         dom,
@@ -698,12 +721,129 @@ enum Done {
     Image(Option<Vec<u8>>),
 }
 
+/// What relative URLs in the document resolve against: the first `<base href>` in tree order,
+/// resolved against the document's URL, or that URL. Only http, https and file bases count
+/// (no `data:` or `javascript:`).
+pub fn document_base(dom: &Dom, url: &net::Url) -> net::Url {
+    dom.descendants(Dom::ROOT)
+        .find(|&id| dom.tag_name(id) == Some("base") && dom.attr(id, "href").is_some())
+        .and_then(|id| web_url(url, dom.attr(id, "href")?))
+        .unwrap_or_else(|| url.clone())
+}
+
+/// `href` resolved against `base` when it names an http, https or file address. `Url::join`
+/// reads an unknown scheme (`javascript:`, `data:`) as a path, so those are refused first.
+fn web_url(base: &net::Url, href: &str) -> Option<net::Url> {
+    let href = href.trim();
+    let scheme = href.split_once(':').map(|(s, _)| s).filter(|s| {
+        s.starts_with(|c: char| c.is_ascii_alphabetic())
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    });
+    let web = |s: &str| {
+        ["http", "https", "file"]
+            .iter()
+            .any(|k| s.eq_ignore_ascii_case(k))
+    };
+    if scheme.is_some_and(|s| !web(s)) {
+        return None;
+    }
+    let url = base.join(href).ok()?;
+    web(&url.scheme).then_some(url)
+}
+
+/// `target` of the first `<base>` that has one: where links without their own target open.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
+pub fn base_target(dom: &Dom) -> Option<&str> {
+    dom.descendants(Dom::ROOT)
+        .find(|&id| dom.tag_name(id) == Some("base") && dom.attr(id, "target").is_some())
+        .and_then(|id| dom.attr(id, "target"))
+}
+
+/// When and where the page asks to go by itself: its `Refresh` header, or else the first
+/// `<meta http-equiv=refresh>`. The URL is resolved against the base; `None` reloads the page.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
+pub fn refresh(page: &Loaded) -> Option<(f32, Option<net::Url>)> {
+    let content = match &page.refresh_header {
+        Some(h) => h.as_str(),
+        None => {
+            let dom = &page.dom;
+            let meta = dom.descendants(Dom::ROOT).find(|&id| {
+                dom.tag_name(id) == Some("meta")
+                    && !in_noscript(dom, id)
+                    && dom
+                        .attr(id, "http-equiv")
+                        .is_some_and(|e| e.trim().eq_ignore_ascii_case("refresh"))
+            })?;
+            dom.attr(meta, "content")?
+        }
+    };
+    let (delay, url) = parse_refresh(content)?;
+    match url {
+        None => Some((delay, None)),
+        Some(u) => Some((delay, Some(web_url(&page.base, u)?))),
+    }
+}
+
+/// A refresh value, `5; url=https://example.com/`: seconds, then an optional URL after `;` or
+/// `,`, with or without `url=` and quotes (the HTML "shared declarative refresh steps").
+pub fn parse_refresh(content: &str) -> Option<(f32, Option<&str>)> {
+    let s = content.trim_start();
+    let digits = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    if digits == 0 {
+        return None;
+    }
+    let seconds: f32 = s[..digits].parse().ok()?;
+    // A fraction is allowed and ignored.
+    let rest = s[digits..].trim_start_matches(|c: char| c.is_ascii_digit() || c == '.');
+    let rest = rest.trim_start();
+    let rest = match rest.chars().next() {
+        None => return Some((seconds, None)),
+        Some(';' | ',') => rest[1..].trim_start(),
+        Some(_) if rest.len() < s[digits..].len() => rest,
+        Some(_) => return None,
+    };
+    let rest = match rest.get(..3) {
+        Some(u) if u.eq_ignore_ascii_case("url") => {
+            let after = rest[3..].trim_start();
+            match after.strip_prefix('=') {
+                Some(v) => v.trim_start(),
+                None => rest,
+            }
+        }
+        _ => rest,
+    };
+    let url = match rest.chars().next() {
+        Some(q @ ('"' | '\'')) => {
+            let inner = &rest[1..];
+            &inner[..inner.find(q).unwrap_or(inner.len())]
+        }
+        _ => rest.trim_end(),
+    };
+    Some((seconds, (!url.is_empty()).then_some(url)))
+}
+
+/// Whether `id` is inside a `<noscript>`. Broxee runs scripts, so that content is not shown
+/// (ua.css) and nothing in it is fetched or run.
+pub fn in_noscript(dom: &Dom, id: NodeId) -> bool {
+    let mut current = dom.parent(id);
+    while let Some(p) = current {
+        if dom.tag_name(p) == Some("noscript") {
+            return true;
+        }
+        current = dom.parent(p);
+    }
+    false
+}
+
 /// Stylesheets and images (stages 5 to 7 in `docs/pipeline.md`). Both go through one bounded
 /// pool; stylesheets are queued first because rendering waits for them. Stylesheets come back
 /// in document order: `<style>` contents and `<link rel=stylesheet>` targets.
+/// `page` is the document's URL (whose site subresources belong to), `base` what relative
+/// URLs resolve against.
 fn load_subresources(
     dom: &Dom,
-    base: &net::Url,
+    (page, base): (&net::Url, &net::Url),
     from: From,
     scripted: bool,
     parser_nodes: usize,
@@ -714,7 +854,7 @@ fn load_subresources(
         _ => None,
     };
     // Subresources send and store cookies only for the page's own site.
-    let context = net::Context::subresource(base);
+    let context = net::Context::subresource(page);
     let jar = cookies.map(|c| (c, &context));
     let mut jobs = Vec::new();
     for id in dom.descendants(Dom::ROOT) {
@@ -722,6 +862,8 @@ fn load_subresources(
             break;
         }
         match dom.tag_name(id) {
+            // With scripts on, `<noscript>` is inert: its stylesheets are not for us.
+            Some("style" | "link") if in_noscript(dom, id) => {}
             Some("style") => jobs.push(Job::Css(CssSource::Inline(dom.text_content(id)))),
             Some("link") if external && is_stylesheet_link(dom, id) => {
                 if let Some(url) = dom.attr(id, "href").and_then(|href| base.join(href).ok()) {
@@ -1102,5 +1244,40 @@ mod tests {
             standard.styles.style(td).text_align,
             css::TextAlign::WebkitCenter
         );
+    }
+
+    #[test]
+    fn parses_refresh_values() {
+        assert_eq!(parse_refresh("5"), Some((5.0, None)));
+        assert_eq!(parse_refresh(" 3.5 "), Some((3.0, None)));
+        assert_eq!(parse_refresh("0; url=/next"), Some((0.0, Some("/next"))));
+        assert_eq!(
+            parse_refresh("0;URL = 'a b.html' x"),
+            Some((0.0, Some("a b.html")))
+        );
+        assert_eq!(parse_refresh("2, \"x.html\""), Some((2.0, Some("x.html"))));
+        assert_eq!(parse_refresh("1 next.html"), Some((1.0, Some("next.html"))));
+        assert_eq!(parse_refresh("1;"), Some((1.0, None)));
+        assert_eq!(parse_refresh("url=x"), None);
+        assert_eq!(parse_refresh("-1; url=x"), None);
+        assert_eq!(parse_refresh("5x"), None);
+        assert_eq!(parse_refresh(""), None);
+    }
+
+    #[test]
+    fn the_first_base_with_an_href_counts() {
+        let url = net::Url::parse("https://example.com/a/page.html").unwrap();
+        let base = |html: &str| document_base(&html::parse(html), &url).to_string();
+        assert_eq!(base("<p>none"), "https://example.com/a/page.html");
+        assert_eq!(
+            base("<base target=_top><base href=\"../b/\"><base href=\"/c/\">"),
+            "https://example.com/b/"
+        );
+        assert_eq!(
+            base("<base href=\"javascript:x\">"),
+            "https://example.com/a/page.html"
+        );
+        let dom = html::parse("<base href=x><base target=\"_blank\">");
+        assert_eq!(base_target(&dom), Some("_blank"));
     }
 }
