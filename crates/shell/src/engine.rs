@@ -335,7 +335,9 @@ pub struct Jar<'a> {
     pub same_site_initiator: bool,
 }
 
-/// Where a page's subresources come from.
+/// Where a page's subresources come from. Made once per load and moved into `finish`,
+/// never kept, so the snapshot variant's size costs nothing worth a box.
+#[allow(clippy::large_enum_variant)]
 enum From<'a> {
     /// Fetched, with the profile's cookies for subresources of the page's own site.
     Network(Option<&'a net::Cookies>),

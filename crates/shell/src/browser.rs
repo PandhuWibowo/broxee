@@ -799,7 +799,7 @@ struct Browser<S: Screen> {
     link_preview: Option<String>,
     /// Images the visible page named after it loaded (`Loaded::pending_images`), being
     /// fetched on their own thread: (source, bytes or `None`) for each.
-    image_fetch: Option<Receiver<Vec<(String, Option<Vec<u8>>)>>>,
+    image_fetch: Option<Receiver<crate::images::Fetched>>,
     /// Loads of tabs that are no longer visible, downloading without building
     /// (`BACKGROUND_LOADS` at most). Each ends as its tab's sleeping file.
     background: Vec<Load>,

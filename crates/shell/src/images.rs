@@ -70,14 +70,16 @@ pub fn img_nodes(dom: &Dom, root: NodeId) -> impl Iterator<Item = NodeId> + '_ {
         .filter(move |&id| dom.tag_name(id) == Some("img") && !crate::engine::in_noscript(dom, id))
 }
 
+/// Each source once, with its key, and which source each `<img>` node uses.
+pub type Discovered = (Vec<(String, Source)>, Vec<(NodeId, usize)>);
+
+/// Files fetched by source: (key, bytes or `None` for a failure).
+pub type Fetched = Vec<(String, Option<Vec<u8>>)>;
+
 /// The `<img>` elements worth loading and their sources (with their keys), in document
 /// order. Several elements can share one source.
 /// Only nodes below `limit` count: the ones the parser made.
-pub fn discover(
-    dom: &Dom,
-    base: &net::Url,
-    limit: usize,
-) -> (Vec<(String, Source)>, Vec<(NodeId, usize)>) {
+pub fn discover(dom: &Dom, base: &net::Url, limit: usize) -> Discovered {
     let mut sources: Vec<(String, Source)> = Vec::new();
     let mut seen: HashMap<String, usize> = HashMap::new();
     let mut uses = Vec::new();
