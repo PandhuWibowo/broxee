@@ -8,6 +8,7 @@
 //! neither hang the browser nor spend its memory budget.
 
 mod builtins;
+pub mod date;
 mod interp;
 mod lexer;
 mod parser;
@@ -51,6 +52,10 @@ pub trait Host {
     fn set_checked(&mut self, node: u32, checked: bool);
     fn url(&self) -> String;
     fn log(&mut self, line: &str);
+    /// A script asked to go to `url` (as written, relative to the page): `location.href = …`,
+    /// `assign`, or with `replace`, in place of the page in the history. The embedder decides
+    /// whether and when; nothing happens by default.
+    fn navigate(&mut self, _url: &str, _replace: bool) {}
     /// Start a request a script made. Its answer comes back through `Runtime::deliver` with
     /// the id returned; `None` refuses it (no network here, or too many requests).
     fn fetch(&mut self, _request: Request) -> Option<u32> {
@@ -86,6 +91,21 @@ pub struct Reply {
     pub body: String,
 }
 
+/// A page's address as `location` shows it: `href` whole, then its parts as the URL
+/// standard splits them (`protocol` ends with `:`, `search` starts with `?` or is empty).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Location {
+    pub href: String,
+    pub origin: String,
+    pub protocol: String,
+    pub host: String,
+    pub hostname: String,
+    pub port: String,
+    pub pathname: String,
+    pub search: String,
+    pub hash: String,
+}
+
 /// The scripts of one page.
 pub struct Runtime {
     interp: Interp,
@@ -112,10 +132,25 @@ impl Runtime {
         self.interp.stopped.as_deref()
     }
 
+    /// The page's address, for `location` (scripts read it; they cannot change it).
+    pub fn set_location(&mut self, location: &Location) {
+        builtins::set_location(&mut self.interp, location);
+    }
+
+    /// The local time zone `Date` uses: milliseconds to add to a UTC time. UTC until set,
+    /// which replays keep so a saved page renders the same on every machine.
+    pub fn set_time_zone(&mut self, offset: date::Offset) {
+        self.interp.offset = offset;
+    }
+
     /// Advance the page's clock: milliseconds since the page started, and the wall clock.
     pub fn set_time(&mut self, now_ms: f64, epoch_ms: f64) {
+        let first = self.interp.epoch_ms == 0.0;
         self.interp.now = now_ms;
         self.interp.epoch_ms = epoch_ms;
+        if first {
+            builtins::set_time_origin(&mut self.interp);
+        }
     }
 
     fn finish(&mut self, host: &mut dyn Host, r: Result<Value, Ctrl>, what: &str) -> Value {
@@ -360,6 +395,7 @@ mod tests {
     #[derive(Default)]
     struct Bare {
         log: Vec<String>,
+        navigations: Vec<(String, bool)>,
         requests: Vec<Request>,
         cookies: Vec<String>,
     }
@@ -417,6 +453,9 @@ mod tests {
         fn url(&self) -> String {
             "https://example.org/".into()
         }
+        fn navigate(&mut self, url: &str, replace: bool) {
+            self.navigations.push((url.to_string(), replace));
+        }
         fn log(&mut self, line: &str) {
             self.log.push(line.to_string());
         }
@@ -453,6 +492,173 @@ mod tests {
             .expect("spawn")
             .join()
             .expect("the test passed");
+    }
+
+    /// Evaluate in a page in Jakarta (UTC+7) whose clock reads 2026-11-17T13:54:00Z.
+    fn eval_in_jakarta(src: &str) -> String {
+        fn jakarta(_: f64) -> f64 {
+            7.0 * 3_600_000.0
+        }
+        let mut rt = Runtime::new();
+        rt.set_time_zone(jakarta);
+        // The page started 250 ms before.
+        rt.set_time(250.0, 1_794_923_639_750.0);
+        rt.eval_to_string(&mut Bare::default(), src)
+    }
+
+    #[test]
+    fn scripts_ask_the_host_to_navigate() {
+        let mut rt = Runtime::new();
+        let mut host = Bare::default();
+        for src in [
+            "location.href = 'a.html'",
+            "location = 'b.html'",
+            "window.location = 'c.html'",
+            "document.location = 'd.html'",
+            "location.assign('e.html')",
+            "location.replace('f.html')",
+            "location.hash = 'top'",
+        ] {
+            rt.eval_to_string(&mut host, src);
+        }
+        let want: Vec<(String, bool)> = [
+            ("a.html", false),
+            ("b.html", false),
+            ("c.html", false),
+            ("d.html", false),
+            ("e.html", false),
+            ("f.html", true),
+        ]
+        .iter()
+        .map(|&(u, r)| (u.to_string(), r))
+        .collect();
+        assert_eq!(host.navigations, want, "a hash change stays on the page");
+        assert_eq!(rt.eval_to_string(&mut host, "location.hash"), "#top");
+        assert_eq!(
+            rt.eval_to_string(&mut host, "typeof location.assign"),
+            "function",
+            "location keeps its methods after writes"
+        );
+    }
+
+    #[test]
+    fn location_and_navigator_answer_as_strings() {
+        let mut rt = Runtime::new();
+        rt.set_location(&Location {
+            href: "https://e.com/a?b=1".into(),
+            origin: "https://e.com".into(),
+            protocol: "https:".into(),
+            host: "e.com".into(),
+            hostname: "e.com".into(),
+            port: String::new(),
+            pathname: "/a".into(),
+            search: "?b=1".into(),
+            hash: String::new(),
+        });
+        let mut host = Bare::default();
+        for (src, want) in [
+            ("location.href.indexOf('?')", "15"),
+            ("location.search.match(/b=(\\d)/)[1]", "1"),
+            ("window.location.pathname + location.hash", "/a"),
+            ("document.location.origin", "https://e.com"),
+            ("typeof document.referrer", "string"),
+            (
+                "navigator.languages[0] + ' ' + typeof navigator.platform",
+                "en-US string",
+            ),
+        ] {
+            assert_eq!(rt.eval_to_string(&mut host, src), want, "{src}");
+        }
+    }
+
+    #[test]
+    fn dates_work_in_local_time_and_utc() {
+        let cases = [
+            ("new Date().getTime()", "1794923640000"),
+            ("Date.now()", "1794923640000"),
+            ("new Date(0).toISOString()", "1970-01-01T00:00:00.000Z"),
+            (
+                "new Date().getHours() + ' ' + new Date().getUTCHours()",
+                "20 13",
+            ),
+            ("new Date().getTimezoneOffset()", "-420"),
+            (
+                "new Date().getDay() + ' ' + new Date().getMonth() + ' ' + new Date().getDate()",
+                "2 10 17",
+            ),
+            ("new Date(2024, 1, 29).getDate()", "29"),
+            ("new Date(2023, 1, 29).getMonth()", "2"),
+            ("new Date(99, 0).getFullYear()", "1999"),
+            ("new Date(2026, 10, 17, 20, 54).getTime()", "1794923640000"),
+            ("Date.UTC(2026, 10, 17, 13, 54)", "1794923640000"),
+            ("new Date('2026-11-17').getUTCDate()", "17"),
+            (
+                "Date.parse('Tue, 17 Nov 2026 13:54:00 GMT')",
+                "1794923640000",
+            ),
+            ("new Date('nonsense').getTime()", "NaN"),
+            ("String(new Date('nonsense'))", "Invalid Date"),
+            ("new Date(0).toUTCString()", "Thu, 01 Jan 1970 00:00:00 GMT"),
+            ("new Date(0).toGMTString()", "Thu, 01 Jan 1970 00:00:00 GMT"),
+            (
+                "new Date(0).toString()",
+                "Thu Jan 01 1970 07:00:00 GMT+0700",
+            ),
+            ("new Date().toLocaleDateString()", "11/17/2026"),
+            ("new Date().toLocaleTimeString()", "8:54:00 PM"),
+            (
+                "JSON.stringify({d: new Date(0)})",
+                "{\"d\":\"1970-01-01T00:00:00.000Z\"}",
+            ),
+            (
+                "var d = new Date(0); d.setFullYear(2000); d.getFullYear()",
+                "2000",
+            ),
+            (
+                "var d = new Date(0); d.setUTCHours(25); d.toISOString()",
+                "1970-01-02T01:00:00.000Z",
+            ),
+            (
+                "var d = new Date(0); d.setDate(d.getDate() + 31); d.getMonth()",
+                "1",
+            ),
+            (
+                "var d = new Date(0); d.setTime(86400000); d.getUTCDate()",
+                "2",
+            ),
+            ("var a = new Date(0); var b = new Date(a); b.getTime()", "0"),
+            ("new Date(1000) - new Date(0)", "1000"),
+            ("new Date(8.64e15 + 1).getTime()", "NaN"),
+            (
+                "var e; try { new Date(NaN).toISOString() } catch (x) { e = x.name } e",
+                "RangeError",
+            ),
+            ("typeof Date()", "string"),
+            ("performance.timing.navigationStart", "1794923639750"),
+            ("performance.timeOrigin", "1794923639750"),
+            ("performance.getEntriesByType('navigation').length", "0"),
+            // ToPrimitive: numbers ask valueOf first, strings toString, `+` valueOf except
+            // for a Date.
+            ("({ valueOf() { return 5 } }) * 2", "10"),
+            (
+                "var o = { valueOf() { return 1 }, toString() { return 'x' } }; o + ''",
+                "1",
+            ),
+            (
+                "var o = { valueOf() { return 1 }, toString() { return 'x' } }; `${o}`",
+                "x",
+            ),
+            ("new Date(0) + ''", "Thu Jan 01 1970 07:00:00 GMT+0700"),
+            ("new Date(5) > new Date(3)", "true"),
+            ("[1, 2] + ''", "1,2"),
+            (
+                "var e; try { Object.create(null) + '' } catch (x) { e = x.name } e",
+                "TypeError",
+            ),
+        ];
+        for (src, want) in cases {
+            assert_eq!(eval_in_jakarta(src), want, "{src}");
+        }
     }
 
     #[test]

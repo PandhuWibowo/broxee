@@ -396,8 +396,9 @@ Where data lives, and what compression does for it (measured 2026-11-07):
 
 - No table layout and no presentational attributes (`bgcolor`, `align`): Hacker News renders centred without its
   orange bar.
-- The palette cannot search the web: with no search engine chosen, a query that matches nothing says
-  "Broxee can't search the web yet." Bookmarks will join its results when they exist.
+- Searching uses Bing (words typed in the address field, or Enter in ⌘K when nothing matches), with no
+  setting to choose another engine yet. Google's results page needs scripts to navigate, which Broxee does
+  not allow; DuckDuckGo is blocked on some networks.
 - Figtree has no ⌘ ⇧ ⌥: they come from the system's symbol font, and the chrome draws them as icons on systems
   without one.
 - Bookmarks cannot be imported from other browsers yet, and folders are flat (no folders inside folders).

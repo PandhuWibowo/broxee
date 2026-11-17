@@ -1005,6 +1005,15 @@ impl Chrome {
                     pane,
                     ..
                 } => {
+                    // The row's background first: the pane badge's outline goes over it.
+                    if selected {
+                        list.push(Op::Mask {
+                            x: px(ROW_INSET),
+                            y: px(row_top(i) + 1.0),
+                            mask: &masks[&(Shape::Rounded, row_w, row_h)],
+                            color: t.selected,
+                        });
+                    }
                     if let Some(n) = pane {
                         // A small outlined box with the pane's number, left of the close
                         // button's place.
@@ -1036,14 +1045,6 @@ impl Chrome {
                             size: 11.0 * s,
                             font: FontKey::UI_SEMIBOLD,
                             color: t.text_2,
-                        });
-                    }
-                    if selected {
-                        list.push(Op::Mask {
-                            x: px(ROW_INSET),
-                            y: px(row_top(i) + 1.0),
-                            mask: &masks[&(Shape::Rounded, row_w, row_h)],
-                            color: t.selected,
                         });
                     }
                     if *closable {
@@ -1877,21 +1878,13 @@ impl Chrome {
         (x, y): (f32, f32),
         text: &str,
     ) {
-        let t = self.theme;
         let s = frame.scale;
-        let px = |v: f32| (v * s).round() as i32;
         let window = (
             frame.width as f32 / s,
             (frame.pixels.len() / frame.stride) as f32 / s,
         );
-        let key_px = px(KEY_ICON) as u32;
-        for shape in [Shape::Command, Shape::Shift, Shape::Option] {
-            self.masks
-                .entry((shape, key_px, key_px))
-                .or_insert_with(|| key_icon(shape, s));
-        }
         let w = keys_width(text, s, 12.0, metrics) / s + 16.0;
-        let h = 24.0;
+        let h = PANEL_HEIGHT;
         // Below and right of the pointer, or above / left of it near the window's edges.
         let tx = (x + 12.0).min(window.0 - w - 4.0).max(4.0);
         let ty = if y + 20.0 + h < window.1 {
@@ -1899,6 +1892,57 @@ impl Chrome {
         } else {
             (y - h - 8.0).max(4.0)
         };
+        self.draw_panel(painter, frame, metrics, (tx, ty, w), text);
+    }
+
+    /// The address of the link under the pointer, in a small panel at the bottom left of the
+    /// page area (`frame`), shortened in the middle to fit half the pane. Moves to the right
+    /// when the pointer (`at`, in the frame's points) is over where it would be.
+    pub fn draw_link_preview(
+        &mut self,
+        painter: &mut Painter,
+        frame: Frame,
+        metrics: &dyn TextMetrics,
+        at: Option<(f32, f32)>,
+        url: &str,
+    ) {
+        let s = frame.scale;
+        let area = (
+            frame.width as f32 / s,
+            (frame.pixels.len() / frame.stride) as f32 / s,
+        );
+        let room = (area.0 / 2.0).max(120.0).min(area.0 - 8.0) - 16.0;
+        if room <= 0.0 || area.1 < PANEL_HEIGHT + 8.0 {
+            return;
+        }
+        let text = fit_middle(url, room * s, |t| keys_width(t, s, 12.0, metrics));
+        let w = keys_width(&text, s, 12.0, metrics) / s + 16.0;
+        let ty = area.1 - PANEL_HEIGHT - 4.0;
+        let covered = at.is_some_and(|(x, y)| x < w + 8.0 && y >= ty - 4.0);
+        let tx = if covered { area.0 - w - 4.0 } else { 4.0 };
+        self.draw_panel(painter, frame, metrics, (tx, ty, w), &text);
+    }
+
+    /// A one-line panel with `text` (⌘ ⇧ ⌥ as icons), outlined in `line` on `surface`; its
+    /// top left at (x, y) and `w` wide, in points from the frame's top left.
+    fn draw_panel(
+        &mut self,
+        painter: &mut Painter,
+        frame: Frame,
+        metrics: &dyn TextMetrics,
+        (tx, ty, w): (f32, f32, f32),
+        text: &str,
+    ) {
+        let t = self.theme;
+        let s = frame.scale;
+        let px = |v: f32| (v * s).round() as i32;
+        let key_px = px(KEY_ICON) as u32;
+        for shape in [Shape::Command, Shape::Shift, Shape::Option] {
+            self.masks
+                .entry((shape, key_px, key_px))
+                .or_insert_with(|| key_icon(shape, s));
+        }
+        let h = PANEL_HEIGHT;
         let hair = px(1.0).max(1);
         let size = (px(w) as u32, px(h) as u32);
         let inner = (size.0 - 2 * hair as u32, size.1 - 2 * hair as u32);
@@ -2001,6 +2045,40 @@ fn fit_in<'t>(
 }
 
 /// Width in device pixels of a shortcut such as "⌘⇧T" at `size` points.
+/// Height of a tooltip or the link preview, in points.
+const PANEL_HEIGHT: f32 = 24.0;
+
+/// `text`, or its start and end around an ellipsis, so that `width` of it is at most `room`.
+pub(crate) fn fit_middle(text: &str, room: f32, width: impl Fn(&str) -> f32) -> String {
+    if width(text) <= room {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    // Keep more of the start: the host says most about where a link goes.
+    let (mut lo, mut hi) = (0, chars.len());
+    while lo < hi {
+        let keep = (lo + hi).div_ceil(2);
+        let head = keep * 2 / 3;
+        let tail = keep - head;
+        let candidate: String = chars[..head]
+            .iter()
+            .chain(std::iter::once(&'…'))
+            .chain(&chars[chars.len() - tail..])
+            .collect();
+        if width(&candidate) <= room {
+            lo = keep;
+        } else {
+            hi = keep - 1;
+        }
+    }
+    let head = lo * 2 / 3;
+    chars[..head]
+        .iter()
+        .chain(std::iter::once(&'…'))
+        .chain(&chars[chars.len() - (lo - head)..])
+        .collect()
+}
+
 fn keys_width(keys: &str, scale: f32, size: f32, metrics: &dyn TextMetrics) -> f32 {
     keys.chars()
         .map(|c| match modifier_icon(c, metrics) {

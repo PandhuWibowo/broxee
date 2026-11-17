@@ -540,6 +540,7 @@ fn single_prop(name: &str) -> Option<Prop> {
         "left" => Prop::Left,
         "visibility" => Prop::Visibility,
         "opacity" => Prop::Opacity,
+        "clip" => Prop::Clip,
         "overflow-x" | "overflow-y" => Prop::Overflow,
         "box-sizing" => Prop::BoxSizing,
         "flex-direction" => Prop::FlexDirection,
@@ -643,6 +644,39 @@ fn border_radius(v: &str, sink: &mut Sink) {
     }
 }
 
+/// `clip`: `auto`, or `rect(top, right, bottom, left)` with commas or spaces. Says whether the
+/// rectangle leaves at most one pixel of width or height (sides in px or 0; `auto` or other
+/// units count as not hiding).
+fn parse_clip(v: &str) -> Option<bool> {
+    let v = v.trim();
+    if v.eq_ignore_ascii_case("auto") {
+        return Some(false);
+    }
+    let inner = v
+        .get(..5)
+        .filter(|p| p.eq_ignore_ascii_case("rect("))
+        .and_then(|_| v[5..].strip_suffix(')'))?;
+    let sides: Vec<&str> = inner
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if sides.len() != 4 {
+        return None;
+    }
+    let px = |s: &str| -> Option<f32> {
+        let n = s.strip_suffix("px").unwrap_or(s);
+        if n != s || n.parse::<f32>().ok() == Some(0.0) {
+            n.parse().ok()
+        } else {
+            None
+        }
+    };
+    let [top, right, bottom, left] = [sides[0], sides[1], sides[2], sides[3]].map(px);
+    let width = right.zip(left).map(|(r, l)| r - l);
+    let height = bottom.zip(top).map(|(b, t)| b - t);
+    Some(width.is_some_and(|w| w <= 1.0) || height.is_some_and(|h| h <= 1.0))
+}
+
 fn side_index(side: &str) -> Option<usize> {
     ["top", "right", "bottom", "left"]
         .iter()
@@ -699,6 +733,7 @@ fn parse_for(prop: Prop, v: &str) -> Option<Value> {
             "hidden" | "collapse" => Some(Value::Visible(false)),
             _ => None,
         },
+        Clip => parse_clip(v).map(Value::ClipHides),
         Opacity => match v.strip_suffix('%') {
             Some(pct) => pct
                 .parse::<f32>()
@@ -1612,5 +1647,22 @@ mod tests {
         ] {
             let _ = parse_stylesheet(css);
         }
+    }
+
+    #[test]
+    fn reads_whether_clip_hides() {
+        assert_eq!(parse_clip("rect(1px, 1px, 1px, 1px)"), Some(true));
+        assert_eq!(parse_clip("rect(0 0 0 0)"), Some(true));
+        assert_eq!(parse_clip("RECT(0px,1px,1px,0px)"), Some(true));
+        assert_eq!(parse_clip("rect(0, 100px, 50px, 0)"), Some(false));
+        assert_eq!(parse_clip("rect(auto, auto, auto, auto)"), Some(false));
+        assert_eq!(
+            parse_clip("rect(0 1em 1em 0)"),
+            Some(false),
+            "other units: unknown"
+        );
+        assert_eq!(parse_clip("auto"), Some(false));
+        assert_eq!(parse_clip("rect(1px 1px)"), None);
+        assert_eq!(parse_clip("inset(50%)"), None);
     }
 }

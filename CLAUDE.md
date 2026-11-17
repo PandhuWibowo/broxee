@@ -113,10 +113,15 @@ casts), not taken from binding crates. Ask before proposing any dependency.
 
 - **Only the visible tab is a live page** (`Browser::page`). Every other tab is a file in `TabStore` or just
   its history. Never keep a second `Loaded` around: a heavy page is 10 to 20 MB live.
-- **CSS background images are kept by URL** in the page's `ImageStore` (beside `<img>` files by `NodeId`,
-  within the same budget), keyed by the URL as the computed style holds it: stylesheets' URLs are made absolute
-  after parsing (`Stylesheet::resolve_urls`), `style` attributes' stay relative and are fetched against the page.
-  They are found after the cascade, for displayed elements only, and stored with a sleeping tab.
+- **Every image file is kept by its source** in the page's `ImageStore`, within one budget. CSS backgrounds by
+  the URL as the computed style holds it (stylesheets' URLs are made absolute after parsing,
+  `Stylesheet::resolve_urls`; `style` attributes' stay relative and are fetched against the page), found after
+  the cascade for displayed elements only. `<img>` files by `images::key_of` (absolute URL, or a hash of a
+  `data:` URL), and an `<img>` shows the file of its *current* source (`ImageStore::bind`): images scripts add,
+  or whose `src` they set later (lazy loading), are fetched by source, at load with the backgrounds or later
+  by the window (`Loaded::pending_images`, `Browser::fetch_images`), which lays them out when they arrive
+  (`Dom::touch`). A source that failed is not asked for again. All are stored with a sleeping tab, so a waking
+  tab finds them by source whatever ids its scripts' nodes get.
 - **A snapshot holds only what the page was built from**, as it arrived (`net::Wire`): rebuilding must give the
   same DOM, so `NodeId`s in the stored `ImageStore` stay valid. Do not store anything derived (styles, layout).
 - **Sleeping tabs share their large parts** (`hibernate.rs`): every part of 4 KB or more is a blob named by
@@ -135,9 +140,13 @@ casts), not taken from binding crates. Ask before proposing any dependency.
   the previous frame surface (`Screen::render` hands it over), so they cost no memory. Giving a pane focus
   sleeps the focused tab and wakes the pane's tab at the pane's size. Events over the focused pane get
   pane-relative y (`Browser::route`); anything that draws in the pane uses its rows of the frame.
-- **One page load at a time.** `Browser::navigate` stops the running load before starting another, and every
-  tab or profile change stops it too. A finished load always belongs to the visible tab, because nothing can
-  change the visible tab without stopping it first. Keep both true when adding background work.
+- **One page is built at a time.** `Browser::navigate` stops the running load before starting another. Leaving
+  a tab while it loads sends its load to `Browser::background` (at most `BACKGROUND_LOADS`, form posts never):
+  the loader stops building at its next checkpoint (`engine::load_in_tab`) and ends with a partial snapshot
+  (`Sources::partial`: no fonts or CSS background images yet), stored as the tab's sleeping file. Coming back
+  adopts a running load, or builds a partial file on the loader thread (`restore_in_tab`, which fetches what it
+  lacks). A page that finished building anyway is snapshotted at once: never a second `Loaded`. Switching
+  profile drops every background load (no connections shared across profiles).
 - **Cookies belong to a profile.** Every fetch for a page passes that profile's jar (`engine::Jar`);
   subresources use `net::Context::subresource`, which blocks other sites' cookies. Never log or print cookie
   values, never write session cookies to disk, and keep cookie and session files 0600 (`write_private`).
@@ -189,8 +198,8 @@ casts), not taken from binding crates. Ask before proposing any dependency.
 - **Script work runs on a large-stack thread** (`script::on_script_stack`, `js::STACK_SIZE`): the interpreter
   recurses. The runtime is `Send` (`Arc`, not `Rc`) so a `Loaded` can still cross from the loader thread.
 - **Scripts run before styles**, after form controls are prepared; later DOM changes (events, timers) restyle
-  and lay out the page again. Image ids come from parser nodes only, so a waking tab finds them again even if
-  its scripts behave differently the second time.
+  and lay out the page again. Images are found by source, not node id (see the tab invariants), so a waking tab
+  finds them again even if its scripts behave differently the second time.
 - **Accessors and classes live in the same arena.** A getter/setter pair is a `Kind::Accessor` object in the
   property slot; `get` calls the getter, and `put` looks up the prototype chain for a setter only once the page
   has made an accessor (`Interp::accessors`). A class is its constructor function plus a `ClassRec` (fields,
@@ -211,7 +220,12 @@ casts), not taken from binding crates. Ask before proposing any dependency.
   the page and arms it with the jar (`ScriptNet::arm`): the CLI and pages being built never send any, and a
   page that goes away drops its answers. `document.cookie` never shows or replaces `HttpOnly` cookies.
   Failures are logged by reason only, never with what a request carried.
-- **Scripts cannot navigate and store nothing on disk.** Widen this only on purpose.
+- **Scripts navigate only like a link the page followed.** `location.href = …`, `location = …`,
+  `document.location = …`, `assign` and `replace` (`Host::navigate`) are kept in `ScriptNet::navigation`
+  and followed after the task by `Browser::follow_script_navigation`: http, https and file only (never
+  `javascript:` or `data:`), a fragment stays on the page, the same-site cookie rule of links, and at most
+  `SCRIPT_HOPS` in a row until the person clicks or types (redirect loops stop). `replace` takes the page's
+  place in the history. No popups (`window.open`). Scripts store nothing on disk. Widen either only on purpose.
 
 ### Compression invariants
 

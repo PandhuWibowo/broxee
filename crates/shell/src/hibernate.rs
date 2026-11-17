@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::engine::{Snapshot, Sources};
 use crate::images::ImageStore;
 
-const MAGIC: &[u8] = b"broxee-tab 5\n";
+const MAGIC: &[u8] = b"broxee-tab 6\n";
 /// Parts smaller than this stay in the tab's own file.
 const SHARED_FROM: usize = 4096;
 
@@ -230,6 +230,7 @@ fn encode(s: &Snapshot, out: &mut impl Write, share: &mut Share) -> io::Result<(
     out.write_all(MAGIC)?;
     put_bytes(out, s.url.to_string().as_bytes())?;
     out.write_all(&s.status.to_le_bytes())?;
+    out.write_all(&[u8::from(s.sources.partial)])?;
     put_wire(out, &s.sources.html, share)?;
     put_u32(out, s.sources.stylesheets.len())?;
     for (url, wire) in &s.sources.stylesheets {
@@ -373,6 +374,11 @@ fn decode(
     }
     let url = net::Url::parse(&String::from_utf8(r.bytes()?).ok()?).ok()?;
     let status = u16::from_le_bytes(r.array()?);
+    let partial = match r.array::<1>()?[0] {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
     let html = r.wire()?;
     let mut stylesheets = Vec::new();
     for _ in 0..r.count(9)? {
@@ -409,6 +415,7 @@ fn decode(
             stylesheets,
             scripts,
             fonts,
+            partial,
         },
         images: ImageStore::from_parts(files, uses, urls),
     })
@@ -448,6 +455,7 @@ mod tests {
                         bytes: b"wOF2".to_vec(),
                     },
                 )],
+                partial: true,
             },
             images: ImageStore::from_parts(
                 vec![vec![9; 5], vec![]],
@@ -468,6 +476,10 @@ mod tests {
         assert_eq!(back.sources.html.bytes, [1, 2, 3]);
         assert_eq!(back.sources.fonts[0].0, "https://example.com/f.woff2");
         assert_eq!(back.sources.fonts[0].1.bytes, b"wOF2");
+        assert!(
+            back.sources.partial,
+            "a downloaded tab stays partial until built"
+        );
         assert_eq!(back.sources.html.encoding, net::Encoding::Brotli);
         assert_eq!(back.sources.stylesheets[0].1.bytes, b"p{}");
         assert_eq!(back.sources.scripts[0].1.bytes, b"var a = 1");

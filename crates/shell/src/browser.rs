@@ -35,6 +35,15 @@ use crate::palette::{self, Action, Command, Hint};
 use crate::selection::{self, Selection};
 use crate::Options;
 
+/// Pages may send the browser on by script this many times in a row without the person
+/// clicking or typing (a redirect chain); a page that loops is stopped there.
+const SCRIPT_HOPS: u32 = 10;
+/// Loads that may go on downloading after their tab is left; more stop the oldest.
+const BACKGROUND_LOADS: usize = 2;
+/// The shortest wait before a page's refresh is followed.
+const REFRESH_MIN: Duration = Duration::from_secs(1);
+/// How often an offline tab looks whether a network is back.
+const OFFLINE_CHECK: Duration = Duration::from_secs(2);
 /// Arrow keys scroll by this many points.
 const LINE_STEP: f32 = 40.0;
 /// Page Up/Down keep this much of the previous view visible.
@@ -189,6 +198,9 @@ struct Tab {
     pinned: bool,
     /// The tab group it belongs to, by name.
     group: Option<String>,
+    /// Opened in the background from a link on another site and not loaded yet: its first
+    /// load does not carry SameSite=Strict cookies, as if the link had been followed.
+    cross_site_start: bool,
 }
 
 impl Default for Tab {
@@ -204,6 +216,7 @@ impl Default for Tab {
             focused_link: None,
             pinned: false,
             group: None,
+            cross_site_start: false,
         }
     }
 }
@@ -241,6 +254,16 @@ struct Load {
     to: Destination,
     settings: Settings,
     messages: Receiver<LoadMessage>,
+    /// The tab it is for (`Tab::id`) and its profile: a load can outlive the tab's
+    /// visibility (`Browser::background`).
+    tab: u64,
+    profile: usize,
+    /// Set when its tab is no longer visible: the loader stops building and ends with what
+    /// the page is built from (`engine::Outcome::Downloaded`).
+    background: Arc<std::sync::atomic::AtomicBool>,
+    /// A form submission: never continued in the background (it would be sent again on
+    /// return if it failed).
+    post: bool,
 }
 
 /// Where a finished load goes in the tab's history.
@@ -250,12 +273,14 @@ enum Destination {
     Push,
     /// This existing entry (back, forward, reload, waking), restoring its scroll position.
     Entry(usize),
+    /// In place of the current entry, at the top (a page refreshing to another address).
+    Replace,
 }
 
 enum LoadMessage {
     Progress(f32),
     /// Boxed: a channel slot is as large as its largest message.
-    Done(Box<Result<Loaded, String>>),
+    Done(Box<Result<engine::Outcome, String>>),
 }
 
 /// The ⋯ menu while it is open.
@@ -773,6 +798,29 @@ struct Browser<S: Screen> {
     /// Window size, header rows, sidebar edge and pane count of the last full frame: a
     /// header alone, or a pane's old pixels, can be reused only while these hold.
     frame_geometry: Option<Geometry>,
+    /// The address of the link under the pointer, shown at the bottom of the pane.
+    link_preview: Option<String>,
+    /// Script navigations in a row since the person last clicked or typed (`SCRIPT_HOPS`).
+    script_hops: u32,
+    /// Images the visible page named after it loaded (`Loaded::pending_images`), being
+    /// fetched on their own thread: (source, bytes or `None`) for each.
+    image_fetch: Option<Receiver<crate::images::Fetched>>,
+    /// Loads of tabs that are no longer visible, downloading without building
+    /// (`BACKGROUND_LOADS` at most). Each ends as its tab's sleeping file.
+    background: Vec<Load>,
+    /// When the visible page asked to go somewhere by itself (`Refresh`, meta refresh), and
+    /// where (`None`: reload). Any navigation or tab change drops it.
+    refresh: Option<(Instant, Option<net::Url>)>,
+    /// The visible tab failed to load while the machine was offline: when to look again
+    /// whether a network is back, to reload it then.
+    offline_retry: Option<Instant>,
+    /// Whether a network interface is up (`net::online`; tests replace it).
+    online: fn() -> bool,
+    /// Where the pointer last rested over the focused pane (pane-relative, as `route` gives).
+    last_pointer: Option<(f32, f32)>,
+    /// Tabs opened from links of one tab in a row (its id, how many): the next one goes
+    /// after them, so links open in the order they were clicked.
+    opened: (u64, usize),
 }
 
 impl<S: Screen> Browser<S> {
@@ -836,6 +884,15 @@ impl<S: Screen> Browser<S> {
             handle_hover: None,
             sidebar_scroll: 0.0,
             drag: None,
+            link_preview: None,
+            background: Vec::new(),
+            image_fetch: None,
+            script_hops: 0,
+            refresh: None,
+            offline_retry: None,
+            online: net::online,
+            last_pointer: None,
+            opened: (0, 0),
             selection: None,
             find: None,
             dropdown: None,
@@ -1000,8 +1057,17 @@ impl<S: Screen> Browser<S> {
             if let Some(due) = self.next_page_timer() {
                 wait = wait.min(due);
             }
+            if let Some((at, _)) = &self.refresh {
+                wait = wait.min(at.saturating_duration_since(Instant::now()));
+            }
+            if let Some(at) = self.offline_retry {
+                wait = wait.min(at.saturating_duration_since(Instant::now()));
+            }
             // Answers to the page's requests arrive on their own channel: look each frame.
-            if self.page_requests_busy() {
+            if self.page_requests_busy()
+                || !self.background.is_empty()
+                || self.image_fetch.is_some()
+            {
                 wait = wait.min(LOAD_POLL);
             }
             let mut repaint = Repaint::Nothing;
@@ -1020,9 +1086,16 @@ impl<S: Screen> Browser<S> {
                 // Progress moves the loading line; a finished load painted its page already.
                 repaint = repaint.max(Repaint::Header);
             }
-            if self.tick() | self.run_page_timers() | self.poll_page_requests() {
+            if self.tick()
+                | self.run_page_timers()
+                | self.poll_page_requests()
+                | self.poll_background()
+                | self.poll_images()
+            {
                 repaint = Repaint::Frame;
             }
+            self.run_refresh();
+            self.retry_if_online();
             if repaint != Repaint::Nothing {
                 self.repaint(repaint);
                 trimmed = false;
@@ -1182,6 +1255,13 @@ impl<S: Screen> Browser<S> {
             return self.hover_at(x as f32, y as f32) | handle_changed;
         }
         let from_key = matches!(event, Event::Key(_));
+        // The person acting: pages may navigate by script again.
+        if matches!(
+            event,
+            Event::Key(_) | Event::Click { .. } | Event::OpenClick { .. } | Event::Paste(_)
+        ) {
+            self.script_hops = 0;
+        }
         let focus_before = self.link_focus.as_ref().map(|l| l.node);
         // Anything else hides a tooltip, which needs a full frame.
         let hid = self.hover.take().is_some_and(|h| h.shown);
@@ -1219,6 +1299,9 @@ impl<S: Screen> Browser<S> {
                 true
             }
             Event::Click { x, y } => self.click(x as f32, y as f32),
+            Event::OpenClick { x, y, foreground } => {
+                self.open_click(x as f32, y as f32, foreground)
+            }
             Event::Key(key) => self.key(key),
             Event::Paste(text) => {
                 let line = text.trim().lines().next().unwrap_or_default();
@@ -1320,6 +1403,7 @@ impl<S: Screen> Browser<S> {
         let (x, y) = match event {
             Event::Click { x, y }
             | Event::ShiftClick { x, y }
+            | Event::OpenClick { x, y, .. }
             | Event::Hover { x, y }
             | Event::Drag { x, y }
             | Event::Release { x, y }
@@ -1349,8 +1433,10 @@ impl<S: Screen> Browser<S> {
         };
         if j != self.focused.min(rects.len() - 1) {
             return Err(match event {
-                Event::Click { .. } => self.focus_pane(j),
-                Event::Hover { .. } => self.hover.take().is_some_and(|h| h.shown),
+                Event::Click { .. } | Event::OpenClick { .. } => self.focus_pane(j),
+                Event::Hover { .. } => {
+                    self.hover.take().is_some_and(|h| h.shown) | self.link_preview.take().is_some()
+                }
                 _ => false,
             });
         }
@@ -1358,6 +1444,11 @@ impl<S: Screen> Browser<S> {
         Ok(match event {
             Event::Click { x, y } => Event::Click { x, y: y - top },
             Event::ShiftClick { x, y } => Event::ShiftClick { x, y: y - top },
+            Event::OpenClick { x, y, foreground } => Event::OpenClick {
+                x,
+                y: y - top,
+                foreground,
+            },
             Event::Hover { x, y } => Event::Hover { x, y: y - top },
             Event::Drag { x, y } => Event::Drag { x, y: y - top },
             Event::Release { x, y } => Event::Release { x, y: y - top },
@@ -1419,6 +1510,7 @@ impl<S: Screen> Browser<S> {
             self.close_palette();
         }
         self.hover = None;
+        self.link_preview = None;
         self.focused = j;
         let pane = self.panes[j];
         let profile = pane.profile.min(self.profiles.len() - 1);
@@ -1716,8 +1808,12 @@ impl<S: Screen> Browser<S> {
             }
             return true;
         }
-        if let Some(url) = self.link_at(x, y - HEADER_HEIGHT) {
-            self.follow(url);
+        if let Some((url, blank)) = self.link_hit(x, y - HEADER_HEIGHT) {
+            if blank {
+                self.open_in_tab(url, true);
+            } else {
+                self.follow(url);
+            }
             return true;
         }
         if let Some(find) = self.find.as_mut() {
@@ -2201,6 +2297,7 @@ impl<S: Screen> Browser<S> {
         if r.0 {
             self.relayout_page();
         }
+        self.follow_script_navigation();
         r
     }
 
@@ -2224,7 +2321,7 @@ impl<S: Screen> Browser<S> {
         if changed {
             self.relayout_page();
         }
-        changed
+        self.follow_script_navigation() || changed
     }
 
     /// Whether the page's scripts wait for answers to requests.
@@ -2255,7 +2352,48 @@ impl<S: Screen> Browser<S> {
         if changed {
             self.relayout_page();
         }
-        changed
+        self.follow_script_navigation() || changed
+    }
+
+    /// Go where the visible page's scripts asked (`location.href = …`, `assign`, `replace`),
+    /// once their task is over: a link the page followed by itself, with the same cookie
+    /// rules. Only http, https and file addresses; a fragment of this page stays here. A page
+    /// that keeps sending the browser on is stopped after `SCRIPT_HOPS` in a row without the
+    /// person clicking or typing. Returns whether a load started.
+    fn follow_script_navigation(&mut self) -> bool {
+        let Some(page) = self.page.as_mut() else {
+            return false;
+        };
+        let Some((target, replace)) = page.script.as_mut().and_then(|s| s.net.navigation.take())
+        else {
+            return false;
+        };
+        let target = target.trim();
+        let lower = target.to_ascii_lowercase();
+        if lower.starts_with("javascript:") || lower.starts_with("data:") || target.starts_with('#')
+        {
+            return false;
+        }
+        let Ok(url) = page.base.join(target) else {
+            return false;
+        };
+        if !matches!(url.scheme.as_str(), "http" | "https" | "file") {
+            return false;
+        }
+        if self.script_hops >= SCRIPT_HOPS {
+            eprintln!("broxee: a page kept navigating by itself; stopped");
+            return false;
+        }
+        self.script_hops += 1;
+        let same_site = net::site(&page.url.host) == net::site(&url.host);
+        let to = if replace {
+            Destination::Replace
+        } else {
+            self.save_scroll();
+            Destination::Push
+        };
+        self.navigate_from(url, to, same_site);
+        true
     }
 
     /// The form control at (x, y) in pane points, if any.
@@ -2669,6 +2807,7 @@ impl<S: Screen> Browser<S> {
         if let Some(page) = self.page.as_mut() {
             engine::update(page, settings, &self.fonts, states_changed);
         }
+        self.fetch_images();
         self.scroll_field();
         self.clamp_scroll();
         // The focused link moved with the layout.
@@ -2689,7 +2828,7 @@ impl<S: Screen> Browser<S> {
             self.tell_at_control(j, message);
             return;
         }
-        let Some(sent) = page.forms.submission(&page.dom, i, &page.url) else {
+        let Some(sent) = page.forms.submission(&page.dom, i, &page.base) else {
             return;
         };
         self.editing = None;
@@ -2886,6 +3025,7 @@ impl<S: Screen> Browser<S> {
                         }
                     },
                 },
+                Key::Up | Key::Down | Key::Left | Key::Right => self.command_arrow(k.key, k.shift),
                 Key::Char('c') => self.copy_selection(),
                 Key::Char('x') => self.cut_field(),
                 Key::Char('f') => self.open_find(),
@@ -2999,6 +3139,42 @@ impl<S: Screen> Browser<S> {
             Key::Home => self.scroll_to(0.0),
             Key::End => self.scroll_to(f32::MAX),
             _ => false,
+        }
+    }
+
+    /// ⌘ with an arrow. In a text field (the address, find, or a form field) it moves the caret
+    /// to the start or end, extending the selection with Shift; on the page ⌘↑ / ⌘↓ go to its
+    /// top and bottom and ⌘← / ⌘→ go back and forward, as in Safari.
+    fn command_arrow(&mut self, key: Key, shift: bool) -> bool {
+        let to_start = matches!(key, Key::Up | Key::Left);
+        let header_field = match self.find.as_mut().filter(|f| f.focused) {
+            Some(find) => Some(&mut find.field),
+            None => self.field.as_mut(),
+        };
+        if let Some(field) = header_field {
+            let to = if to_start { 0 } else { field.text.len() };
+            field.move_to(to, shift);
+            self.header_change = true;
+            return true;
+        }
+        if let Some(i) = self.focused_control() {
+            if self.editing.is_none() {
+                // A select or a button: arrows are its own.
+                return false;
+            }
+            let k = KeyEvent {
+                key: if to_start { Key::Home } else { Key::End },
+                command: false,
+                shift,
+                option: false,
+            };
+            return self.control_key(i, k).unwrap_or(false);
+        }
+        match key {
+            Key::Up => self.scroll_to(0.0),
+            Key::Down => self.scroll_to(f32::MAX),
+            Key::Left => self.back(),
+            _ => self.forward(),
         }
     }
 
@@ -3123,6 +3299,71 @@ impl<S: Screen> Browser<S> {
             .map(|p| net::site(&p.url.host).to_string());
         let same_site = from.is_none_or(|from| from == net::site(&url.host));
         self.navigate_from(url, Destination::Push, same_site);
+    }
+
+    /// ⌘-click or middle click: a link under the pointer opens in a new tab, in the background
+    /// unless `foreground`. Anywhere else it is a plain click.
+    fn open_click(&mut self, x: f32, y: f32, foreground: bool) -> bool {
+        let left = self.pane_left();
+        let overlay = self.dropdown.is_some()
+            || self.menu.is_some()
+            || self.dialog.is_some()
+            || self.palette.is_some();
+        if !overlay && x >= left && y >= HEADER_HEIGHT {
+            if let Some(url) = self.link_at(x - left, y - HEADER_HEIGHT) {
+                self.open_in_tab(url, foreground);
+                return true;
+            }
+        }
+        self.click(x, y)
+    }
+
+    /// Open `url`, a link of the visible page, in a new tab after the visible one (and after
+    /// the tabs already opened from it). A background tab is only its history until selected.
+    fn open_in_tab(&mut self, url: net::Url, foreground: bool) {
+        let cross_site = self
+            .page
+            .as_ref()
+            .is_some_and(|p| net::site(&p.url.host) != net::site(&url.host));
+        let p = &self.profiles[self.profile];
+        let source = &p.tabs[p.active];
+        let count = if self.opened.0 == source.id {
+            self.opened.1
+        } else {
+            0
+        };
+        let group = source.group.clone().filter(|_| !source.pinned);
+        let tab = Tab {
+            history: vec![Entry {
+                url: url.clone(),
+                scroll: 0.0,
+                title: String::new(),
+            }],
+            title: host_of(&url),
+            group,
+            cross_site_start: cross_site,
+            ..Tab::default()
+        };
+        let id = tab.id;
+        self.opened = (source.id, count + 1);
+        let at = (p.active + 1 + count).min(p.tabs.len());
+        if foreground {
+            self.sleep();
+        }
+        let p = &mut self.profiles[self.profile];
+        p.tabs.insert(at, tab);
+        if at <= p.active {
+            p.active += 1;
+        }
+        p.normalize();
+        if foreground {
+            let p = &mut self.profiles[self.profile];
+            p.active = p.tabs.iter().position(|t| t.id == id).unwrap_or(p.active);
+            self.wake();
+            self.reveal_active_tab();
+        } else {
+            self.save_session();
+        }
     }
 
     /// Run a command, from its shortcut or the palette.
@@ -3559,10 +3800,27 @@ impl<S: Screen> Browser<S> {
         Some(text.to_string())
     }
 
+    /// The address of the link under the pointer, for the preview at the bottom of the pane.
+    fn preview_at(&self, x: f32, y: f32) -> Option<String> {
+        let left = self.pane_left();
+        if x < left || y < HEADER_HEIGHT || self.drag.is_some() {
+            return None;
+        }
+        if self.menu.is_some() || self.palette.is_some() || self.dialog.is_some() {
+            return None;
+        }
+        self.link_at(x - left, y - HEADER_HEIGHT)
+            .map(|url| url.to_string())
+    }
+
     /// The pointer moved: start waiting for a new tooltip, or hide the one shown.
     fn hover_at(&mut self, x: f32, y: f32) -> bool {
         let hovered = self.state_target(x, y, css::HOVER);
         let restyled = self.set_states(|s| s.hover = hovered);
+        let preview = self.preview_at(x, y);
+        self.last_pointer = Some((x, y));
+        let restyled = restyled | (preview != self.link_preview);
+        self.link_preview = preview;
         let text = self.tooltip_at(x, y);
         let same = self.hover.as_ref().map(|h| &h.text) == text.as_ref();
         if same {
@@ -3938,6 +4196,15 @@ impl<S: Screen> Browser<S> {
             });
         }
         items.extend(palette::rank(&query, self.palette_candidates()));
+        // With matches, searching the web stays one row away; with none, Enter does it.
+        if !items.is_empty() && parse_input(&query).is_err() && !query.trim().is_empty() {
+            items.push(palette::Item {
+                title: format!("Search the web for \"{}\"", query.trim()),
+                detail: "Bing".into(),
+                hint: Hint::Label(String::new()),
+                action: Action::Open(search_url(query.trim())),
+            });
+        }
         if let Some(p) = self.palette.as_mut() {
             p.items = items;
             p.selected = 0;
@@ -4068,6 +4335,17 @@ impl<S: Screen> Browser<S> {
             Key::Tab => step(p, if k.shift { -1 } else { 1 }),
             Key::PageDown => step(p, rows as isize),
             Key::PageUp => step(p, -(rows as isize)),
+            Key::Enter if p.items.is_empty() => {
+                // Nothing matches: Enter searches the web (DESIGN.md, section 9).
+                let query = p.query.text.trim().to_string();
+                if query.is_empty() {
+                    return false;
+                }
+                self.close_palette();
+                self.save_scroll();
+                self.navigate(search_url(&query), Destination::Push);
+                return true;
+            }
             Key::Enter => {
                 let selected = p.selected;
                 return self.activate(selected);
@@ -4173,15 +4451,21 @@ impl<S: Screen> Browser<S> {
         self.navigate(url, Destination::Entry(index));
     }
 
-    /// What the user typed in the address field.
+    /// What the user typed in the address field: an address, or else words to search for.
+    /// Several addresses pasted together are neither.
     fn open_input(&mut self, input: &str) {
-        match parse_input(input) {
-            Ok(url) => {
-                self.save_scroll();
-                self.navigate(url, Destination::Push);
+        let url = match parse_input(input) {
+            Ok(url) => url,
+            Err(_) if engine::several_addresses(input.trim()).is_ok() => {
+                if input.trim().is_empty() {
+                    return;
+                }
+                search_url(input.trim())
             }
-            Err(message) => self.show_message("Broxee can't search yet", &message),
-        }
+            Err(message) => return self.show_message("Broxee can't open that", &message),
+        };
+        self.save_scroll();
+        self.navigate(url, Destination::Push);
     }
 
     /// Start loading `url` on its own thread; `to` says where it goes in the history when it
@@ -4206,6 +4490,8 @@ impl<S: Screen> Browser<S> {
         same_site_initiator: bool,
     ) {
         self.stop_load();
+        self.refresh = None;
+        self.offline_retry = None;
         self.editing = None;
         self.field = None;
         self.focus = None;
@@ -4214,6 +4500,9 @@ impl<S: Screen> Browser<S> {
         let fonts = Arc::clone(&self.fonts);
         let cookies = Arc::clone(&self.profiles[self.profile].cookies);
         let target = url.clone();
+        let post = body.is_some();
+        let background = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&background);
         let spawned = std::thread::Builder::new()
             .name("load".into())
             .spawn(move || {
@@ -4222,12 +4511,13 @@ impl<S: Screen> Browser<S> {
                     same_site_initiator,
                 };
                 // A failed send means the browser dropped the load: stop at the next stage.
-                let result = engine::load_with(
+                let result = engine::load_in_tab(
                     &target,
                     body.as_ref(),
                     settings,
                     &fonts,
                     Some(jar),
+                    Some(&flag),
                     &mut |progress| sender.send(LoadMessage::Progress(progress)).is_ok(),
                 );
                 let _ = sender.send(LoadMessage::Done(Box::new(result)));
@@ -4237,6 +4527,10 @@ impl<S: Screen> Browser<S> {
             to,
             settings,
             messages,
+            tab: self.tab().id,
+            profile: self.profile,
+            background,
+            post,
         };
         if let Err(e) = spawned {
             return self.finish_load(load, Err(e.to_string()));
@@ -4302,18 +4596,29 @@ impl<S: Screen> Browser<S> {
     }
 
     /// Show a finished load (or its error page) and record it in the tab's history.
-    fn finish_load(&mut self, load: Load, result: Result<Loaded, String>) {
+    fn finish_load(&mut self, load: Load, result: Result<engine::Outcome, String>) {
         self.loading = None;
         self.save_cookies();
-        let url = load.url;
         if matches!(&result, Err(e) if e == engine::CANCELLED) {
             return;
         }
+        // Sent to the background and brought back after it stopped building: build it now.
+        let result = match result {
+            Ok(engine::Outcome::Page(page)) => Ok(*page),
+            Ok(engine::Outcome::Downloaded(snapshot, _)) => {
+                return self.build_downloaded(*snapshot, load.to);
+            }
+            Err(e) => Err(e),
+        };
+        let url = load.url;
         let loaded = result.is_ok();
+        let mut offline = false;
         let mut page = result.unwrap_or_else(|e| {
+            // A file that is not there is not a network problem.
+            offline = url.scheme != "file" && !(self.online)();
             engine::page_from_html(
                 url.clone(),
-                &error_page(&url, &e, &self.chrome),
+                &error_page(&url, &e, offline, &self.chrome),
                 load.settings,
                 &self.fonts,
             )
@@ -4343,16 +4648,300 @@ impl<S: Screen> Browser<S> {
                 tab.history[i].scroll
             }
             Destination::Entry(_) => 0.0,
+            Destination::Replace => {
+                let entry = Entry {
+                    url: page.url.clone(),
+                    scroll: 0.0,
+                    title: String::new(),
+                };
+                match tab.history.get_mut(tab.index) {
+                    Some(current) => *current = entry,
+                    None => {
+                        tab.history.push(entry);
+                        tab.index = tab.history.len() - 1;
+                    }
+                }
+                0.0
+            }
         };
+        let refresh = engine::refresh(&page).filter(|_| loaded);
         let title = self.show(page, scroll);
         self.set_tab_title(title);
         self.page_is_entry = loaded;
+        // Never sooner than a second: a page refreshing itself at 0 must not spin.
+        self.refresh = refresh.map(|(seconds, url)| {
+            let delay = Duration::from_secs_f32(seconds.clamp(0.0, 86_400.0)).max(REFRESH_MIN);
+            (Instant::now() + delay, url)
+        });
+        self.offline_retry = offline.then(|| Instant::now() + OFFLINE_CHECK);
         self.save_session();
+        // A page whose scripts navigated while it loaded (a redirect page) goes on now.
+        self.follow_script_navigation();
+    }
+
+    /// While the visible tab shows the offline page, look every `OFFLINE_CHECK` whether a
+    /// network is back, and reload the tab when it is.
+    fn retry_if_online(&mut self) {
+        let Some(at) = self.offline_retry else {
+            return;
+        };
+        if Instant::now() < at || self.load.is_some() {
+            return;
+        }
+        if (self.online)() {
+            self.offline_retry = None;
+            self.reload();
+        } else {
+            self.offline_retry = Some(Instant::now() + OFFLINE_CHECK);
+        }
+    }
+
+    /// Follow the visible page's refresh once it is due. The new page takes the place of the
+    /// current history entry; a reload keeps it and its scroll position.
+    fn run_refresh(&mut self) {
+        let due = self
+            .refresh
+            .as_ref()
+            .is_some_and(|(at, _)| Instant::now() >= *at);
+        if !due || self.load.is_some() {
+            return;
+        }
+        let Some((_, to)) = self.refresh.take() else {
+            return;
+        };
+        match to {
+            Some(url) => {
+                let same_site = self
+                    .page
+                    .as_ref()
+                    .is_some_and(|p| net::site(&p.url.host) == net::site(&url.host));
+                self.navigate_from(url, Destination::Replace, same_site);
+            }
+            None => {
+                self.save_scroll();
+                self.reload();
+            }
+        }
+    }
+
+    /// The visible tab is being left while it loads: its load goes on downloading in the
+    /// background, unless it posts a form or `BACKGROUND_LOADS` are running (the oldest
+    /// stops).
+    fn send_load_to_background(&mut self) {
+        let Some(load) = self.load.take() else {
+            return;
+        };
+        self.loading = None;
+        if load.post {
+            return;
+        }
+        load.background
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if self.background.len() >= BACKGROUND_LOADS {
+            self.background.remove(0);
+        }
+        self.background.push(load);
+    }
+
+    /// Build a page downloaded in the background, on the loader thread like a load: the
+    /// fonts and background images it lacks are fetched there. `to` places it in the
+    /// visible tab's history when it is shown.
+    fn build_downloaded(&mut self, snapshot: engine::Snapshot, to: Destination) {
+        let settings = self.settings();
+        let (sender, messages) = mpsc::channel();
+        let fonts = Arc::clone(&self.fonts);
+        let cookies = Arc::clone(&self.profiles[self.profile].cookies);
+        let background = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&background);
+        let url = snapshot.url.clone();
+        let spawned = std::thread::Builder::new()
+            .name("load".into())
+            .spawn(move || {
+                let result = engine::restore_in_tab(
+                    snapshot,
+                    settings,
+                    &fonts,
+                    Some(&cookies),
+                    Some(&flag),
+                    &mut |progress| sender.send(LoadMessage::Progress(progress)).is_ok(),
+                );
+                let _ = sender.send(LoadMessage::Done(Box::new(result)));
+            });
+        let load = Load {
+            url,
+            to,
+            settings,
+            messages,
+            tab: self.tab().id,
+            profile: self.profile,
+            background,
+            post: false,
+        };
+        if let Err(e) = spawned {
+            return self.finish_load(load, Err(e.to_string()));
+        }
+        self.load = Some(load);
+        self.loading = Some(0.1);
+        self.render();
+    }
+
+    /// Start fetching the images the visible page named and has not got, with its profile's
+    /// cookies for its own site (one batch at a time, `FETCH_WORKERS` at once).
+    fn fetch_images(&mut self) {
+        if self.image_fetch.is_some() {
+            return;
+        }
+        let Some(page) = self.page.as_mut() else {
+            return;
+        };
+        if page.pending_images.is_empty() {
+            return;
+        }
+        let urls = std::mem::take(&mut page.pending_images);
+        let page_url = page.url.clone();
+        let cookies = Arc::clone(&self.profiles[self.profile].cookies);
+        let (sender, receiver) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("images".into())
+            .spawn(move || {
+                let context = net::Context::subresource(&page_url);
+                let bytes = crate::pool::map_ordered(urls.clone(), 6, |url| {
+                    let url = net::Url::parse(&url).ok()?;
+                    let resp = net::fetch_in(&url, Some((&cookies, &context))).ok()?;
+                    (resp.status == 200).then_some(resp.body)
+                });
+                let _ = sender.send(urls.into_iter().zip(bytes).collect());
+            });
+        if spawned.is_ok() {
+            self.image_fetch = Some(receiver);
+        }
+    }
+
+    /// Images the visible page asked for have arrived: keep them, show them in every
+    /// `<img>` naming them, and lay those out again. Returns whether to repaint.
+    fn poll_images(&mut self) -> bool {
+        let Some(receiver) = &self.image_fetch else {
+            return false;
+        };
+        let arrived = match receiver.try_recv() {
+            Ok(arrived) => arrived,
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => {
+                self.image_fetch = None;
+                return false;
+            }
+        };
+        self.image_fetch = None;
+        let Some(page) = self.page.as_mut() else {
+            return false;
+        };
+        let keys: Vec<String> = arrived.iter().map(|(k, _)| k.clone()).collect();
+        page.images.add_backgrounds(arrived);
+        let nodes: Vec<NodeId> = crate::images::img_nodes(&page.dom, html::Dom::ROOT)
+            .filter(|&n| {
+                crate::images::key_of(&page.dom, &page.base, n).is_some_and(|k| keys.contains(&k))
+            })
+            .collect();
+        for &n in &nodes {
+            page.dom.touch(n);
+        }
+        page.images.bind(&page.dom, &page.base, nodes);
+        self.update_page(false);
+        true
+    }
+
+    /// Collect what background loads have finished. Returns whether the sidebar changed.
+    fn poll_background(&mut self) -> bool {
+        let mut changed = false;
+        let mut i = 0;
+        while i < self.background.len() {
+            match self.background[i].messages.try_recv() {
+                Ok(LoadMessage::Progress(_)) => {}
+                Ok(LoadMessage::Done(result)) => {
+                    let load = self.background.remove(i);
+                    changed |= self.finish_background(load, *result);
+                }
+                Err(TryRecvError::Empty) => i += 1,
+                Err(TryRecvError::Disconnected) => {
+                    self.background.remove(i);
+                }
+            }
+        }
+        changed
+    }
+
+    /// A background load finished: its tab's history moves on, and the page waits in a
+    /// sleeping file (a page that was built after all is snapshotted at once, so no second
+    /// page stays in memory). A failed load leaves the address in the history: selecting the
+    /// tab tries again. Returns whether the sidebar changed.
+    fn finish_background(&mut self, load: Load, result: Result<engine::Outcome, String>) -> bool {
+        if matches!(&result, Err(e) if e == engine::CANCELLED) {
+            return false;
+        }
+        self.save_cookies();
+        let Some(p) = self.profiles.get(load.profile) else {
+            return false;
+        };
+        let Some(t) = p.tabs.iter().position(|t| t.id == load.tab) else {
+            return false;
+        };
+        // Never the visible tab: it would have adopted its load.
+        if load.profile == self.profile && t == p.active {
+            return false;
+        }
+        let (url, title, snapshot) = match result {
+            Ok(engine::Outcome::Page(page)) => {
+                let title = page.dom.title();
+                (page.url.clone(), title, Some(engine::snapshot(*page)))
+            }
+            Ok(engine::Outcome::Downloaded(snapshot, title)) => {
+                (snapshot.url.clone(), title, Some(*snapshot))
+            }
+            Err(_) => (load.url.clone(), None, None),
+        };
+        let stored = match (snapshot, self.store.as_mut()) {
+            (Some(s), Some(store)) => store.put(&s).ok(),
+            _ => None,
+        };
+        let tab = &mut self.profiles[load.profile].tabs[t];
+        let title = title.unwrap_or_else(|| host_of(&url));
+        let entry = Entry {
+            url,
+            scroll: 0.0,
+            title: title.clone(),
+        };
+        match load.to {
+            Destination::Entry(i) if i < tab.history.len() => {
+                tab.index = i;
+                tab.history[i].title.clone_from(&title);
+            }
+            Destination::Replace if tab.index < tab.history.len() => {
+                tab.history[tab.index] = entry;
+            }
+            _ => {
+                if !tab.history.is_empty() {
+                    tab.history.truncate(tab.index + 1);
+                }
+                tab.history.push(entry);
+                tab.index = tab.history.len() - 1;
+            }
+        }
+        tab.title = title;
+        tab.focused_link = None;
+        let old = std::mem::replace(&mut tab.snapshot, stored);
+        if let (Some(old), Some(store)) = (old, self.store.as_mut()) {
+            store.remove(old);
+        }
+        self.trim_snapshots();
+        self.save_session();
+        true
     }
 
     /// Put the visible tab to sleep: keep what rebuilds its page, drop the page.
     fn sleep(&mut self) {
-        self.stop_load();
+        self.send_load_to_background();
+        self.refresh = None;
+        self.offline_retry = None;
         self.save_scroll();
         self.field = None;
         self.focus = None;
@@ -4404,6 +4993,13 @@ impl<S: Screen> Browser<S> {
     /// Show the visible tab: from its snapshot, from the network, or as a new tab.
     fn wake(&mut self) {
         let settings = self.settings();
+        // A load this tab left running goes on in front.
+        let (id, profile) = (self.tab().id, self.profile);
+        let adopted = self
+            .background
+            .iter()
+            .position(|l| l.tab == id && l.profile == profile)
+            .map(|i| self.background.remove(i));
         let tab = self.tab_mut();
         let stored = tab.snapshot.take();
         let entry = tab.entry().cloned();
@@ -4412,8 +5008,25 @@ impl<S: Screen> Browser<S> {
             (Some(stored), Some(store)) => store.take(stored).ok(),
             _ => None,
         };
-        if let (Some(snapshot), Some(entry)) = (snapshot, &entry) {
-            if let Ok(page) = engine::restore(snapshot, settings, &self.fonts) {
+        if let Some(load) = adopted {
+            load.background
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            self.load = Some(load);
+            self.loading = Some(0.1);
+        }
+        // Downloaded in the background: built on the loader thread, which fetches its fonts.
+        let snapshot = match snapshot {
+            Some(s) if s.sources.partial && self.load.is_none() => {
+                let index = self.tab().index;
+                self.page = None;
+                self.page_is_entry = false;
+                self.window.set_title(&title);
+                return self.build_downloaded(s, Destination::Entry(index));
+            }
+            other => other,
+        };
+        if let (Some(snapshot), Some(entry)) = (snapshot.filter(|s| !s.sources.partial), &entry) {
+            if let Ok(page) = engine::restore(snapshot, settings, &self.fonts, None) {
                 let title = self.show(page, entry.scroll);
                 self.set_tab_title(title);
                 if let Some(node) = self.tab_mut().focused_link.take() {
@@ -4425,10 +5038,20 @@ impl<S: Screen> Browser<S> {
                 return;
             }
         }
+        if self.load.is_some() {
+            // The adopted load shows its page when it finishes.
+            self.page = None;
+            self.page_is_entry = false;
+            self.window.set_title(&title);
+            self.render();
+            return;
+        }
         match entry {
             Some(entry) => {
-                let index = self.tab().index;
-                self.navigate(entry.url, Destination::Entry(index));
+                let tab = self.tab_mut();
+                let index = tab.index;
+                let same_site = !std::mem::take(&mut tab.cross_site_start);
+                self.navigate_from(entry.url, Destination::Entry(index), same_site);
             }
             None => {
                 // A new tab: the palette over an empty pane (DESIGN.md, section 7).
@@ -4468,6 +5091,8 @@ impl<S: Screen> Browser<S> {
     /// Close the visible tab. The last tab of a profile is replaced by a new one.
     fn close_tab(&mut self) -> bool {
         self.stop_load();
+        self.refresh = None;
+        self.offline_retry = None;
         self.save_scroll();
         self.page = None;
         self.page_is_entry = false;
@@ -4528,7 +5153,9 @@ impl<S: Screen> Browser<S> {
             return self.select_tab(index);
         }
         self.sleep();
-        // Nothing a server could use to link the two profiles carries over.
+        // Nothing a server could use to link the two profiles carries over: not even a
+        // download still running for the profile being left.
+        self.background.clear();
         net::forget_sessions();
         self.profile = profile;
         let p = &mut self.profiles[profile];
@@ -4632,6 +5259,11 @@ impl<S: Screen> Browser<S> {
             self.header_change = true;
         }
         self.link_focus = None;
+        self.link_preview = None;
+        // Answers for the last page's images are not this page's.
+        self.image_fetch = None;
+        self.refresh = None;
+        self.offline_retry = None;
         self.editing = None;
         self.loading = None;
         self.scroll = scroll;
@@ -4646,6 +5278,7 @@ impl<S: Screen> Browser<S> {
         if let (Some(i), true) = (auto, scroll == 0.0) {
             self.focus_control(i);
         }
+        self.fetch_images();
         self.painter.trim(GLYPH_CACHE_LIMIT);
         self.painter.forget_images();
         // Loading freed a lot (the previous page, stylesheet text, parse scratch): hand it back
@@ -4660,7 +5293,13 @@ impl<S: Screen> Browser<S> {
     /// topmost fragment wins: later layers paint over earlier ones, and fixed layers do not
     /// scroll. Hidden fragments cannot be clicked.
     fn link_at(&self, x: f32, y_view: f32) -> Option<net::Url> {
+        self.link_hit(x, y_view).map(|(url, _)| url)
+    }
+
+    /// `link_at`, saying too whether the link asks for a new tab (`target=_blank`).
+    fn link_hit(&self, x: f32, y_view: f32) -> Option<(net::Url, bool)> {
         let page = self.page.as_ref()?;
+        let hit = |node| link_for(page, node).map(|url| (url, opens_new_tab(page, node)));
         let layout = &page.layout;
         let metrics = page.metrics(&self.fonts);
         let doc_y = |fixed: bool| if fixed { y_view } else { y_view + self.scroll };
@@ -4680,7 +5319,7 @@ impl<S: Screen> Browser<S> {
                 && (t.x..=t.x + t.width).contains(&x)
                 && (top..=bottom).contains(&y)
             {
-                return link_for(page, t.node);
+                return hit(t.node);
             }
         }
         // Innermost boxes come last in document order; an outer <a> can still wrap them.
@@ -4693,7 +5332,7 @@ impl<S: Screen> Browser<S> {
                 let st = page.styles.style(layout.boxes[i].node);
                 st.visible && !st.transparent
             })
-            .then(|| link_for(page, layout.boxes[i].node))
+            .then(|| hit(layout.boxes[i].node))
             .flatten()
         })
     }
@@ -4943,10 +5582,9 @@ impl<S: Screen> Browser<S> {
             cursor: p.query.cursor,
             rows: &palette_rows,
             selected: (!p.items.is_empty()).then(|| p.selected - p.first),
-            // Honest until a search engine is chosen (DESIGN.md asks for web search).
             empty: nothing
                 .as_deref()
-                .map(|line| (line, "Broxee can't search the web yet.")),
+                .map(|line| (line, "Press Enter to search the web.")),
         });
         // The focused link's rectangles in page-area points.
         let ring: Vec<(f32, f32, f32, f32)> = self.link_focus.as_ref().map_or(Vec::new(), |l| {
@@ -5019,6 +5657,12 @@ impl<S: Screen> Browser<S> {
                 }
             }
         });
+        // The pointer, in the page area's points, so the preview can move out of its way.
+        let preview = self.link_preview.as_deref();
+        let pane_left = self.pane_left();
+        let preview_at = self
+            .last_pointer
+            .map(|(x, y)| (x - pane_left, y - HEADER_HEIGHT));
         let (painter, chrome) = (&mut self.painter, &mut self.chrome);
         let blank = chrome.theme().surface;
         let line = chrome.theme().line;
@@ -5129,6 +5773,16 @@ impl<S: Screen> Browser<S> {
                         scale,
                     };
                     chrome.draw_caret(painter, frame, caret);
+                }
+                if let (Some(url), true) = (preview, page_rows > 0) {
+                    let frame = Frame {
+                        pixels: &mut *bottom,
+                        stride,
+                        left: pane_x,
+                        width: pane_px,
+                        scale,
+                    };
+                    chrome.draw_link_preview(painter, frame, &fonts.ui(), preview_at, url);
                 }
                 let frame = Frame {
                     pixels: top,
@@ -5693,12 +6347,30 @@ fn link_for(page: &Loaded, node: NodeId) -> Option<net::Url> {
             {
                 return None;
             }
-            let url = page.url.join(href).ok()?;
+            let url = page.base.join(href).ok()?;
             return matches!(url.scheme.as_str(), "http" | "https" | "file").then_some(url);
         }
         current = page.dom.parent(id);
     }
     None
+}
+
+/// Whether the link around `node` asks to open in a new tab: `target="_blank"`, its own or
+/// the `<base>`'s. Other
+/// names would open in a window of that name; Broxee follows those in place.
+fn opens_new_tab(page: &Loaded, node: NodeId) -> bool {
+    let mut current = Some(node);
+    while let Some(id) = current {
+        if page.dom.tag_name(id) == Some("a") {
+            let target = page
+                .dom
+                .attr(id, "target")
+                .or_else(|| engine::base_target(&page.dom));
+            return target.is_some_and(|t| t.trim().eq_ignore_ascii_case("_blank"));
+        }
+        current = page.dom.parent(id);
+    }
+    false
 }
 
 /// The links Tab can reach, in document order: `<a href>` elements that are visible and have
@@ -5777,6 +6449,15 @@ fn link_rects(
 }
 
 /// Typed text to a URL: full URLs as they are, `example.com` as https.
+/// The search engine's results for `query`. Bing answers without JavaScript, which Google's
+/// results page needs; DuckDuckGo is blocked on some networks (Indonesia). A choice of
+/// engine belongs in settings once they exist.
+fn search_url(query: &str) -> net::Url {
+    let q = forms::urlencode(&[("q".to_string(), query.to_string())]);
+    net::Url::parse(&format!("https://www.bing.com/search?{q}"))
+        .expect("an encoded query is a valid address")
+}
+
 fn parse_input(input: &str) -> Result<net::Url, String> {
     let input = input.trim();
     engine::several_addresses(input)?;
@@ -5801,25 +6482,57 @@ fn host_of(url: &net::Url) -> String {
     }
 }
 
-fn error_page(url: &net::Url, error: &str, chrome: &Chrome) -> String {
+/// The page for a load that failed: what went wrong in plain words, the address, and Try
+/// again. `offline`: no network interface was up, whatever the error says.
+fn error_page(url: &net::Url, error: &str, offline: bool, chrome: &Chrome) -> String {
     let host = host_of(url);
-    let lower = error.to_ascii_lowercase();
-    let title = if lower.contains("certificate") {
-        format!("{host}'s certificate isn't valid, so Broxee didn't open it")
+    let kind = if offline {
+        None
     } else {
-        format!("Couldn't reach {host}")
+        Some(net::classify(error))
     };
-    message_page(&title, error, Some(url), chrome)
+    let (title, detail) = match kind {
+        None => (
+            "You're offline".to_string(),
+            "Broxee will open the page again when a network connection is back.".to_string(),
+        ),
+        Some(net::Failure::Dns) => (
+            format!("Couldn't find {host}"),
+            "No server answers to that name. Check the address for typos.".to_string(),
+        ),
+        Some(net::Failure::Refused) => (
+            format!("{host} refused the connection"),
+            "The site may be down, or not taking connections on this port.".to_string(),
+        ),
+        Some(net::Failure::TimedOut) => (
+            format!("{host} took too long to answer"),
+            "The site may be busy or down. Try again in a moment.".to_string(),
+        ),
+        Some(net::Failure::Unreachable) => (
+            format!("Couldn't reach {host}"),
+            "There is no route to the site's network from this connection.".to_string(),
+        ),
+        Some(net::Failure::Redirects) => (
+            format!("{host} redirected too many times"),
+            "The page keeps sending Broxee to another address. Clearing this profile's \
+             cookies can fix it."
+                .to_string(),
+        ),
+        Some(net::Failure::Certificate) => (
+            format!("{host}'s certificate isn't valid, so Broxee didn't open it"),
+            error.to_string(),
+        ),
+        Some(net::Failure::Other) => (format!("Couldn't reach {host}"), error.to_string()),
+    };
+    message_page(&title, &detail, Some(url), chrome)
 }
 
 /// A small page in Broxee's own style (DESIGN.md tokens), rendered by the engine itself.
 fn message_page(title: &str, detail: &str, retry: Option<&net::Url>, chrome: &Chrome) -> String {
     let t = chrome.theme();
     let action = retry.map_or(String::new(), |url| {
-        format!(
-            "<p><a href=\"{}\">Try again</a></p>",
-            escape(&url.to_string())
-        )
+        let url = escape(&url.to_string());
+        format!("<p class=url>{url}</p><p><a href=\"{url}\">Try again</a></p>")
     });
     format!(
         "<!doctype html><html><head><title>{title}</title><style>\
@@ -5828,6 +6541,7 @@ fn message_page(title: &str, detail: &str, retry: Option<&net::Url>, chrome: &Ch
          main {{ max-width: 32em; margin: 0 auto; padding: 120px 24px 0 }} \
          h1 {{ font-size: 20px; margin: 0 0 8px; line-height: 1.3 }} \
          p {{ margin: 0 0 16px; color: {text_2} }} \
+         .url {{ font-size: 12px; overflow-wrap: anywhere }} \
          a {{ color: {accent}; text-decoration: none; font-weight: bold }}\
          </style></head><body><main><h1>{title}</h1><p>{detail}</p>{action}</main></body></html>",
         title = escape(title),
@@ -5862,6 +6576,7 @@ mod tests {
         /// Full frames and header-only frames painted.
         frames: std::cell::Cell<usize>,
         headers: std::cell::Cell<usize>,
+        dark: std::cell::Cell<bool>,
     }
 
     const PAD: usize = 16;
@@ -5876,7 +6591,7 @@ mod tests {
         }
 
         fn dark(&self) -> bool {
-            false
+            self.dark.get()
         }
 
         fn set_title(&self, title: &str) {
@@ -6512,12 +7227,14 @@ mod tests {
             .text_content(html::Dom::ROOT)
             .contains("Try again"));
 
+        // Two addresses pasted together are neither an address nor a search.
         act(&mut b, command('l'));
-        for c in "what is rust".chars() {
-            act(&mut b, key(Key::Char(c)));
-        }
+        act(
+            &mut b,
+            Event::Paste("https://a.com/x https://b.com/".into()),
+        );
         act(&mut b, key(Key::Enter));
-        assert_eq!(title(&b), "Broxee can't search yet");
+        assert_eq!(title(&b), "Broxee can't open that");
     }
 
     #[test]
@@ -6871,7 +7588,8 @@ mod tests {
         let (slow, release) = slow_server("Slow");
         let mut b = browser(&a);
 
-        // A new tab while a page loads: answered at once, and the load is dropped.
+        // A new tab while a page loads: answered at once, and the load goes on in the
+        // background for the tab it belongs to.
         start_loading(&mut b, &slow);
         let started = std::time::Instant::now();
         assert!(b.handle(command('t')));
@@ -6879,8 +7597,12 @@ mod tests {
         // bound only guards against a regression that waits for the network's timeout.
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(b.load.is_none() && b.loading.is_none());
+        assert_eq!(b.background.len(), 1);
         assert_eq!(tab_titles(&b), ["Page A", "New tab"]);
-        act(&mut b, command('w'));
+        // Back on its tab, the load is in front again; Esc stops it.
+        b.handle(command('w'));
+        assert!(b.load.is_some() && b.background.is_empty());
+        assert!(b.handle(key(Key::Escape)));
         assert_eq!(title(&b), "Page A");
 
         // Esc stops a load and keeps the page and history as they were.
@@ -8046,8 +8768,20 @@ mod tests {
         type_text(&mut b, "zzqx");
         assert!(results(&b).is_empty());
         b.render();
-        assert!(!act(&mut b, key(Key::Enter)), "nothing to open");
-        assert!(b.palette.is_some());
+        // Enter would search the web (no network in tests): only check where it goes.
+        assert_eq!(
+            search_url("zzqx").to_string(),
+            "https://www.bing.com/search?q=zzqx"
+        );
+        // A query that matches something keeps search as its last row.
+        for _ in 0..4 {
+            act(&mut b, key(Key::Backspace));
+        }
+        type_text(&mut b, "page");
+        assert_eq!(
+            results(&b).last().map(String::as_str),
+            Some("Search the web for \"page\"")
+        );
 
         for _ in 0..4 {
             act(&mut b, key(Key::Backspace));
@@ -8992,10 +9726,993 @@ mod tests {
     }
 
     #[test]
+    fn searches_encode_the_words() {
+        assert_eq!(
+            search_url("rust & c++ 100%").to_string(),
+            "https://www.bing.com/search?q=rust+%26+c%2B%2B+100%25"
+        );
+    }
+
+    #[test]
     fn escapes_message_text() {
         assert_eq!(
             escape("<a href=\"x\">&"),
             "&lt;a href=&quot;x&quot;&gt;&amp;"
         );
+    }
+
+    fn command_key(key: Key, shift: bool) -> Event {
+        Event::Key(KeyEvent {
+            key,
+            command: true,
+            shift,
+            option: false,
+        })
+    }
+
+    #[test]
+    fn keyboard_scrolls_the_page_and_command_arrows_reach_its_ends() {
+        let (a, _) = site("keyboard-scrolling");
+        let mut b = browser(&a);
+        let max = b.max_scroll();
+        assert!(max > 0.0, "page A is taller than the pane");
+        let page = b.page_height() - PAGE_OVERLAP;
+
+        act(&mut b, key(Key::Down));
+        assert_eq!(b.scroll, LINE_STEP);
+        act(&mut b, key(Key::Char(' ')));
+        assert_eq!(b.scroll, LINE_STEP + page);
+        act(
+            &mut b,
+            Event::Key(KeyEvent {
+                key: Key::Char(' '),
+                command: false,
+                shift: true,
+                option: false,
+            }),
+        );
+        assert_eq!(b.scroll, LINE_STEP);
+        act(&mut b, key(Key::PageDown));
+        assert_eq!(b.scroll, LINE_STEP + page);
+        act(&mut b, key(Key::Home));
+        assert_eq!(b.scroll, 0.0);
+        act(&mut b, key(Key::End));
+        assert_eq!(b.scroll, max);
+
+        act(&mut b, command_key(Key::Up, false));
+        assert_eq!(b.scroll, 0.0, "⌘↑ goes to the top");
+        act(&mut b, command_key(Key::Down, false));
+        assert_eq!(b.scroll, max, "⌘↓ goes to the bottom");
+        act(&mut b, command_key(Key::Up, false));
+
+        // ⌘← and ⌘→ go back and forward on the page...
+        click_text(&mut b, "Go to B");
+        assert_eq!(title(&b), "Page B");
+        act(&mut b, command_key(Key::Left, false));
+        assert_eq!(title(&b), "Page A");
+        act(&mut b, command_key(Key::Right, false));
+        assert_eq!(title(&b), "Page B");
+
+        // ...and move the caret in a field instead.
+        act(&mut b, command('l'));
+        act(&mut b, key(Key::Char('x')));
+        act(&mut b, command_key(Key::Left, false));
+        assert_eq!(b.field.as_ref().map(|f| f.cursor), Some(0));
+        act(&mut b, command_key(Key::Right, true));
+        let field = b.field.as_ref().unwrap();
+        assert_eq!(field.cursor, field.text.len());
+        assert_eq!(field.selection(), Some((0, 1)), "⌘⇧→ selects to the end");
+        assert_eq!(title(&b), "Page B", "the caret moved, the page did not");
+    }
+
+    fn link_point(b: &Browser<FakeScreen>, text: &str) -> (f64, f64) {
+        let page = b.page.as_ref().expect("a page is loaded");
+        let run = page
+            .layout
+            .texts
+            .iter()
+            .find(|t| page.layout.text(t).contains(text))
+            .expect("text on the page");
+        (
+            f64::from(SIDEBAR_WIDTH + run.x + run.width / 2.0),
+            f64::from(run.baseline - 4.0 - b.scroll + HEADER_HEIGHT),
+        )
+    }
+
+    fn links_page(name: &str) -> PathBuf {
+        let page = page_file(
+            name,
+            "<title>Links</title><style>body { margin: 0 } p { margin: 0; line-height: 20px }
+             </style><p><a href=\"one.html\">One</a></p><p><a href=\"two.html\">Two</a></p>
+             <p><a href=\"three.html\">Three</a></p><p><a href=\"new.html\" target=\"_BLANK\">
+             New</a></p><p>Plain text</p>",
+        );
+        let dir = page.parent().unwrap();
+        for name in ["one", "two", "three", "new"] {
+            std::fs::write(
+                dir.join(format!("{name}.html")),
+                format!("<title>Page {name}</title>"),
+            )
+            .unwrap();
+        }
+        page
+    }
+
+    #[test]
+    fn command_and_middle_clicks_open_links_in_background_tabs() {
+        let page = links_page("open-click");
+        let mut b = browser(&page);
+        for text in ["One", "Two", "Three"] {
+            let (x, y) = link_point(&b, text);
+            assert!(act(
+                &mut b,
+                Event::OpenClick {
+                    x,
+                    y,
+                    foreground: false
+                }
+            ));
+        }
+        assert_eq!(
+            tab_titles(&b),
+            ["Links", "one.html", "two.html", "three.html"],
+            "in the order they were clicked, after the page"
+        );
+        assert_eq!(b.profiles[b.profile].active, 0);
+        assert_eq!(title(&b), "Links", "the page stays");
+        assert!(b.load.is_none(), "background tabs load when selected");
+
+        act(&mut b, command('3'));
+        assert_eq!(title(&b), "Page two");
+        act(&mut b, command('1'));
+
+        // ⌘⇧-click (and Shift with the middle button) opens in front.
+        let (x, y) = link_point(&b, "Three");
+        act(
+            &mut b,
+            Event::OpenClick {
+                x,
+                y,
+                foreground: true,
+            },
+        );
+        assert_eq!(title(&b), "Page three");
+        assert_eq!(b.profiles[b.profile].active, 4);
+
+        // Not on a link, it is a plain click.
+        act(&mut b, command('1'));
+        let tabs = b.profiles[b.profile].tabs.len();
+        let (x, y) = link_point(&b, "Plain");
+        act(
+            &mut b,
+            Event::OpenClick {
+                x,
+                y,
+                foreground: false,
+            },
+        );
+        assert_eq!(b.profiles[b.profile].tabs.len(), tabs);
+        assert_eq!(title(&b), "Links");
+    }
+
+    #[test]
+    fn target_blank_opens_a_new_tab_in_front() {
+        let page = links_page("target-blank");
+        let mut b = browser(&page);
+        let (x, y) = link_point(&b, "New");
+        act(&mut b, Event::Click { x, y });
+        assert_eq!(tab_titles(&b), ["Links", "Page new"]);
+        assert_eq!(b.profiles[b.profile].active, 1);
+        act(&mut b, command('['));
+        assert_eq!(
+            title(&b),
+            "Page new",
+            "a new tab has no history to go back to"
+        );
+    }
+
+    #[test]
+    fn hovering_a_link_previews_its_address_at_the_bottom_of_the_pane() {
+        let page = links_page("link-preview");
+        let mut b = browser(&page);
+        b.render();
+        // The panel's outline, left of the pane's bottom edge.
+        let (px, py) = (SIDEBAR_WIDTH as usize + 14, 300 - 4 - 24);
+        let page_bg = b.window.pixel(px, py);
+
+        let (x, y) = link_point(&b, "Two");
+        assert!(act(&mut b, Event::Hover { x, y }), "a preview appears");
+        let url = b.link_preview.clone().expect("a preview");
+        assert!(
+            url.starts_with("file://") && url.ends_with("/two.html"),
+            "{url}"
+        );
+        b.render();
+        let line = b.chrome.theme().line;
+        assert_eq!(b.window.pixel(px, py), [line.b, line.g, line.r, 255]);
+
+        let (x, y) = link_point(&b, "Plain");
+        assert!(act(&mut b, Event::Hover { x, y }), "it goes away");
+        assert_eq!(b.link_preview, None);
+        b.render();
+        assert_eq!(b.window.pixel(px, py), page_bg);
+    }
+
+    #[test]
+    fn long_addresses_are_shortened_in_the_middle() {
+        let width = |t: &str| t.chars().count() as f32;
+        assert_eq!(chrome::fit_middle("short", 10.0, width), "short");
+        let fit = chrome::fit_middle("https://example.com/a/very/long/path", 16.0, width);
+        assert_eq!(fit.chars().count(), 16);
+        assert!(
+            fit.starts_with("https://ex") && fit.ends_with("path"),
+            "{fit}"
+        );
+        assert!(fit.contains('…'));
+    }
+
+    #[test]
+    fn base_href_resolves_links_and_base_target_opens_tabs() {
+        let page = page_file(
+            "base-href",
+            "<title>Based</title><base href=\"sub/\"><p><a href=\"x.html\">Into sub</a></p>",
+        );
+        let sub = page.parent().unwrap().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("x.html"), "<title>Sub X</title>").unwrap();
+        let mut b = browser(&page);
+        assert!(b.page.as_ref().unwrap().base.to_string().ends_with("/sub/"));
+        click_text(&mut b, "Into sub");
+        assert_eq!(title(&b), "Sub X");
+
+        let page = page_file(
+            "base-target",
+            "<title>Targeted</title><base target=\"_blank\"><p><a href=\"page.html\">Me</a></p>",
+        );
+        let mut b = browser(&page);
+        click_text(&mut b, "Me");
+        assert_eq!(
+            b.profiles[b.profile].tabs.len(),
+            2,
+            "the base's target opens a tab"
+        );
+    }
+
+    #[test]
+    fn meta_refresh_goes_on_after_its_delay_in_place_of_the_page() {
+        let (a, _) = site("meta-refresh");
+        let page = page_file(
+            "meta-refresh-from",
+            &format!(
+                "<title>Moving</title><meta http-equiv=refresh content=\"0; URL='{}'\">",
+                a.display()
+            ),
+        );
+        let mut b = browser(&page);
+        assert_eq!(title(&b), "Moving");
+        let (at, to) = b.refresh.clone().expect("a refresh is waiting");
+        assert!(at >= Instant::now() + REFRESH_MIN - Duration::from_millis(100));
+        assert!(to.unwrap().to_string().ends_with("/a.html"));
+        // Not yet due: nothing happens.
+        b.run_refresh();
+        assert!(b.load.is_none());
+        b.refresh.as_mut().unwrap().0 = Instant::now();
+        b.run_refresh();
+        b.wait_for_load();
+        assert_eq!(title(&b), "Page A");
+        assert_eq!(b.tab().history.len(), 1, "the refresh replaced the entry");
+        assert!(b.refresh.is_none());
+
+        // Navigating away first drops it.
+        let mut b = browser(&page);
+        assert!(b.refresh.is_some());
+        act(&mut b, command('t'));
+        assert!(b.refresh.is_none());
+    }
+
+    #[test]
+    fn noscript_content_is_hidden_and_not_fetched() {
+        let page = page_file(
+            "noscript",
+            "<title>NS</title><noscript><link rel=stylesheet href=\"no.css\">\
+             <p>Turn on JavaScript</p><img src=\"no.png\"></noscript><p>Shown</p>",
+        );
+        let b = browser(&page);
+        let p = b.page.as_ref().unwrap();
+        let texts: Vec<&str> = p.layout.texts.iter().map(|t| p.layout.text(t)).collect();
+        assert!(texts.contains(&"Shown"));
+        assert!(!texts.iter().any(|t| t.contains("JavaScript")), "{texts:?}");
+        assert!(
+            p.sources.stylesheets.is_empty(),
+            "its stylesheet is not fetched"
+        );
+        assert_eq!(p.images.len(), 0, "nor its image");
+    }
+
+    #[test]
+    fn error_pages_say_what_failed_in_plain_words() {
+        let chrome = Chrome::new(false);
+        let url = net::Url::parse("https://example.com/a?b").unwrap();
+        let page = |error: &str, offline: bool| error_page(&url, error, offline, &chrome);
+        let cases = [
+            (
+                "resolve example.com: failed to lookup",
+                "Couldn't find example.com",
+            ),
+            (
+                "connect example.com:443: connection refused",
+                "example.com refused the connection",
+            ),
+            (
+                "connect example.com:443: timed out",
+                "example.com took too long to answer",
+            ),
+            (
+                "too many redirects ending at https://example.com/",
+                "example.com redirected too many times",
+            ),
+            (
+                "invalid peer certificate: Expired",
+                "example.com's certificate isn't valid",
+            ),
+            ("connection closed mid-body", "Couldn't reach example.com"),
+        ];
+        for (error, title) in cases {
+            let html = page(error, false);
+            assert!(html.contains(title), "{error}: {html}");
+            assert!(
+                html.contains("https://example.com/a?b"),
+                "the address is shown"
+            );
+            assert!(html.contains(">Try again</a>"));
+        }
+        assert!(page("resolve example.com: x", true).contains("You're offline"));
+        assert!(
+            !page("<script>", false).contains("<script>"),
+            "errors are escaped"
+        );
+    }
+
+    /// A port nothing listens on (bound, then freed).
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    #[test]
+    fn a_refused_connection_shows_its_page() {
+        let (a, _) = site("refused");
+        let mut b = browser(&a);
+        b.online = || true;
+        b.open_input(&format!("http://127.0.0.1:{}/", free_port()));
+        b.wait_for_load();
+        assert_eq!(title(&b), "127.0.0.1 refused the connection");
+        assert!(b.offline_retry.is_none(), "online: no automatic retry");
+    }
+
+    #[test]
+    fn an_offline_tab_reloads_when_the_network_is_back() {
+        let (a, _) = site("offline");
+        let mut b = browser(&a);
+        b.online = || false;
+        let port = free_port();
+        b.open_input(&format!("http://127.0.0.1:{port}/"));
+        b.wait_for_load();
+        assert_eq!(title(&b), "You're offline");
+        assert!(b.offline_retry.is_some());
+
+        // Still offline: it looks again later.
+        b.offline_retry = Some(Instant::now());
+        b.retry_if_online();
+        assert!(b.load.is_none());
+        assert!(b.offline_retry.unwrap() > Instant::now());
+
+        // The network is back (and so is the server).
+        let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port)) else {
+            return; // Another test took the port meanwhile.
+        };
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let page = "<title>Back online</title>";
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
+                    page.len()
+                );
+            }
+        });
+        b.online = || true;
+        b.offline_retry = Some(Instant::now());
+        b.retry_if_online();
+        b.wait_for_load();
+        assert_eq!(title(&b), "Back online");
+        assert!(b.offline_retry.is_none());
+        assert_eq!(
+            b.tab().history.len(),
+            2,
+            "the reload kept the failed entry's place"
+        );
+    }
+
+    #[test]
+    fn the_refresh_header_counts_like_meta_refresh() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let port = http_server(Arc::clone(&seen), |_, path, _, _| match path {
+            "/" => (
+                200,
+                "Refresh: 3; url=/next\r\n".into(),
+                "<title>First</title>".into(),
+            ),
+            _ => (200, String::new(), "<title>Next</title>".into()),
+        });
+        let (a, _) = site("refresh-header");
+        let mut b = browser(&a);
+        b.open_input(&format!("http://127.0.0.1:{port}/"));
+        b.wait_for_load();
+        assert_eq!(title(&b), "First");
+        let (at, to) = b.refresh.clone().expect("the header's refresh waits");
+        assert!(at > Instant::now() + Duration::from_secs(2));
+        assert_eq!(to.unwrap().path, "/next");
+    }
+
+    /// Poll background loads until none is left (or five seconds pass).
+    fn wait_for_background(b: &mut Browser<FakeScreen>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !b.background.is_empty() && Instant::now() < deadline {
+            b.poll_background();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(b.background.is_empty(), "background loads finish");
+    }
+
+    #[test]
+    fn a_tab_left_while_loading_keeps_downloading_and_builds_on_return() {
+        let (a, _) = site("left-loading");
+        let (slow, release) = slow_server("Slow page");
+        let mut b = browser(&a);
+        start_loading(&mut b, &slow);
+        let loading_tab = b.tab().id;
+
+        // Another tab: the load goes on in the background, not stopped.
+        act(&mut b, command('t'));
+        b.close_palette();
+        assert!(b.load.is_none());
+        assert_eq!(b.background.len(), 1);
+        assert_eq!(b.background[0].tab, loading_tab);
+
+        release.send(()).unwrap();
+        wait_for_background(&mut b);
+        let tab = &b.profiles[b.profile].tabs[0];
+        assert_eq!(tab.title, "Slow page", "the sidebar shows the arrived page");
+        assert_eq!(tab.history.len(), 2, "pushed after page A");
+        let stored = tab.snapshot.is_some();
+        assert!(stored, "it waits as a sleeping file, not a live page");
+
+        // Back to it: built from the download, without asking the server again.
+        act(&mut b, command('1'));
+        b.wait_for_load();
+        assert_eq!(title(&b), "Slow page");
+        assert!(b
+            .page
+            .as_ref()
+            .unwrap()
+            .dom
+            .text_content(html::Dom::ROOT)
+            .contains("slow"));
+        assert!(
+            !b.page.as_ref().unwrap().sources.partial,
+            "complete once built"
+        );
+    }
+
+    #[test]
+    fn returning_before_it_finishes_takes_the_load_back() {
+        let (a, _) = site("back-early");
+        let (slow, release) = slow_server("Late page");
+        let mut b = browser(&a);
+        start_loading(&mut b, &slow);
+        act(&mut b, command('t'));
+        b.close_palette();
+        assert_eq!(b.background.len(), 1);
+
+        // `handle`, not `act`: the server answers only once released below.
+        b.handle(command('1'));
+        assert!(b.background.is_empty(), "adopted");
+        assert!(b.load.is_some());
+        release.send(()).unwrap();
+        b.wait_for_load();
+        assert_eq!(title(&b), "Late page");
+        assert_eq!(b.tab().history.len(), 2);
+    }
+
+    #[test]
+    fn switching_profile_stops_background_loads() {
+        let (a, _) = site("profile-stops");
+        let (slow, _release) = slow_server("Never");
+        let mut b = browser(&a);
+        start_loading(&mut b, &slow);
+        act(&mut b, command('t'));
+        b.close_palette();
+        assert_eq!(b.background.len(), 1);
+        act(&mut b, command_shift('p'));
+        assert!(b.background.is_empty(), "profiles share no connections");
+    }
+
+    /// Poll the visible page's image fetches until none is running or waiting.
+    fn wait_for_images(b: &mut Browser<FakeScreen>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            b.poll_images();
+            let waiting = b
+                .page
+                .as_ref()
+                .is_some_and(|p| !p.pending_images.is_empty());
+            if b.image_fetch.is_none() && !waiting {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("images still loading");
+    }
+
+    fn png_file(path: &Path, (w, h): (usize, usize)) {
+        std::fs::write(path, paint::png::encode(w, h, &vec![200; w * h * 4])).unwrap();
+    }
+
+    fn natural_of(b: &Browser<FakeScreen>, id: &str) -> Option<(f32, f32)> {
+        let p = b.page.as_ref().unwrap();
+        let node = (0..p.dom.len() as NodeId).find(|&n| p.dom.attr(n, "id") == Some(id))?;
+        p.images.natural_size(node)
+    }
+
+    #[test]
+    fn images_scripts_add_or_repoint_are_fetched_and_laid_out() {
+        let page = page_file(
+            "script-images",
+            "<html><body><img id=lazy src=small.png data-src=big.png>\
+             <script>var i = document.createElement('img'); i.setAttribute('id', 'added');\
+             i.setAttribute('src', 'big.png'); document.body.appendChild(i);\
+             setTimeout(function () { var l = document.getElementById('lazy');\
+             l.setAttribute('src', l.getAttribute('data-src')); }, 10);</script></body></html>",
+        );
+        let dir = page.parent().unwrap();
+        png_file(&dir.join("small.png"), (7, 5));
+        png_file(&dir.join("big.png"), (20, 10));
+        let mut b = browser(&page);
+        wait_for_images(&mut b);
+        assert_eq!(
+            natural_of(&b, "added"),
+            Some((20.0, 10.0)),
+            "added by a script"
+        );
+        assert_eq!(natural_of(&b, "lazy"), Some((7.0, 5.0)));
+        let added_width = |b: &Browser<FakeScreen>| {
+            let p = b.page.as_ref().unwrap();
+            let node = (0..p.dom.len() as NodeId)
+                .find(|&n| p.dom.attr(n, "id") == Some("added"))
+                .unwrap();
+            p.layout
+                .boxes
+                .iter()
+                .find(|bx| bx.node == node)
+                .map(|bx| bx.rect.width)
+        };
+        assert_eq!(
+            added_width(&b),
+            Some(20.0),
+            "laid out at its size once it arrived"
+        );
+
+        // The timer points the lazy image at the big file: shown once kept (already is).
+        std::thread::sleep(Duration::from_millis(20));
+        b.run_page_timers();
+        wait_for_images(&mut b);
+        assert_eq!(natural_of(&b, "lazy"), Some((20.0, 10.0)), "its new source");
+
+        // A woken tab finds them by source, without the network.
+        act(&mut b, command('t'));
+        b.close_palette();
+        std::fs::remove_file(dir.join("big.png")).unwrap();
+        act(&mut b, command('1'));
+        assert_eq!(
+            natural_of(&b, "added"),
+            Some((20.0, 10.0)),
+            "from its sleeping file"
+        );
+    }
+
+    #[test]
+    fn scripts_navigate_like_links_and_loops_stop() {
+        let (a, b_path) = site("script-nav");
+        let dir = a.parent().unwrap().to_path_buf();
+        let write = |name: &str, html: &str| {
+            std::fs::write(dir.join(name), html).unwrap();
+            dir.join(name)
+        };
+        // A redirect page (as search engines' result links are) takes its own place.
+        let redirect = write(
+            "redirect.html",
+            "<title>Moving</title><script>location.replace('b.html')</script>",
+        );
+        let mut b = browser(&a);
+        open(&mut b, &redirect);
+        b.wait_for_load();
+        assert_eq!(title(&b), "Page B");
+        assert_eq!(
+            b.tab().history.len(),
+            2,
+            "A, then B in the redirect's place"
+        );
+
+        // A click handler navigates, pushing an entry.
+        let clicky = write(
+            "click.html",
+            "<title>Clicky</title><p id=go onclick=\"location.href = 'a.html'\">Go there</p>",
+        );
+        open(&mut b, &clicky);
+        click_text(&mut b, "Go there");
+        b.wait_for_load();
+        assert_eq!(title(&b), "Page A");
+        act(&mut b, command('['));
+        assert_eq!(title(&b), "Clicky");
+
+        // Not to javascript: or data:, and not anywhere for a fragment.
+        let odd = write(
+            "odd.html",
+            "<title>Odd</title><script>location.href = 'javascript:alert(1)';\
+             location.assign('#part')</script>",
+        );
+        open(&mut b, &odd);
+        assert_eq!(title(&b), "Odd");
+        assert!(b.load.is_none());
+
+        // A page reloading itself forever is stopped.
+        let loop_page = write(
+            "loop.html",
+            "<title>Loop</title><script>location.replace('loop.html')</script>",
+        );
+        open(&mut b, &loop_page);
+        for _ in 0..SCRIPT_HOPS + 3 {
+            b.wait_for_load();
+        }
+        assert_eq!(title(&b), "Loop");
+        assert!(b.load.is_none(), "stopped after {SCRIPT_HOPS} hops");
+        let _ = b_path;
+    }
+
+    #[test]
+    fn the_active_tab_row_keeps_its_pane_badge_outline() {
+        let (a, _) = site("badge");
+        let mut b = browser(&a);
+        act(&mut b, command('t'));
+        b.close_palette();
+        act(&mut b, command('1'));
+        act(&mut b, command_shift('2'));
+        b.render();
+        let theme = b.chrome.theme();
+        let line = [theme.text_2.b, theme.text_2.g, theme.text_2.r, 255];
+        // Outline pixels in the badge's place (left of the close button) on each tab row.
+        // Rows with a close button (the active one) keep its place free.
+        let outline = |b: &Browser<FakeScreen>, row: usize, closable: bool| {
+            let top = chrome::LIST_TOP as usize + row * chrome::TAB_ROW as usize;
+            let right = SIDEBAR_WIDTH as usize - 8 - if closable { 24 } else { 8 };
+            (top..top + chrome::TAB_ROW as usize)
+                .flat_map(|y| (right - 18..right + 2).map(move |x| (x, y)))
+                .filter(|&(x, y)| b.window.pixel(x, y) == line)
+                .count()
+        };
+        let active = b.profiles[b.profile].active;
+        assert!(
+            outline(&b, active, true) >= 40,
+            "the selected row draws the box over its background"
+        );
+        assert!(outline(&b, 1 - active, false) >= 40);
+    }
+
+    /// Not a check: renders the window in many states to PNGs for a person to look at.
+    /// `UI_TOUR=dir cargo test -p shell -- --ignored ui_tour`
+    #[test]
+    #[ignore]
+    fn ui_tour() {
+        let Ok(dir) = std::env::var("UI_TOUR") else {
+            return;
+        };
+        for dark in [false, true] {
+            tour(&dir, dark);
+        }
+    }
+
+    fn tour(dir: &str, dark: bool) {
+        let mode = if dark { "dark" } else { "light" };
+        let page = page_file(
+            &format!("tour-{mode}"),
+            ("<title>Tour page</title><style>body { font: 16px/1.5 sans-serif; margin: 24px }</style>\
+             <h1>A heading for the tour</h1>\
+             <p>Some <a href=\"page.html#a\">link text</a> in a paragraph, and <b>bold</b> and \
+             <a href=\"https://example.com/a/very/long/path/that/goes/on/and/on?with=query&and=more\">\
+             a long link</a>.</p>\
+             <form><p><input name=q placeholder=\"Search here\"> <button>Send</button></p>\
+             <p><select name=s><option>First option<option>Second option<option>Third</select>\
+             <label><input type=checkbox checked> Check</label> \
+             <label><input type=radio name=r> Radio</label></p>\
+             <p><textarea rows=3 cols=30>Text area</textarea></p></form>"
+                .to_string()
+                + &"<p>More text to scroll through on the page.</p>".repeat(30))
+                .as_str(),
+        );
+        let root = std::env::temp_dir().join(format!("broxee-tour-{}-{mode}", std::process::id()));
+        let store = TabStore::open(&root).expect("a folder for sleeping tabs");
+        let opts = Options {
+            target: page.display().to_string(),
+            more: Vec::new(),
+            tree: false,
+            styles: false,
+            layout: false,
+            png: None,
+            tiles: None,
+            paint: false,
+            window: true,
+            depth: 8,
+            width: 1100.0,
+            height: 700.0,
+            scale: 2.0,
+            fetch_css: false,
+            panes: 1,
+            cache: None,
+            record: None,
+            replay: None,
+        };
+        let screen = FakeScreen::default();
+        screen.dark.set(dark);
+        let mut b = Browser::new(opts, screen, None, Some(store));
+        b.start();
+        b.wait_for_load();
+        b.handle(Event::Resize {
+            width: 1100.0,
+            height: 700.0,
+            scale: 2.0,
+        });
+        let shot = |b: &mut Browser<FakeScreen>, name: &str| {
+            b.render();
+            let frame = b.window.frame.borrow();
+            let stride = frame.0 * 4 + PAD;
+            let rgba: Vec<u8> = (0..frame.1)
+                .flat_map(|y| {
+                    frame.2[y * stride..y * stride + frame.0 * 4]
+                        .chunks(4)
+                        .flat_map(|p| [p[2], p[1], p[0], 255])
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let path = format!("{dir}/{mode}-{name}.png");
+            std::fs::write(path, paint::png::encode(frame.0, frame.1, &rgba)).unwrap();
+        };
+        shot(&mut b, "01-page");
+        // Hover a link: preview at the bottom.
+        let (x, y) = link_point(&b, "a long link");
+        b.handle(Event::Hover { x, y });
+        shot(&mut b, "02-link-preview");
+        // Tooltip on back button.
+        b.handle(Event::Hover {
+            x: f64::from(SIDEBAR_WIDTH) + 14.0,
+            y: 18.0,
+        });
+        if let Some(h) = b.hover.as_mut() {
+            h.shown = true;
+        }
+        shot(&mut b, "03-tooltip");
+        act(&mut b, key(Key::Escape));
+        // Address field.
+        act(&mut b, command('l'));
+        shot(&mut b, "04-address");
+        act(&mut b, key(Key::Escape));
+        // Find.
+        act(&mut b, command('f'));
+        type_text(&mut b, "text");
+        shot(&mut b, "05-find");
+        act(&mut b, key(Key::Escape));
+        // Selection.
+        act(&mut b, command('a'));
+        shot(&mut b, "06-select-all");
+        act(&mut b, key(Key::Escape));
+        // Field focused and typing.
+        let field = box_or_control(&b, 0);
+        act(
+            &mut b,
+            Event::Click {
+                x: field.0,
+                y: field.1,
+            },
+        );
+        type_text(&mut b, "typed");
+        shot(&mut b, "07-field");
+        act(&mut b, key(Key::Escape));
+        // Dropdown.
+        let sel = box_or_control(&b, 2);
+        act(&mut b, Event::Click { x: sel.0, y: sel.1 });
+        shot(&mut b, "08-dropdown");
+        act(&mut b, key(Key::Escape));
+        // More menu.
+        b.open_menu(false);
+        shot(&mut b, "09-menu");
+        b.close_menu();
+        // Bookmark dialog.
+        act(&mut b, command('d'));
+        shot(&mut b, "10-bookmark-dialog");
+        act(&mut b, key(Key::Enter));
+        // Bookmarks panel.
+        act(
+            &mut b,
+            Event::Key(KeyEvent {
+                key: Key::Char('b'),
+                command: true,
+                shift: false,
+                option: true,
+            }),
+        );
+        shot(&mut b, "11-bookmarks-panel");
+        act(
+            &mut b,
+            Event::Key(KeyEvent {
+                key: Key::Char('b'),
+                command: true,
+                shift: false,
+                option: true,
+            }),
+        );
+        // Several tabs, one pinned, one grouped.
+        for _ in 0..3 {
+            let (x, y) = link_point(&b, "link text");
+            act(
+                &mut b,
+                Event::OpenClick {
+                    x,
+                    y,
+                    foreground: false,
+                },
+            );
+        }
+        shot(&mut b, "12-tabs");
+        // Palette with and without a query.
+        act(&mut b, command('k'));
+        shot(&mut b, "13-palette");
+        type_text(&mut b, "tour");
+        shot(&mut b, "14-palette-query");
+        act(&mut b, key(Key::Escape));
+        // New tab.
+        act(&mut b, command('t'));
+        shot(&mut b, "15-new-tab");
+        act(&mut b, key(Key::Escape));
+        act(&mut b, command('w'));
+        // Split views.
+        act(&mut b, command_shift('2'));
+        shot(&mut b, "16-split-2");
+        act(&mut b, command_shift('4'));
+        shot(&mut b, "17-split-4");
+        act(&mut b, command_shift('1'));
+        // New profile dialog.
+        b.run_command(Command::NewProfile);
+        shot(&mut b, "18-profile-dialog");
+        act(&mut b, key(Key::Escape));
+        // Error page.
+        b.open_input("file:///no/such/broxee/page.html");
+        b.wait_for_load();
+        shot(&mut b, "19-error");
+        // Sidebar hidden.
+        act(&mut b, command('\\'));
+        shot(&mut b, "20-no-sidebar");
+        act(&mut b, command('\\'));
+        // Narrow window.
+        b.handle(Event::Resize {
+            width: 520.0,
+            height: 600.0,
+            scale: 2.0,
+        });
+        act(&mut b, command('['));
+        shot(&mut b, "21-narrow");
+    }
+
+    /// The middle of form control `i`, in window points.
+    fn box_or_control(b: &Browser<FakeScreen>, i: usize) -> (f64, f64) {
+        let p = b.page.as_ref().unwrap();
+        let node = p.forms.controls[i].node;
+        let layout = &p.layout;
+        let r = layout
+            .boxes
+            .iter()
+            .find(|bx| bx.node == node)
+            .map(|bx| bx.rect)
+            .expect("the control is laid out");
+        (
+            f64::from(b.pane_left() + r.x + r.width / 2.0),
+            f64::from(r.y + r.height / 2.0 - b.scroll + HEADER_HEIGHT),
+        )
+    }
+
+    /// Not a check: loads SHOT_URL in a 1000x630 window, scrolls by SHOT_SCROLL points and
+    /// writes the frame to SHOT_PNG.
+    #[test]
+    #[ignore]
+    fn shot_url() {
+        let (Ok(url), Ok(out)) = (std::env::var("SHOT_URL"), std::env::var("SHOT_PNG")) else {
+            return;
+        };
+        let scroll: f32 = std::env::var("SHOT_SCROLL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        let root = std::env::temp_dir().join(format!("broxee-shot-{}", std::process::id()));
+        let opts = Options {
+            target: url,
+            more: Vec::new(),
+            tree: false,
+            styles: false,
+            layout: false,
+            png: None,
+            tiles: None,
+            paint: false,
+            window: true,
+            depth: 8,
+            width: 1000.0,
+            height: 630.0,
+            scale: 1.0,
+            fetch_css: true,
+            panes: 1,
+            cache: None,
+            record: None,
+            replay: None,
+        };
+        let mut b = Browser::new(
+            opts,
+            FakeScreen::default(),
+            None,
+            TabStore::open(&root).ok(),
+        );
+        b.start();
+        b.wait_for_load();
+        b.handle(Event::Resize {
+            width: 1000.0,
+            height: 630.0,
+            scale: 1.0,
+        });
+        b.handle(Event::Scroll {
+            dy: -f64::from(scroll),
+            x: 600.0,
+            y: 300.0,
+        });
+        // Two seconds of the page's life: its timers, requests and late images.
+        let until = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < until {
+            b.run_page_timers();
+            b.poll_page_requests();
+            b.poll_images();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        b.render();
+        let p = b.page.as_ref().unwrap();
+        eprintln!(
+            "scroll {} of {} (page height {}), {} images kept",
+            b.scroll,
+            b.max_scroll(),
+            p.layout.height,
+            p.images.len()
+        );
+        let frame = b.window.frame.borrow();
+        let stride = frame.0 * 4 + PAD;
+        let rgba: Vec<u8> = (0..frame.1)
+            .flat_map(|y| {
+                frame.2[y * stride..y * stride + frame.0 * 4]
+                    .chunks(4)
+                    .flat_map(|p| [p[2], p[1], p[0], 255])
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        std::fs::write(out, paint::png::encode(frame.0, frame.1, &rgba)).unwrap();
     }
 }

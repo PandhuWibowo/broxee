@@ -39,16 +39,106 @@ pub fn freeze_clock(epoch_ms: f64) {
     let _ = FROZEN_AT.set(epoch_ms);
 }
 
+/// `location`'s parts of a page address.
+fn location_of(url: &net::Url) -> js::Location {
+    let default_port = matches!(
+        (url.scheme.as_str(), url.port),
+        ("http", 80) | ("https", 443) | ("file", _)
+    );
+    let port = if default_port {
+        String::new()
+    } else {
+        url.port.to_string()
+    };
+    let host = if port.is_empty() {
+        url.host.clone()
+    } else {
+        format!("{}:{port}", url.host)
+    };
+    let (pathname, search) = match url.path.split_once('?') {
+        Some((p, q)) if !q.is_empty() => (p.to_string(), format!("?{q}")),
+        Some((p, _)) => (p.to_string(), String::new()),
+        None => (url.path.clone(), String::new()),
+    };
+    let origin = if url.scheme == "file" {
+        "null".to_string()
+    } else {
+        format!("{}://{host}", url.scheme)
+    };
+    js::Location {
+        href: url.to_string(),
+        origin,
+        protocol: format!("{}:", url.scheme),
+        host,
+        hostname: url.host.clone(),
+        port,
+        pathname,
+        search,
+        hash: String::new(),
+    }
+}
+
+/// The system time zone's offset at UTC time `t` (ms since 1970), in milliseconds to add:
+/// `localtime_r` knows the zone's rules, daylight saving included.
+fn system_offset(t: f64) -> f64 {
+    #[cfg(unix)]
+    {
+        use std::os::raw::{c_char, c_int, c_long};
+        /// `struct tm` from <time.h>: the same fields in the same order on macOS and Linux.
+        #[repr(C)]
+        struct Tm {
+            sec: c_int,
+            min: c_int,
+            hour: c_int,
+            mday: c_int,
+            mon: c_int,
+            year: c_int,
+            wday: c_int,
+            yday: c_int,
+            isdst: c_int,
+            gmtoff: c_long,
+            zone: *const c_char,
+        }
+        extern "C" {
+            fn localtime_r(time: *const i64, out: *mut Tm) -> *mut Tm;
+        }
+        if !t.is_finite() {
+            return 0.0;
+        }
+        let secs = (t / 1000.0).floor() as i64;
+        let mut tm = std::mem::MaybeUninit::<Tm>::zeroed();
+        // SAFETY: localtime_r(const time_t *, struct tm *) fills `tm` and returns it, or null
+        // on failure; time_t is 64-bit on both systems, and `Tm` matches their struct tm.
+        let filled = unsafe { localtime_r(&secs, tm.as_mut_ptr()) };
+        if filled.is_null() {
+            return 0.0;
+        }
+        // SAFETY: localtime_r returned non-null, so it wrote every field.
+        unsafe { tm.assume_init() }.gmtoff as f64 * 1000.0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = t;
+        0.0
+    }
+}
+
 impl PageScript {
-    fn new(page: &net::Url) -> PageScript {
+    fn new(page: &net::Url, base: &net::Url) -> PageScript {
         let epoch_ms = FROZEN_AT.get().copied().unwrap_or_else(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0.0, |d| d.as_secs_f64() * 1000.0)
         });
+        let mut runtime = js::Runtime::new();
+        runtime.set_location(&location_of(page));
+        // Replays keep UTC: a saved page renders the same in every time zone.
+        if FROZEN_AT.get().is_none() {
+            runtime.set_time_zone(system_offset);
+        }
         PageScript {
-            runtime: js::Runtime::new(),
-            net: crate::scriptnet::ScriptNet::new(page.clone()),
+            runtime,
+            net: crate::scriptnet::ScriptNet::new(page.clone(), base.clone()),
             started: Instant::now(),
             epoch_ms,
         }
@@ -141,6 +231,13 @@ impl DomHost<'_> {
 impl js::Host for DomHost<'_> {
     fn fetch(&mut self, request: js::Request) -> Option<u32> {
         self.net.as_mut()?.request(request)
+    }
+
+    fn navigate(&mut self, url: &str, replace: bool) {
+        // The last request in a task wins, as in browsers.
+        if let Some(net) = self.net.as_deref_mut() {
+            net.navigation = Some((url.to_string(), replace));
+        }
     }
 
     fn cookie(&self) -> String {
@@ -323,20 +420,39 @@ fn runs(dom: &Dom, node: NodeId) -> bool {
     }
 }
 
+/// Whether some element has an event handler attribute (`onclick`, `onsubmit`…).
+fn has_inline_handlers(dom: &Dom) -> bool {
+    dom.descendants(Dom::ROOT).any(|id| {
+        dom.element(id).is_some_and(|e| {
+            e.attrs().any(|(name, _)| {
+                let name = dom.atom_name(name);
+                name.len() > 2 && name.starts_with("on")
+            })
+        })
+    })
+}
+
 /// Run the page's scripts in document order, then `DOMContentLoaded` and `load`. Returns the
 /// live scripts (`None` when the page has none) and the external scripts as they arrived,
 /// for a sleeping tab.
 pub fn run_page_scripts(
     dom: &mut Dom,
     forms: &mut Forms,
-    url: &net::Url,
+    (url, base): (&net::Url, &net::Url),
     from: ScriptFrom,
+    run: bool,
 ) -> (Option<Box<PageScript>>, Vec<(String, net::Wire)>) {
     let nodes: Vec<NodeId> = dom
         .descendants(Dom::ROOT)
-        .filter(|&n| dom.tag_name(n) == Some("script") && runs(dom, n))
+        .filter(|&n| {
+            dom.tag_name(n) == Some("script") && runs(dom, n) && !crate::engine::in_noscript(dom, n)
+        })
         .take(MAX_SCRIPTS)
         .collect();
+    // Inline handlers (`onclick="…"`) need a runtime even on a page without <script>.
+    if nodes.is_empty() && run && has_inline_handlers(dom) {
+        return (Some(Box::new(PageScript::new(url, base))), Vec::new());
+    }
     if nodes.is_empty() {
         return (None, Vec::new());
     }
@@ -347,7 +463,7 @@ pub fn run_page_scripts(
     let sources: Vec<Source> = nodes
         .iter()
         .filter_map(|&n| match dom.attr(n, "src") {
-            Some(src) => url.join(src.trim()).ok().map(Source::External),
+            Some(src) => base.join(src.trim()).ok().map(Source::External),
             None => Some(Source::Inline(dom.text_content(n))),
         })
         .collect();
@@ -393,7 +509,11 @@ pub fn run_page_scripts(
         }
         texts.push((name, text));
     }
-    let mut script = Box::new(PageScript::new(url));
+    if !run {
+        // Fetched for later (a page downloading in the background): nothing runs now.
+        return (None, wires);
+    }
+    let mut script = Box::new(PageScript::new(url, base));
     let page_url = url.to_string();
     let jar = match &from {
         ScriptFrom::Network(Some((jar, _))) => Some(*jar),
@@ -521,7 +641,8 @@ mod tests {
         let mut dom = html::parse(src);
         let mut forms = Forms::prepare(&mut dom);
         let url = net::Url::parse("https://example.org/").unwrap();
-        let (script, _) = run_page_scripts(&mut dom, &mut forms, &url, ScriptFrom::Inline);
+        let (script, _) =
+            run_page_scripts(&mut dom, &mut forms, (&url, &url), ScriptFrom::Inline, true);
         (dom, forms, script)
     }
 
@@ -592,5 +713,49 @@ mod tests {
     fn pages_without_scripts_have_none() {
         let (_, _, script) = page("<p>x</p><script type=application/json>{}</script>");
         assert!(script.is_none());
+    }
+
+    #[test]
+    fn the_system_time_zone_is_a_real_offset() {
+        // Whatever zone the machine is in: within ±14 hours, in whole quarter hours.
+        for t in [0.0, 1_794_923_640_000.0, 1_782_000_000_000.0] {
+            let off = system_offset(t);
+            assert!(off.abs() <= 14.0 * 3_600_000.0, "{off}");
+            assert_eq!(off % (15.0 * 60_000.0), 0.0, "{off}");
+        }
+        assert_eq!(system_offset(f64::NAN), 0.0);
+    }
+
+    #[test]
+    fn location_splits_the_address() {
+        let url = net::Url::parse("https://www.bing.com:8443/search?q=meta&x=1").unwrap();
+        let l = location_of(&url);
+        assert_eq!(l.href, "https://www.bing.com:8443/search?q=meta&x=1");
+        assert_eq!(l.origin, "https://www.bing.com:8443");
+        assert_eq!(
+            (l.protocol.as_str(), l.host.as_str()),
+            ("https:", "www.bing.com:8443")
+        );
+        assert_eq!(
+            (l.hostname.as_str(), l.port.as_str()),
+            ("www.bing.com", "8443")
+        );
+        assert_eq!(
+            (l.pathname.as_str(), l.search.as_str()),
+            ("/search", "?q=meta&x=1")
+        );
+        let plain = location_of(&net::Url::parse("https://e.com/a").unwrap());
+        assert_eq!(
+            (
+                plain.port.as_str(),
+                plain.search.as_str(),
+                plain.host.as_str()
+            ),
+            ("", "", "e.com")
+        );
+        assert_eq!(
+            location_of(&net::Url::parse("file:///tmp/a.html").unwrap()).origin,
+            "null"
+        );
     }
 }

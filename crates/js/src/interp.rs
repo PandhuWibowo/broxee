@@ -51,6 +51,14 @@ impl Value {
 
 pub type NativeFn = fn(&mut Interp, &mut dyn Host, Value, &[Value]) -> Result<Value, Ctrl>;
 
+/// Which primitive a conversion prefers (ECMA-262 ToPrimitive's hint).
+#[derive(Clone, Copy, PartialEq)]
+pub enum Hint {
+    Default,
+    Number,
+    String,
+}
+
 pub enum Kind {
     Plain,
     Array(Vec<Value>),
@@ -162,6 +170,9 @@ pub struct Interp {
     /// Scopes below this index are referenced by some closure and must stay.
     pinned: usize,
     pub global: ObjId,
+    /// The `location` object: writes to it navigate (`builtins::location_set`). 0 until the
+    /// DOM bindings are installed.
+    pub location: ObjId,
     pub global_env: EnvId,
     pub protos: Protos,
     pub elements: HashMap<u32, ObjId>,
@@ -173,6 +184,8 @@ pub struct Interp {
     /// Milliseconds since the page started, for timers and `Date.now`.
     pub now: f64,
     pub epoch_ms: f64,
+    /// The local time zone, for `Date` (`date::utc` until the embedder sets one).
+    pub offset: crate::date::Offset,
     /// Set when the page's scripts were stopped, with the reason.
     pub stopped: Option<String>,
     pub storage: Vec<(String, String)>,
@@ -278,7 +291,9 @@ impl Interp {
             steps: 0,
             depth: 0,
             now: 0.0,
+            location: 0,
             epoch_ms: 0.0,
+            offset: crate::date::utc,
             stopped: None,
             storage: Vec::new(),
             pending_label: None,
@@ -436,7 +451,7 @@ impl Interp {
             Value::Num(n) => *n,
             Value::Str(s) => parse_number(s),
             Value::Obj(_) => {
-                let p = self.to_primitive(host, v)?;
+                let p = self.to_primitive_as(host, v, Hint::Number)?;
                 return self.to_number(host, &p);
             }
         })
@@ -450,39 +465,50 @@ impl Interp {
             Value::Num(n) => number_to_string(*n).into(),
             Value::Str(s) => s.clone(),
             Value::Obj(_) => {
-                let p = self.to_primitive(host, v)?;
+                let p = self.to_primitive_as(host, v, Hint::String)?;
                 return self.to_string(host, &p);
             }
         })
     }
 
-    /// Objects to primitives: `toString()` (arrays join, errors show their message).
+    /// Objects to primitives with no hint (`+`, `==`): `valueOf` first, except a `Date`,
+    /// which tries `toString` first (ECMA-262 OrdinaryToPrimitive, Date's @@toPrimitive).
     pub fn to_primitive(&mut self, host: &mut dyn Host, v: &Value) -> Result<Value, Ctrl> {
+        self.to_primitive_as(host, v, Hint::Default)
+    }
+
+    /// Objects to primitives: `valueOf()` then `toString()` for a number, the other way for
+    /// a string; the first that gives a primitive wins, else a TypeError.
+    pub fn to_primitive_as(
+        &mut self,
+        host: &mut dyn Host,
+        v: &Value,
+        hint: Hint,
+    ) -> Result<Value, Ctrl> {
         let Value::Obj(o) = v else {
             return Ok(v.clone());
         };
-        if let Some(f) = self.get(host, v, "valueOf")? {
-            if self.is_callable(&f)
-                && !matches!(
-                    self.objects[*o as usize].kind,
-                    Kind::Plain | Kind::Array(_) | Kind::Error | Kind::Element(_)
-                )
-            {
-                let r = self.call(host, &f, v.clone(), &[])?;
-                if !matches!(r, Value::Obj(_)) {
-                    return Ok(r);
+        let string_first = match hint {
+            Hint::String => true,
+            Hint::Number => false,
+            Hint::Default => self.get_own(*o, "__time").is_some(),
+        };
+        let order = if string_first {
+            ["toString", "valueOf"]
+        } else {
+            ["valueOf", "toString"]
+        };
+        for name in order {
+            if let Some(f) = self.get(host, v, name)? {
+                if self.is_callable(&f) {
+                    let r = self.call(host, &f, v.clone(), &[])?;
+                    if !matches!(r, Value::Obj(_)) {
+                        return Ok(r);
+                    }
                 }
             }
         }
-        if let Some(f) = self.get(host, v, "toString")? {
-            if self.is_callable(&f) {
-                let r = self.call(host, &f, v.clone(), &[])?;
-                if !matches!(r, Value::Obj(_)) {
-                    return Ok(r);
-                }
-            }
-        }
-        Ok(Value::str("[object Object]"))
+        self.type_error("cannot convert an object to a primitive value")
     }
 
     pub fn type_of(&self, v: &Value) -> &'static str {
@@ -683,6 +709,13 @@ impl Interp {
             return Ok(());
         };
         let o = *o;
+        // `location.href = …`, `location = …`: one comparison per write, no accessor.
+        if (o == self.location && self.location != 0) || (o == self.global && key == "location") {
+            let on_global = o == self.global;
+            if crate::builtins::location_set(self, host, on_global, key, &value)? {
+                return Ok(());
+            }
+        }
         match &mut self.objects[o as usize].kind {
             Kind::Array(items) => {
                 if key == "length" {
@@ -1999,8 +2032,8 @@ impl Interp {
             "===" => Value::Bool(self.strict_equals(&a, &b)),
             "!==" => Value::Bool(!self.strict_equals(&a, &b)),
             "<" | ">" | "<=" | ">=" => {
-                let a = self.to_primitive(host, &a)?;
-                let b = self.to_primitive(host, &b)?;
+                let a = self.to_primitive_as(host, &a, Hint::Number)?;
+                let b = self.to_primitive_as(host, &b, Hint::Number)?;
                 if let (Value::Str(x), Value::Str(y)) = (&a, &b) {
                     let o = x.cmp(y);
                     return Ok(Value::Bool(match op {

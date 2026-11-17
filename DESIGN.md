@@ -185,6 +185,9 @@ uses). It never appears as decoration anywhere else.
   field, pinned tabs, tab groups, today's tabs, "New tab". Each profile has its own tabs and groups.
 - **Pane header (one per pane, 36px):** back, forward, reload, the host and the profile name, and a ⋯ menu. The full
   URL appears when the field is focused (⌘L). No other toolbar.
+- **Link preview:** while the pointer is over a link, its address shows in a small panel (tooltip style)
+at the bottom left of the pane, shortened in the middle to half the pane's width; it moves to the bottom
+right when the pointer is over it. `target=_blank` links open in a new tab in front.
 - **Split view:** ⌘⇧1 single pane, ⌘⇧2 two side by side, ⌘⇧4 a 2×2 grid. Drag a tab onto a pane to put it there.
   Panes can use different profiles.
 - **New tab:** the ⌘K palette, focused, over a blank `surface`. It lists real recent tabs and bookmarks. No speed
@@ -207,6 +210,9 @@ uses). It never appears as decoration anywhere else.
 | Switch profile | ⌘⇧P |
 | Find in page / next / previous match | ⌘F, then Enter / Shift+Enter (or ⌘G / ⌘⇧G); Esc closes |
 | Select all page text / copy the selection | ⌘A / ⌘C |
+| Scroll: line / page / top and bottom | ↑ ↓ / Space, Shift+Space, Page Up/Down / Home, End, ⌘↑ ⌘↓ |
+| Back / forward (outside text fields) | ⌘[ / ⌘], or ⌘← / ⌘→ |
+| Open a link in a background tab / in front | ⌘-click or middle click / ⌘⇧-click |
 
 ## 8. Icons
 
@@ -225,7 +231,8 @@ Every list and every page Broxee draws has its empty, loading and error state.
 |---|---|
 | Page loading | A 2px `accent` progress line under the pane header, only while loading. Reload becomes Stop. |
 | Sleeping tab | Title in `muted`. Tooltip: "Asleep to save memory. Select to wake." |
-| Network error | Broxee page: what failed in plain words ("Couldn't reach github.com: the connection was reset") and **Try again**. |
+| Network error | Broxee page: what failed in plain words, one title per cause ("Couldn't find github.com", "github.com refused the connection", "github.com took too long to answer", "github.com redirected too many times"), the address, and **Try again**. |
+| Offline | "You're offline". The tab reloads by itself once a network interface is back. |
 | Certificate error | "github.com's certificate isn't valid, so Broxee didn't open it." No click-through in the first version. |
 | Page Broxee can't render yet | "This page needs JavaScript, which Broxee doesn't run yet." Action: **Open in default browser**. |
 | No bookmarks | "No bookmarks yet. Press ⌘D on any page to save it here." |

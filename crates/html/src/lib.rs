@@ -407,6 +407,12 @@ impl Dom {
         self.append(parent, Kind::Text, start, len, 0)
     }
 
+    /// Record that what `id` shows changed though the node did not (an image it names
+    /// arrived), so the next update lays it out again.
+    pub fn touch(&mut self, id: NodeId) {
+        self.record(Change::Element(id));
+    }
+
     fn record(&mut self, change: Change) {
         if let Some(list) = &mut self.changes {
             if list.last() == Some(&change) {
