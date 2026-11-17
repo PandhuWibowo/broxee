@@ -1136,7 +1136,10 @@ impl<'a> Engine<'a> {
             width: content_width + padding[1] + padding[3],
             height: height + padding[0] + padding[2],
         };
-        if s.clips {
+        // The root's overflow, and `<body>`'s, belong to the viewport: the page scrolls
+        // instead of being cut at the element's own height (`html { height: 100%;
+        // overflow-x: clip }` would otherwise hide everything below the first screen).
+        if clips_content {
             self.out.clips.push(Clip {
                 boxes: (index as u32 + 1, self.out.boxes.len() as u32),
                 texts: (first_text as u32, self.out.texts.len() as u32),
@@ -1522,10 +1525,16 @@ impl<'a> Engine<'a> {
     /// Whether `id` is the root element or `<body>`, whose `overflow` browsers apply to the
     /// viewport (CSS Overflow 3, 3.3): what they hide still scrolls the page.
     fn overflows_to_viewport(&self, id: NodeId) -> bool {
+        // Only a real `<html>`: the parser does not add one around a bare fragment, whose
+        // first element must keep its own overflow.
         match self.dom.parent(id) {
-            Some(Dom::ROOT) => true,
+            Some(Dom::ROOT) => self.dom.tag_name(id) == Some("html"),
+            // `<body>`'s goes to the viewport only while the root's own is `visible`.
             Some(p) => {
-                self.dom.parent(p) == Some(Dom::ROOT) && self.dom.tag_name(id) == Some("body")
+                self.dom.parent(p) == Some(Dom::ROOT)
+                    && self.dom.tag_name(p) == Some("html")
+                    && self.dom.tag_name(id) == Some("body")
+                    && !self.styles.style(p).clips
             }
             None => false,
         }
@@ -2885,6 +2894,34 @@ mod tests {
             1,
             "the p inside, not the div itself"
         );
+    }
+
+    #[test]
+    fn the_root_and_body_overflow_belongs_to_the_viewport() {
+        // A page as tall as the window that clips: everything below still shows.
+        let tall = "<html><body><p style=\"height: 900px\">tall</p><p>below</p></body></html>";
+        let css = "html { height: 100% } p { margin: 0 }";
+        for clip in [
+            "html, body { overflow-x: clip }",
+            "html { overflow: hidden }",
+        ] {
+            let (_, l) = run(tall, &format!("{css} {clip}"), 300.0);
+            // `<body>` may keep a clip of its own (the root clips), but it grows with its
+            // content: nothing is cut at the window's height.
+            assert!(
+                l.clips.iter().all(|c| c.rect.height >= 900.0),
+                "{clip}: {:?}",
+                l.clips.iter().map(|c| c.rect).collect::<Vec<_>>()
+            );
+            assert!(l.height >= 900.0);
+        }
+        // With the root clipping, `<body>` keeps its own overflow.
+        let (_, l) = run(
+            tall,
+            &format!("{css} html {{ overflow: hidden }} body {{ height: 50px; overflow: hidden }}"),
+            300.0,
+        );
+        assert_eq!(l.clips.len(), 1, "body clips itself");
     }
 
     fn by_id(dom: &Dom, l: &Layout, id: &str) -> Rect {

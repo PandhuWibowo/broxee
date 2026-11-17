@@ -9996,4 +9996,77 @@ mod tests {
             f64::from(r.y + r.height / 2.0 - b.scroll + HEADER_HEIGHT),
         )
     }
+
+    /// Not a check: loads SHOT_URL in a 1000x630 window, scrolls by SHOT_SCROLL points and
+    /// writes the frame to SHOT_PNG.
+    #[test]
+    #[ignore]
+    fn shot_url() {
+        let (Ok(url), Ok(out)) = (std::env::var("SHOT_URL"), std::env::var("SHOT_PNG")) else {
+            return;
+        };
+        let scroll: f32 = std::env::var("SHOT_SCROLL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        let root = std::env::temp_dir().join(format!("broxee-shot-{}", std::process::id()));
+        let opts = Options {
+            target: url,
+            more: Vec::new(),
+            tree: false,
+            styles: false,
+            layout: false,
+            png: None,
+            tiles: None,
+            paint: false,
+            window: true,
+            depth: 8,
+            width: 1000.0,
+            height: 630.0,
+            scale: 1.0,
+            fetch_css: true,
+            panes: 1,
+            cache: None,
+            record: None,
+            replay: None,
+        };
+        let mut b = Browser::new(
+            opts,
+            FakeScreen::default(),
+            None,
+            TabStore::open(&root).ok(),
+        );
+        b.start();
+        b.wait_for_load();
+        b.handle(Event::Resize {
+            width: 1000.0,
+            height: 630.0,
+            scale: 1.0,
+        });
+        b.handle(Event::Scroll {
+            dy: -f64::from(scroll),
+            x: 600.0,
+            y: 300.0,
+        });
+        b.run_page_timers();
+        b.render();
+        let p = b.page.as_ref().unwrap();
+        eprintln!(
+            "scroll {} of {} (page height {})",
+            b.scroll,
+            b.max_scroll(),
+            p.layout.height
+        );
+        let frame = b.window.frame.borrow();
+        let stride = frame.0 * 4 + PAD;
+        let rgba: Vec<u8> = (0..frame.1)
+            .flat_map(|y| {
+                frame.2[y * stride..y * stride + frame.0 * 4]
+                    .chunks(4)
+                    .flat_map(|p| [p[2], p[1], p[0], 255])
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        std::fs::write(out, paint::png::encode(frame.0, frame.1, &rgba)).unwrap();
+    }
 }
