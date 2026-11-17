@@ -135,9 +135,13 @@ casts), not taken from binding crates. Ask before proposing any dependency.
   the previous frame surface (`Screen::render` hands it over), so they cost no memory. Giving a pane focus
   sleeps the focused tab and wakes the pane's tab at the pane's size. Events over the focused pane get
   pane-relative y (`Browser::route`); anything that draws in the pane uses its rows of the frame.
-- **One page load at a time.** `Browser::navigate` stops the running load before starting another, and every
-  tab or profile change stops it too. A finished load always belongs to the visible tab, because nothing can
-  change the visible tab without stopping it first. Keep both true when adding background work.
+- **One page is built at a time.** `Browser::navigate` stops the running load before starting another. Leaving
+  a tab while it loads sends its load to `Browser::background` (at most `BACKGROUND_LOADS`, form posts never):
+  the loader stops building at its next checkpoint (`engine::load_in_tab`) and ends with a partial snapshot
+  (`Sources::partial`: no fonts or CSS background images yet), stored as the tab's sleeping file. Coming back
+  adopts a running load, or builds a partial file on the loader thread (`restore_in_tab`, which fetches what it
+  lacks). A page that finished building anyway is snapshotted at once: never a second `Loaded`. Switching
+  profile drops every background load (no connections shared across profiles).
 - **Cookies belong to a profile.** Every fetch for a page passes that profile's jar (`engine::Jar`);
   subresources use `net::Context::subresource`, which blocks other sites' cookies. Never log or print cookie
   values, never write session cookies to disk, and keep cookie and session files 0600 (`write_private`).

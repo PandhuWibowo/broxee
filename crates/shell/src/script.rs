@@ -329,9 +329,9 @@ fn runs(dom: &Dom, node: NodeId) -> bool {
 pub fn run_page_scripts(
     dom: &mut Dom,
     forms: &mut Forms,
-    url: &net::Url,
-    base: &net::Url,
+    (url, base): (&net::Url, &net::Url),
     from: ScriptFrom,
+    run: bool,
 ) -> (Option<Box<PageScript>>, Vec<(String, net::Wire)>) {
     let nodes: Vec<NodeId> = dom
         .descendants(Dom::ROOT)
@@ -395,6 +395,10 @@ pub fn run_page_scripts(
             break;
         }
         texts.push((name, text));
+    }
+    if !run {
+        // Fetched for later (a page downloading in the background): nothing runs now.
+        return (None, wires);
     }
     let mut script = Box::new(PageScript::new(url, base));
     let page_url = url.to_string();
@@ -524,7 +528,8 @@ mod tests {
         let mut dom = html::parse(src);
         let mut forms = Forms::prepare(&mut dom);
         let url = net::Url::parse("https://example.org/").unwrap();
-        let (script, _) = run_page_scripts(&mut dom, &mut forms, &url, &url, ScriptFrom::Inline);
+        let (script, _) =
+            run_page_scripts(&mut dom, &mut forms, (&url, &url), ScriptFrom::Inline, true);
         (dom, forms, script)
     }
 

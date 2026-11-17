@@ -224,6 +224,9 @@ pub struct Sources {
     pub scripts: Vec<(String, net::Wire)>,
     /// `@font-face` files the page used, by URL.
     pub fonts: Vec<(String, net::Wire)>,
+    /// Downloaded in the background and never built: the fonts and CSS background images,
+    /// which only styling finds, are not here yet, so building it fetches them (`restore`).
+    pub partial: bool,
 }
 
 /// A page put to sleep: its sources and compressed images, and nothing built from them.
@@ -248,11 +251,30 @@ pub fn snapshot(page: Loaded) -> Snapshot {
 
 /// Rebuild a sleeping page from its snapshot, without the network.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
+/// Build a sleeping page again from its snapshot, without the network, except that a
+/// partial snapshot (`Sources::partial`) fetches its fonts, CSS background images and any
+/// stylesheet it lacks, with `cookies`.
 pub fn restore(
     snapshot: Snapshot,
     settings: Settings,
     fonts: &FontStore,
+    cookies: Option<&net::Cookies>,
 ) -> Result<Loaded, String> {
+    restore_in_tab(snapshot, settings, fonts, cookies, None, &mut |_| true)
+        .map(|o| o.page().expect("never sent to the background"))
+}
+
+/// `restore` on a tab's loader thread (a partial snapshot, which fetches): like
+/// `load_in_tab`, it reports progress, stops when `progress` says so, and once `background`
+/// is set it ends with the snapshot again instead of building the page.
+pub fn restore_in_tab(
+    snapshot: Snapshot,
+    settings: Settings,
+    fonts: &FontStore,
+    cookies: Option<&net::Cookies>,
+    background: Option<&std::sync::atomic::AtomicBool>,
+    progress: &mut dyn FnMut(f32) -> bool,
+) -> Result<Outcome, String> {
     let started = Instant::now();
     let Snapshot {
         url,
@@ -279,17 +301,25 @@ pub fn restore(
         fetch_ms: 0.0,
         parse_ms: millis(started),
     };
-    let mut page = finish(
+    let mut outcome = finish(
         source,
         dom,
         settings,
         fonts,
-        From::Snapshot(sources, images),
-        &mut |_| true,
+        From::Snapshot(sources, images, cookies),
+        progress,
+        background,
     )
-    .expect("a load without a stop request finishes");
-    page.sources.html = html;
-    Ok(page)
+    .ok_or(CANCELLED)?;
+    match &mut outcome {
+        Outcome::Page(page) => page.sources.html = html,
+        Outcome::Downloaded(snapshot, _) => {
+            snapshot.sources.html = html;
+            // Its fonts and background images were not fetched this time either.
+            snapshot.sources.partial = true;
+        }
+    }
+    Ok(outcome)
 }
 
 /// A profile's cookie jar, for a load. `same_site_initiator`: the person started this
@@ -305,9 +335,10 @@ pub struct Jar<'a> {
 enum From<'a> {
     /// Fetched, with the profile's cookies for subresources of the page's own site.
     Network(Option<&'a net::Cookies>),
-    /// A sleeping page waking: stylesheets from their stored bytes, images as they were.
+    /// A sleeping page waking: stylesheets from their stored bytes, images as they were. A
+    /// partial snapshot fetches what it lacks, with these cookies.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    Snapshot(Sources, ImageStore),
+    Snapshot(Sources, ImageStore, Option<&'a net::Cookies>),
     /// Pages Broxee writes itself.
     Nowhere,
 }
@@ -337,6 +368,39 @@ pub fn load_with(
     jar: Option<Jar>,
     progress: &mut dyn FnMut(f32) -> bool,
 ) -> Result<Loaded, String> {
+    load_in_tab(url, body, settings, fonts, jar, None, progress)
+        .map(|o| o.page().expect("never sent to the background"))
+}
+
+/// What a load gave: the built page, or, once it was sent to the background, what the page
+/// is built from (a partial snapshot) and its title.
+pub enum Outcome {
+    Page(Loaded),
+    Downloaded(Snapshot, Option<String>),
+}
+
+impl Outcome {
+    fn page(self) -> Option<Loaded> {
+        match self {
+            Outcome::Page(page) => Some(page),
+            Outcome::Downloaded(..) => None,
+        }
+    }
+}
+
+/// `load_with` for a tab, which may go to the background while it loads: once `background`
+/// is set, the page is not built. Its scripts, stylesheets and images are still fetched, and
+/// the load ends with `Outcome::Downloaded` before styling (or with the page, when the flag
+/// came after styling began). Memory stays at the bytes downloaded and the DOM.
+pub fn load_in_tab(
+    url: &net::Url,
+    body: Option<&net::Body>,
+    settings: Settings,
+    fonts: &FontStore,
+    jar: Option<Jar>,
+    background: Option<&std::sync::atomic::AtomicBool>,
+    progress: &mut dyn FnMut(f32) -> bool,
+) -> Result<Outcome, String> {
     let started = Instant::now();
     let context = net::Context::top_level(jar.is_none_or(|j| j.same_site_initiator));
     let resp = net::send_in(url, body, jar.map(|j| (j.cookies, &context)))?;
@@ -370,7 +434,7 @@ pub fn load_with(
     } else {
         From::Nowhere
     };
-    let mut page = finish(
+    let mut outcome = finish(
         Source {
             url: response_url,
             status,
@@ -383,11 +447,17 @@ pub fn load_with(
         fonts,
         from,
         progress,
+        background,
     )
     .ok_or(CANCELLED)?;
-    page.sources.html = html;
-    page.refresh_header = refresh_header;
-    Ok(page)
+    match &mut outcome {
+        Outcome::Page(page) => {
+            page.sources.html = html;
+            page.refresh_header = refresh_header;
+        }
+        Outcome::Downloaded(snapshot, _) => snapshot.sources.html = html,
+    }
+    Ok(outcome)
 }
 
 /// Build a page from HTML Broxee generated itself (error and message pages). No network.
@@ -410,8 +480,17 @@ pub fn page_from_html(
         fetch_ms: 0.0,
         parse_ms: 0.0,
     };
-    let mut page = finish(origin, dom, settings, fonts, From::Nowhere, &mut |_| true)
-        .expect("a load without a stop request finishes");
+    let mut page = finish(
+        origin,
+        dom,
+        settings,
+        fonts,
+        From::Nowhere,
+        &mut |_| true,
+        None,
+    )
+    .and_then(Outcome::page)
+    .expect("a load without a stop request finishes");
     page.sources.html = net::Wire {
         encoding: net::Encoding::Identity,
         bytes: source.as_bytes().to_vec(),
@@ -434,14 +513,18 @@ fn finish(
     fonts: &FontStore,
     mut from: From,
     progress: &mut dyn FnMut(f32) -> bool,
-) -> Option<Loaded> {
+    background: Option<&std::sync::atomic::AtomicBool>,
+) -> Option<Outcome> {
+    let downloading = || background.is_some_and(|b| b.load(std::sync::atomic::Ordering::Relaxed));
     let font_from = match &mut from {
         From::Network(cookies) => FontFrom::Network(*cookies),
-        From::Snapshot(sources, _) => FontFrom::Stored(std::mem::take(&mut sources.fonts)),
+        From::Snapshot(sources, _, cookies) if sources.partial => FontFrom::Network(*cookies),
+        From::Snapshot(sources, ..) => FontFrom::Stored(std::mem::take(&mut sources.fonts)),
         From::Nowhere => FontFrom::Nowhere,
     };
     let background_from = match &from {
         From::Network(cookies) => BackgroundFrom::Network(*cookies),
+        From::Snapshot(sources, _, cookies) if sources.partial => BackgroundFrom::Network(*cookies),
         From::Snapshot(..) => BackgroundFrom::Stored,
         From::Nowhere => BackgroundFrom::Inline,
     };
@@ -456,11 +539,18 @@ fn finish(
         From::Network(cookies) => {
             crate::script::ScriptFrom::Network(cookies.map(|c| (c, &context)))
         }
-        From::Snapshot(sources, _) => crate::script::ScriptFrom::Stored(&sources.scripts),
+        From::Snapshot(sources, ..) => crate::script::ScriptFrom::Stored(&sources.scripts),
         From::Nowhere => crate::script::ScriptFrom::Inline,
     };
     let (script, scripts) =
-        crate::script::run_page_scripts(&mut dom, &mut forms, &source.url, &base, script_from);
+        // A page downloading in the background only fetches its scripts.
+        crate::script::run_page_scripts(
+            &mut dom,
+            &mut forms,
+            (&source.url, &base),
+            script_from,
+            !downloading(),
+        );
     let (css, mut images, stylesheets) = load_subresources(
         &dom,
         (&source.url, &base),
@@ -470,6 +560,24 @@ fn finish(
     );
     if !progress(0.75) {
         return None;
+    }
+    if downloading() {
+        let title = dom.title();
+        return Some(Outcome::Downloaded(
+            Snapshot {
+                url: source.url,
+                status: source.status,
+                sources: Sources {
+                    html: net::Wire::default(),
+                    stylesheets,
+                    scripts,
+                    fonts: Vec::new(),
+                    partial: true,
+                },
+                images,
+            },
+            title,
+        ));
     }
     // Join stage 1 before layout, the first stage that measures text.
     let fonts_wait_ms = fonts.ready();
@@ -499,7 +607,7 @@ fn finish(
     webfonts.plan(&styles, fonts);
     let (layout, layout_ms) = lay_out(&dom, &styles, &images, &webfonts, settings, fonts);
     progress(0.95);
-    Some(Loaded {
+    Some(Outcome::Page(Loaded {
         url: source.url,
         base,
         refresh_header: None,
@@ -515,6 +623,7 @@ fn finish(
             stylesheets,
             scripts,
             fonts: font_files,
+            partial: false,
         },
         webfonts,
         styles,
@@ -527,7 +636,7 @@ fn finish(
         cascade_ms,
         fonts_wait_ms,
         layout_ms,
-    })
+    }))
 }
 
 /// Cascade and lay out again, for a new viewport size or color scheme. `@media` rules can
@@ -849,8 +958,11 @@ fn load_subresources(
     parser_nodes: usize,
 ) -> (LoadedCss, ImageStore, Vec<(String, net::Wire)>) {
     let external = !matches!(from, From::Nowhere);
-    let cookies = match from {
-        From::Network(cookies) => cookies,
+    // A partial snapshot fetches the stylesheets it lacks (added by scripts it never ran).
+    let fallback = matches!(&from, From::Snapshot(s, ..) if s.partial);
+    let cookies = match &from {
+        From::Network(cookies) => *cookies,
+        From::Snapshot(s, _, cookies) if s.partial => *cookies,
         _ => None,
     };
     // Subresources send and store cookies only for the page's own site.
@@ -874,7 +986,7 @@ fn load_subresources(
         }
     }
     let (stored_sheets, stored_images) = match from {
-        From::Snapshot(sources, images) => (Some(sources.stylesheets), Some(images)),
+        From::Snapshot(sources, images, _) => (Some(sources.stylesheets), Some(images)),
         _ => (None, None),
     };
     let (image_sources, image_uses) = if external && stored_images.is_none() {
@@ -894,7 +1006,7 @@ fn load_subresources(
     let stored = stored_sheets.as_deref();
     let started = Instant::now();
     let results = pool::map_ordered(jobs, FETCH_WORKERS, |job| match job {
-        Job::Css(source) => Done::Css(load_css(source, base, &vocabulary, stored, jar)),
+        Job::Css(source) => Done::Css(load_css(source, base, &vocabulary, (stored, fallback), jar)),
         Job::Image(images::Source::Inline(bytes)) => Done::Image(Some(bytes)),
         Job::Image(images::Source::Url(url)) => Done::Image(
             net::fetch_in(&url, jar)
@@ -939,7 +1051,7 @@ fn load_css(
     source: CssSource,
     page_url: &net::Url,
     vocabulary: &css::Vocabulary,
-    stored: Option<&[(String, net::Wire)]>,
+    (stored, fallback): (Option<&[(String, net::Wire)]>, bool),
     jar: Option<(&net::Cookies, &net::Context)>,
 ) -> CssResult {
     let failed = CssResult {
@@ -956,17 +1068,15 @@ fn load_css(
         CssSource::Inline(text) => (text.into_bytes(), None, false),
         CssSource::External(url) => {
             let key = url.to_string();
-            match stored {
-                Some(sheets) => {
-                    let Some((_, wire)) = sheets.iter().find(|(u, _)| *u == key) else {
-                        return failed;
-                    };
-                    match wire.decode(net::MAX_BODY) {
-                        Ok(bytes) => (bytes, Some((key, wire.clone())), false),
-                        Err(_) => return failed,
-                    }
-                }
-                None => match net::fetch_in(&url, jar) {
+            let kept = stored.map(|sheets| sheets.iter().find(|(u, _)| *u == key));
+            match kept {
+                Some(Some((_, wire))) => match wire.decode(net::MAX_BODY) {
+                    Ok(bytes) => (bytes, Some((key, wire.clone())), false),
+                    Err(_) => return failed,
+                },
+                // A snapshot without it: only a partial one may fetch it.
+                Some(None) if !fallback => return failed,
+                _ => match net::fetch_in(&url, jar) {
                     Ok(mut resp) if resp.status == 200 => {
                         let wire = if resp.wire.bytes.is_empty() {
                             net::Wire {
@@ -1076,7 +1186,7 @@ mod tests {
             dark: false,
             fetch_css: false,
         };
-        let after = restore(snapshot, settings, &FontStore::default()).expect("restores");
+        let after = restore(snapshot, settings, &FontStore::default(), None).expect("restores");
         assert_eq!(
             after.sources.html.bytes,
             src.as_bytes(),
@@ -1141,7 +1251,7 @@ mod tests {
 
         // A sleeping tab wakes with its fonts, without the files.
         std::fs::remove_file(dir.join("f/icons.woff2")).unwrap();
-        let woken = restore(snapshot(page), settings, &fonts).expect("restores");
+        let woken = restore(snapshot(page), settings, &fonts, None).expect("restores");
         assert_eq!(woken.webfonts.faces.len(), 1);
         assert_eq!(width(&woken, "\u{e001}\u{e002}"), 32.0);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1197,7 +1307,7 @@ mod tests {
         );
         // A sleeping tab wakes with its backgrounds, without the files.
         std::fs::remove_dir_all(dir.join("img")).unwrap();
-        let woken = restore(snapshot(page), settings, &fonts).expect("restores");
+        let woken = restore(snapshot(page), settings, &fonts, None).expect("restores");
         assert!(woken.images.background(&sheet_url).is_some());
         assert!(woken.images.background("img/b.png").is_some());
         let _ = std::fs::remove_dir_all(&dir);

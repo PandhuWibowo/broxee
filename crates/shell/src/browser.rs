@@ -35,6 +35,8 @@ use crate::palette::{self, Action, Command, Hint};
 use crate::selection::{self, Selection};
 use crate::Options;
 
+/// Loads that may go on downloading after their tab is left; more stop the oldest.
+const BACKGROUND_LOADS: usize = 2;
 /// The shortest wait before a page's refresh is followed.
 const REFRESH_MIN: Duration = Duration::from_secs(1);
 /// How often an offline tab looks whether a network is back.
@@ -249,6 +251,16 @@ struct Load {
     to: Destination,
     settings: Settings,
     messages: Receiver<LoadMessage>,
+    /// The tab it is for (`Tab::id`) and its profile: a load can outlive the tab's
+    /// visibility (`Browser::background`).
+    tab: u64,
+    profile: usize,
+    /// Set when its tab is no longer visible: the loader stops building and ends with what
+    /// the page is built from (`engine::Outcome::Downloaded`).
+    background: Arc<std::sync::atomic::AtomicBool>,
+    /// A form submission: never continued in the background (it would be sent again on
+    /// return if it failed).
+    post: bool,
 }
 
 /// Where a finished load goes in the tab's history.
@@ -265,7 +277,7 @@ enum Destination {
 enum LoadMessage {
     Progress(f32),
     /// Boxed: a channel slot is as large as its largest message.
-    Done(Box<Result<Loaded, String>>),
+    Done(Box<Result<engine::Outcome, String>>),
 }
 
 /// The ⋯ menu while it is open.
@@ -785,6 +797,9 @@ struct Browser<S: Screen> {
     frame_geometry: Option<Geometry>,
     /// The address of the link under the pointer, shown at the bottom of the pane.
     link_preview: Option<String>,
+    /// Loads of tabs that are no longer visible, downloading without building
+    /// (`BACKGROUND_LOADS` at most). Each ends as its tab's sleeping file.
+    background: Vec<Load>,
     /// When the visible page asked to go somewhere by itself (`Refresh`, meta refresh), and
     /// where (`None`: reload). Any navigation or tab change drops it.
     refresh: Option<(Instant, Option<net::Url>)>,
@@ -862,6 +877,7 @@ impl<S: Screen> Browser<S> {
             sidebar_scroll: 0.0,
             drag: None,
             link_preview: None,
+            background: Vec::new(),
             refresh: None,
             offline_retry: None,
             online: net::online,
@@ -1038,7 +1054,7 @@ impl<S: Screen> Browser<S> {
                 wait = wait.min(at.saturating_duration_since(Instant::now()));
             }
             // Answers to the page's requests arrive on their own channel: look each frame.
-            if self.page_requests_busy() {
+            if self.page_requests_busy() || !self.background.is_empty() {
                 wait = wait.min(LOAD_POLL);
             }
             let mut repaint = Repaint::Nothing;
@@ -1057,7 +1073,11 @@ impl<S: Screen> Browser<S> {
                 // Progress moves the loading line; a finished load painted its page already.
                 repaint = repaint.max(Repaint::Header);
             }
-            if self.tick() | self.run_page_timers() | self.poll_page_requests() {
+            if self.tick()
+                | self.run_page_timers()
+                | self.poll_page_requests()
+                | self.poll_background()
+            {
                 repaint = Repaint::Frame;
             }
             self.run_refresh();
@@ -4390,6 +4410,9 @@ impl<S: Screen> Browser<S> {
         let fonts = Arc::clone(&self.fonts);
         let cookies = Arc::clone(&self.profiles[self.profile].cookies);
         let target = url.clone();
+        let post = body.is_some();
+        let background = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&background);
         let spawned = std::thread::Builder::new()
             .name("load".into())
             .spawn(move || {
@@ -4398,12 +4421,13 @@ impl<S: Screen> Browser<S> {
                     same_site_initiator,
                 };
                 // A failed send means the browser dropped the load: stop at the next stage.
-                let result = engine::load_with(
+                let result = engine::load_in_tab(
                     &target,
                     body.as_ref(),
                     settings,
                     &fonts,
                     Some(jar),
+                    Some(&flag),
                     &mut |progress| sender.send(LoadMessage::Progress(progress)).is_ok(),
                 );
                 let _ = sender.send(LoadMessage::Done(Box::new(result)));
@@ -4413,6 +4437,10 @@ impl<S: Screen> Browser<S> {
             to,
             settings,
             messages,
+            tab: self.tab().id,
+            profile: self.profile,
+            background,
+            post,
         };
         if let Err(e) = spawned {
             return self.finish_load(load, Err(e.to_string()));
@@ -4478,13 +4506,21 @@ impl<S: Screen> Browser<S> {
     }
 
     /// Show a finished load (or its error page) and record it in the tab's history.
-    fn finish_load(&mut self, load: Load, result: Result<Loaded, String>) {
+    fn finish_load(&mut self, load: Load, result: Result<engine::Outcome, String>) {
         self.loading = None;
         self.save_cookies();
-        let url = load.url;
         if matches!(&result, Err(e) if e == engine::CANCELLED) {
             return;
         }
+        // Sent to the background and brought back after it stopped building: build it now.
+        let result = match result {
+            Ok(engine::Outcome::Page(page)) => Ok(page),
+            Ok(engine::Outcome::Downloaded(snapshot, _)) => {
+                return self.build_downloaded(snapshot, load.to);
+            }
+            Err(e) => Err(e),
+        };
+        let url = load.url;
         let loaded = result.is_ok();
         let mut offline = false;
         let mut page = result.unwrap_or_else(|e| {
@@ -4596,9 +4632,157 @@ impl<S: Screen> Browser<S> {
         }
     }
 
+    /// The visible tab is being left while it loads: its load goes on downloading in the
+    /// background, unless it posts a form or `BACKGROUND_LOADS` are running (the oldest
+    /// stops).
+    fn to_background(&mut self) {
+        let Some(load) = self.load.take() else {
+            return;
+        };
+        self.loading = None;
+        if load.post {
+            return;
+        }
+        load.background
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if self.background.len() >= BACKGROUND_LOADS {
+            self.background.remove(0);
+        }
+        self.background.push(load);
+    }
+
+    /// Build a page downloaded in the background, on the loader thread like a load: the
+    /// fonts and background images it lacks are fetched there. `to` places it in the
+    /// visible tab's history when it is shown.
+    fn build_downloaded(&mut self, snapshot: engine::Snapshot, to: Destination) {
+        let settings = self.settings();
+        let (sender, messages) = mpsc::channel();
+        let fonts = Arc::clone(&self.fonts);
+        let cookies = Arc::clone(&self.profiles[self.profile].cookies);
+        let background = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&background);
+        let url = snapshot.url.clone();
+        let spawned = std::thread::Builder::new()
+            .name("load".into())
+            .spawn(move || {
+                let result = engine::restore_in_tab(
+                    snapshot,
+                    settings,
+                    &fonts,
+                    Some(&cookies),
+                    Some(&flag),
+                    &mut |progress| sender.send(LoadMessage::Progress(progress)).is_ok(),
+                );
+                let _ = sender.send(LoadMessage::Done(Box::new(result)));
+            });
+        let load = Load {
+            url,
+            to,
+            settings,
+            messages,
+            tab: self.tab().id,
+            profile: self.profile,
+            background,
+            post: false,
+        };
+        if let Err(e) = spawned {
+            return self.finish_load(load, Err(e.to_string()));
+        }
+        self.load = Some(load);
+        self.loading = Some(0.1);
+        self.render();
+    }
+
+    /// Collect what background loads have finished. Returns whether the sidebar changed.
+    fn poll_background(&mut self) -> bool {
+        let mut changed = false;
+        let mut i = 0;
+        while i < self.background.len() {
+            match self.background[i].messages.try_recv() {
+                Ok(LoadMessage::Progress(_)) => {}
+                Ok(LoadMessage::Done(result)) => {
+                    let load = self.background.remove(i);
+                    changed |= self.finish_background(load, *result);
+                }
+                Err(TryRecvError::Empty) => i += 1,
+                Err(TryRecvError::Disconnected) => {
+                    self.background.remove(i);
+                }
+            }
+        }
+        changed
+    }
+
+    /// A background load finished: its tab's history moves on, and the page waits in a
+    /// sleeping file (a page that was built after all is snapshotted at once, so no second
+    /// page stays in memory). A failed load leaves the address in the history: selecting the
+    /// tab tries again. Returns whether the sidebar changed.
+    fn finish_background(&mut self, load: Load, result: Result<engine::Outcome, String>) -> bool {
+        if matches!(&result, Err(e) if e == engine::CANCELLED) {
+            return false;
+        }
+        self.save_cookies();
+        let Some(p) = self.profiles.get(load.profile) else {
+            return false;
+        };
+        let Some(t) = p.tabs.iter().position(|t| t.id == load.tab) else {
+            return false;
+        };
+        // Never the visible tab: it would have adopted its load.
+        if load.profile == self.profile && t == p.active {
+            return false;
+        }
+        let (url, title, snapshot) = match result {
+            Ok(engine::Outcome::Page(page)) => {
+                let title = page.dom.title();
+                (page.url.clone(), title, Some(engine::snapshot(page)))
+            }
+            Ok(engine::Outcome::Downloaded(snapshot, title)) => {
+                (snapshot.url.clone(), title, Some(snapshot))
+            }
+            Err(_) => (load.url.clone(), None, None),
+        };
+        let stored = match (snapshot, self.store.as_mut()) {
+            (Some(s), Some(store)) => store.put(&s).ok(),
+            _ => None,
+        };
+        let tab = &mut self.profiles[load.profile].tabs[t];
+        let title = title.unwrap_or_else(|| host_of(&url));
+        let entry = Entry {
+            url,
+            scroll: 0.0,
+            title: title.clone(),
+        };
+        match load.to {
+            Destination::Entry(i) if i < tab.history.len() => {
+                tab.index = i;
+                tab.history[i].title.clone_from(&title);
+            }
+            Destination::Replace if tab.index < tab.history.len() => {
+                tab.history[tab.index] = entry;
+            }
+            _ => {
+                if !tab.history.is_empty() {
+                    tab.history.truncate(tab.index + 1);
+                }
+                tab.history.push(entry);
+                tab.index = tab.history.len() - 1;
+            }
+        }
+        tab.title = title;
+        tab.focused_link = None;
+        let old = std::mem::replace(&mut tab.snapshot, stored);
+        if let (Some(old), Some(store)) = (old, self.store.as_mut()) {
+            store.remove(old);
+        }
+        self.trim_snapshots();
+        self.save_session();
+        true
+    }
+
     /// Put the visible tab to sleep: keep what rebuilds its page, drop the page.
     fn sleep(&mut self) {
-        self.stop_load();
+        self.to_background();
         self.refresh = None;
         self.offline_retry = None;
         self.save_scroll();
@@ -4652,6 +4836,13 @@ impl<S: Screen> Browser<S> {
     /// Show the visible tab: from its snapshot, from the network, or as a new tab.
     fn wake(&mut self) {
         let settings = self.settings();
+        // A load this tab left running goes on in front.
+        let (id, profile) = (self.tab().id, self.profile);
+        let adopted = self
+            .background
+            .iter()
+            .position(|l| l.tab == id && l.profile == profile)
+            .map(|i| self.background.remove(i));
         let tab = self.tab_mut();
         let stored = tab.snapshot.take();
         let entry = tab.entry().cloned();
@@ -4660,8 +4851,25 @@ impl<S: Screen> Browser<S> {
             (Some(stored), Some(store)) => store.take(stored).ok(),
             _ => None,
         };
-        if let (Some(snapshot), Some(entry)) = (snapshot, &entry) {
-            if let Ok(page) = engine::restore(snapshot, settings, &self.fonts) {
+        if let Some(load) = adopted {
+            load.background
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            self.load = Some(load);
+            self.loading = Some(0.1);
+        }
+        // Downloaded in the background: built on the loader thread, which fetches its fonts.
+        let snapshot = match snapshot {
+            Some(s) if s.sources.partial && self.load.is_none() => {
+                let index = self.tab().index;
+                self.page = None;
+                self.page_is_entry = false;
+                self.window.set_title(&title);
+                return self.build_downloaded(s, Destination::Entry(index));
+            }
+            other => other,
+        };
+        if let (Some(snapshot), Some(entry)) = (snapshot.filter(|s| !s.sources.partial), &entry) {
+            if let Ok(page) = engine::restore(snapshot, settings, &self.fonts, None) {
                 let title = self.show(page, entry.scroll);
                 self.set_tab_title(title);
                 if let Some(node) = self.tab_mut().focused_link.take() {
@@ -4672,6 +4880,14 @@ impl<S: Screen> Browser<S> {
                 self.save_session();
                 return;
             }
+        }
+        if self.load.is_some() {
+            // The adopted load shows its page when it finishes.
+            self.page = None;
+            self.page_is_entry = false;
+            self.window.set_title(&title);
+            self.render();
+            return;
         }
         match entry {
             Some(entry) => {
@@ -4780,7 +4996,9 @@ impl<S: Screen> Browser<S> {
             return self.select_tab(index);
         }
         self.sleep();
-        // Nothing a server could use to link the two profiles carries over.
+        // Nothing a server could use to link the two profiles carries over: not even a
+        // download still running for the profile being left.
+        self.background.clear();
         net::forget_sessions();
         self.profile = profile;
         let p = &mut self.profiles[profile];
@@ -7200,7 +7418,8 @@ mod tests {
         let (slow, release) = slow_server("Slow");
         let mut b = browser(&a);
 
-        // A new tab while a page loads: answered at once, and the load is dropped.
+        // A new tab while a page loads: answered at once, and the load goes on in the
+        // background for the tab it belongs to.
         start_loading(&mut b, &slow);
         let started = std::time::Instant::now();
         assert!(b.handle(command('t')));
@@ -7208,8 +7427,12 @@ mod tests {
         // bound only guards against a regression that waits for the network's timeout.
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(b.load.is_none() && b.loading.is_none());
+        assert_eq!(b.background.len(), 1);
         assert_eq!(tab_titles(&b), ["Page A", "New tab"]);
-        act(&mut b, command('w'));
+        // Back on its tab, the load is in front again; Esc stops it.
+        b.handle(command('w'));
+        assert!(b.load.is_some() && b.background.is_empty());
+        assert!(b.handle(key(Key::Escape)));
         assert_eq!(title(&b), "Page A");
 
         // Esc stops a load and keeps the page and history as they were.
@@ -9746,6 +9969,89 @@ mod tests {
         let (at, to) = b.refresh.clone().expect("the header's refresh waits");
         assert!(at > Instant::now() + Duration::from_secs(2));
         assert_eq!(to.unwrap().path, "/next");
+    }
+
+    /// Poll background loads until none is left (or five seconds pass).
+    fn wait_for_background(b: &mut Browser<FakeScreen>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !b.background.is_empty() && Instant::now() < deadline {
+            b.poll_background();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(b.background.is_empty(), "background loads finish");
+    }
+
+    #[test]
+    fn a_tab_left_while_loading_keeps_downloading_and_builds_on_return() {
+        let (a, _) = site("left-loading");
+        let (slow, release) = slow_server("Slow page");
+        let mut b = browser(&a);
+        start_loading(&mut b, &slow);
+        let loading_tab = b.tab().id;
+
+        // Another tab: the load goes on in the background, not stopped.
+        act(&mut b, command('t'));
+        b.close_palette();
+        assert!(b.load.is_none());
+        assert_eq!(b.background.len(), 1);
+        assert_eq!(b.background[0].tab, loading_tab);
+
+        release.send(()).unwrap();
+        wait_for_background(&mut b);
+        let tab = &b.profiles[b.profile].tabs[0];
+        assert_eq!(tab.title, "Slow page", "the sidebar shows the arrived page");
+        assert_eq!(tab.history.len(), 2, "pushed after page A");
+        let stored = tab.snapshot.is_some();
+        assert!(stored, "it waits as a sleeping file, not a live page");
+
+        // Back to it: built from the download, without asking the server again.
+        act(&mut b, command('1'));
+        b.wait_for_load();
+        assert_eq!(title(&b), "Slow page");
+        assert!(b
+            .page
+            .as_ref()
+            .unwrap()
+            .dom
+            .text_content(html::Dom::ROOT)
+            .contains("slow"));
+        assert!(
+            !b.page.as_ref().unwrap().sources.partial,
+            "complete once built"
+        );
+    }
+
+    #[test]
+    fn returning_before_it_finishes_takes_the_load_back() {
+        let (a, _) = site("back-early");
+        let (slow, release) = slow_server("Late page");
+        let mut b = browser(&a);
+        start_loading(&mut b, &slow);
+        act(&mut b, command('t'));
+        b.close_palette();
+        assert_eq!(b.background.len(), 1);
+
+        // `handle`, not `act`: the server answers only once released below.
+        b.handle(command('1'));
+        assert!(b.background.is_empty(), "adopted");
+        assert!(b.load.is_some());
+        release.send(()).unwrap();
+        b.wait_for_load();
+        assert_eq!(title(&b), "Late page");
+        assert_eq!(b.tab().history.len(), 2);
+    }
+
+    #[test]
+    fn switching_profile_stops_background_loads() {
+        let (a, _) = site("profile-stops");
+        let (slow, _release) = slow_server("Never");
+        let mut b = browser(&a);
+        start_loading(&mut b, &slow);
+        act(&mut b, command('t'));
+        b.close_palette();
+        assert_eq!(b.background.len(), 1);
+        act(&mut b, command_shift('p'));
+        assert!(b.background.is_empty(), "profiles share no connections");
     }
 
     #[test]
