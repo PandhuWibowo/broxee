@@ -10668,6 +10668,8 @@ mod tests {
         b.open_input(&start);
         b.wait_for_load();
         assert_eq!(title(&b), "Start");
+        // Images are fetched once the page is shown (#160).
+        wait_for_images(&mut b);
         let heard_now = heard.lock().unwrap().clone();
         assert!(
             heard_now.contains(&"/?secret=1 none".to_string()),
