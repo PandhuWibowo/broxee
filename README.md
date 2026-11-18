@@ -134,8 +134,16 @@ Tabs and profiles:
   there are. The files total at most 256 MB; past that the tabs seen longest ago keep only their history and
   reload when selected. The folder is removed on exit, or at the next start when the browser was killed.
 - The session (profiles, tabs, history, scroll positions; no page contents) is written to
-  `~/Library/Application Support/Broxee/session` after each change. On start every tab comes back asleep and
-  only the visible one loads.
+  `~/Library/Application Support/Broxee/session` after each change, through a temporary file and a rename,
+  so a crash leaves the old file or the new one; scroll positions go in a second after scrolling stops. On
+  start every tab comes back asleep and only the visible one loads.
+- Crash recovery: a page whose loading or later work panics shows "Broxee couldn't show this page" with
+  **Try again**, and every other tab keeps working. If Broxee itself crashed or was killed (a running
+  browser leaves `session.running` with its process id; a normal quit removes it), the next start brings back
+  the profiles, tabs, history and split, but the visible tab waits ("Broxee quit unexpectedly", **Open the
+  page**), so a page that brings Broxee down cannot do it again in a loop. Each caught panic adds one line to
+  `crash.log` next to the session (0600, newest 64 KB): the time, the page's host and the source location of
+  the panic, never the address, the panic message or page contents. Nothing is sent anywhere.
 
 ## Written from scratch
 
@@ -316,6 +324,7 @@ time something reads it (most theme variables never are). A `var()` value is sub
 | 2026-11-18 | `Referer` by `Referrer-Policy` (#125) | 3.8 MB (3,783,520 → 3,783,536 bytes, +16 bytes) | 49.9 MB peak painted at 2x (unchanged) | Header, `<meta name=referrer>` (legacy names too), link and `<img>` `referrerpolicy`, `rel=noreferrer`, redirects; the header's policy is kept with sleeping tabs (tab file 7). The 22 saved pages render the same |
 | 2026-11-18 | `<html>`, `<head>` and `<body>` added when a page leaves them out | 3.8 MB (3,783,536 → 3,800,064 bytes, +16.5 KB: one more 16 KB page) | 49.8 MB peak painted at 2x; parse 18.0 → 18.3 ms (median of 12, +1.3%) | Head elements before body content go in the head, the rest in the body; `</body>` and `</html>` close nothing; `innerHTML` parses a fragment (`html::parse_fragment`). A page of `<title>` and `<p>` now gets its 8px margin and `body` rules. The 22 saved pages render the same |
 | 2026-11-18 | Pages show before their images | 3.8 MB (3,800,064 → 3,800,080 bytes, +16 bytes) | 49.9 MB peak painted at 2x (the CLI still waits for images) | singapay.id in the window (`FakeScreen`, 3 runs): on screen after 3.8 to 6.1 s → 0.6 to 3.1 s; its 61 images arrive one by one after that. `<img>` files and CSS backgrounds go to `pending_images`, fetched once the page is shown, six at once, each laid out as it arrives; a tab that slept first fetches what it lacks when it wakes. Loads in the background still take their images along. The 22 saved pages render the same |
+| 2026-11-18 | Crash recovery (#146): `panic = "unwind"`, panics contained per page, the session back after a crash | 4.4 MB (3,800,080 → 4,445,104 bytes, +630 KB: unwinding tables +612 KB, the code +16 KB) | 50.0 MB peak painted at 2x (49.9 before, within run-to-run noise) | Loader threads and each turn of the engine thread's loop run under `catch_unwind`; a panic ends as an error page in its tab. A marker holding the process id tells the next start that the last run crashed, and the visible tab then waits to be opened. The 22 saved pages render the same |
 
 Other pages after the layout milestone: GitHub home 22.7 MB peak (8,170 rules); Hacker News 11.5 MB.
 
@@ -427,6 +436,7 @@ Where data lives, and what compression does for it (measured 2026-11-07):
 | Memory: images | Keep compressed files; decode only what is on screen, at its drawn size | Re-decoding from the file is the cheapest compressed form: 1 to 30 ms even for a 12 MP photo. A compressed pixel cache would add code and save little. |
 | Memory: page | Not compressed while open | Layout and paint read text and styles constantly; compressing them would cost every frame. |
 | Memory: tabs | A sleeping tab is its sources as received plus compressed images, in a file on disk | GitHub 2.5 MB (92 KB of gzip HTML, 712 KB of CSS, 1.75 MB of images), Wikipedia "Cat" 1.2 MB, MDN 57 KB. Waking takes 5 to 45 ms without the network. In RAM, even a few of them would fill the headroom under 60 MB. |
+| Disk: binary | `panic = "unwind"` (#146) | +0.6 MB (3.80 → 4.43 MB) of unwinding tables. With `abort`, a bug that one page hits closed every tab; now it ends as an error page in that tab. |
 | Disk: binary | Keep `opt-level = 3` | `"s"` saves 0.31 MB (1.95 → 1.64) but layout is 55% slower and cascade 25%; `"z"` is 3x slower. |
 | Disk: caches (later) | Store responses in the encoding they arrived in | No re-compression work, and already the smallest form. |
 
@@ -486,5 +496,9 @@ Where data lives, and what compression does for it (measured 2026-11-07):
   and `fetch()`'s own `referrerPolicy` are not read, so they use the page's policy; images and fonts named
   by a stylesheet name the page as their referrer, not the stylesheet; the CLI sends none unless it has a
   cookie jar (`--cache`).
+- Crash recovery covers panics in Rust code. A stack overflow, an abort or a crash in AppKit still closes
+  the window; the next start restores the session as above. After any crash or kill the visible tab waits
+  to be opened again, even when its page was not the cause. The session file is not flushed to disk with
+  `fsync`, so a power cut (unlike a crash) can lose its latest write.
 - Painting will add a window framebuffer (about 16 MB at 2x for 1280x800). The stress page sits at 37 MB, so
   paint must stay within roughly 20 MB including glyph caches.

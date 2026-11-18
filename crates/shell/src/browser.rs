@@ -28,6 +28,7 @@ use crate::chrome::{
     MarkKind, MenuView, PaletteHit, PaletteRow, PaletteView, SidebarItem, SidebarView,
     HEADER_HEIGHT, SIDEBAR_MAX, SIDEBAR_MIN, SIDEBAR_WIDTH,
 };
+use crate::crash;
 use crate::engine::{self, FontStore, Loaded, Settings};
 use crate::forms;
 use crate::hibernate::{Stored, TabStore};
@@ -166,9 +167,42 @@ pub fn run(opts: Options) -> std::process::ExitCode {
         .as_ref()
         .map(|home| home.join("Library/Application Support/Broxee/session"));
     let store = home.and_then(|home| TabStore::open(&home.join("Library/Caches/Broxee/tabs")).ok());
+    if let Some(session) = &session {
+        crash::clean_at_exit(crash::marker_for(session));
+    }
     platform::run_app("Broxee", width, height, move |window, events| {
-        Browser::new(opts, window, session, store).run(&events);
+        // `run` recovers from panics on its own (`Browser::guarded`), or aborts; only one while
+        // starting gets here. It ends the process with the marker left behind, so the next
+        // start knows: a window without its engine thread would only hang.
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            Browser::new(opts, window, session, store).run(&events);
+        }));
+        if ran.is_err() {
+            std::process::abort();
+        }
     })
+}
+
+/// How a load fetches and builds its page (`engine::load_in_tab`; tests put in their own).
+type LoadPage = fn(
+    &net::Url,
+    Option<&net::Body>,
+    Settings,
+    &FontStore,
+    Option<engine::Jar>,
+    Option<&std::sync::atomic::AtomicBool>,
+    &mut dyn FnMut(f32) -> bool,
+) -> Result<engine::Outcome, String>;
+
+impl<S: Screen> Drop for Browser<S> {
+    /// The browser ends normally: the last scroll position goes into the session, and the
+    /// marker goes, so the next start does not take it for a crash.
+    fn drop(&mut self) {
+        self.save_session_now();
+        if let Some(marker) = &self.marker {
+            crash::mark_clean(marker);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -285,6 +319,19 @@ enum LoadMessage {
     Progress(f32),
     /// Boxed: a channel slot is as large as its largest message.
     Done(Box<Result<engine::Outcome, String>>),
+}
+
+/// Run a load's work on its thread; a panic in it is noted in the crash log and ends the
+/// load as `crash::PAGE_CRASHED`, which shows an error page in its tab.
+fn contain(
+    log: Option<&std::path::Path>,
+    url: &net::Url,
+    work: impl FnOnce() -> Result<engine::Outcome, String>,
+) -> Result<engine::Outcome, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_else(|_| {
+        crash::record(log, &url.host);
+        Err(crash::PAGE_CRASHED.into())
+    })
 }
 
 /// The ⋯ menu while it is open.
@@ -825,6 +872,16 @@ struct Browser<S: Screen> {
     /// Tabs opened from links of one tab in a row (its id, how many): the next one goes
     /// after them, so links open in the order they were clicked.
     opened: (u64, usize),
+    /// The last run ended without shutting down (`crash::crashed_before`): `start` brings
+    /// the session back without loading the visible tab.
+    crashed: bool,
+    /// This run's marker (`crash::marker_for`), removed when the browser ends normally.
+    marker: Option<PathBuf>,
+    /// The crash log (`crash::record`).
+    crash_log: Option<PathBuf>,
+    /// A hash of the session as last written, so an unchanged session is not written again.
+    saved: std::cell::Cell<u64>,
+    load_page: LoadPage,
 }
 
 impl<S: Screen> Browser<S> {
@@ -836,6 +893,13 @@ impl<S: Screen> Browser<S> {
     ) -> Browser<S> {
         let (width, height) = window.size();
         let (scale, dark) = (window.scale() as f32, window.dark());
+        crash::install_hook();
+        let marker = session.as_deref().map(crash::marker_for);
+        let crashed = marker.as_deref().is_some_and(crash::crashed_before);
+        if let Some(marker) = &marker {
+            let _ = crash::mark_running(marker);
+        }
+        let crash_log = session.as_deref().map(crash::log_for);
         // The profiles of the last session, or Personal and Work; their files are read now,
         // their tabs in `start`.
         let restored = session
@@ -897,6 +961,11 @@ impl<S: Screen> Browser<S> {
             online: net::online,
             last_pointer: None,
             opened: (0, 0),
+            crashed,
+            marker,
+            crash_log,
+            saved: std::cell::Cell::new(0),
+            load_page: engine::load_in_tab,
             selection: None,
             find: None,
             dropdown: None,
@@ -1043,72 +1112,77 @@ impl<S: Screen> Browser<S> {
 
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn run(&mut self, events: &Receiver<Event>) {
+        self.guarded(Self::start);
+        let mut trimmed = false;
+        while self.guarded(|b| b.turn(events, &mut trimmed)) != Some(false) {}
+    }
+
+    /// One turn of the engine thread's loop: wait for events (or a timer, or a load's
+    /// progress), handle them, paint. `false` once the window has gone.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn turn(&mut self, events: &Receiver<Event>, trimmed: &mut bool) -> bool {
         /// How long without events before the window frees its spare frame.
         const IDLE_AFTER: Duration = Duration::from_secs(1);
-        self.start();
-        let mut trimmed = false;
-        loop {
-            // While a page loads, wake every frame to show its progress; otherwise sleep until
-            // an event arrives.
-            let mut wait = if self.load.is_some() {
-                LOAD_POLL
-            } else {
-                IDLE_AFTER
-            };
-            // Wake when a waiting tooltip is due, or a script timer.
-            if let Some(h) = self.hover.as_ref().filter(|h| !h.shown) {
-                wait = wait.min(TOOLTIP_DELAY.saturating_sub(h.since.elapsed()));
-            }
-            if let Some(due) = self.next_page_timer() {
-                wait = wait.min(due);
-            }
-            if let Some((at, _)) = &self.refresh {
-                wait = wait.min(at.saturating_duration_since(Instant::now()));
-            }
-            if let Some(at) = self.offline_retry {
-                wait = wait.min(at.saturating_duration_since(Instant::now()));
-            }
-            // Answers to the page's requests arrive on their own channel: look each frame.
-            if self.page_requests_busy()
-                || !self.background.is_empty()
-                || self.image_fetch.is_some()
-            {
-                wait = wait.min(LOAD_POLL);
-            }
-            let mut repaint = Repaint::Nothing;
-            let mut quiet = false;
-            match events.recv_timeout(wait) {
-                Ok(event) => {
-                    repaint = repaint.max(self.apply(event));
-                    for event in events.try_iter() {
-                        repaint = repaint.max(self.apply(event));
-                    }
-                }
-                Err(RecvTimeoutError::Timeout) => quiet = true,
-                Err(RecvTimeoutError::Disconnected) => break,
-            }
-            if self.poll_load() {
-                // Progress moves the loading line; a finished load painted its page already.
-                repaint = repaint.max(Repaint::Header);
-            }
-            if self.tick()
-                | self.run_page_timers()
-                | self.poll_page_requests()
-                | self.poll_background()
-                | self.poll_images()
-            {
-                repaint = Repaint::Frame;
-            }
-            self.run_refresh();
-            self.retry_if_online();
-            if repaint != Repaint::Nothing {
-                self.repaint(repaint);
-                trimmed = false;
-            } else if quiet && self.load.is_none() && !trimmed {
-                self.window.idle();
-                trimmed = true;
-            }
+        // While a page loads, wake every frame to show its progress; otherwise sleep until
+        // an event arrives.
+        let mut wait = if self.load.is_some() {
+            LOAD_POLL
+        } else {
+            IDLE_AFTER
+        };
+        // Wake when a waiting tooltip is due, or a script timer.
+        if let Some(h) = self.hover.as_ref().filter(|h| !h.shown) {
+            wait = wait.min(TOOLTIP_DELAY.saturating_sub(h.since.elapsed()));
         }
+        if let Some(due) = self.next_page_timer() {
+            wait = wait.min(due);
+        }
+        if let Some((at, _)) = &self.refresh {
+            wait = wait.min(at.saturating_duration_since(Instant::now()));
+        }
+        if let Some(at) = self.offline_retry {
+            wait = wait.min(at.saturating_duration_since(Instant::now()));
+        }
+        // Answers to the page's requests arrive on their own channel: look each frame.
+        if self.page_requests_busy() || !self.background.is_empty() || self.image_fetch.is_some() {
+            wait = wait.min(LOAD_POLL);
+        }
+        let mut repaint = Repaint::Nothing;
+        let mut quiet = false;
+        match events.recv_timeout(wait) {
+            Ok(event) => {
+                repaint = repaint.max(self.apply(event));
+                for event in events.try_iter() {
+                    repaint = repaint.max(self.apply(event));
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => quiet = true,
+            Err(RecvTimeoutError::Disconnected) => return false,
+        }
+        if self.poll_load() {
+            // Progress moves the loading line; a finished load painted its page already.
+            repaint = repaint.max(Repaint::Header);
+        }
+        if self.tick()
+            | self.run_page_timers()
+            | self.poll_page_requests()
+            | self.poll_background()
+            | self.poll_images()
+        {
+            repaint = Repaint::Frame;
+        }
+        self.run_refresh();
+        self.retry_if_online();
+        if repaint != Repaint::Nothing {
+            self.repaint(repaint);
+            *trimmed = false;
+        } else if quiet && self.load.is_none() && !*trimmed {
+            self.window.idle();
+            // Scrolling is not saved as it happens: a crash loses at most the last second.
+            self.save_session_now();
+            *trimmed = true;
+        }
+        true
     }
 
     /// Show the first frame, bring back the last session, and open the page from the command
@@ -1140,8 +1214,21 @@ impl<S: Screen> Browser<S> {
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty())
             .collect();
+        // After a crash the visible tab waits: if its page brought Broxee down, opening it
+        // again at once would do it again.
+        let crashed = std::mem::take(&mut self.crashed);
         if targets.is_empty() {
-            self.wake();
+            if crashed && self.tab().entry().is_some() {
+                self.show_note(
+                    "Broxee quit unexpectedly",
+                    "Your tabs are back. This one waits until you open it, in case it caused \
+                     the problem.",
+                    "Open the page",
+                );
+                self.render();
+            } else {
+                self.wake();
+            }
         }
         let last = targets.len().saturating_sub(1);
         for (i, target) in targets.iter().enumerate() {
@@ -1152,7 +1239,7 @@ impl<S: Screen> Browser<S> {
                 self.wait_for_load();
             }
         }
-        if self.panes.len() > 1 && self.opts.panes <= 1 {
+        if self.panes.len() > 1 && self.opts.panes <= 1 && !crashed {
             // Restored panes: show each once so every one has its page, ending with the one
             // that had focus.
             let focused = self.focused;
@@ -3354,6 +3441,12 @@ impl<S: Screen> Browser<S> {
     /// Follow a link the person chose, by click or with Enter. `referrer`: what the link
     /// lets the next page know about this one (`link_referrer`).
     fn follow(&mut self, url: net::Url, referrer: Option<net::Referrer>) {
+        // "Try again" on a Broxee page shown for the tab's own entry opens that entry again,
+        // keeping the history after it.
+        let index = self.tab().index;
+        if !self.page_is_entry && self.tab().entry().is_some_and(|e| e.url == url) {
+            return self.navigate(url, Destination::Entry(index));
+        }
         self.save_scroll();
         // A link from another site does not carry SameSite=Strict cookies.
         let from = self
@@ -4576,6 +4669,7 @@ impl<S: Screen> Browser<S> {
         let post = body.is_some();
         let background = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = Arc::clone(&background);
+        let (load_page, log) = (self.load_page, self.crash_log.clone());
         let spawned = std::thread::Builder::new()
             .name("load".into())
             .spawn(move || {
@@ -4585,15 +4679,17 @@ impl<S: Screen> Browser<S> {
                     referrer: referrer.as_ref(),
                 };
                 // A failed send means the browser dropped the load: stop at the next stage.
-                let result = engine::load_in_tab(
-                    &target,
-                    body.as_ref(),
-                    settings,
-                    &fonts,
-                    Some(jar),
-                    Some(&flag),
-                    &mut |progress| sender.send(LoadMessage::Progress(progress)).is_ok(),
-                );
+                let result = contain(log.as_deref(), &target, || {
+                    load_page(
+                        &target,
+                        body.as_ref(),
+                        settings,
+                        &fonts,
+                        Some(jar),
+                        Some(&flag),
+                        &mut |progress| sender.send(LoadMessage::Progress(progress)).is_ok(),
+                    )
+                });
                 let _ = sender.send(LoadMessage::Done(Box::new(result)));
             });
         let load = Load {
@@ -4689,7 +4785,7 @@ impl<S: Screen> Browser<S> {
         let mut offline = false;
         let mut page = result.unwrap_or_else(|e| {
             // A file that is not there is not a network problem.
-            offline = url.scheme != "file" && !(self.online)();
+            offline = url.scheme != "file" && e != crash::PAGE_CRASHED && !(self.online)();
             engine::page_from_html(
                 url.clone(),
                 &error_page(&url, &e, offline, &self.chrome),
@@ -4829,17 +4925,20 @@ impl<S: Screen> Browser<S> {
         let background = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = Arc::clone(&background);
         let url = snapshot.url.clone();
+        let (target, log) = (url.clone(), self.crash_log.clone());
         let spawned = std::thread::Builder::new()
             .name("load".into())
             .spawn(move || {
-                let result = engine::restore_in_tab(
-                    snapshot,
-                    settings,
-                    &fonts,
-                    Some(&cookies),
-                    Some(&flag),
-                    &mut |progress| sender.send(LoadMessage::Progress(progress)).is_ok(),
-                );
+                let result = contain(log.as_deref(), &target, || {
+                    engine::restore_in_tab(
+                        snapshot,
+                        settings,
+                        &fonts,
+                        Some(&cookies),
+                        Some(&flag),
+                        &mut |progress| sender.send(LoadMessage::Progress(progress)).is_ok(),
+                    )
+                });
                 let _ = sender.send(LoadMessage::Done(Box::new(result)));
             });
         let load = Load {
@@ -5316,6 +5415,8 @@ impl<S: Screen> Browser<S> {
         })
     }
 
+    /// Write the session file if it changed since it was last written: atomically (a crash
+    /// leaves the old file or the new one, never half of one), after every change.
     fn save_session(&self) {
         let Some(path) = &self.session else {
             return;
@@ -5326,11 +5427,30 @@ impl<S: Screen> Browser<S> {
             (self.sidebar_width, self.sidebar),
             self.saved_panes().as_ref(),
         );
-        // History is private: the file is this user's only, like the cookies.
-        if let Err(e) = write_private(path, text.as_bytes()) {
-            self.window
-                .set_title(&format!("Broxee: couldn't save the session ({e})"));
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            text.hash(&mut h);
+            h.finish()
+        };
+        if hash == self.saved.get() {
+            return;
         }
+        // History is private: the file is this user's only, like the cookies.
+        match write_private(path, text.as_bytes()) {
+            Ok(()) => self.saved.set(hash),
+            Err(e) => self
+                .window
+                .set_title(&format!("Broxee: couldn't save the session ({e})")),
+        }
+    }
+
+    /// The session with the visible page's scroll position as it is now.
+    fn save_session_now(&mut self) {
+        if self.page_is_entry {
+            self.save_scroll();
+        }
+        self.save_session();
     }
 
     /// A page Broxee writes itself, without a history entry.
@@ -5340,6 +5460,92 @@ impl<S: Screen> Browser<S> {
         let html = message_page(title, detail, None, &self.chrome);
         let page = engine::page_from_html(url, &html, self.settings(), &self.fonts);
         self.show(page, 0.0);
+    }
+
+    /// Show a Broxee page in place of the visible tab's page, without touching its history:
+    /// `title`, `detail`, and a link labelled `action` that opens the tab's page again.
+    fn show_note(&mut self, title: &str, detail: &str, action: &str) {
+        self.stop_load();
+        let entry = self.tab().entry().map(|e| e.url.clone());
+        let html = message_page(
+            title,
+            detail,
+            entry.as_ref().map(|url| (url, action)),
+            &self.chrome,
+        );
+        let url =
+            entry.unwrap_or_else(|| net::Url::parse("file:///").expect("a file URL always parses"));
+        let page = engine::page_from_html(url, &html, self.settings(), &self.fonts);
+        self.show(page, 0.0);
+    }
+
+    /// Run `work`. If it panics, the page it worked on is dropped, the visible tab shows what
+    /// happened, and the browser goes on; `None` then. A panic while recovering ends the
+    /// process, leaving the marker for the next start to notice.
+    fn guarded<R>(&mut self, work: impl FnOnce(&mut Self) -> R) -> Option<R> {
+        let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(self)));
+        match done {
+            Ok(result) => Some(result),
+            Err(_) => {
+                let recovered =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.recover()));
+                if recovered.is_err() {
+                    crash::record(self.crash_log.as_deref(), "");
+                    std::process::abort();
+                }
+                None
+            }
+        }
+    }
+
+    /// After a panic on the engine thread: note it, drop the visible page and everything made
+    /// from it (the panic may have left any of it half changed), and say so in its place.
+    /// Tabs, history, profiles and sleeping tabs stay.
+    fn recover(&mut self) {
+        let url = self
+            .page
+            .as_ref()
+            .map(|p| p.url.clone())
+            .or_else(|| self.load.as_ref().map(|l| l.url.clone()));
+        let host = url.as_ref().map_or(String::new(), |u| u.host.clone());
+        crash::record(self.crash_log.as_deref(), &host);
+        self.load = None;
+        self.loading = None;
+        self.page = None;
+        self.page_is_entry = false;
+        self.painter = Painter::new();
+        self.selection = None;
+        self.find = None;
+        self.dropdown = None;
+        self.editing = None;
+        self.field = None;
+        self.focus = None;
+        self.link_focus = None;
+        self.link_preview = None;
+        self.hover = None;
+        self.menu = None;
+        self.dialog = None;
+        self.palette = None;
+        self.drag = None;
+        self.image_fetch = None;
+        self.refresh = None;
+        self.offline_retry = None;
+        self.frame_geometry = None;
+        // Keep every index in range, in case the panic came halfway through a change.
+        for profile in &mut self.profiles {
+            if profile.tabs.is_empty() {
+                profile.tabs.push(Tab::default());
+            }
+            profile.active = profile.active.min(profile.tabs.len() - 1);
+            for tab in &mut profile.tabs {
+                tab.index = tab.index.min(tab.history.len().saturating_sub(1));
+            }
+        }
+        self.profile = self.profile.min(self.profiles.len() - 1);
+        let (title, detail) = crashed_text(&url.as_ref().map_or(String::new(), host_of));
+        self.show_note(&title, &detail, "Try again");
+        self.save_session();
+        self.render();
     }
 
     /// Show `page` in the pane; returns its title.
@@ -6625,6 +6831,10 @@ fn host_of(url: &net::Url) -> String {
 /// again. `offline`: no network interface was up, whatever the error says.
 fn error_page(url: &net::Url, error: &str, offline: bool, chrome: &Chrome) -> String {
     let host = host_of(url);
+    if error == crash::PAGE_CRASHED {
+        let (title, detail) = crashed_text(&host);
+        return message_page(&title, &detail, Some((url, "Try again")), chrome);
+    }
     let kind = if offline {
         None
     } else {
@@ -6663,15 +6873,33 @@ fn error_page(url: &net::Url, error: &str, offline: bool, chrome: &Chrome) -> St
         ),
         Some(net::Failure::Other) => (format!("Couldn't reach {host}"), error.to_string()),
     };
-    message_page(&title, &detail, Some(url), chrome)
+    message_page(&title, &detail, Some((url, "Try again")), chrome)
+}
+
+/// What a page whose work panicked shows in its place.
+fn crashed_text(host: &str) -> (String, String) {
+    let site = if host.is_empty() { "This page" } else { host };
+    (
+        "Broxee couldn't show this page".to_string(),
+        format!(
+            "{site} ran into a bug in Broxee, so the page was closed. Your other tabs are \
+             still open. Where it happened is noted in a crash log that stays on this computer."
+        ),
+    )
 }
 
 /// A small page in Broxee's own style (DESIGN.md tokens), rendered by the engine itself.
-fn message_page(title: &str, detail: &str, retry: Option<&net::Url>, chrome: &Chrome) -> String {
+/// `action` is a link and its label ("Try again"), shown under the address it opens.
+fn message_page(
+    title: &str,
+    detail: &str,
+    action: Option<(&net::Url, &str)>,
+    chrome: &Chrome,
+) -> String {
     let t = chrome.theme();
-    let action = retry.map_or(String::new(), |url| {
-        let url = escape(&url.to_string());
-        format!("<p class=url>{url}</p><p><a href=\"{url}\">Try again</a></p>")
+    let action = action.map_or(String::new(), |(url, label)| {
+        let (url, label) = (escape(&url.to_string()), escape(label));
+        format!("<p class=url>{url}</p><p><a href=\"{url}\">{label}</a></p>")
     });
     format!(
         "<!doctype html><html><head><title>{title}</title><style>\
@@ -11142,5 +11370,192 @@ mod tests {
             })
             .collect();
         std::fs::write(out, paint::png::encode(frame.0, frame.1, &rgba)).unwrap();
+    }
+
+    /// The id of a process that has exited, for a marker left by a run that crashed.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    /// A fresh folder with a session path in it.
+    fn session_in(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("broxee-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("session")
+    }
+
+    /// Loads a page like the engine, except that pages named `boom.html` panic while building.
+    fn panicking_loader(
+        url: &net::Url,
+        body: Option<&net::Body>,
+        settings: Settings,
+        fonts: &FontStore,
+        jar: Option<engine::Jar>,
+        background: Option<&std::sync::atomic::AtomicBool>,
+        progress: &mut dyn FnMut(f32) -> bool,
+    ) -> Result<engine::Outcome, String> {
+        if url.path.ends_with("boom.html") {
+            panic!("the engine hit a bug");
+        }
+        engine::load_in_tab(url, body, settings, fonts, jar, background, progress)
+    }
+
+    #[test]
+    fn a_crash_brings_the_session_back_with_the_visible_tab_waiting() {
+        let (a, bpath) = site("crash-restore");
+        let session = session_in("crash-restore-session");
+        let marker = crash::marker_for(&session);
+        let mut b = browser_with(&a, Some(session.clone()));
+        assert!(!b.crashed, "a first run");
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            std::process::id().to_string(),
+            "the running browser's marker"
+        );
+        act(&mut b, command('t'));
+        open(&mut b, &bpath);
+        act(&mut b, command_shift('2'));
+        assert_eq!(b.panes.len(), 2);
+        act(&mut b, key(Key::PageDown));
+        drop(b);
+        assert!(!marker.exists(), "a clean end removes the marker");
+
+        // The next run is killed: its marker stays behind.
+        std::fs::write(&marker, dead_pid().to_string()).unwrap();
+        let mut b = browser_with(Path::new(""), Some(session.clone()));
+        assert_eq!(tab_titles(&b), ["Page A", "Page B"], "every tab is back");
+        assert_eq!(b.panes.len(), 2, "and the split");
+        assert_eq!(title(&b), "Broxee quit unexpectedly");
+        assert!(b.load.is_none() && !b.page_is_entry, "nothing loaded");
+        let shown = b.page.as_ref().unwrap();
+        assert!(shown
+            .dom
+            .text_content(html::Dom::ROOT)
+            .contains("Open the page"));
+        assert!(b
+            .profiles
+            .iter()
+            .all(|p| p.tabs.iter().all(|t| t.snapshot.is_none())));
+        let tab = b.tab();
+        assert_eq!((tab.history.len(), tab.title()), (1, "Page B"));
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            std::process::id().to_string(),
+            "this run's marker replaces the old one"
+        );
+
+        // Opening the page again keeps its history entry, not a copy of it.
+        click_text(&mut b, "Open the page");
+        assert_eq!(title(&b), "Page B");
+        assert_eq!(b.tab().history.len(), 1);
+        drop(b);
+
+        // A clean end: the next start loads the visible tab as usual.
+        let b = browser_with(Path::new(""), Some(session));
+        assert_eq!(title(&b), "Page B");
+        assert!(b.page_is_entry);
+    }
+
+    #[test]
+    fn a_page_that_panics_while_loading_shows_an_error_and_other_tabs_keep_working() {
+        let (a, _) = site("crash-load");
+        let boom = a.with_file_name("boom.html");
+        std::fs::write(&boom, "<title>Boom</title>").unwrap();
+        let session = session_in("crash-load-session");
+        let mut b = browser_with(&a, Some(session.clone()));
+        b.load_page = panicking_loader;
+        act(&mut b, command('t'));
+        open(&mut b, &boom);
+        assert_eq!(title(&b), "Broxee couldn't show this page");
+        let shown = b.page.as_ref().unwrap();
+        let text = shown.dom.text_content(html::Dom::ROOT);
+        assert!(
+            text.contains("boom.html ran into a bug in Broxee"),
+            "{text}"
+        );
+        assert!(text.contains("Try again"));
+        assert!(b.offline_retry.is_none(), "not taken for being offline");
+
+        // The other tab wakes as before.
+        act(&mut b, command('1'));
+        assert_eq!(title(&b), "Page A");
+        assert!(b.page_is_entry);
+        act(&mut b, command('2'));
+        assert_eq!(b.tab().history.len(), 1);
+        // Try again loads the same entry again.
+        click_text(&mut b, "Try again");
+        assert_eq!(title(&b), "Broxee couldn't show this page");
+        assert_eq!(b.tab().history.len(), 1);
+
+        let log = std::fs::read_to_string(crash::log_for(&session)).unwrap();
+        let line = log.lines().next().unwrap();
+        let fields: Vec<&str> = line.split('\t').collect();
+        assert_eq!(fields.len(), 3, "{line}");
+        assert_eq!(fields[1], "(local)", "a file has no host");
+        assert!(
+            !log.contains("the engine hit a bug"),
+            "never the panic message"
+        );
+        assert!(!log.contains("boom.html"), "never the address");
+    }
+
+    #[test]
+    fn a_panic_on_the_engine_thread_closes_only_the_page() {
+        let (a, bpath) = site("crash-engine");
+        let session = session_in("crash-engine-session");
+        let mut b = browser_with(&a, Some(session.clone()));
+        act(&mut b, command('t'));
+        open(&mut b, &bpath);
+        let done = b.guarded(|b| {
+            b.scroll = 5.0;
+            panic!("layout went wrong")
+        });
+        assert!(done.is_none());
+        assert_eq!(title(&b), "Broxee couldn't show this page");
+        assert!(!b.page_is_entry);
+        assert_eq!(tab_titles(&b), ["Page A", "Page B"], "tabs stay");
+        assert!(
+            b.profiles[0].tabs[0].snapshot.is_some(),
+            "sleeping tabs stay"
+        );
+        let log = std::fs::read_to_string(crash::log_for(&session)).unwrap();
+        assert!(log.contains("\t(local)\t"), "{log}");
+
+        act(&mut b, command('r'));
+        assert_eq!(title(&b), "Page B", "reload opens the page again");
+        act(&mut b, command('1'));
+        assert_eq!(title(&b), "Page A");
+        assert_eq!(b.guarded(|_| 7), Some(7), "work that does not panic");
+    }
+
+    #[test]
+    fn damaged_session_and_marker_files_still_give_a_usable_browser() {
+        let (a, bpath) = site("crash-damaged");
+        let session = session_in("crash-damaged-session");
+        let mut b = browser_with(&a, Some(session.clone()));
+        act(&mut b, command('t'));
+        open(&mut b, &bpath);
+        drop(b);
+        let good = std::fs::read(&session).unwrap();
+        let marker = crash::marker_for(&session);
+
+        let mut damaged: Vec<Vec<u8>> = (1..8)
+            .map(|i| good[..good.len() * i / 8].to_vec())
+            .collect();
+        damaged.push(vec![0xff, 0xfe, 0x00, b'\t', b'\n']);
+        damaged
+            .push(b"broxee-session 1\npanes\t9\t-1\t2\npane\t7\t99\nprofile\t99\t\t\t\n".to_vec());
+        for (i, bytes) in damaged.iter().enumerate() {
+            std::fs::write(&session, bytes).unwrap();
+            std::fs::write(&marker, b"\xff not a pid").unwrap();
+            let mut b = browser_with(Path::new(""), Some(session.clone()));
+            assert!(!b.profiles.is_empty(), "case {i}");
+            open(&mut b, &a);
+            assert_eq!(title(&b), "Page A", "case {i}: the browser works");
+        }
     }
 }

@@ -238,6 +238,8 @@ Every list and every page Broxee draws has its empty, loading and error state.
 | No bookmarks | "No bookmarks yet. Press ⌘D on any page to save it here." |
 | ⌘K finds nothing | "Nothing matches "rust bok". Press Enter to search the web." |
 | Restored session | Tabs come back asleep except the visible ones, so startup stays fast. No banner announcing it. |
+| A page hit a bug in Broxee | Broxee page in that tab: "Broxee couldn't show this page", that the other tabs are still open and where the note went (a crash log on this computer), the address, and **Try again**. |
+| Restored after a crash | Tabs come back as above, but the visible tab waits with a Broxee page: "Broxee quit unexpectedly", why it waits, and **Open the page**. Still no banner. |
 
 ## 10. Size and speed budget for the design
 
