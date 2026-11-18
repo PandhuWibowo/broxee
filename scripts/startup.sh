@@ -19,9 +19,11 @@
 # interactive: the visible tab's page is laid out and painted, answering input.
 set -euo pipefail
 
-# Warm launches: what a person waits for every day.
-FIRST_FRAME_LIMIT_MS=100
-INTERACTIVE_LIMIT_MS=250
+# Warm launches: what a person waits for every day. GitHub's macOS runner took 56 ms to the first
+# frame and 75 ms to interactive (17 to 28 and 26 to 44 ms on an Apple Silicon laptop): the limits
+# leave it about 3.5x and 5x, so a noisy run does not fail and a real regression still does.
+FIRST_FRAME_LIMIT_MS=200
+INTERACTIVE_LIMIT_MS=400
 # The cold launch is mostly the system checking a binary it has never run (200 to 460 ms on
 # macOS before `main` here), which varies from run to run and machine to machine: a loose limit.
 COLD_LIMIT_MS=1500

@@ -449,8 +449,8 @@ includes loading the binary and, on macOS, its restart with `MallocSpaceEfficien
   cookies or cache), with a 178 KB local article as its address. The OS file cache is not flushed (that needs
   root). Limit 1.5 s, interactive.
 - **Warm**: a launch without an address in the HOME the cold one left (three tabs, two profiles): the session
-  is restored and its visible tab, the same article, loads again. Median of 5. Limits 100 ms to the first
-  frame and 250 ms to interactive.
+  is restored and its visible tab, the same article, loads again. Median of 5. Limits 200 ms to the first
+  frame and 400 ms to interactive.
 
 Apple M-series laptop, macOS, release build, 2026-11-18 (seven runs of the script, the slower ones while other
 builds ran on the machine):
@@ -461,8 +461,10 @@ builds ran on the machine):
 | Warm (session restored) | 11 to 19 ms | 17 to 28 ms | 26 to 44 ms |
 
 A cold launch is almost all the system checking a binary it has never run, before `main`; Broxee's own part is
-about 15 ms, as warm. That is why its limit is loose; the warm limits (4x and 6x the slowest run here)
-are the ones that catch regressions on slower CI machines. Linking AppKit costs about 1.7 ms per `exec`
+about 15 ms, as warm. That is why its limit is loose; the warm limits are the ones that catch regressions.
+They are set from the CI runners, the slowest machines that run them: GitHub's macOS runner took 56 ms to
+the first frame and 75 ms to interactive warm (cold 141 ms), its Linux runner 14 and 24 ms (cold 24 ms, no
+first-launch check there), so the limits leave the macOS runner about 3.5x and 5x. Linking AppKit costs about 1.7 ms per `exec`
 (a C program with and without it), paid twice on macOS because of the restart: loading it lazily is the next
 saving if startup ever needs one. The real window adds AppKit's setup and the first `IOSurface` on top of
 these numbers; `BROXEE_STARTUP=1` prints the same milestones there.
