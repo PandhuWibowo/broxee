@@ -181,6 +181,10 @@ pub struct Loaded {
     /// after loading): the window fetches them and lays the page out again.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
     pub pending_images: Vec<String>,
+    /// What the page's requests tell other servers about it (`Referer`): its
+    /// `<meta name=referrer>`, else its `Referrer-Policy` header, else the default.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
+    pub referrer_policy: net::ReferrerPolicy,
     /// The response's `Refresh` header, when it had one (a woken tab has none).
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
     pub refresh_header: Option<String>,
@@ -228,6 +232,8 @@ pub struct Sources {
     pub scripts: Vec<(String, net::Wire)>,
     /// `@font-face` files the page used, by URL.
     pub fonts: Vec<(String, net::Wire)>,
+    /// The policy the response's `Referrer-Policy` header named, if any.
+    pub referrer_header: Option<net::ReferrerPolicy>,
     /// Downloaded in the background and never built: the fonts and CSS background images,
     /// which only styling finds, are not here yet, so building it fetches them (`restore`).
     pub partial: bool,
@@ -304,6 +310,7 @@ pub fn restore_in_tab(
         bytes,
         fetch_ms: 0.0,
         parse_ms: millis(started),
+        referrer_header: sources.referrer_header,
     };
     let mut outcome = finish(
         source,
@@ -333,6 +340,9 @@ pub fn restore_in_tab(
 pub struct Jar<'a> {
     pub cookies: &'a net::Cookies,
     pub same_site_initiator: bool,
+    /// The page a link, form or script navigation came from; `None` for what the person
+    /// typed or chose in the browser.
+    pub referrer: Option<&'a net::Referrer>,
 }
 
 /// Where a page's subresources come from. Made once per load and moved into `finish`,
@@ -413,7 +423,8 @@ pub fn load_in_tab(
     progress: &mut dyn FnMut(f32) -> bool,
 ) -> Result<Outcome, String> {
     let started = Instant::now();
-    let context = net::Context::top_level(jar.is_none_or(|j| j.same_site_initiator));
+    let context = net::Context::top_level(jar.is_none_or(|j| j.same_site_initiator))
+        .with_referrer(jar.and_then(|j| j.referrer.cloned()));
     let resp = net::send_in(url, body, jar.map(|j| (j.cookies, &context)))?;
     let fetch_ms = millis(started);
     if !progress(0.4) {
@@ -424,6 +435,9 @@ pub fn load_in_tab(
     let dom = html::parse(&String::from_utf8_lossy(&resp.body));
     let parse_ms = millis(started);
     let refresh_header = resp.header("refresh").map(str::to_string);
+    let referrer_header = resp
+        .header("referrer-policy")
+        .and_then(net::ReferrerPolicy::from_list);
     let (response_url, status, bytes) = (resp.url, resp.status, resp.body.len());
     // The DOM holds everything later stages need. Keep the HTML only as it arrived: the
     // compressed bytes when there are some, otherwise the body itself.
@@ -452,6 +466,7 @@ pub fn load_in_tab(
             bytes,
             fetch_ms,
             parse_ms,
+            referrer_header,
         },
         dom,
         settings,
@@ -490,6 +505,7 @@ pub fn page_from_html(
         bytes: source.len(),
         fetch_ms: 0.0,
         parse_ms: 0.0,
+        referrer_header: None,
     };
     let mut page = finish(
         origin,
@@ -515,6 +531,7 @@ struct Source {
     bytes: usize,
     fetch_ms: f64,
     parse_ms: f64,
+    referrer_header: Option<net::ReferrerPolicy>,
 }
 
 fn finish(
@@ -545,7 +562,9 @@ fn finish(
     // same way when a sleeping tab wakes, and stored images refer to nodes by id.
     let parser_nodes = dom.len();
     let base = document_base(&dom, &source.url);
-    let context = net::Context::subresource(&source.url);
+    // From the parser's nodes, like the images: a waking tab gets the same policy.
+    let referrer_policy = document_policy(&dom, source.referrer_header);
+    let context = net::Context::subresource(&source.url).with_policy(referrer_policy);
     let script_from = match &from {
         From::Network(cookies) => {
             crate::script::ScriptFrom::Network(cookies.map(|c| (c, &context)))
@@ -564,7 +583,7 @@ fn finish(
         );
     let (css, mut images, stylesheets) = load_subresources(
         &dom,
-        (&source.url, &base),
+        (&context, &base),
         from,
         script.is_some(),
         parser_nodes,
@@ -583,6 +602,7 @@ fn finish(
                     stylesheets,
                     scripts,
                     fonts: Vec::new(),
+                    referrer_header: source.referrer_header,
                     partial: true,
                 },
                 images,
@@ -606,13 +626,13 @@ fn finish(
             backgrounds::load(
                 &dom,
                 &styles,
-                (&source.url, &base),
+                (&context, &base),
                 background_from,
                 &images,
                 added,
             )
         });
-        let fonts = webfonts::load(&dom, &styles, &css.sheets, &source.url, font_from, fonts);
+        let fonts = webfonts::load(&dom, &styles, &css.sheets, &context, font_from, fonts);
         (fonts, backgrounds.join().unwrap_or_default())
     });
     images.add_backgrounds(backgrounds);
@@ -628,6 +648,7 @@ fn finish(
         url: source.url,
         base,
         pending_images,
+        referrer_policy,
         refresh_header: None,
         status: source.status,
         bytes: source.bytes,
@@ -641,6 +662,7 @@ fn finish(
             stylesheets,
             scripts,
             fonts: font_files,
+            referrer_header: source.referrer_header,
             partial: false,
         },
         webfonts,
@@ -655,6 +677,17 @@ fn finish(
         fonts_wait_ms,
         layout_ms,
     })))
+}
+
+impl Loaded {
+    /// This page as the referrer of what it asks for, under its own policy.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
+    pub fn referrer(&self) -> net::Referrer {
+        net::Referrer {
+            page: self.url.clone(),
+            policy: self.referrer_policy,
+        }
+    }
 }
 
 /// Cascade and lay out again, for a new viewport size or color scheme. `@media` rules can
@@ -875,6 +908,23 @@ pub fn document_base(dom: &Dom, url: &net::Url) -> net::Url {
         .unwrap_or_else(|| url.clone())
 }
 
+/// The document's referrer policy: the last `<meta name=referrer>` that names one (outside
+/// `<noscript>`), else the response's `Referrer-Policy` header, else the default.
+pub fn document_policy(dom: &Dom, header: Option<net::ReferrerPolicy>) -> net::ReferrerPolicy {
+    dom.descendants(Dom::ROOT)
+        .filter(|&id| {
+            dom.tag_name(id) == Some("meta")
+                && dom
+                    .attr(id, "name")
+                    .is_some_and(|n| n.trim().eq_ignore_ascii_case("referrer"))
+                && !in_noscript(dom, id)
+        })
+        .filter_map(|id| net::ReferrerPolicy::from_meta(dom.attr(id, "content")?))
+        .last()
+        .or(header)
+        .unwrap_or_default()
+}
+
 /// `href` resolved against `base` when it names an http, https or file address. `Url::join`
 /// reads an unknown scheme (`javascript:`, `data:`) as a path, so those are refused first.
 fn web_url(base: &net::Url, href: &str) -> Option<net::Url> {
@@ -987,7 +1037,7 @@ pub fn in_noscript(dom: &Dom, id: NodeId) -> bool {
 /// URLs resolve against.
 fn load_subresources(
     dom: &Dom,
-    (page, base): (&net::Url, &net::Url),
+    (context, base): (&net::Context, &net::Url),
     from: From,
     scripted: bool,
     parser_nodes: usize,
@@ -1001,8 +1051,7 @@ fn load_subresources(
         _ => None,
     };
     // Subresources send and store cookies only for the page's own site.
-    let context = net::Context::subresource(page);
-    let jar = cookies.map(|c| (c, &context));
+    let jar = cookies.map(|c| (c, context));
     let mut jobs = Vec::new();
     for id in dom.descendants(Dom::ROOT) {
         if jobs.len() >= MAX_STYLESHEETS {
@@ -1030,6 +1079,11 @@ fn load_subresources(
         Default::default()
     };
     let image_keys: Vec<String> = image_sources.iter().map(|(k, _)| k.clone()).collect();
+    let own_policies = if image_sources.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        images::own_policies(dom, base)
+    };
     jobs.extend(image_sources.into_iter().map(|(_, s)| Job::Image(s)));
 
     // Rules that need names this document lacks are dropped while parsing, unless scripts
@@ -1044,12 +1098,18 @@ fn load_subresources(
     let results = pool::map_ordered(jobs, FETCH_WORKERS, |job| match job {
         Job::Css(source) => Done::Css(load_css(source, base, &vocabulary, (stored, fallback), jar)),
         Job::Image(images::Source::Inline(bytes)) => Done::Image(Some(bytes)),
-        Job::Image(images::Source::Url(url)) => Done::Image(
-            net::fetch_in(&url, jar)
-                .ok()
-                .filter(|r| r.status == 200)
-                .map(|r| r.body),
-        ),
+        Job::Image(images::Source::Url(url)) => {
+            let own = own_policies
+                .get(&url.to_string())
+                .map(|&p| context.clone().with_policy(p));
+            let jar = cookies.map(|c| (c, own.as_ref().unwrap_or(context)));
+            Done::Image(
+                net::fetch_in(&url, jar)
+                    .ok()
+                    .filter(|r| r.status == 200)
+                    .map(|r| r.body),
+            )
+        }
     });
 
     let mut loaded = LoadedCss {
@@ -1187,6 +1247,27 @@ pub fn millis(since: Instant) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_document_policy_comes_from_meta_then_the_header() {
+        use net::ReferrerPolicy as P;
+        let policy = |html: &str, header| document_policy(&html::parse(html), header);
+        assert_eq!(policy("<p>x", None), P::StrictOriginWhenCrossOrigin);
+        assert_eq!(policy("<p>x", Some(P::Origin)), P::Origin);
+        assert_eq!(
+            policy("<meta name=Referrer content=never>", Some(P::UnsafeUrl)),
+            P::NoReferrer
+        );
+        // The last meta that names a policy; unknown ones and `<noscript>` ones do not count.
+        assert_eq!(
+            policy(
+                "<meta name=referrer content=origin><meta name=referrer content=bogus>\
+                 <noscript><meta name=referrer content=unsafe-url></noscript>",
+                None
+            ),
+            P::Origin
+        );
+    }
 
     #[test]
     fn opens_files_with_spaces_in_their_names() {

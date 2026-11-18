@@ -22,7 +22,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::engine::{Snapshot, Sources};
 use crate::images::ImageStore;
 
-const MAGIC: &[u8] = b"broxee-tab 6\n";
+const MAGIC: &[u8] = b"broxee-tab 7\n";
+/// The byte for a page whose response named no `Referrer-Policy`.
+const NO_POLICY: u8 = 0xff;
 /// Parts smaller than this stay in the tab's own file.
 const SHARED_FROM: usize = 4096;
 
@@ -231,6 +233,8 @@ fn encode(s: &Snapshot, out: &mut impl Write, share: &mut Share) -> io::Result<(
     put_bytes(out, s.url.to_string().as_bytes())?;
     out.write_all(&s.status.to_le_bytes())?;
     out.write_all(&[u8::from(s.sources.partial)])?;
+    let policy = s.sources.referrer_header.map_or(NO_POLICY, |p| p.to_byte());
+    out.write_all(&[policy])?;
     put_wire(out, &s.sources.html, share)?;
     put_u32(out, s.sources.stylesheets.len())?;
     for (url, wire) in &s.sources.stylesheets {
@@ -379,6 +383,10 @@ fn decode(
         1 => true,
         _ => return None,
     };
+    let referrer_header = match r.array::<1>()?[0] {
+        NO_POLICY => None,
+        b => Some(net::ReferrerPolicy::from_byte(b)?),
+    };
     let html = r.wire()?;
     let mut stylesheets = Vec::new();
     for _ in 0..r.count(9)? {
@@ -415,6 +423,7 @@ fn decode(
             stylesheets,
             scripts,
             fonts,
+            referrer_header,
             partial,
         },
         images: ImageStore::from_parts(files, uses, urls),
@@ -455,6 +464,7 @@ mod tests {
                         bytes: b"wOF2".to_vec(),
                     },
                 )],
+                referrer_header: Some(net::ReferrerPolicy::Origin),
                 partial: true,
             },
             images: ImageStore::from_parts(
@@ -476,6 +486,10 @@ mod tests {
         assert_eq!(back.sources.html.bytes, [1, 2, 3]);
         assert_eq!(back.sources.fonts[0].0, "https://example.com/f.woff2");
         assert_eq!(back.sources.fonts[0].1.bytes, b"wOF2");
+        assert_eq!(
+            back.sources.referrer_header,
+            Some(net::ReferrerPolicy::Origin)
+        );
         assert!(
             back.sources.partial,
             "a downloaded tab stays partial until built"

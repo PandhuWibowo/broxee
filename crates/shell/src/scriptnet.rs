@@ -29,6 +29,8 @@ pub struct ScriptNet {
     /// The document's base URL, which request URLs resolve against.
     base: net::Url,
     jar: Option<Arc<net::Cookies>>,
+    /// The page's referrer policy, given with the jar.
+    policy: net::ReferrerPolicy,
     queued: Vec<(u32, js::Request)>,
     /// `document.cookie` writes made before the page had its profile's jar.
     cookie_writes: Vec<String>,
@@ -47,6 +49,7 @@ impl ScriptNet {
             page,
             base,
             jar: None,
+            policy: net::ReferrerPolicy::default(),
             queued: Vec::new(),
             cookie_writes: Vec::new(),
             sender,
@@ -70,10 +73,12 @@ impl ScriptNet {
         Some(id)
     }
 
-    /// The page is shown: requests may go out, with the cookies of `jar`'s profile.
+    /// The page is shown: requests may go out, with the cookies of `jar`'s profile and the
+    /// `Referer` the page's `policy` allows.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
-    pub fn arm(&mut self, jar: &Arc<net::Cookies>) {
+    pub fn arm(&mut self, jar: &Arc<net::Cookies>, policy: net::ReferrerPolicy) {
         if self.jar.is_none() {
+            self.policy = policy;
             let context = net::Context::subresource(&self.page);
             for text in std::mem::take(&mut self.cookie_writes) {
                 jar.store_from_script(&self.page, &text, &context);
@@ -122,11 +127,12 @@ impl ScriptNet {
         while self.running < MAX_RUNNING && !self.queued.is_empty() {
             let (id, request) = self.queued.remove(0);
             let (page, base) = (self.page.clone(), self.base.clone());
-            let (jar, sender) = (Arc::clone(jar), self.sender.clone());
+            let (jar, sender, policy) = (Arc::clone(jar), self.sender.clone(), self.policy);
             let spawned = std::thread::Builder::new()
                 .name("script fetch".into())
                 .spawn(move || {
-                    let answer = perform((&page, &base), &request, &jar);
+                    let context = net::Context::subresource(&page).with_policy(policy);
+                    let answer = perform((&page, &base), &request, (&jar, &context));
                     // The page went away: nobody is waiting.
                     let _ = sender.send((id, answer));
                 });
@@ -199,7 +205,7 @@ fn listed(list: Option<&str>, item: &str) -> bool {
 fn perform(
     (page, base): (&net::Url, &net::Url),
     request: &js::Request,
-    jar: &net::Cookies,
+    (jar, context): (&net::Cookies, &net::Context),
 ) -> Result<js::Reply, String> {
     let url = base.join(&request.url)?;
     let same_origin = origin(&url) == origin(page);
@@ -246,8 +252,7 @@ fn perform(
         method: method.to_string(),
         headers,
     };
-    let context = net::Context::subresource(page);
-    let resp = net::send_with(&url, body.as_ref(), Some(&extra), Some((jar, &context)))?;
+    let resp = net::send_with(&url, body.as_ref(), Some(&extra), Some((jar, context)))?;
     if !same_origin {
         let allowed = resp.header("access-control-allow-origin").map(str::trim);
         if !matches!(allowed, Some(a) if a == "*" || a == page_origin) {

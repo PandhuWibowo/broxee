@@ -28,7 +28,7 @@ pub enum BackgroundFrom<'a> {
 pub fn load(
     dom: &Dom,
     styles: &StyleMap,
-    (page_url, base): (&net::Url, &net::Url),
+    (context, base): (&net::Context, &net::Url),
     from: BackgroundFrom,
     store: &ImageStore,
     extra: Vec<String>,
@@ -57,9 +57,8 @@ pub fn load(
     if wanted.is_empty() {
         return Vec::new();
     }
-    let context = net::Context::subresource(page_url);
     let jar = match from {
-        BackgroundFrom::Network(cookies) => cookies.map(|c| (c, &context)),
+        BackgroundFrom::Network(cookies) => cookies.map(|c| (c, context)),
         _ => None,
     };
     let network = matches!(from, BackgroundFrom::Network(_));

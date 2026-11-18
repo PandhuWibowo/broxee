@@ -66,7 +66,7 @@ pub fn load(
     dom: &Dom,
     styles: &StyleMap,
     sheets: &[css::Stylesheet],
-    page_url: &net::Url,
+    context: &net::Context,
     from: FontFrom,
     store: &FontStore,
 ) -> (WebFonts, Vec<(String, net::Wire)>) {
@@ -83,9 +83,8 @@ pub fn load(
     let descs: Vec<FaceDesc> = declared.iter().map(|f| describe(f)).collect();
     let wanted = needed(dom, styles, &descs);
 
-    let context = net::Context::subresource(page_url);
     let jar = match &from {
-        FontFrom::Network(cookies) => cookies.map(|c| (c, &context)),
+        FontFrom::Network(cookies) => cookies.map(|c| (c, context)),
         _ => None,
     };
     let stored = match &from {
