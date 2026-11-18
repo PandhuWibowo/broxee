@@ -125,6 +125,11 @@ casts), not taken from binding crates. Ask before proposing any dependency.
   it out (`Dom::touch`). The CLI, replays and loads in the background wait for them. A waking tab names what
   it still lacks, backgrounds too. A source that failed is not asked for again. All are stored with a sleeping tab, so a waking
   tab finds them by source whatever ids its scripts' nodes get.
+- **An `<img>`'s current source is chosen for `Loaded::device`** (viewport and scale the page was built for):
+  `srcset`, `sizes` and `<picture>` (`images::choose`). Every `key_of`, `discover`, `bind` and `own_policies`
+  call for a page passes that same device, so an element's key never changes while the page lives; a page
+  built at another size or scale simply has other sources to fetch. The chosen density divides the natural
+  size, and a chosen `<source>`'s `width`/`height` size the `<img>` (`layout::Images::sized_by`).
 - **A snapshot holds only what the page was built from**, as it arrived (`net::Wire`): rebuilding must give the
   same DOM, so `NodeId`s in the stored `ImageStore` stay valid. Do not store anything derived (styles, layout).
 - **Sleeping tabs share their large parts** (`hibernate.rs`): every part of 4 KB or more is a blob named by
@@ -192,7 +197,9 @@ casts), not taken from binding crates. Ask before proposing any dependency.
 - **A changed tile is a change.** Look at it (`./scripts/sites.sh --base main` writes red-on-faded diffs to
   `target/sites/diff`), then either fix the regression or `--update` and commit the tiles with the change.
 - **Only openly licensed pages are saved** (each `site` file names its license), or pages written for the
-  suite. Record with `./scripts/sites.sh --record NAME URL LICENSE`.
+  suite. Record with `./scripts/sites.sh --record NAME URL LICENSE`. When a change makes a saved page ask
+  for files its archive lacks (2x `srcset` files), `./scripts/sites.sh --fill NAME` fetches and appends only
+  those; commit them with the tiles.
 
 ### Change invariants
 

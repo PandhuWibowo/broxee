@@ -44,6 +44,8 @@ const SYMBOL_FONTS: [&str; 1] = ["/System/Library/Fonts/Keyboard.ttf"];
 pub struct Settings {
     pub width: f32,
     pub height: f32,
+    /// Device pixels per CSS px: which `srcset` file an `<img>` shows.
+    pub scale: f32,
     pub dark: bool,
     pub fetch_css: bool,
     /// Build the page without waiting for `<img>` files and CSS background images: they
@@ -59,6 +61,14 @@ impl Settings {
             height: self.height,
             dark: self.dark,
             ..css::Media::default()
+        }
+    }
+
+    /// What the page's `<img>` files are chosen for (`images::Device`).
+    pub fn device(&self) -> images::Device {
+        images::Device {
+            media: self.media(),
+            scale: self.scale,
         }
     }
 }
@@ -197,6 +207,9 @@ pub struct Loaded {
     pub dom: Dom,
     pub css: LoadedCss,
     pub images: ImageStore,
+    /// What the page chose its `<img>` files for, kept for its life so an element's key
+    /// stays the same; a page built again (reload, a woken tab) chooses for its new size.
+    pub device: images::Device,
     /// Form controls and what has been typed into them.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
     pub forms: Forms,
@@ -589,9 +602,10 @@ fn finish(
     // A page someone is waiting for shows before its images; one downloading in the
     // background takes them along.
     let later = settings.images_later && !downloading();
+    let device = settings.device();
     let (css, mut images, stylesheets) = load_subresources(
         &dom,
-        (&context, &base),
+        (&context, &base, &device),
         from,
         (script.is_some(), later),
         parser_nodes,
@@ -628,7 +642,7 @@ fn finish(
     // cascade and layout, at the same time.
     // `<img>` elements scripts added, or whose source they set: found by source, and
     // fetched with the backgrounds.
-    let added = images.bind(&dom, &base, images::img_nodes(&dom, Dom::ROOT));
+    let added = images.bind(&dom, &base, &device, images::img_nodes(&dom, Dom::ROOT));
     let ((mut webfonts, font_files), backgrounds) = std::thread::scope(|scope| {
         let backgrounds = scope.spawn(|| {
             backgrounds::load(
@@ -647,7 +661,7 @@ fn finish(
     images.add_backgrounds(backgrounds);
     // What is still missing (a woken page whose scripts named other files, or everything
     // with `later`) loads once the page is shown.
-    let mut pending_images = images.bind(&dom, &base, images::img_nodes(&dom, Dom::ROOT));
+    let mut pending_images = images.bind(&dom, &base, &device, images::img_nodes(&dom, Dom::ROOT));
     for key in background_later {
         if !pending_images.contains(&key) {
             pending_images.push(key);
@@ -670,6 +684,7 @@ fn finish(
         dom,
         css,
         images,
+        device,
         forms,
         script,
         sources: Sources {
@@ -757,12 +772,21 @@ pub fn update(page: &mut Loaded, settings: Settings, fonts: &FontStore, states_c
     for change in &changes {
         match *change {
             html::Change::Element(n) if dom.tag_name(n) == Some("img") => imgs.push(n),
+            // A `<picture>`'s `<source>` changed: its `<img>` may choose another file.
+            html::Change::Element(n) if dom.tag_name(n) == Some("source") => {
+                if let Some(p) = dom
+                    .parent(n)
+                    .filter(|&p| dom.tag_name(p) == Some("picture"))
+                {
+                    imgs.extend(images::img_nodes(dom, p));
+                }
+            }
             html::Change::Children(n) => imgs.extend(images::img_nodes(dom, n)),
             _ => {}
         }
     }
     if !imgs.is_empty() {
-        for url in page.images.bind(&page.dom, &page.base, imgs) {
+        for url in page.images.bind(&page.dom, &page.base, &page.device, imgs) {
             if !page.pending_images.contains(&url) {
                 page.pending_images.push(url);
             }
@@ -794,11 +818,9 @@ pub fn update(page: &mut Loaded, settings: Settings, fonts: &FontStore, states_c
     }
     let started = Instant::now();
     let metrics = page.webfonts.metrics(fonts);
-    let images = &page.images;
-    let natural = |node: NodeId| images.natural_size(node);
     let done = page
         .layout
-        .relayout(&page.dom, &page.styles, &metrics, &natural, &changed);
+        .relayout(&page.dom, &page.styles, &metrics, &page.images, &changed);
     if done {
         page.layout_ms = millis(started);
         page.in_place += 1;
@@ -854,9 +876,8 @@ fn lay_out(
 ) -> (Layout, f64) {
     let started = Instant::now();
     let media = settings.media();
-    let natural = |node: NodeId| images.natural_size(node);
     let metrics = webfonts.metrics(fonts);
-    let layout = layout::layout(dom, styles, &metrics, &natural, media.width, media.height);
+    let layout = layout::layout(dom, styles, &metrics, images, media.width, media.height);
     (layout, millis(started))
 }
 
@@ -1052,7 +1073,7 @@ pub fn in_noscript(dom: &Dom, id: NodeId) -> bool {
 /// URLs resolve against.
 fn load_subresources(
     dom: &Dom,
-    (context, base): (&net::Context, &net::Url),
+    (context, base, device): (&net::Context, &net::Url, &images::Device),
     from: From,
     (scripted, later): (bool, bool),
     parser_nodes: usize,
@@ -1089,7 +1110,7 @@ fn load_subresources(
         _ => (None, None),
     };
     let (mut image_sources, mut image_uses) = if external && stored_images.is_none() {
-        images::discover(dom, base, parser_nodes)
+        images::discover(dom, base, device, parser_nodes)
     } else {
         Default::default()
     };
@@ -1103,7 +1124,7 @@ fn load_subresources(
     let own_policies = if image_sources.is_empty() {
         std::collections::HashMap::new()
     } else {
-        images::own_policies(dom, base)
+        images::own_policies(dom, base, device)
     };
     jobs.extend(image_sources.into_iter().map(|(_, s)| Job::Image(s)));
 
@@ -1301,6 +1322,7 @@ mod tests {
         let settings = Settings {
             width: 400.0,
             height: 300.0,
+            scale: 1.0,
             dark: false,
             fetch_css: false,
             images_later: false,
@@ -1322,6 +1344,7 @@ mod tests {
         let settings = Settings {
             width: 400.0,
             height: 300.0,
+            scale: 1.0,
             dark: false,
             fetch_css: false,
             images_later: false,
@@ -1362,6 +1385,7 @@ mod tests {
         let settings = Settings {
             width: 400.0,
             height: 300.0,
+            scale: 1.0,
             dark: false,
             fetch_css: true,
             images_later: false,
@@ -1425,6 +1449,7 @@ mod tests {
         let settings = Settings {
             width: 400.0,
             height: 300.0,
+            scale: 1.0,
             dark: false,
             fetch_css: true,
             images_later: false,
@@ -1459,6 +1484,7 @@ mod tests {
         let settings = Settings {
             width: 400.0,
             height: 300.0,
+            scale: 1.0,
             dark: false,
             fetch_css: false,
             images_later: false,

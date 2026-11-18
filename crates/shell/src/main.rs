@@ -33,7 +33,7 @@ use engine::{FontStore, Settings};
 const USAGE: &str =
     "usage: broxee [<url-or-file>...] [--window | --png FILE | --paint] [--tree | --styles | --layout] \
                      [--tiles FILE] [--depth N] [--width PX] [--height PX] [--scale N] [--no-css-fetch] [--panes 1|2|4] [--cache DIR] \
-                     [--record DIR | --replay DIR]";
+                     [--record DIR | --replay DIR | --fill DIR]";
 
 #[derive(Clone)]
 struct Options {
@@ -61,6 +61,8 @@ struct Options {
     record: Option<String>,
     /// Answer every request from a saved folder, with the bundled font and a frozen clock.
     replay: Option<String>,
+    /// Like `replay`, but what the folder lacks is fetched and added to it.
+    fill: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -86,6 +88,7 @@ fn main() -> ExitCode {
         cache: None,
         record: None,
         replay: None,
+        fill: None,
     };
 
     let mut args = std::env::args().skip(1);
@@ -108,6 +111,7 @@ fn main() -> ExitCode {
             "--cache" => opts.cache = args.next(),
             "--record" => opts.record = args.next(),
             "--replay" => opts.replay = args.next(),
+            "--fill" => opts.fill = args.next(),
             "--width" => opts.width = number(&mut args, 100.0, 8000.0, opts.width),
             "--height" => opts.height = number(&mut args, 100.0, 8000.0, opts.height),
             "--scale" => opts.scale = number(&mut args, 0.5, 4.0, opts.scale),
@@ -161,8 +165,9 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     opts.target = target;
-    if opts.record.is_some() && opts.replay.is_some() {
-        eprintln!("--record and --replay cannot be used together\n{USAGE}");
+    let archives = [&opts.record, &opts.replay, &opts.fill];
+    if archives.iter().filter(|a| a.is_some()).count() > 1 {
+        eprintln!("--record, --replay and --fill cannot be used together\n{USAGE}");
         return ExitCode::from(2);
     }
     match run(&opts) {
@@ -212,9 +217,10 @@ fn run(opts: &Options) -> Result<(), String> {
     if let Some(dir) = &opts.record {
         net::archive::record(std::path::Path::new(dir))?;
     }
-    let replayed_at = match &opts.replay {
-        Some(dir) => Some(net::archive::replay(std::path::Path::new(dir))?),
-        None => None,
+    let replayed_at = match (&opts.replay, &opts.fill) {
+        (Some(dir), _) => Some(net::archive::replay(std::path::Path::new(dir))?),
+        (_, Some(dir)) => Some(net::archive::fill(std::path::Path::new(dir))?),
+        _ => None,
     };
     if let Some(at) = replayed_at {
         script::freeze_clock(at as f64 * 1000.0);
@@ -228,6 +234,7 @@ fn run(opts: &Options) -> Result<(), String> {
     let settings = Settings {
         width: opts.width,
         height: opts.height,
+        scale: opts.scale,
         dark: false,
         fetch_css: opts.fetch_css,
         images_later: false,

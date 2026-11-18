@@ -210,7 +210,7 @@ fonts for text that scripts add after loading.
 | Line breaking, collapsed white space, `pre`, `nowrap`, `pre-wrap`, `<br>` | `justify`, hyphenation, bidi, `word-break`/`overflow-wrap` |
 | Half-leading baselines, `line-height` normal/number/length | `vertical-align` outside table cells |
 | Inline elements with margins, padding, borders and backgrounds (one box per line they span; plain inline elements cost nothing) | `box-decoration-break` (every piece draws all four borders) |
-| `<img>` as a replaced element: CSS size, `width`/`height` attributes, the file's natural size and ratio, `max-width` keeping proportions, in inline, block, flex and grid | `object-fit`, `<picture>`, `srcset` density selection (first candidate is used), `loading=lazy` |
+| `<img>` as a replaced element: CSS size, `width`/`height` attributes, the file's natural size and ratio, `max-width` keeping proportions, in inline, block, flex and grid; `srcset` (`x` and `w` descriptors, `sizes` with media conditions and px/em/rem/vw/vh lengths) and `<picture>` (`<source media type srcset sizes width height>`), chosen by drawn width and device scale, the file drawn at its density | `object-fit`, `loading=lazy`, `calc()` in `sizes`, choosing again after a resize or a move to another display |
 | Scrollable height includes overflow, except what a box with `overflow` other than `visible` hides (the root's and `<body>`'s still scrolls, as browsers apply theirs to the viewport) | padding, borders and margins on inline elements |
 | Changes from scripts, form controls and `:hover`/`:focus` lay out again only inside the nearest box that clips its overflow, sits in normal flow and keeps its size (typing in a field: the field); text-only changes skip the cascade unless a rule uses `:empty` | restyling only the changed subtree (the whole page is restyled, then compared); moving what follows a box whose height changed (the page is laid out again) |
 
@@ -323,6 +323,7 @@ time something reads it (most theme variables never are). A `var()` value is sub
 | 2026-11-15 | Site regression suite: `--record`/`--replay`, `--tiles`, 22 saved pages in CI (#148) | 3.7 MB (3,651,136 → 3,667,520 bytes, +16.0 KB, Rust 1.100) | 49.9 MB peak painted at 2x (unchanged) | Replays are exact and agree between macOS arm64 and Linux x86_64. Peak RAM over the 22 pages 26.7 to 38.7 MB (rust-std-vec, 1x at 1280x2400); the 44 renders take about 3 s once built. A 1 px change of the UA list indent fails 6 pages |
 | 2026-11-18 | `Referer` by `Referrer-Policy` (#125) | 3.8 MB (3,783,520 → 3,783,536 bytes, +16 bytes) | 49.9 MB peak painted at 2x (unchanged) | Header, `<meta name=referrer>` (legacy names too), link and `<img>` `referrerpolicy`, `rel=noreferrer`, redirects; the header's policy is kept with sleeping tabs (tab file 7). The 22 saved pages render the same |
 | 2026-11-18 | `<html>`, `<head>` and `<body>` added when a page leaves them out | 3.8 MB (3,783,536 → 3,800,064 bytes, +16.5 KB: one more 16 KB page) | 49.8 MB peak painted at 2x; parse 18.0 → 18.3 ms (median of 12, +1.3%) | Head elements before body content go in the head, the rest in the body; `</body>` and `</html>` close nothing; `innerHTML` parses a fragment (`html::parse_fragment`). A page of `<title>` and `<p>` now gets its 8px margin and `body` rules. The 22 saved pages render the same |
+| 2026-11-18 | `srcset` and `<picture>` by drawn width and scale (part of #59) | 3.8 MB (3,800,080 → 3,816,608 bytes, +16.5 KB) | 49.9 MB peak painted at 2x (unchanged) | The HTML candidate parser, `sizes`, `<source media type>`; the smallest density at least the scale, else the largest, drawn at its density (a 2x file of 440 px is 220 CSS px). A chosen `<source>`'s `width`/`height` size the `<img>`. Wikipedia "Rust" (replay): 1x 379 → 392 KB of images (the footer's wide logos), 2x 379 → 704 KB (2x thumbnails), peak 35.6 → 36.1 MB at 2x. `--fill DIR` adds what an archive lacks: 21 image responses for wikipedia-rust and arch-install; wikipedia-rust 2x changes 10 tiles (sharper logo and icon), the other 43 renders are the same |
 | 2026-11-18 | Pages show before their images | 3.8 MB (3,800,064 → 3,800,080 bytes, +16 bytes) | 49.9 MB peak painted at 2x (the CLI still waits for images) | singapay.id in the window (`FakeScreen`, 3 runs): on screen after 3.8 to 6.1 s → 0.6 to 3.1 s; its 61 images arrive one by one after that. `<img>` files and CSS backgrounds go to `pending_images`, fetched once the page is shown, six at once, each laid out as it arrives; a tab that slept first fetches what it lacks when it wakes. Loads in the background still take their images along. The 22 saved pages render the same |
 | 2026-11-18 | Crash recovery (#146): `panic = "unwind"`, panics contained per page, the session back after a crash | 4.4 MB (3,800,080 → 4,445,104 bytes, +630 KB: unwinding tables +612 KB, the code +16 KB) | 50.0 MB peak painted at 2x (49.9 before, within run-to-run noise) | Loader threads and each turn of the engine thread's loop run under `catch_unwind`; a panic ends as an error page in its tab. A marker holding the process id tells the next start that the last run crashed, and the visible tab then waits to be opened. The 22 saved pages render the same |
 
@@ -403,6 +404,8 @@ inline text, effects, images, forms, scripts).
 
 - **Saved, not live.** `broxee URL --record DIR` writes every response the page loads into `DIR`
   (`net::archive`); `--replay DIR` answers every request from it and never opens a connection.
+  `--fill DIR` answers from it what it has and fetches and appends the rest, for a page that now asks
+  for more than it did when it was recorded (its 2x `srcset` files).
 - **Exact.** A replay uses the bundled Figtree for every page and freezes the scripts' clock at the
   recording time, so a render is the same bytes on every run and on both CI systems (macOS arm64 and
   Linux x86_64 agree). Any change is a real one: no threshold to tune. For that the engine computes sine,
@@ -423,6 +426,7 @@ show the list items moved.
 | `./scripts/sites.sh --base main` | also draw what moved since `main` |
 | `./scripts/sites.sh --update` | store the current renders as the reference |
 | `./scripts/sites.sh --record NAME URL LICENSE` | save a page and everything it loads |
+| `./scripts/sites.sh --fill NAME` | render a saved page at 1x and 2x, fetching and saving what its archive lacks |
 
 ## Compression
 
@@ -492,6 +496,9 @@ Where data lives, and what compression does for it (measured 2026-11-07):
 - GIF animations and animated WebP show their first frame. SVG draws shapes, strokes, `use`, simple `<style>`
   rules and transforms; gradients are drawn as the average of their stops, and text, filters, masks and clip
   paths are skipped. Failed images draw nothing.
+- `srcset` and `<picture>` choose when the page is built (and when a script changes an `<img>` or its
+  `<source>`): resizing the window or moving it to another display keeps the files until the page is
+  built again (reload, or a sleeping tab waking). `sizes` entries with `calc()` are skipped.
 - `Referer`: back, forward and reload send none (browsers resend the first one); `<link>`, `<script>`
   and `fetch()`'s own `referrerPolicy` are not read, so they use the page's policy; images and fonts named
   by a stylesheet name the page as their referrer, not the stylesheet; the CLI sends none unless it has a
