@@ -210,7 +210,7 @@ right when the pointer is over it. `target=_blank` links open in a new tab in fr
 | Switch profile | ⌘⇧P |
 | Find in page / next / previous match | ⌘F, then Enter / Shift+Enter (or ⌘G / ⌘⇧G); Esc closes |
 | Select all page text / copy the selection | ⌘A / ⌘C |
-| Scroll: line / page / top and bottom | ↑ ↓ / Space, Shift+Space, Page Up/Down / Home, End, ⌘↑ ⌘↓ |
+| Scroll: line / page / top and bottom | ↑ ↓ / Space, Shift+Space, Page Up/Down, ⌥↑ ⌥↓ / Home, End, ⌘↑ ⌘↓ |
 | Back / forward (outside text fields) | ⌘[ / ⌘], or ⌘← / ⌘→ |
 | Open a link in a background tab / in front | ⌘-click or middle click / ⌘⇧-click |
 
