@@ -122,6 +122,11 @@ Tabs and profiles:
   `~/Library/Application Support/Broxee/profiles/<profile>/cookies` (0600, written atomically); session cookies
   never touch the disk. "Clear this profile's cookies" is in the palette. Limits: 4 KB per cookie, 60 per
   site, 3,000 per profile.
+- The `Referer` header follows `Referrer-Policy` (default `strict-origin-when-cross-origin`: the whole
+  address to the page's own origin, only the origin to other sites, nothing from https to http). A page
+  sets it with the header or `<meta name=referrer>`; a link with `referrerpolicy` or `rel=noreferrer`, an
+  `<img>` with `referrerpolicy`. A redirect's own policy holds for the hops after it. What you type or choose
+  in Broxee (address field, palette, bookmarks) tells no page where you came from.
 - Only the visible tab is a live page. The others sleep: the HTML and stylesheets as they arrived (usually
   Brotli or gzip) and the compressed images go to a private file in `~/Library/Caches/Broxee/tabs` (folder
   0700, files 0600). Selecting the tab rebuilds it from that file, without the network, at its old scroll
@@ -308,6 +313,7 @@ time something reads it (most theme variables never are). A `var()` value is sub
 
 | 2026-11-15 | Sleeping tabs share stylesheets, scripts, fonts and images (#51) | 3.7 MB | 49.9 MB peak painted at 2x | Disk: six tabs (three Wikipedia articles, two GitHub repositories, example.com) sleep in 1.7 MB instead of 2.9 MB; GitHub's 428 KB of stylesheets is stored once |
 | 2026-11-15 | Site regression suite: `--record`/`--replay`, `--tiles`, 22 saved pages in CI (#148) | 3.7 MB (3,651,136 → 3,667,520 bytes, +16.0 KB, Rust 1.100) | 49.9 MB peak painted at 2x (unchanged) | Replays are exact and agree between macOS arm64 and Linux x86_64. Peak RAM over the 22 pages 26.7 to 38.7 MB (rust-std-vec, 1x at 1280x2400); the 44 renders take about 3 s once built. A 1 px change of the UA list indent fails 6 pages |
+| 2026-11-18 | `Referer` by `Referrer-Policy` (#125) | 3.8 MB (3,783,520 → 3,783,536 bytes, +16 bytes) | 49.9 MB peak painted at 2x (unchanged) | Header, `<meta name=referrer>` (legacy names too), link and `<img>` `referrerpolicy`, `rel=noreferrer`, redirects; the header's policy is kept with sleeping tabs (tab file 7). The 22 saved pages render the same |
 
 Other pages after the layout milestone: GitHub home 22.7 MB peak (8,170 rules); Hacker News 11.5 MB.
 
@@ -476,5 +482,9 @@ Where data lives, and what compression does for it (measured 2026-11-07):
 - GIF animations and animated WebP show their first frame. SVG draws shapes, strokes, `use`, simple `<style>`
   rules and transforms; gradients are drawn as the average of their stops, and text, filters, masks and clip
   paths are skipped. Failed images draw nothing.
+- `Referer`: back, forward and reload send none (browsers resend the first one); `<link>`, `<script>`
+  and `fetch()`'s own `referrerPolicy` are not read, so they use the page's policy; images and fonts named
+  by a stylesheet name the page as their referrer, not the stylesheet; the CLI sends none unless it has a
+  cookie jar (`--cache`).
 - Painting will add a window framebuffer (about 16 MB at 2x for 1280x800). The stress page sits at 37 MB, so
   paint must stay within roughly 20 MB including glyph caches.

@@ -9,10 +9,12 @@ mod cache;
 mod cookies;
 mod failure;
 mod psl;
+mod referrer;
 
 pub use cache::Cache;
 pub use cookies::{Context, Cookie, Cookies, SameSite};
 pub use failure::{classify, online, Failure};
+pub use referrer::{referer, Policy as ReferrerPolicy, Referrer};
 
 /// Bytes of response bodies read from the network (not from a cache or a file), as they
 /// arrived (compressed or not).
@@ -436,6 +438,8 @@ pub fn send_with(
     let mut body = body;
     let mut extra = extra;
     let cache = cookies.and_then(|(jar, _)| jar.cache());
+    // A redirect's own `Referrer-Policy` applies to the hops after it.
+    let mut referrer = cookies.and_then(|(_, context)| context.referrer.clone());
     for _ in 0..MAX_REDIRECTS {
         // A plain GET (no body, no credentials of its own) may come from the cache.
         let cacheable = body.is_none()
@@ -470,11 +474,12 @@ pub fn send_with(
             }
             _ => extra,
         };
-        let header = cookies.and_then(|(jar, context)| jar.header(&url, context));
-        let resp = match fetch_once(&url, header.as_deref(), body, ask) {
-            Err(FetchError::Retryable(_)) if body.is_none() => {
-                fetch_once(&url, header.as_deref(), None, ask)?
-            }
+        let sent = Sent {
+            cookie: cookies.and_then(|(jar, context)| jar.header(&url, context)),
+            referer: referrer.as_ref().and_then(|r| r.header_for(&url)),
+        };
+        let resp = match fetch_once(&url, &sent, body, ask) {
+            Err(FetchError::Retryable(_)) if body.is_none() => fetch_once(&url, &sent, None, ask)?,
             other => other?,
         };
         if let (Some(c), Some(entry)) = (cache, stored) {
@@ -495,6 +500,13 @@ pub fn send_with(
         }
         if (300..400).contains(&resp.status) {
             if let Some(location) = resp.header("location") {
+                if let (Some(r), Some(policy)) = (
+                    referrer.as_mut(),
+                    resp.header("referrer-policy")
+                        .and_then(ReferrerPolicy::from_list),
+                ) {
+                    r.policy = policy;
+                }
                 url = url.join(location)?;
                 if !matches!(resp.status, 307 | 308) {
                     body = None;
@@ -508,9 +520,15 @@ pub fn send_with(
     Err(format!("too many redirects ending at {url}"))
 }
 
+/// Headers that depend on who asks: the profile's cookies and the referring page.
+struct Sent {
+    cookie: Option<String>,
+    referer: Option<String>,
+}
+
 fn fetch_once(
     url: &Url,
-    cookie: Option<&str>,
+    sent: &Sent,
     body: Option<&Body>,
     extra: Option<&Extra>,
 ) -> Result<Response, FetchError> {
@@ -543,7 +561,7 @@ fn fetch_once(
         archive::keep(url, &resp);
         resp
     };
-    match request(&mut conn, url, cookie, body, extra) {
+    match request(&mut conn, url, sent, body, extra) {
         Ok((resp, reusable)) => {
             if reusable {
                 put_idle(key, conn);
@@ -553,7 +571,7 @@ fn fetch_once(
         // A pooled connection the server already closed: not the server's answer.
         Err(FetchError::Retryable(_)) if reused => {
             let mut conn = Conn::open(url)?;
-            let (resp, reusable) = request(&mut conn, url, cookie, body, extra)?;
+            let (resp, reusable) = request(&mut conn, url, sent, body, extra)?;
             if reusable {
                 put_idle(key, conn);
             }
@@ -566,7 +584,7 @@ fn fetch_once(
 fn request(
     conn: &mut Conn,
     url: &Url,
-    cookie: Option<&str>,
+    sent: &Sent,
     body: Option<&Body>,
     extra: Option<&Extra>,
 ) -> Result<(Response, bool), FetchError> {
@@ -576,7 +594,14 @@ fn request(
         format!("{}:{}", url.host, url.port)
     };
     // Cookie values never hold CR or LF: the jar refuses them when storing.
-    let cookie = cookie.map_or(String::new(), |c| format!("Cookie: {c}\r\n"));
+    let mut asker = sent
+        .cookie
+        .as_ref()
+        .map_or(String::new(), |c| format!("Cookie: {c}\r\n"));
+    // A referrer is a parsed `Url`, which never holds CR or LF; checked again all the same.
+    if let Some(r) = sent.referer.as_ref().filter(|r| !r.contains(['\r', '\n'])) {
+        asker.push_str(&format!("Referer: {r}\r\n"));
+    }
     let (method, content) = match body {
         Some(b) => (
             "POST",
@@ -607,7 +632,7 @@ fn request(
     let mut request = format!(
         "{method} {} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: {USER_AGENT}\r\n\
          Accept: {accept}\r\nAccept-Encoding: br, gzip, deflate\r\n\
-         {cookie}{own}{content}Connection: keep-alive\r\n\r\n",
+         {asker}{own}{content}Connection: keep-alive\r\n\r\n",
         url.path
     )
     .into_bytes();
@@ -1165,6 +1190,48 @@ mod tests {
         assert_eq!(file.decoded_path(), "/tmp/My File.html");
         assert_eq!(percent_decode("a%2"), b"a%2", "a cut escape stays as it is");
         assert_eq!(percent_decode("%41%zz"), b"A%zz");
+    }
+
+    #[test]
+    fn sends_the_referer_its_policy_allows_on_every_hop() {
+        let (base, _) = cache_server(|path, head| {
+            let referer = head
+                .lines()
+                .find_map(|l| l.strip_prefix("Referer: "))
+                .unwrap_or("none")
+                .to_string();
+            match path {
+                "/quiet" => (
+                    302,
+                    "Location: /echo\r\nReferrer-Policy: no-referrer\r\n".into(),
+                    String::new(),
+                ),
+                "/plain" => (302, "Location: /echo\r\n".into(), String::new()),
+                _ => (200, String::new(), referer),
+            }
+        });
+        let jar = Cookies::new();
+        let get = |path: &str, context: &Context| {
+            let url = Url::parse(&format!("{base}{path}")).unwrap();
+            String::from_utf8(fetch_in(&url, Some((&jar, context))).unwrap().body).unwrap()
+        };
+        let page = Url::parse(&format!("{base}/docs/a?q=1")).unwrap();
+        let mine = Context::subresource(&page);
+        assert_eq!(get("/echo", &mine), format!("{base}/docs/a?q=1"));
+        assert_eq!(get("/plain", &mine), format!("{base}/docs/a?q=1"));
+        // The redirect's own policy holds for the hops after it.
+        assert_eq!(get("/quiet", &mine), "none");
+        // Another origin hears only the origin; `no-referrer` sends nothing at all.
+        let other = Url::parse(&base.replace("127.0.0.1", "localhost")).unwrap();
+        let theirs = Context::subresource(&other.join("/private/path").unwrap());
+        assert_eq!(
+            get("/echo", &theirs),
+            format!("{}/", other.to_string().trim_end_matches('/'))
+        );
+        let silent = Context::subresource(&page).with_policy(ReferrerPolicy::NoReferrer);
+        assert_eq!(get("/echo", &silent), "none");
+        // What the person typed carries none.
+        assert_eq!(get("/echo", &Context::top_level(true)), "none");
     }
 
     /// A local server that closes the first `drops` connections right after reading the

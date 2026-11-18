@@ -201,6 +201,9 @@ struct Tab {
     /// Opened in the background from a link on another site and not loaded yet: its first
     /// load does not carry SameSite=Strict cookies, as if the link had been followed.
     cross_site_start: bool,
+    /// Opened in the background from a link and not loaded yet: the page it came from, for
+    /// the first load's `Referer`.
+    start_referrer: Option<net::Referrer>,
 }
 
 impl Default for Tab {
@@ -217,6 +220,7 @@ impl Default for Tab {
             pinned: false,
             group: None,
             cross_site_start: false,
+            start_referrer: None,
         }
     }
 }
@@ -1808,11 +1812,11 @@ impl<S: Screen> Browser<S> {
             }
             return true;
         }
-        if let Some((url, blank)) = self.link_hit(x, y - HEADER_HEIGHT) {
-            if blank {
-                self.open_in_tab(url, true);
+        if let Some(link) = self.link_hit(x, y - HEADER_HEIGHT) {
+            if link.blank {
+                self.open_in_tab(link.url, link.referrer, true);
             } else {
-                self.follow(url);
+                self.follow(link.url, link.referrer);
             }
             return true;
         }
@@ -2339,10 +2343,11 @@ impl<S: Screen> Browser<S> {
         let Some(page) = self.page.as_mut() else {
             return false;
         };
+        let policy = page.referrer_policy;
         let Some(script) = page.script.as_mut() else {
             return false;
         };
-        script.net.arm(&jar);
+        script.net.arm(&jar, policy);
         let answers = script.net.take_answers();
         if answers.is_empty() {
             return false;
@@ -2386,13 +2391,14 @@ impl<S: Screen> Browser<S> {
         }
         self.script_hops += 1;
         let same_site = net::site(&page.url.host) == net::site(&url.host);
+        let referrer = Some(page.referrer());
         let to = if replace {
             Destination::Replace
         } else {
             self.save_scroll();
             Destination::Push
         };
-        self.navigate_from(url, to, same_site);
+        self.navigate_from(url, to, same_site, referrer);
         true
     }
 
@@ -2831,10 +2837,11 @@ impl<S: Screen> Browser<S> {
         let Some(sent) = page.forms.submission(&page.dom, i, &page.base) else {
             return;
         };
+        let referrer = Some(page.referrer());
         self.editing = None;
         self.link_focus = None;
         self.save_scroll();
-        self.navigate_with(sent.url, sent.body, Destination::Push, true);
+        self.navigate_with(sent.url, sent.body, Destination::Push, true, referrer);
     }
 
     /// Keys for the focused control `i`. `None` lets the key do what it does elsewhere.
@@ -3110,10 +3117,13 @@ impl<S: Screen> Browser<S> {
         if let Some(node) = self.link_focus.as_ref().map(|l| l.node) {
             match k.key {
                 Key::Enter => {
-                    let url = self.page.as_ref().and_then(|p| link_for(p, node));
-                    return match url {
-                        Some(url) => {
-                            self.follow(url);
+                    let link = self.page.as_ref().and_then(|p| {
+                        let url = link_for(p, node)?;
+                        Some((url, link_referrer(p, node)))
+                    });
+                    return match link {
+                        Some((url, referrer)) => {
+                            self.follow(url, referrer);
                             true
                         }
                         None => false,
@@ -3289,8 +3299,9 @@ impl<S: Screen> Browser<S> {
         self.link_focus = Some(LinkFocus { node, rects });
     }
 
-    /// Follow a link the person chose, by click or with Enter.
-    fn follow(&mut self, url: net::Url) {
+    /// Follow a link the person chose, by click or with Enter. `referrer`: what the link
+    /// lets the next page know about this one (`link_referrer`).
+    fn follow(&mut self, url: net::Url, referrer: Option<net::Referrer>) {
         self.save_scroll();
         // A link from another site does not carry SameSite=Strict cookies.
         let from = self
@@ -3298,7 +3309,7 @@ impl<S: Screen> Browser<S> {
             .as_ref()
             .map(|p| net::site(&p.url.host).to_string());
         let same_site = from.is_none_or(|from| from == net::site(&url.host));
-        self.navigate_from(url, Destination::Push, same_site);
+        self.navigate_from(url, Destination::Push, same_site, referrer);
     }
 
     /// ⌘-click or middle click: a link under the pointer opens in a new tab, in the background
@@ -3310,8 +3321,8 @@ impl<S: Screen> Browser<S> {
             || self.dialog.is_some()
             || self.palette.is_some();
         if !overlay && x >= left && y >= HEADER_HEIGHT {
-            if let Some(url) = self.link_at(x - left, y - HEADER_HEIGHT) {
-                self.open_in_tab(url, foreground);
+            if let Some(link) = self.link_hit(x - left, y - HEADER_HEIGHT) {
+                self.open_in_tab(link.url, link.referrer, foreground);
                 return true;
             }
         }
@@ -3320,7 +3331,7 @@ impl<S: Screen> Browser<S> {
 
     /// Open `url`, a link of the visible page, in a new tab after the visible one (and after
     /// the tabs already opened from it). A background tab is only its history until selected.
-    fn open_in_tab(&mut self, url: net::Url, foreground: bool) {
+    fn open_in_tab(&mut self, url: net::Url, referrer: Option<net::Referrer>, foreground: bool) {
         let cross_site = self
             .page
             .as_ref()
@@ -3342,6 +3353,7 @@ impl<S: Screen> Browser<S> {
             title: host_of(&url),
             group,
             cross_site_start: cross_site,
+            start_referrer: referrer,
             ..Tab::default()
         };
         let id = tab.id;
@@ -4472,13 +4484,21 @@ impl<S: Screen> Browser<S> {
     /// arrives. The current page stays on screen and the window keeps answering input. A load
     /// already running is cancelled: one page is built at a time.
     fn navigate(&mut self, url: net::Url, to: Destination) {
-        // Typed, from the palette, back, forward, reload: started by the person.
-        self.navigate_from(url, to, true);
+        // Typed, from the palette, back, forward, reload: started by the person, and no page
+        // is told about it (`Referer`).
+        self.navigate_from(url, to, true, None);
     }
 
-    /// `navigate`, saying whether the navigation started on the same site as `url`.
-    fn navigate_from(&mut self, url: net::Url, to: Destination, same_site_initiator: bool) {
-        self.navigate_with(url, None, to, same_site_initiator);
+    /// `navigate`, saying whether the navigation started on the same site as `url`, and the
+    /// page it came from (a link, a script, a refresh).
+    fn navigate_from(
+        &mut self,
+        url: net::Url,
+        to: Destination,
+        same_site_initiator: bool,
+        referrer: Option<net::Referrer>,
+    ) {
+        self.navigate_with(url, None, to, same_site_initiator, referrer);
     }
 
     /// `navigate_from`, POSTing `body` when there is one (a submitted form).
@@ -4488,6 +4508,7 @@ impl<S: Screen> Browser<S> {
         body: Option<net::Body>,
         to: Destination,
         same_site_initiator: bool,
+        referrer: Option<net::Referrer>,
     ) {
         self.stop_load();
         self.refresh = None;
@@ -4509,6 +4530,7 @@ impl<S: Screen> Browser<S> {
                 let jar = engine::Jar {
                     cookies: &cookies,
                     same_site_initiator,
+                    referrer: referrer.as_ref(),
                 };
                 // A failed send means the browser dropped the load: stop at the next stage.
                 let result = engine::load_in_tab(
@@ -4715,7 +4737,8 @@ impl<S: Screen> Browser<S> {
                     .page
                     .as_ref()
                     .is_some_and(|p| net::site(&p.url.host) == net::site(&url.host));
-                self.navigate_from(url, Destination::Replace, same_site);
+                let referrer = self.page.as_ref().map(Loaded::referrer);
+                self.navigate_from(url, Destination::Replace, same_site, referrer);
             }
             None => {
                 self.save_scroll();
@@ -4799,15 +4822,21 @@ impl<S: Screen> Browser<S> {
         }
         let urls = std::mem::take(&mut page.pending_images);
         let page_url = page.url.clone();
+        let policy = page.referrer_policy;
+        let own_policies = crate::images::own_policies(&page.dom, &page.base);
         let cookies = Arc::clone(&self.profiles[self.profile].cookies);
         let (sender, receiver) = mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name("images".into())
             .spawn(move || {
-                let context = net::Context::subresource(&page_url);
+                let context = net::Context::subresource(&page_url).with_policy(policy);
                 let bytes = crate::pool::map_ordered(urls.clone(), 6, |url| {
+                    let own = own_policies
+                        .get(&url)
+                        .map(|&p| context.clone().with_policy(p));
                     let url = net::Url::parse(&url).ok()?;
-                    let resp = net::fetch_in(&url, Some((&cookies, &context))).ok()?;
+                    let context = own.as_ref().unwrap_or(&context);
+                    let resp = net::fetch_in(&url, Some((&cookies, context))).ok()?;
                     (resp.status == 200).then_some(resp.body)
                 });
                 let _ = sender.send(urls.into_iter().zip(bytes).collect());
@@ -5051,7 +5080,8 @@ impl<S: Screen> Browser<S> {
                 let tab = self.tab_mut();
                 let index = tab.index;
                 let same_site = !std::mem::take(&mut tab.cross_site_start);
-                self.navigate_from(entry.url, Destination::Entry(index), same_site);
+                let referrer = tab.start_referrer.take();
+                self.navigate_from(entry.url, Destination::Entry(index), same_site, referrer);
             }
             None => {
                 // A new tab: the palette over an empty pane (DESIGN.md, section 7).
@@ -5293,13 +5323,19 @@ impl<S: Screen> Browser<S> {
     /// topmost fragment wins: later layers paint over earlier ones, and fixed layers do not
     /// scroll. Hidden fragments cannot be clicked.
     fn link_at(&self, x: f32, y_view: f32) -> Option<net::Url> {
-        self.link_hit(x, y_view).map(|(url, _)| url)
+        self.link_hit(x, y_view).map(|link| link.url)
     }
 
-    /// `link_at`, saying too whether the link asks for a new tab (`target=_blank`).
-    fn link_hit(&self, x: f32, y_view: f32) -> Option<(net::Url, bool)> {
+    /// `link_at`, with whether the link asks for a new tab and what it tells the next page.
+    fn link_hit(&self, x: f32, y_view: f32) -> Option<Link> {
         let page = self.page.as_ref()?;
-        let hit = |node| link_for(page, node).map(|url| (url, opens_new_tab(page, node)));
+        let hit = |node| {
+            link_for(page, node).map(|url| Link {
+                url,
+                blank: opens_new_tab(page, node),
+                referrer: link_referrer(page, node),
+            })
+        };
         let layout = &page.layout;
         let metrics = page.metrics(&self.fonts);
         let doc_y = |fixed: bool| if fixed { y_view } else { y_view + self.scroll };
@@ -6353,6 +6389,42 @@ fn link_for(page: &Loaded, node: NodeId) -> Option<net::Url> {
         current = page.dom.parent(id);
     }
     None
+}
+
+/// A link under the pointer.
+struct Link {
+    url: net::Url,
+    /// `target=_blank`: it asks for a new tab.
+    blank: bool,
+    referrer: Option<net::Referrer>,
+}
+
+/// What following the link around `node` tells the next page about this one: nothing with
+/// `rel=noreferrer`, else this page under the link's `referrerpolicy` or the page's policy.
+fn link_referrer(page: &Loaded, node: NodeId) -> Option<net::Referrer> {
+    let mut current = Some(node);
+    while let Some(id) = current {
+        if page.dom.tag_name(id) == Some("a") {
+            let rel = page.dom.attr(id, "rel").unwrap_or("");
+            if rel
+                .split_ascii_whitespace()
+                .any(|r| r.eq_ignore_ascii_case("noreferrer"))
+            {
+                return None;
+            }
+            let mut referrer = page.referrer();
+            if let Some(own) = page
+                .dom
+                .attr(id, "referrerpolicy")
+                .and_then(net::ReferrerPolicy::parse)
+            {
+                referrer.policy = own;
+            }
+            return Some(referrer);
+        }
+        current = page.dom.parent(id);
+    }
+    Some(page.referrer())
 }
 
 /// Whether the link around `node` asks to open in a new tab: `target="_blank"`, its own or
@@ -10159,6 +10231,145 @@ mod tests {
         let (at, to) = b.refresh.clone().expect("the header's refresh waits");
         assert!(at > Instant::now() + Duration::from_secs(2));
         assert_eq!(to.unwrap().path, "/next");
+    }
+
+    /// The `Referer` header of a request head, or "none".
+    fn referer_of(head: &str) -> String {
+        head.lines()
+            .find_map(|l| l.strip_prefix("Referer: "))
+            .unwrap_or("none")
+            .to_string()
+    }
+
+    #[test]
+    fn links_images_and_forms_send_the_referer_the_policy_allows() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Another origin (another port): every page is titled with the Referer it got.
+        let other = http_server(Arc::clone(&seen), |_, _, head, _| {
+            (
+                200,
+                String::new(),
+                format!("<title>{}</title>", referer_of(head)),
+            )
+        });
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&heard);
+        let main = http_server(Arc::clone(&seen), move |_, path, head, _| {
+            log.lock()
+                .unwrap()
+                .push(format!("{path} {}", referer_of(head)));
+            let away = format!("http://127.0.0.1:{other}/away");
+            let links = format!(
+                "<p><a href='{away}'>Plain link</a></p>\
+                 <p><a href='{away}' rel='nofollow noreferrer'>Quiet link</a></p>\
+                 <p><a href='{away}' referrerpolicy='unsafe-url'>Whole link</a></p>\
+                 <p><a href='/echo'>Home link</a></p>\
+                 <form action='{away}'><button>Send form</button></form>"
+            );
+            match path.split('?').next().unwrap_or("") {
+                "/" => (
+                    200,
+                    String::new(),
+                    format!(
+                        "<title>Start</title>{links}<img src='/a.png' width=4 height=4>\
+                         <img src='/b.png' width=4 height=4 referrerpolicy='no-referrer'>"
+                    ),
+                ),
+                "/meta" => (
+                    200,
+                    "Referrer-Policy: unsafe-url\r\n".into(),
+                    format!("<meta name=referrer content=never><title>Meta</title>{links}"),
+                ),
+                "/header" => (
+                    200,
+                    "Referrer-Policy: unknown-policy, same-origin\r\n".into(),
+                    format!("<title>Header</title>{links}"),
+                ),
+                _ => (
+                    200,
+                    String::new(),
+                    format!("<title>{}</title>", referer_of(head)),
+                ),
+            }
+        });
+        let start = format!("http://127.0.0.1:{main}/?secret=1");
+        let (a, _) = site("referer");
+        let mut b = browser(&a);
+        b.open_input(&start);
+        b.wait_for_load();
+        assert_eq!(title(&b), "Start");
+        let heard_now = heard.lock().unwrap().clone();
+        assert!(
+            heard_now.contains(&"/?secret=1 none".to_string()),
+            "typed: none"
+        );
+        assert!(
+            heard_now.contains(&format!("/a.png {start}")),
+            "{heard_now:?}"
+        );
+        assert!(
+            heard_now.contains(&"/b.png none".to_string()),
+            "{heard_now:?}"
+        );
+
+        let origin = format!("http://127.0.0.1:{main}/");
+        let follow = |b: &mut Browser<FakeScreen>, text: &str| {
+            assert!(click_text(b, text), "{text}");
+            b.wait_for_load();
+            let got = title(b);
+            act(b, command('['));
+            b.wait_for_load();
+            got
+        };
+        // The default policy: only the origin to another origin, all of it to its own.
+        assert_eq!(follow(&mut b, "Plain link"), origin);
+        assert_eq!(follow(&mut b, "Home link"), start);
+        assert_eq!(follow(&mut b, "Quiet link"), "none");
+        assert_eq!(follow(&mut b, "Whole link"), start);
+        assert_eq!(follow(&mut b, "Send form"), origin);
+
+        // A link opened in a background tab sends it when that tab first loads.
+        let page = b.page.as_ref().unwrap();
+        let run = page
+            .layout
+            .texts
+            .iter()
+            .find(|t| page.layout.text(t).contains("Plain link"))
+            .unwrap();
+        let (x, y) = (
+            SIDEBAR_WIDTH + run.x + run.width / 2.0,
+            run.baseline - 4.0 - b.scroll + HEADER_HEIGHT,
+        );
+        act(
+            &mut b,
+            Event::OpenClick {
+                x: f64::from(x),
+                y: f64::from(y),
+                foreground: false,
+            },
+        );
+        act(&mut b, command('2'));
+        b.wait_for_load();
+        assert_eq!(title(&b), origin);
+        act(&mut b, command('1'));
+        b.wait_for_load();
+
+        // `<meta name=referrer>` wins over the header; the header's last known name counts.
+        b.open_input(&format!("http://127.0.0.1:{main}/meta"));
+        b.wait_for_load();
+        assert_eq!(follow(&mut b, "Plain link"), "none");
+        b.open_input(&format!("http://127.0.0.1:{main}/header"));
+        b.wait_for_load();
+        assert_eq!(follow(&mut b, "Plain link"), "none");
+        assert_eq!(
+            follow(&mut b, "Home link"),
+            format!("http://127.0.0.1:{main}/header")
+        );
+        // A link's own policy beats the page's.
+        assert_eq!(
+            follow(&mut b, "Whole link"),
+            format!("http://127.0.0.1:{main}/header")
+        );
     }
 
     /// Poll background loads until none is left (or five seconds pass).

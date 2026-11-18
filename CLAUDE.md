@@ -150,6 +150,11 @@ casts), not taken from binding crates. Ask before proposing any dependency.
 - **Cookies belong to a profile.** Every fetch for a page passes that profile's jar (`engine::Jar`);
   subresources use `net::Context::subresource`, which blocks other sites' cookies. Never log or print cookie
   values, never write session cookies to disk, and keep cookie and session files 0600 (`write_private`).
+- **`Referer` travels with `net::Context`** (`Context::referrer`, #125): `subresource(page)` names the page,
+  `with_policy` gives it the page's `Loaded::referrer_policy` (meta, else the response's header, else the
+  default), and `send_with` works it out again on every redirect hop. Navigations the person starts in the
+  browser carry none; links, forms, scripts and refreshes pass `Loaded::referrer` (`link_referrer` for
+  `rel=noreferrer` and `referrerpolicy`). A new fetch site must start from `subresource(page)` with the policy.
 - **Form controls draw with nodes the browser adds** (`forms::Forms::prepare`, before anything reads the
   DOM): they go after the page's own nodes so no id changes, and rebuilding from the sources gives the same
   DOM. Typed values live in `Loaded::forms` only; passwords are never logged or written to disk.

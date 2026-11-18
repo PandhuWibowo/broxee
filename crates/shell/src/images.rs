@@ -70,6 +70,25 @@ pub fn img_nodes(dom: &Dom, root: NodeId) -> impl Iterator<Item = NodeId> + '_ {
         .filter(move |&id| dom.tag_name(id) == Some("img") && !crate::engine::in_noscript(dom, id))
 }
 
+/// Sources whose `<img>` names its own `referrerpolicy`, by key: the first such element of
+/// each source decides. Image hosts that refuse other sites' pages are often reached with
+/// `referrerpolicy=no-referrer`.
+pub fn own_policies(dom: &Dom, base: &net::Url) -> HashMap<String, net::ReferrerPolicy> {
+    let mut policies = HashMap::new();
+    for id in img_nodes(dom, Dom::ROOT) {
+        let Some(policy) = dom
+            .attr(id, "referrerpolicy")
+            .and_then(net::ReferrerPolicy::parse)
+        else {
+            continue;
+        };
+        if let Some(key) = key_of(dom, base, id) {
+            policies.entry(key).or_insert(policy);
+        }
+    }
+    policies
+}
+
 /// Each source once, with its key, and which source each `<img>` node uses.
 pub type Discovered = (Vec<(String, Source)>, Vec<(NodeId, usize)>);
 

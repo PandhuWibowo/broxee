@@ -238,6 +238,7 @@ fn run(opts: &Options) -> Result<(), String> {
     let jar = jar.as_ref().map(|cookies| engine::Jar {
         cookies,
         same_site_initiator: true,
+        referrer: None,
     });
     let page = engine::load(&url, settings, &fonts, jar, &mut |_| true)?;
 

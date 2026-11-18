@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::psl;
+use crate::referrer::{Policy, Referrer};
 use crate::Url;
 
 /// Name plus value, as browsers limit them.
@@ -42,7 +43,7 @@ pub struct Cookie {
     last_used: u64,
 }
 
-/// Who is asking, for the `SameSite` and third-party rules.
+/// Who is asking, for the `SameSite` and third-party rules and the `Referer` header.
 #[derive(Clone, Debug)]
 pub struct Context {
     /// The site (`psl::site`) of the page a subresource is for; `None` for the page itself
@@ -51,6 +52,9 @@ pub struct Context {
     /// A top-level navigation the person started (typed, from the palette, back, reload) or
     /// that came from a link on the same site: `SameSite=Strict` cookies go with it.
     pub same_site_initiator: bool,
+    /// The page the request comes from, for `Referer`; `None` sends none (what the person
+    /// typed or chose in the browser's own interface).
+    pub referrer: Option<Referrer>,
 }
 
 impl Context {
@@ -58,14 +62,33 @@ impl Context {
         Context {
             page_site: None,
             same_site_initiator,
+            referrer: None,
         }
     }
 
+    /// A part of `page` (stylesheet, script, image, font, a script's request): `page` is its
+    /// referrer, under the default policy until `with_policy` gives the page's own.
     pub fn subresource(page: &Url) -> Context {
         Context {
             page_site: Some(psl::site(&page.host).to_string()),
             same_site_initiator: true,
+            referrer: Some(Referrer {
+                page: page.clone(),
+                policy: Policy::default(),
+            }),
         }
+    }
+
+    pub fn with_policy(mut self, policy: Policy) -> Context {
+        if let Some(r) = &mut self.referrer {
+            r.policy = policy;
+        }
+        self
+    }
+
+    pub fn with_referrer(mut self, referrer: Option<Referrer>) -> Context {
+        self.referrer = referrer;
+        self
     }
 
     /// Cookies may be used for `url` at all: not for another site's subresources.
