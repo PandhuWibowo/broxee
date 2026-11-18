@@ -1615,6 +1615,54 @@ impl<S: Screen> Browser<S> {
         self.scroll = self.scroll.clamp(0.0, self.max_scroll());
     }
 
+    /// How far Space and Page Down go: the view less what fixed bars cover at its top and
+    /// bottom (a site's header or cookie banner), keeping `PAGE_OVERLAP` of what was read, so
+    /// no line passes hidden under a bar.
+    fn page_step(&self) -> f32 {
+        let view = self.page_height();
+        let (top, bottom) = self.fixed_bars();
+        (view - top - bottom - PAGE_OVERLAP).max(LINE_STEP)
+    }
+
+    /// The height fixed bars cover at the top and the bottom of the view: fixed boxes at least
+    /// half the pane wide and at most a third of the view tall, touching its top or bottom.
+    fn fixed_bars(&self) -> (f32, f32) {
+        let Some(page) = self.page.as_ref() else {
+            return (0.0, 0.0);
+        };
+        let (view, width) = (self.page_height(), self.pane_width());
+        let layout = &page.layout;
+        let (mut top, mut bottom) = (0.0f32, 0.0f32);
+        for (k, layer) in layout.layers.iter().enumerate() {
+            if !layer.fixed {
+                continue;
+            }
+            let end = layout
+                .layers
+                .get(k + 1)
+                .map_or(layout.boxes.len(), |l| l.boxes as usize);
+            let start = (layer.boxes as usize).min(end);
+            for b in &layout.boxes[start..end] {
+                let r = b.rect;
+                let style = page.styles.style(b.node);
+                if !style.visible
+                    || style.transparent
+                    || r.width < width / 2.0
+                    || r.height <= 0.0
+                    || r.height > view / 3.0
+                {
+                    continue;
+                }
+                if r.y <= 1.0 && r.y + r.height > 0.0 {
+                    top = top.max(r.y + r.height);
+                } else if r.y + r.height >= view - 1.0 && r.y < view {
+                    bottom = bottom.max(view - r.y);
+                }
+            }
+        }
+        (top, bottom)
+    }
+
     fn scroll_by(&mut self, delta: f32) -> bool {
         self.scroll_to(self.scroll + delta)
     }
@@ -3140,8 +3188,11 @@ impl<S: Screen> Browser<S> {
         if k.key == Key::Escape {
             return self.stop_load();
         }
-        let page = self.page_height() - PAGE_OVERLAP;
+        let page = self.page_step();
         match k.key {
+            // ⌥↑ / ⌥↓ page, as in other macOS apps.
+            Key::Down if k.option => self.scroll_by(page),
+            Key::Up if k.option => self.scroll_by(-page),
             Key::Down => self.scroll_by(LINE_STEP),
             Key::Up => self.scroll_by(-LINE_STEP),
             Key::PageDown => self.scroll_by(page),
@@ -6754,6 +6805,81 @@ mod tests {
         )
         .unwrap();
         (a, b)
+    }
+
+    #[test]
+    fn space_reads_every_line_past_fixed_bars() {
+        let dir = std::env::temp_dir().join(format!("broxee-bars-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let page = dir.join("bars.html");
+        let lines: String = (0..120).map(|i| format!("<p>line {i}</p>")).collect();
+        std::fs::write(
+            &page,
+            format!(
+                "<title>Bars</title><style>body {{ margin: 0 }} p {{ margin: 0; line-height: 20px }}\
+                 .top {{ position: fixed; top: 0; left: 0; right: 0; height: 50px; background: #ddd }}\
+                 .end {{ position: fixed; bottom: 0; left: 0; right: 0; height: 30px; background: #ddd }}\
+                 .side {{ position: fixed; top: 0; left: 0; width: 40px; height: 100%; background: #eee }}\
+                 </style><div class=top>Header</div><div class=end>Cookies</div><div class=side></div>\
+                 <div style='height: 50px'></div>{lines}<div style='height: 30px'></div>"
+            ),
+        )
+        .unwrap();
+        let mut b = browser(&page);
+        assert_eq!(title(&b), "Bars");
+        let view = b.page_height();
+        assert_eq!(b.fixed_bars(), (50.0, 30.0), "the side rail is not a bar");
+        let step = view - 50.0 - 30.0 - PAGE_OVERLAP;
+        assert_eq!(b.page_step(), step);
+
+        // Space from top to bottom: every line is once wholly between the bars.
+        let boxes = |b: &Browser<FakeScreen>| -> Vec<(usize, f32)> {
+            let page = b.page.as_ref().unwrap();
+            let ps: Vec<NodeId> = page
+                .dom
+                .descendants(html::Dom::ROOT)
+                .filter(|&n| page.dom.tag_name(n) == Some("p"))
+                .collect();
+            ps.iter()
+                .enumerate()
+                .filter_map(|(i, &n)| {
+                    let r = page.layout.boxes.iter().find(|x| x.node == n)?.rect;
+                    Some((i, r.y))
+                })
+                .collect()
+        };
+        let all = boxes(&b);
+        assert_eq!(all.len(), 120);
+        let mut read = [false; 120];
+        loop {
+            for &(i, y) in &all {
+                let top = y - b.scroll;
+                if top >= 50.0 && top + 20.0 <= view - 30.0 {
+                    read[i] = true;
+                }
+            }
+            if !act(&mut b, key(Key::Char(' '))) {
+                break;
+            }
+        }
+        assert_eq!(b.scroll, b.max_scroll());
+        let missed: Vec<usize> = (0..120).filter(|&i| !read[i]).collect();
+        assert!(missed.is_empty(), "lines hidden under a bar: {missed:?}");
+
+        // ⌥↑ / ⌥↓ page like Page Up / Page Down.
+        act(&mut b, key(Key::Home));
+        let option = |k: Key| {
+            Event::Key(KeyEvent {
+                key: k,
+                command: false,
+                shift: false,
+                option: true,
+            })
+        };
+        act(&mut b, option(Key::Down));
+        assert_eq!(b.scroll, step);
+        act(&mut b, option(Key::Up));
+        assert_eq!(b.scroll, 0.0);
     }
 
     fn browser(target: &Path) -> Browser<FakeScreen> {
