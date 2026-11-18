@@ -34,6 +34,7 @@ styles or layout with timings and peak RAM. On Linux only the CLI exists (no win
 | Path | What lives there |
 |---|---|
 | `crates/flate` | DEFLATE, zlib, gzip, Brotli, CRC-32, Adler-32 |
+| `crates/math` | sin, cos, tan, atan2, exp giving the same bits on every platform (renders must not depend on libm) |
 | `crates/net` | URLs, HTTP/1.1, TLS, keep-alive pool, redirects, `file://`, cookies, Public Suffix List |
 | `crates/html` | tokenizer, entities, tree builder, arena DOM, the shared fast hasher |
 | `crates/css` | parser, `@media`, selectors, cascade, computed values, grid templates, UA and quirks sheets |
@@ -44,6 +45,7 @@ styles or layout with timings and peak RAM. On Linux only the CLI exists (no win
 | `crates/platform` | macOS window via the Objective-C runtime and `IOSurface` (empty on other OSes) |
 | `crates/shell` | the `broxee` binary: CLI, page pipeline, browser (tabs, profiles, session), chrome, palette |
 | `scripts/budget.sh` | the 60 MB check |
+| `scripts/sites.sh`, `testdata/sites` | site regression suite: saved pages rendered and compared tile by tile |
 | `docs/pipeline.md` | what runs sequentially, in parallel, or on the main thread only |
 | `DESIGN.md` | design data for every UI change |
 | `CHANGELOG.md`, `README.md` | changes per release; roadmap, CSS/layout support, budget log, compression decisions |
@@ -71,9 +73,11 @@ cargo fmt
 cargo clippy --all-targets -- -D warnings
 cargo test
 ./scripts/budget.sh
+./scripts/sites.sh      # after anything that can change what a page looks like
 ```
 
-`make check` runs all four.
+`make check` runs all five. When `sites.sh` fails, `./scripts/sites.sh --base main` draws what moved; if the change
+is intended, `./scripts/sites.sh --update` and commit the tiles with it.
 
 Other useful commands:
 

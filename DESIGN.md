@@ -85,6 +85,10 @@ Rules:
 
 - **`muted` is at the limit in light mode (4.52).** Never lighten it, and never put it on `selected`. A sleeping tab
   that gets selected wakes up, so its title returns to `text` anyway.
+- **Marks over page text are translucent `accent`** (selection 40%, find matches 24%, the current match 51%),
+  never an opaque fill: a page's own colors and text stay readable under them, in either theme. The find
+  field takes the address field's place in the pane header, with "Find in page" as its placeholder and
+  "2 of 5" (or "No matches") muted at its right end.
 - **One accent.** Sky marks the thing you can act on now: a link, the focused control, the primary button, page
   load progress. It is never a background for a whole region.
 - **Emerald is a signature, not a second accent.** It appears on the wordmark and as a profile color. Buttons and
@@ -111,8 +115,11 @@ Amber in light mode is at the limit (4.53): never lighten it.
 ## 4. Typography
 
 - **UI: Figtree**, the family's body face, bundled with the app so tabs and menus render identically on every OS.
-  Its open, friendly shapes stay legible at the small sizes a sidebar needs. One variable font file, budgeted at
-  under 1 MB.
+  Its open, friendly shapes stay legible at the small sizes a sidebar needs. Two static faces, Regular (400) and
+  SemiBold (600), stored in the binary as WOFF2: 46 KB together, decoded the first time the interface draws text.
+  A variable font would need glyph variations (`gvar`) Broxee does not read yet; 500 renders as 400.
+- **Modifier symbols (⌘ ⇧ ⌥)** are not in Figtree. They come from the system's symbol font (macOS
+  `Keyboard.ttf`) through per-character fallback, and are drawn as icons where no font has them.
 - **Wordmark: Figtree semibold** in `signature`. No separate display face: Broxee has no headlines in its chrome,
   so a second font would cost bytes for nothing. **(agent)**
 - **No monospace in the chrome.** URLs are shown in Figtree. A mono face arrives only if developer tools do.
@@ -131,9 +138,14 @@ Sentence case everywhere. No uppercase tracked labels. Numbers use tabular figur
 ## 5. Shape and depth
 
 - Radius: 6px for tab rows, inputs and buttons; 10px for menus, the ⌘K palette and dialogs. Nothing is pill-shaped.
-- Shadow: only on things that float above the page (menus, ⌘K, dialogs), one soft shadow. Everything else is flat
+- Shadow: only on things that float above the page (menus, ⌘K, dialogs, a select's dropdown), one soft shadow.
+  A select's dropdown is a menu panel under its control (above it when there is no room), at least 160px
+  wide, ten rows before it scrolls: group labels as section labels, disabled options in `muted`, the current
+  choice in semibold (not marked by color alone), the highlighted row on `selected`. Everything else is flat
   and separated by `line` hairlines.
-- Panes in a split are separated by a 1px `line` hairline and a 6px drag handle that only shows on hover.
+- Panes in a split are separated by a 1px `line` hairline and a 6px drag handle (`text-2`) that only shows on
+  hover. A tab shown in a pane carries a 16px outlined box with the pane's number (`text-2`) in its sidebar
+  row: a number, never only a color. A tab dragged over a pane washes it in translucent `accent`.
 
 ## 6. Identity motif: the profile edge **(agent)**
 
@@ -173,12 +185,21 @@ uses). It never appears as decoration anywhere else.
   field, pinned tabs, tab groups, today's tabs, "New tab". Each profile has its own tabs and groups.
 - **Pane header (one per pane, 36px):** back, forward, reload, the host and the profile name, and a ⋯ menu. The full
   URL appears when the field is focused (⌘L). No other toolbar.
+- **Link preview:** while the pointer is over a link, its address shows in a small panel (tooltip style)
+at the bottom left of the pane, shortened in the middle to half the pane's width; it moves to the bottom
+right when the pointer is over it. `target=_blank` links open in a new tab in front.
 - **Split view:** ⌘⇧1 single pane, ⌘⇧2 two side by side, ⌘⇧4 a 2×2 grid. Drag a tab onto a pane to put it there.
   Panes can use different profiles.
 - **New tab:** the ⌘K palette, focused, over a blank `surface`. It lists real recent tabs and bookmarks. No speed
   dial tiles, no suggestions Broxee did not get from your own history.
-- **Bookmarks:** ⌘D saves the current page to a folder (last used folder preselected). ⌘⌥B opens the bookmarks
-  panel in place of the tab list. Every bookmark is also a ⌘K result, so most people never open the panel.
+- **Bookmarks:** ⌘D saves the current page to a folder (last used folder preselected; ↑ ↓ in the folder field
+  step through saved folders, `a / b` nests b in a). ⌘⌥B opens the bookmarks panel in place of the tab list:
+  a tree of folders, each a section label with a chevron (pointing right when folded, down when open) and, when
+  folded, its count in parentheses, so state is never shown by the chevron alone. Each level indents 10px, up to
+  six levels; a folder's bookmarks line up with its name. The row chosen with the keyboard sits on `selected`,
+  and its label turns `text-2` there. Importing (⌘K, "Import bookmarks from another browser") files everything
+  under one folder named Imported and says in a dialog what it added and skipped. Every bookmark is also a ⌘K
+  result, so most people never open the panel.
 - **Settings:** a Broxee page in a tab, not a modal: Profiles, Appearance, Privacy, Sleeping tabs, Shortcuts.
 
 ### Shortcuts
@@ -193,6 +214,11 @@ uses). It never appears as decoration anywhere else.
 | Show or hide the sidebar | ⌘\\ |
 | Bookmark this page / bookmarks panel | ⌘D / ⌘⌥B |
 | Switch profile | ⌘⇧P |
+| Find in page / next / previous match | ⌘F, then Enter / Shift+Enter (or ⌘G / ⌘⇧G); Esc closes |
+| Select all page text / copy the selection | ⌘A / ⌘C |
+| Scroll: line / page / top and bottom | ↑ ↓ / Space, Shift+Space, Page Up/Down, ⌥↑ ⌥↓ / Home, End, ⌘↑ ⌘↓ |
+| Back / forward (outside text fields) | ⌘[ / ⌘], or ⌘← / ⌘→ |
+| Open a link in a background tab / in front | ⌘-click or middle click / ⌘⇧-click |
 
 ## 8. Icons
 
@@ -211,12 +237,15 @@ Every list and every page Broxee draws has its empty, loading and error state.
 |---|---|
 | Page loading | A 2px `accent` progress line under the pane header, only while loading. Reload becomes Stop. |
 | Sleeping tab | Title in `muted`. Tooltip: "Asleep to save memory. Select to wake." |
-| Network error | Broxee page: what failed in plain words ("Couldn't reach github.com: the connection was reset") and **Try again**. |
+| Network error | Broxee page: what failed in plain words, one title per cause ("Couldn't find github.com", "github.com refused the connection", "github.com took too long to answer", "github.com redirected too many times"), the address, and **Try again**. |
+| Offline | "You're offline". The tab reloads by itself once a network interface is back. |
 | Certificate error | "github.com's certificate isn't valid, so Broxee didn't open it." No click-through in the first version. |
 | Page Broxee can't render yet | "This page needs JavaScript, which Broxee doesn't run yet." Action: **Open in default browser**. |
 | No bookmarks | "No bookmarks yet. Press ⌘D on any page to save it here." |
 | ⌘K finds nothing | "Nothing matches "rust bok". Press Enter to search the web." |
 | Restored session | Tabs come back asleep except the visible ones, so startup stays fast. No banner announcing it. |
+| A page hit a bug in Broxee | Broxee page in that tab: "Broxee couldn't show this page", that the other tabs are still open and where the note went (a crash log on this computer), the address, and **Try again**. |
+| Restored after a crash | Tabs come back as above, but the visible tab waits with a Broxee page: "Broxee quit unexpectedly", why it waits, and **Open the page**. Still no banner. |
 
 ## 10. Size and speed budget for the design
 
@@ -224,7 +253,7 @@ The design has to fit inside the 60 MB budget enforced by `scripts/budget.sh`.
 
 | Item | Budget |
 |---|---|
-| Figtree variable font | under 1 MB |
+| Figtree (Regular + SemiBold, WOFF2) | under 1 MB (46 KB) |
 | Icons (vector paths in code) | under 20 KB |
 | Images in the chrome | none |
 | Animation duration | 120 ms maximum, ease-out; off under reduced motion |

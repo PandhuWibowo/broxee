@@ -1,3 +1,5 @@
+use crate::effects::{parse_images, parse_shadows, EffectSlot, EffectSpec};
+use crate::fontface::{parse_family_list, parse_font_face, FamilyList, FontFace};
 use crate::grid::{expand_grid, is_grid_property, GridSlot, GridValue};
 use crate::media::{Media, MediaList};
 use crate::selector::{parse_selector_list, Selector};
@@ -28,6 +30,19 @@ pub enum Declaration {
         value: Box<GridValue>,
         important: bool,
     },
+    /// `font-family`, as lowercase names.
+    Family { value: FamilyList, important: bool },
+    /// `box-shadow` or gradient backgrounds: lists, resolved per element in the cascade.
+    Effect {
+        slot: EffectSlot,
+        value: Box<EffectSpec>,
+        important: bool,
+    },
+    /// `content`, kept as written (strings keep their case).
+    Content {
+        value: Box<Content>,
+        important: bool,
+    },
     /// A value that uses `var()`. Substituted and parsed per element during the cascade.
     Pending {
         name: Box<str>,
@@ -42,6 +57,9 @@ impl Declaration {
             Declaration::Typed(d) => d.important,
             Declaration::Custom { important, .. }
             | Declaration::Pending { important, .. }
+            | Declaration::Content { important, .. }
+            | Declaration::Family { important, .. }
+            | Declaration::Effect { important, .. }
             | Declaration::Grid { important, .. } => *important,
         }
     }
@@ -62,6 +80,8 @@ pub struct Stylesheet {
     pub skipped: usize,
     /// Each condition is the media lists of every enclosing `@media`; all must match.
     pub conditions: Vec<Vec<MediaList>>,
+    /// `@font-face` rules, in order. Their URLs are relative to the stylesheet.
+    pub font_faces: Vec<FontFace>,
 }
 
 impl Stylesheet {
@@ -71,6 +91,27 @@ impl Stylesheet {
 
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
+    }
+
+    /// Make the `url()`s of background layers absolute with `join` (the sheet's URL), right
+    /// after parsing: relative URLs mean the sheet's location, not the page's. `@font-face`
+    /// sources are resolved by the loader the same way.
+    pub fn resolve_urls(&mut self, join: impl Fn(&str) -> Option<String>) {
+        for rule in &mut self.rules {
+            for decl in &mut rule.decls {
+                if let Declaration::Effect { value, .. } = decl {
+                    if let EffectSpec::Images(layers) = &mut **value {
+                        for layer in layers {
+                            if let crate::effects::ImageSpec::Url(url) = layer {
+                                if let Some(absolute) = join(url) {
+                                    *url = absolute;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub fn condition_matches(&self, condition: Option<u32>, media: &Media) -> bool {
@@ -84,7 +125,8 @@ impl Stylesheet {
 
 /// Parse a stylesheet. Unknown properties and invalid values are skipped one declaration at
 /// a time, as browsers do. `@media` rules are kept with their condition; `@supports` and
-/// `@layer` blocks are read as if their condition held; other at-rules are skipped.
+/// `@layer` blocks are read as if their condition held; `@font-face` rules are collected;
+/// other at-rules are skipped.
 pub fn parse_stylesheet(src: &str) -> Stylesheet {
     parse_stylesheet_owned(src.to_owned())
 }
@@ -146,6 +188,7 @@ fn parse_rules(
                             parse_rules(body, condition, sheet, vocabulary);
                         }
                         "layer" => parse_rules(body, condition, sheet, vocabulary),
+                        "font-face" => sheet.font_faces.extend(parse_font_face(body)),
                         _ => {}
                     }
                     i = close + 1;
@@ -236,6 +279,83 @@ pub fn parse_declarations(src: &str) -> Vec<Declaration> {
 
 /// Expand one declaration whose value no longer contains `var()` into longhand declarations.
 pub fn expand_declaration(name: &str, value: &str, important: bool) -> Vec<Declaration> {
+    if name == "font-family" {
+        let value = match value.trim() {
+            v if v.eq_ignore_ascii_case("initial") => Some(FamilyList::default()),
+            v if v.eq_ignore_ascii_case("inherit") || v.eq_ignore_ascii_case("unset") => None,
+            v => parse_family_list(v),
+        };
+        return value
+            .map(|value| Declaration::Family { value, important })
+            .into_iter()
+            .collect();
+    }
+    if let Some(slot) = effect_slot(name) {
+        let v = value.trim().to_ascii_lowercase();
+        let spec = match v.as_str() {
+            "initial" | "unset" | "revert" | "revert-layer" | "none" => Some(match slot {
+                EffectSlot::BoxShadow => EffectSpec::Shadows(Vec::new()),
+                EffectSlot::BackgroundImage => EffectSpec::Images(Vec::new()),
+                EffectSlot::Transform => EffectSpec::Transform(Vec::new()),
+            }),
+            // Not inherited: `inherit` is rare enough to treat as not set.
+            "inherit" => None,
+            v => match slot {
+                EffectSlot::BoxShadow => parse_shadows(v).map(EffectSpec::Shadows),
+                // URLs keep their case.
+                EffectSlot::BackgroundImage => parse_images(value).map(EffectSpec::Images),
+                EffectSlot::Transform => {
+                    crate::transform::parse_transform(v).map(EffectSpec::Transform)
+                }
+            },
+        };
+        return spec
+            .map(|value| Declaration::Effect {
+                slot,
+                value: Box::new(value),
+                important,
+            })
+            .into_iter()
+            .collect();
+    }
+    if name == "background" {
+        // The shorthand sets the color, and resets the image layers and the first layer's
+        // position, size and repeat to what it gives.
+        let v = value.trim().to_ascii_lowercase();
+        let mut out = expand_declaration("background-color-shorthand", &v, important);
+        if !matches!(v.as_str(), "inherit" | "initial" | "unset") {
+            out.push(Declaration::Effect {
+                slot: EffectSlot::BackgroundImage,
+                value: Box::new(EffectSpec::Images(parse_images(value).unwrap_or_default())),
+                important,
+            });
+            let (position, size, repeat) = crate::effects::parse_background_rest(value);
+            for (prop, value) in [
+                (
+                    Prop::BackgroundPosition,
+                    Value::Origin(position.0, position.1),
+                ),
+                (Prop::BackgroundSize, Value::BgSize(size)),
+                (Prop::BackgroundRepeat, Value::Repeat(repeat.0, repeat.1)),
+            ] {
+                out.push(Declaration::Typed(Decl {
+                    prop,
+                    value,
+                    important,
+                }));
+            }
+        }
+        return out;
+    }
+    if name == "content" {
+        return parse_content(value)
+            .map(|c| Declaration::Content {
+                value: Box::new(c),
+                important,
+            })
+            .into_iter()
+            .collect();
+    }
     let mut sink = Sink {
         out: Vec::new(),
         important,
@@ -298,10 +418,11 @@ fn expand(name: &str, v: &str, sink: &mut Sink) {
         "overflow" => {
             // `overflow: hidden auto` clips if either axis clips.
             let clips = v.split_whitespace().any(|t| matches!(t, "hidden" | "clip"));
+            let visible = v.split_whitespace().all(|t| t == "visible");
             if v.split_whitespace()
                 .all(|t| matches!(t, "visible" | "hidden" | "clip" | "auto" | "scroll"))
             {
-                sink.set(Prop::Overflow, Value::Clips(clips));
+                sink.set(Prop::Overflow, Value::Overflow { clips, visible });
             }
         }
         "padding" => box4(v, PADDING, sink),
@@ -309,7 +430,9 @@ fn expand(name: &str, v: &str, sink: &mut Sink) {
         "border-style" => box4(v, BORDER_STYLE, sink),
         "border-color" => box4(v, BORDER_COLOR, sink),
         "border" => border(v, &[0, 1, 2, 3], sink),
-        "background" => background(v, sink),
+        "outline" => outline(v, sink),
+        "background" | "background-color-shorthand" => background(v, sink),
+        "border-radius" => border_radius(v, sink),
         "font" => font(v, sink),
         "text-decoration-line" => expand("text-decoration", v, sink),
         "flex" => flex(v, sink),
@@ -371,7 +494,9 @@ fn longhands(name: &str) -> Vec<Prop> {
         "border-style" => BORDER_STYLE.to_vec(),
         "border-color" => BORDER_COLOR.to_vec(),
         "border" => [BORDER_WIDTH, BORDER_STYLE, BORDER_COLOR].concat(),
-        "background" => vec![Prop::BackgroundColor],
+        "outline" => vec![Prop::OutlineWidth, Prop::OutlineStyle, Prop::OutlineColor],
+        "background" | "background-color-shorthand" => vec![Prop::BackgroundColor],
+        "border-radius" => RADIUS.to_vec(),
         "font" => vec![
             Prop::FontSize,
             Prop::FontWeight,
@@ -415,6 +540,7 @@ fn single_prop(name: &str) -> Option<Prop> {
         "left" => Prop::Left,
         "visibility" => Prop::Visibility,
         "opacity" => Prop::Opacity,
+        "clip" => Prop::Clip,
         "overflow-x" | "overflow-y" => Prop::Overflow,
         "box-sizing" => Prop::BoxSizing,
         "flex-direction" => Prop::FlexDirection,
@@ -428,9 +554,24 @@ fn single_prop(name: &str) -> Option<Prop> {
         "row-gap" | "grid-row-gap" => Prop::RowGap,
         "column-gap" | "grid-column-gap" => Prop::ColumnGap,
         "order" => Prop::Order,
+        "z-index" => Prop::ZIndex,
+        "transform-origin" | "-webkit-transform-origin" => Prop::TransformOrigin,
+        "background-size" | "-webkit-background-size" => Prop::BackgroundSize,
+        "background-position" => Prop::BackgroundPosition,
+        "background-repeat" => Prop::BackgroundRepeat,
         "vertical-align" => Prop::VerticalAlign,
         "border-collapse" => Prop::BorderCollapse,
         "caption-side" => Prop::CaptionSide,
+        "float" => Prop::Float,
+        "clear" => Prop::Clear,
+        "outline-width" => Prop::OutlineWidth,
+        "outline-style" => Prop::OutlineStyle,
+        "outline-color" => Prop::OutlineColor,
+        "outline-offset" => Prop::OutlineOffset,
+        "border-top-left-radius" => Prop::BorderTopLeftRadius,
+        "border-top-right-radius" => Prop::BorderTopRightRadius,
+        "border-bottom-right-radius" => Prop::BorderBottomRightRadius,
+        "border-bottom-left-radius" => Prop::BorderBottomLeftRadius,
         _ => {
             if let Some(side) = name.strip_prefix("margin-").and_then(side_index) {
                 return Some(MARGIN[side]);
@@ -450,6 +591,92 @@ fn single_prop(name: &str) -> Option<Prop> {
     })
 }
 
+const RADIUS: [Prop; 4] = [
+    Prop::BorderTopLeftRadius,
+    Prop::BorderTopRightRadius,
+    Prop::BorderBottomRightRadius,
+    Prop::BorderBottomLeftRadius,
+];
+
+fn effect_slot(name: &str) -> Option<EffectSlot> {
+    match name {
+        "box-shadow" => Some(EffectSlot::BoxShadow),
+        "background-image" => Some(EffectSlot::BackgroundImage),
+        "transform" | "-webkit-transform" => Some(EffectSlot::Transform),
+        _ => None,
+    }
+}
+
+fn radius_length(t: &str) -> Option<SpecLength> {
+    parse_length(t).filter(|l| non_negative(l) && *l != SpecLength::Auto)
+}
+
+/// `border-radius: 4px`, `10px 5%`, `1em 2em 3em 4em / 5px`: one to four horizontal radii,
+/// then optionally one to four vertical ones, for top left, top right, bottom right, bottom left.
+fn border_radius(v: &str, sink: &mut Sink) {
+    let (h, vert) = match v.split_once('/') {
+        Some((h, vert)) => (h, Some(vert)),
+        None => (v, None),
+    };
+    let four = |part: &str| -> Option<[SpecLength; 4]> {
+        let l: Vec<SpecLength> = part
+            .split_whitespace()
+            .map(radius_length)
+            .collect::<Option<_>>()?;
+        Some(match l.as_slice() {
+            [a] => [*a; 4],
+            [a, b] => [*a, *b, *a, *b],
+            [a, b, c] => [*a, *b, *c, *b],
+            [a, b, c, d] => [*a, *b, *c, *d],
+            _ => return None,
+        })
+    };
+    let Some(h) = four(h) else { return };
+    let vert = match vert {
+        Some(part) => match four(part) {
+            Some(v) => v,
+            None => return,
+        },
+        None => h,
+    };
+    for i in 0..4 {
+        sink.set(RADIUS[i], Value::Radius(h[i], vert[i]));
+    }
+}
+
+/// `clip`: `auto`, or `rect(top, right, bottom, left)` with commas or spaces. Says whether the
+/// rectangle leaves at most one pixel of width or height (sides in px or 0; `auto` or other
+/// units count as not hiding).
+fn parse_clip(v: &str) -> Option<bool> {
+    let v = v.trim();
+    if v.eq_ignore_ascii_case("auto") {
+        return Some(false);
+    }
+    let inner = v
+        .get(..5)
+        .filter(|p| p.eq_ignore_ascii_case("rect("))
+        .and_then(|_| v[5..].strip_suffix(')'))?;
+    let sides: Vec<&str> = inner
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if sides.len() != 4 {
+        return None;
+    }
+    let px = |s: &str| -> Option<f32> {
+        let n = s.strip_suffix("px").unwrap_or(s);
+        if n != s || n.parse::<f32>().ok() == Some(0.0) {
+            n.parse().ok()
+        } else {
+            None
+        }
+    };
+    let [top, right, bottom, left] = [sides[0], sides[1], sides[2], sides[3]].map(px);
+    let width = right.zip(left).map(|(r, l)| r - l);
+    let height = bottom.zip(top).map(|(b, t)| b - t);
+    Some(width.is_some_and(|w| w <= 1.0) || height.is_some_and(|h| h <= 1.0))
+}
+
 fn side_index(side: &str) -> Option<usize> {
     ["top", "right", "bottom", "left"]
         .iter()
@@ -461,6 +688,17 @@ fn parse_for(prop: Prop, v: &str) -> Option<Value> {
     use Prop::*;
     match prop {
         Display => parse_display(v).map(Value::Display),
+        p if RADIUS.contains(&p) => {
+            let parts: Vec<SpecLength> = v
+                .split_whitespace()
+                .map(radius_length)
+                .collect::<Option<_>>()?;
+            match parts.as_slice() {
+                [r] => Some(Value::Radius(*r, *r)),
+                [h, v] => Some(Value::Radius(*h, *v)),
+                _ => None,
+            }
+        }
         Color | BackgroundColor => parse_color_value(v),
         FontSize => parse_font_size(v).map(Value::Length),
         FontWeight => parse_font_weight(v),
@@ -495,6 +733,7 @@ fn parse_for(prop: Prop, v: &str) -> Option<Value> {
             "hidden" | "collapse" => Some(Value::Visible(false)),
             _ => None,
         },
+        Clip => parse_clip(v).map(Value::ClipHides),
         Opacity => match v.strip_suffix('%') {
             Some(pct) => pct
                 .parse::<f32>()
@@ -559,12 +798,48 @@ fn parse_for(prop: Prop, v: &str) -> Option<Value> {
                 .map(Value::Length),
         },
         Order => v.parse::<i32>().ok().map(|n| Value::Number(n as f32)),
+        BackgroundSize => crate::effects::parse_size(v).map(Value::BgSize),
+        BackgroundPosition => {
+            crate::effects::parse_bg_position(v).map(|(x, y)| Value::Origin(x, y))
+        }
+        BackgroundRepeat => crate::effects::parse_repeat(v).map(|(x, y)| Value::Repeat(x, y)),
+        TransformOrigin => {
+            // The z part, when given, has no 2D meaning.
+            let xy: Vec<&str> = v.split_whitespace().take(2).collect();
+            crate::effects::parse_position(&xy.join(" ")).map(|(x, y)| Value::Origin(x, y))
+        }
+        ZIndex => match v {
+            "auto" => Some(Value::Normal),
+            n => n.parse::<i32>().ok().map(|n| Value::Number(n as f32)),
+        },
         VerticalAlign => Some(Value::VAlign(match v {
             "top" => VAlign::Top,
             "middle" => VAlign::Middle,
             "bottom" => VAlign::Bottom,
             _ => VAlign::Baseline,
         })),
+        Float => Some(Value::Float(match v {
+            "left" | "inline-start" => crate::values::Float::Left,
+            "right" | "inline-end" => crate::values::Float::Right,
+            "none" => crate::values::Float::None,
+            _ => return None,
+        })),
+        Clear => Some(Value::Clear(match v {
+            "left" | "inline-start" => crate::values::Clear::Left,
+            "right" | "inline-end" => crate::values::Clear::Right,
+            "both" => crate::values::Clear::Both,
+            "none" => crate::values::Clear::None,
+            _ => return None,
+        })),
+        OutlineWidth => parse_border_width(v).map(Value::Length),
+        // `auto` is the browser's own ring; it is drawn as a solid line.
+        OutlineStyle if v == "auto" => Some(Value::BorderStyle(true)),
+        OutlineStyle => parse_border_style(v).map(Value::BorderStyle),
+        OutlineColor if v == "invert" => Some(Value::CurrentColor),
+        OutlineColor => parse_color_value(v),
+        OutlineOffset => parse_length(v)
+            .filter(|l| !matches!(l, SpecLength::Auto | SpecLength::Percent(_)))
+            .map(Value::Length),
         CaptionSide => match v {
             "bottom" => Some(Value::CaptionBottom(true)),
             "top" => Some(Value::CaptionBottom(false)),
@@ -577,8 +852,18 @@ fn parse_for(prop: Prop, v: &str) -> Option<Value> {
         },
         // `auto` and `scroll` stay unclipped until boxes can scroll their own content.
         Overflow => match v {
-            "hidden" | "clip" => Some(Value::Clips(true)),
-            "visible" | "auto" | "scroll" => Some(Value::Clips(false)),
+            "hidden" | "clip" => Some(Value::Overflow {
+                clips: true,
+                visible: false,
+            }),
+            "auto" | "scroll" => Some(Value::Overflow {
+                clips: false,
+                visible: false,
+            }),
+            "visible" => Some(Value::Overflow {
+                clips: false,
+                visible: true,
+            }),
             _ => None,
         },
         p if PADDING.contains(&p) => parse_length(v)
@@ -634,6 +919,110 @@ fn border(v: &str, sides: &[usize], sink: &mut Sink) {
     }
 }
 
+/// `outline: 2px solid blue`, `outline: none`, `outline: auto`.
+fn outline(v: &str, sink: &mut Sink) {
+    let mut width = Value::Length(SpecLength::Px(3.0));
+    let mut style = Value::BorderStyle(false);
+    let mut color = Value::CurrentColor;
+    for token in split_values(v) {
+        if token == "auto" {
+            style = Value::BorderStyle(true);
+            width = Value::Length(SpecLength::Px(2.0));
+        } else if let Some(s) = parse_border_style(token) {
+            style = Value::BorderStyle(s);
+        } else if let Some(w) = parse_border_width(token) {
+            width = Value::Length(w);
+        } else if let Some(c) = parse_color_value(token) {
+            color = c;
+        } else if token != "invert" {
+            return;
+        }
+    }
+    sink.set(Prop::OutlineWidth, width);
+    sink.set(Prop::OutlineStyle, style);
+    sink.set(Prop::OutlineColor, color);
+}
+
+/// `content`: strings and `attr()`, or `none` / `normal`. Anything else (counters, quotes,
+/// images) drops the declaration rather than showing part of it.
+pub(crate) fn parse_content(v: &str) -> Option<Content> {
+    // `content: "x" / "alt text"`: the part after the slash is for screen readers.
+    let v = split_top_level(v, b'/').into_iter().next()?.trim();
+    if v.eq_ignore_ascii_case("none") || v.eq_ignore_ascii_case("normal") {
+        return Some(Content::None);
+    }
+    let mut parts = Vec::new();
+    let mut rest = v;
+    while !rest.is_empty() {
+        if let Some(q @ ('"' | '\'')) = rest.chars().next() {
+            let (text, after) = css_string(&rest[1..], q)?;
+            parts.push(ContentPart::Text(text.into()));
+            rest = after;
+        } else if rest.len() >= 5 && rest[..5].eq_ignore_ascii_case("attr(") {
+            let close = rest.find(')')?;
+            let name = rest[5..close].trim();
+            if name.is_empty()
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            {
+                return None;
+            }
+            parts.push(ContentPart::Attr(name.to_ascii_lowercase().into()));
+            rest = &rest[close + 1..];
+        } else {
+            return None;
+        }
+        rest = rest.trim_start();
+    }
+    Some(Content::Parts(parts))
+}
+
+/// The text of a CSS string after its opening quote `q`, with escapes decoded (`\f101`, `\"`),
+/// and what follows the closing quote.
+pub(crate) fn css_string(s: &str, q: char) -> Option<(String, &str)> {
+    let mut out = String::new();
+    let mut chars = s.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            _ if c == q => return Some((out, &s[i + 1..])),
+            '\\' => {
+                let &(_, next) = chars.peek()?;
+                if next.is_ascii_hexdigit() {
+                    let mut code = 0u32;
+                    for _ in 0..6 {
+                        match chars.peek() {
+                            Some(&(_, h)) if h.is_ascii_hexdigit() => {
+                                code = code * 16 + h.to_digit(16)?;
+                                chars.next();
+                            }
+                            _ => break,
+                        }
+                    }
+                    // One white space character after a hex escape belongs to it.
+                    if chars.peek().is_some_and(|&(_, w)| w.is_ascii_whitespace()) {
+                        chars.next();
+                    }
+                    out.push(
+                        char::from_u32(code)
+                            .filter(|&c| c != '\0')
+                            .unwrap_or('\u{fffd}'),
+                    );
+                } else {
+                    chars.next();
+                    // An escaped newline continues the string.
+                    if next != '\n' {
+                        out.push(next);
+                    }
+                }
+            }
+            '\n' => return None,
+            _ => out.push(c),
+        }
+    }
+    None
+}
+
 /// Only the color part of `background` is used; images and positions come later.
 fn background(v: &str, sink: &mut Sink) {
     let color = split_values(v)
@@ -643,7 +1032,7 @@ fn background(v: &str, sink: &mut Sink) {
     sink.set(Prop::BackgroundColor, color);
 }
 
-/// `font: italic bold 16px/1.5 system-ui, sans-serif`. The family is not used yet.
+/// `font: italic bold 16px/1.5 system-ui, sans-serif`.
 fn font(v: &str, sink: &mut Sink) {
     let tokens = split_values(v);
     let mut weight = Value::FontWeight(400);
@@ -670,6 +1059,24 @@ fn font(v: &str, sink: &mut Sink) {
                 },
                 None => Value::Normal,
             };
+            // The family is everything after the size and line height, and it is required.
+            let after = match (inline_lh, lh_text) {
+                (Some(lh), _) if !lh.is_empty() => i + 1,
+                (_, None) => i + 1,
+                (Some(_), Some(_)) => i + 2,
+                (None, Some(_)) if tokens.get(i + 1) == Some(&"/") => i + 3,
+                (None, Some(_)) => i + 2,
+            };
+            let Some(family) = tokens
+                .get(after..)
+                .and_then(|rest| parse_family_list(&rest.join(" ")))
+            else {
+                return;
+            };
+            sink.out.push(Declaration::Family {
+                value: family,
+                important: sink.important,
+            });
             sink.set(Prop::FontSize, Value::Length(size));
             sink.set(Prop::LineHeight, line);
             sink.set(Prop::FontWeight, weight);
@@ -808,7 +1215,8 @@ fn flex(v: &str, sink: &mut Sink) {
 
 fn parse_display(v: &str) -> Option<Display> {
     Some(match v {
-        "block" | "flow-root" => Display::Block,
+        "block" => Display::Block,
+        "flow-root" => Display::FlowRoot,
         "table" => Display::Table,
         "inline-table" => Display::InlineTable,
         "table-row-group" => Display::TableRowGroup,
@@ -880,7 +1288,7 @@ fn parse_color_value(v: &str) -> Option<Value> {
 }
 
 /// Split on whitespace that is not inside parentheses, so `rgb(0, 0, 0)` stays one token.
-fn split_values(v: &str) -> Vec<&str> {
+pub(crate) fn split_values(v: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut depth = 0i32;
     let mut start = None;
@@ -905,7 +1313,7 @@ fn split_values(v: &str) -> Vec<&str> {
 }
 
 /// Split on `sep` outside parentheses, brackets and quotes.
-fn split_top_level(s: &str, sep: u8) -> Vec<&str> {
+pub(crate) fn split_top_level(s: &str, sep: u8) -> Vec<&str> {
     let mut out = Vec::new();
     let mut depth = 0i32;
     let mut quote: Option<u8> = None;
@@ -1000,6 +1408,71 @@ fn block_end(s: &str, open: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_content_with_escapes_and_attr() {
+        let content = |v: &str| parse_content(v);
+        let text = |s: &str| ContentPart::Text(s.into());
+        assert_eq!(
+            content(r#""Hello""#),
+            Some(Content::Parts(vec![text("Hello")]))
+        );
+        assert_eq!(
+            content(r#""\f101""#),
+            Some(Content::Parts(vec![text("\u{f101}")]))
+        );
+        assert_eq!(
+            content(r#""\201C x""#),
+            Some(Content::Parts(vec![text("\u{201c}x")])),
+            "one space ends the escape"
+        );
+        assert_eq!(
+            content(r#"'it\'s'"#),
+            Some(Content::Parts(vec![text("it's")]))
+        );
+        assert_eq!(
+            content(r#""(" attr(data-Count) ")""#),
+            Some(Content::Parts(vec![
+                text("("),
+                ContentPart::Attr("data-count".into()),
+                text(")")
+            ]))
+        );
+        assert_eq!(
+            content(r#""x" / "alt""#),
+            Some(Content::Parts(vec![text("x")]))
+        );
+        assert_eq!(content("none"), Some(Content::None));
+        assert_eq!(content("normal"), Some(Content::None));
+        for dropped in [
+            "counter(item)",
+            "open-quote",
+            r#""a" counter(x)"#,
+            r#""unclosed"#,
+            "url(x.png)",
+        ] {
+            assert_eq!(content(dropped), None, "{dropped}");
+        }
+        // Strings keep their case even though other values are lowercased.
+        let decls = parse_declarations(r#"content: "MiXeD""#);
+        assert!(matches!(&decls[..], [Declaration::Content { value, .. }]
+            if **value == Content::Parts(vec![text("MiXeD")])));
+    }
+
+    #[test]
+    fn parses_outline() {
+        let d = typed("outline: 2px dashed red");
+        assert_eq!(d.len(), 3);
+        assert_eq!(d[0].value, Value::Length(SpecLength::Px(2.0)));
+        assert_eq!(d[1].value, Value::BorderStyle(true));
+        assert_eq!(typed("outline: none")[1].value, Value::BorderStyle(false));
+        assert_eq!(typed("outline: auto")[1].value, Value::BorderStyle(true));
+        assert_eq!(
+            typed("outline-offset: -2px")[0].value,
+            Value::Length(SpecLength::Px(-2.0))
+        );
+        assert!(typed("outline: 2px wobbly").is_empty());
+    }
 
     fn typed(s: &str) -> Vec<Decl> {
         parse_declarations(s)
@@ -1120,7 +1593,7 @@ mod tests {
             .decls
             .iter()
             .filter_map(|d| match d {
-                Declaration::Typed(d) => Some(d.value),
+                Declaration::Typed(d) if matches!(d.value, Value::Color(_)) => Some(d.value),
                 _ => None,
             })
             .collect();
@@ -1130,6 +1603,18 @@ mod tests {
                 Value::Color(Color::rgb(255, 255, 255)),
                 Value::Color(Color::rgb(255, 0, 0))
             ]
+        );
+        // And the data URL is one layer, its semicolon kept.
+        let layer = sheet.rules[0].decls.iter().find_map(|d| match d {
+            Declaration::Effect { value, .. } => match &**value {
+                EffectSpec::Images(layers) => layers.first().cloned(),
+                _ => None,
+            },
+            _ => None,
+        });
+        assert_eq!(
+            layer,
+            Some(crate::effects::ImageSpec::Url("data:x;y".into()))
         );
     }
 
@@ -1162,5 +1647,22 @@ mod tests {
         ] {
             let _ = parse_stylesheet(css);
         }
+    }
+
+    #[test]
+    fn reads_whether_clip_hides() {
+        assert_eq!(parse_clip("rect(1px, 1px, 1px, 1px)"), Some(true));
+        assert_eq!(parse_clip("rect(0 0 0 0)"), Some(true));
+        assert_eq!(parse_clip("RECT(0px,1px,1px,0px)"), Some(true));
+        assert_eq!(parse_clip("rect(0, 100px, 50px, 0)"), Some(false));
+        assert_eq!(parse_clip("rect(auto, auto, auto, auto)"), Some(false));
+        assert_eq!(
+            parse_clip("rect(0 1em 1em 0)"),
+            Some(false),
+            "other units: unknown"
+        );
+        assert_eq!(parse_clip("auto"), Some(false));
+        assert_eq!(parse_clip("rect(1px 1px)"), None);
+        assert_eq!(parse_clip("inset(50%)"), None);
     }
 }

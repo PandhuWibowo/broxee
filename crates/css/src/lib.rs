@@ -1,28 +1,42 @@
 //! CSS: stylesheet parsing, selector matching and the cascade.
 //!
-//! Supported today: type, class, id, universal, `[attr]`, `[attr=value]` and `:root` selectors,
-//! with descendant and child combinators. Selectors using anything else (`:hover`, `+`, `~`,
-//! pseudo-elements) are dropped, which is the same as never matching. `@media` is evaluated
-//! against a [`Media`]; `@supports` and `@layer` contents are used; other at-rules are skipped.
+//! Selectors Broxee cannot evaluate are dropped, which is the same as never matching (README
+//! lists what is supported). States (`:hover`, `:focus`...) match against [`States`];
+//! `::before` / `::after` produce [`Generated`] boxes. `@media` is evaluated against a
+//! [`Media`]; `@supports` and `@layer` contents are used; `@font-face` rules are collected
+//! ([`FontFace`]); other at-rules are skipped.
 
 mod cascade;
+mod effects;
+mod fontface;
 pub mod grid;
 mod hints;
 mod media;
 mod parser;
 mod selector;
+mod transform;
 mod values;
 mod vocabulary;
 
 use std::sync::OnceLock;
 
-pub use cascade::{cascade, Origin, StyleMap};
+pub use cascade::{
+    cascade, cascade_with, matches_selector, select, Generated, Origin, States, StyleMap,
+};
+pub use effects::{
+    BackgroundImage, BackgroundLayer, BackgroundSize, Gradient, GradientKind, RadialSize, Shadow,
+};
+pub use fontface::{parse_family_list, FamilyList, FontFace, FontSource};
 pub use media::{Media, MediaList};
 pub use parser::{
     parse_declarations, parse_stylesheet, parse_stylesheet_for, parse_stylesheet_owned, Decl, Rule,
     Stylesheet,
 };
-pub use selector::{parse_selector_list, Combinator, Compound, Selector};
+pub use selector::{
+    parse_selector_list, Combinator, Compound, Pseudo, Selector, ACTIVE, FOCUS, FOCUS_VISIBLE,
+    FOCUS_WITHIN, HOVER,
+};
+pub use transform::TransformOp;
 pub use values::*;
 pub use vocabulary::Vocabulary;
 

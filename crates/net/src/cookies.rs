@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::psl;
+use crate::referrer::{Policy, Referrer};
 use crate::Url;
 
 /// Name plus value, as browsers limit them.
@@ -42,7 +43,7 @@ pub struct Cookie {
     last_used: u64,
 }
 
-/// Who is asking, for the `SameSite` and third-party rules.
+/// Who is asking, for the `SameSite` and third-party rules and the `Referer` header.
 #[derive(Clone, Debug)]
 pub struct Context {
     /// The site (`psl::site`) of the page a subresource is for; `None` for the page itself
@@ -51,6 +52,9 @@ pub struct Context {
     /// A top-level navigation the person started (typed, from the palette, back, reload) or
     /// that came from a link on the same site: `SameSite=Strict` cookies go with it.
     pub same_site_initiator: bool,
+    /// The page the request comes from, for `Referer`; `None` sends none (what the person
+    /// typed or chose in the browser's own interface).
+    pub referrer: Option<Referrer>,
 }
 
 impl Context {
@@ -58,14 +62,33 @@ impl Context {
         Context {
             page_site: None,
             same_site_initiator,
+            referrer: None,
         }
     }
 
+    /// A part of `page` (stylesheet, script, image, font, a script's request): `page` is its
+    /// referrer, under the default policy until `with_policy` gives the page's own.
     pub fn subresource(page: &Url) -> Context {
         Context {
             page_site: Some(psl::site(&page.host).to_string()),
             same_site_initiator: true,
+            referrer: Some(Referrer {
+                page: page.clone(),
+                policy: Policy::default(),
+            }),
         }
+    }
+
+    pub fn with_policy(mut self, policy: Policy) -> Context {
+        if let Some(r) = &mut self.referrer {
+            r.policy = policy;
+        }
+        self
+    }
+
+    pub fn with_referrer(mut self, referrer: Option<Referrer>) -> Context {
+        self.referrer = referrer;
+        self
     }
 
     /// Cookies may be used for `url` at all: not for another site's subresources.
@@ -89,6 +112,8 @@ impl Context {
 pub struct Cookies {
     jar: Mutex<Vec<Cookie>>,
     changed: AtomicBool,
+    /// The profile's HTTP cache, travelling with its cookies so it is never another's.
+    cache: std::sync::OnceLock<crate::Cache>,
 }
 
 fn now() -> u64 {
@@ -100,6 +125,15 @@ fn now() -> u64 {
 impl Cookies {
     pub fn new() -> Cookies {
         Cookies::default()
+    }
+
+    /// Give this profile its HTTP cache (once; later calls are ignored).
+    pub fn attach_cache(&self, cache: crate::Cache) {
+        let _ = self.cache.set(cache);
+    }
+
+    pub fn cache(&self) -> Option<&crate::Cache> {
+        self.cache.get()
     }
 
     fn jar(&self) -> std::sync::MutexGuard<'_, Vec<Cookie>> {
@@ -165,6 +199,64 @@ impl Cookies {
             header.push_str(&cookie.value);
         }
         Some(header)
+    }
+
+    /// What `document.cookie` reads on a page at `url`: the cookies a request to it would
+    /// carry, without `HttpOnly` ones. Empty when there are none.
+    pub fn script_view(&self, url: &Url, context: &Context) -> String {
+        if !context.allows(url) || !matches!(url.scheme.as_str(), "http" | "https") {
+            return String::new();
+        }
+        let now = now();
+        let path = url.path.split('?').next().unwrap_or("/");
+        let jar = self.jar();
+        let mut matching: Vec<&Cookie> = jar
+            .iter()
+            .filter(|c| {
+                !c.http_only
+                    && c.expires.is_none_or(|e| e > now)
+                    && domain_matches(&url.host, c)
+                    && path_matches(path, &c.path)
+                    && (!c.secure || url.scheme == "https")
+            })
+            .collect();
+        matching.sort_by(|a, b| {
+            b.path
+                .len()
+                .cmp(&a.path.len())
+                .then(a.created.cmp(&b.created))
+        });
+        let parts: Vec<String> = matching
+            .iter()
+            .map(|c| {
+                if c.name.is_empty() {
+                    c.value.clone()
+                } else {
+                    format!("{}={}", c.name, c.value)
+                }
+            })
+            .collect();
+        parts.join("; ")
+    }
+
+    /// `document.cookie = "…"` on a page at `url`: stored as a `Set-Cookie` would be, except
+    /// that a script can neither set an `HttpOnly` cookie nor replace one.
+    pub fn store_from_script(&self, url: &Url, text: &str, context: &Context) {
+        let Some(cookie) = parse(url, text, now()) else {
+            return;
+        };
+        if cookie.http_only {
+            return;
+        }
+        let protected = self.jar().iter().any(|c| {
+            c.http_only
+                && c.name == cookie.name
+                && c.domain == cookie.domain
+                && c.path == cookie.path
+        });
+        if !protected {
+            self.store(url, text, context);
+        }
     }
 
     /// Store a `Set-Cookie` header received from `url`. Invalid or forbidden cookies are
@@ -288,6 +380,7 @@ impl Cookies {
         Cookies {
             jar: Mutex::new(jar),
             changed: AtomicBool::new(false),
+            cache: std::sync::OnceLock::new(),
         }
     }
 }
@@ -522,6 +615,25 @@ mod tests {
 
     fn top() -> Context {
         Context::top_level(true)
+    }
+
+    #[test]
+    fn scripts_read_and_write_their_sites_cookies_but_not_http_only_ones() {
+        let jar = Cookies::new();
+        let page = Url::parse("http://127.0.0.1:8080/app").unwrap();
+        let ctx = Context::subresource(&page);
+        jar.store(&page, "sid=secret; HttpOnly; Path=/", &ctx);
+        jar.store_from_script(&page, "theme=dark; path=/", &ctx);
+        jar.store_from_script(&page, "sid=stolen; path=/", &ctx);
+        jar.store_from_script(&page, "x=1; HttpOnly", &ctx);
+        assert_eq!(jar.script_view(&page, &ctx), "theme=dark");
+        assert_eq!(
+            jar.header(&page, &ctx).as_deref(),
+            Some("sid=secret; theme=dark"),
+            "the HttpOnly cookie is still sent, unchanged"
+        );
+        let other = Url::parse("http://localhost:8080/").unwrap();
+        assert_eq!(jar.header(&other, &ctx), None, "never to another site");
     }
 
     #[test]

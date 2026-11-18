@@ -1,9 +1,21 @@
+mod backgrounds;
+#[cfg(any(target_os = "macos", test))]
+mod crash;
 mod engine;
+mod forms;
 #[cfg(any(target_os = "macos", test))]
 mod hibernate;
 mod images;
 mod pool;
+mod script;
+mod scriptnet;
+// Used by the window (browser.rs), which only macOS builds; its tests run everywhere.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod selection;
+mod webfonts;
 
+#[cfg(any(target_os = "macos", test))]
+mod bookmarks;
 #[cfg(any(target_os = "macos", test))]
 mod browser;
 #[cfg(any(target_os = "macos", test))]
@@ -22,7 +34,8 @@ use engine::{FontStore, Settings};
 
 const USAGE: &str =
     "usage: broxee [<url-or-file>...] [--window | --png FILE | --paint] [--tree | --styles | --layout] \
-                     [--depth N] [--width PX] [--height PX] [--scale N] [--no-css-fetch]";
+                     [--tiles FILE] [--depth N] [--width PX] [--height PX] [--scale N] [--no-css-fetch] [--panes 1|2|4] [--cache DIR] \
+                     [--record DIR | --replay DIR | --fill DIR]";
 
 #[derive(Clone)]
 struct Options {
@@ -33,6 +46,8 @@ struct Options {
     styles: bool,
     layout: bool,
     png: Option<String>,
+    /// One hash per 64 CSS px square of the painted frame (`paint::compare::tiles`).
+    tiles: Option<String>,
     paint: bool,
     window: bool,
     depth: usize,
@@ -40,6 +55,16 @@ struct Options {
     height: f32,
     scale: f32,
     fetch_css: bool,
+    /// Panes the window opens with (1, 2 or 4), showing the addresses given.
+    panes: usize,
+    /// An HTTP cache folder for this run (the window uses each profile's own).
+    cache: Option<String>,
+    /// Save every response of this run into a folder (`net::archive`).
+    record: Option<String>,
+    /// Answer every request from a saved folder, with the bundled font and a frozen clock.
+    replay: Option<String>,
+    /// Like `replay`, but what the folder lacks is fetched and added to it.
+    fill: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -53,6 +78,7 @@ fn main() -> ExitCode {
         styles: false,
         layout: false,
         png: None,
+        tiles: None,
         paint: false,
         window: false,
         depth: 8,
@@ -60,6 +86,11 @@ fn main() -> ExitCode {
         height: 800.0,
         scale: 1.0,
         fetch_css: true,
+        panes: 1,
+        cache: None,
+        record: None,
+        replay: None,
+        fill: None,
     };
 
     let mut args = std::env::args().skip(1);
@@ -78,10 +109,21 @@ fn main() -> ExitCode {
             "--window" => opts.window = true,
             "--no-css-fetch" => opts.fetch_css = false,
             "--png" => opts.png = args.next(),
+            "--tiles" => opts.tiles = args.next(),
+            "--cache" => opts.cache = args.next(),
+            "--record" => opts.record = args.next(),
+            "--replay" => opts.replay = args.next(),
+            "--fill" => opts.fill = args.next(),
             "--width" => opts.width = number(&mut args, 100.0, 8000.0, opts.width),
             "--height" => opts.height = number(&mut args, 100.0, 8000.0, opts.height),
             "--scale" => opts.scale = number(&mut args, 0.5, 4.0, opts.scale),
             "--depth" => opts.depth = number(&mut args, 0.0, 1000.0, opts.depth as f32) as usize,
+            "--panes" => {
+                opts.panes = match number(&mut args, 1.0, 4.0, 1.0) as usize {
+                    n @ (1 | 2 | 4) => n,
+                    _ => 1,
+                }
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;
@@ -99,7 +141,12 @@ fn main() -> ExitCode {
     // Opened from Finder (double-clicked, or Broxee.app from the .dmg) there are no arguments:
     // open the window instead of printing the usage and exiting at once. Anything that asks
     // for CLI output keeps the CLI.
-    let cli_output = opts.png.is_some() || opts.paint || opts.tree || opts.styles || opts.layout;
+    let cli_output = opts.png.is_some()
+        || opts.tiles.is_some()
+        || opts.paint
+        || opts.tree
+        || opts.styles
+        || opts.layout;
     if cfg!(target_os = "macos") && targets.is_empty() && !cli_output {
         opts.window = true;
     }
@@ -120,6 +167,11 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     opts.target = target;
+    let archives = [&opts.record, &opts.replay, &opts.fill];
+    if archives.iter().filter(|a| a.is_some()).count() > 1 {
+        eprintln!("--record, --replay and --fill cannot be used together\n{USAGE}");
+        return ExitCode::from(2);
+    }
     match run(&opts) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -164,16 +216,43 @@ fn run_window(_opts: Options) -> ExitCode {
 }
 
 fn run(opts: &Options) -> Result<(), String> {
+    if let Some(dir) = &opts.record {
+        net::archive::record(std::path::Path::new(dir))?;
+    }
+    let replayed_at = match (&opts.replay, &opts.fill) {
+        (Some(dir), _) => Some(net::archive::replay(std::path::Path::new(dir))?),
+        (_, Some(dir)) => Some(net::archive::fill(std::path::Path::new(dir))?),
+        _ => None,
+    };
+    if let Some(at) = replayed_at {
+        script::freeze_clock(at as f64 * 1000.0);
+    }
     // Fonts start loading now and overlap the page request (stage 1 of docs/pipeline.md).
-    let fonts = FontStore::start();
+    let fonts = match replayed_at {
+        Some(_) => FontStore::bundled(),
+        None => FontStore::start(),
+    };
     let url = engine::to_url(&opts.target)?;
     let settings = Settings {
         width: opts.width,
         height: opts.height,
+        scale: opts.scale,
         dark: false,
         fetch_css: opts.fetch_css,
+        images_later: false,
     };
-    let page = engine::load(&url, settings, &fonts, None, &mut |_| true)?;
+    // With --cache, a jar of its own carries the cache (and keeps this run's cookies).
+    let jar = opts.cache.as_ref().map(|dir| {
+        let jar = net::Cookies::new();
+        jar.attach_cache(net::Cache::open(dir.into(), 1 << 30));
+        jar
+    });
+    let jar = jar.as_ref().map(|cookies| engine::Jar {
+        cookies,
+        same_site_initiator: true,
+        referrer: None,
+    });
+    let page = engine::load(&url, settings, &fonts, jar, &mut |_| true)?;
 
     if opts.layout {
         let mut out = String::new();
@@ -187,8 +266,9 @@ fn run(opts: &Options) -> Result<(), String> {
         println!("{}", page.dom.dump(opts.depth));
     }
 
-    let painted = (opts.paint || opts.png.is_some()).then(|| {
-        let view = engine::page_view(&page, &fonts);
+    let painted = (opts.paint || opts.png.is_some() || opts.tiles.is_some()).then(|| {
+        let metrics = page.metrics(&fonts);
+        let view = engine::page_view(&page, &metrics);
         let viewport = Viewport {
             width: opts.width,
             height: opts.height,
@@ -200,6 +280,11 @@ fn run(opts: &Options) -> Result<(), String> {
     if let (Some(path), Some((frame, _))) = (&opts.png, &painted) {
         let png = paint::png::encode(frame.width, frame.height, &frame.pixels);
         std::fs::write(path, png).map_err(|e| format!("{path}: {e}"))?;
+    }
+    if let (Some(path), Some((frame, _))) = (&opts.tiles, &painted) {
+        let tile = (64.0 * opts.scale).round() as usize;
+        let text = paint::compare::tiles(frame.width, frame.height, &frame.pixels, tile);
+        std::fs::write(path, text).map_err(|e| format!("{path}: {e}"))?;
     }
 
     let css = &page.css;
@@ -218,6 +303,10 @@ fn run(opts: &Options) -> Result<(), String> {
         page.dom.element_count()
     );
     println!("fetch     {:.1} ms", page.fetch_ms);
+    println!(
+        "network   {:.1} KB received",
+        net::bytes_received() as f64 / 1024.0
+    );
     println!("parse     {:.2} ms", page.parse_ms);
     println!(
         "css       {} sheets ({} fetched, {} failed), {rules} rules ({skipped} skipped: no match possible), {:.1} ms wall ({:.1} ms parsing across threads)",
@@ -242,6 +331,17 @@ fn run(opts: &Options) -> Result<(), String> {
         fonts.name(),
         page.fonts_wait_ms
     );
+    let web = &page.webfonts;
+    if web.declared > 0 {
+        println!(
+            "webfonts  {} of {} faces loaded ({} failed), {:.0} KB in memory, {:.1} ms",
+            web.faces.len(),
+            web.declared,
+            web.failed,
+            web.bytes as f64 / 1024.0,
+            web.ms
+        );
+    }
     println!(
         "layout    {:.2} ms, {} boxes, {} text runs, {:.0}x{:.0} px",
         page.layout_ms,

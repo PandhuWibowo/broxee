@@ -6,7 +6,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use css::Color;
-use font::{FontSet, TextMetrics};
+use font::{FontKey, TextMetrics};
 use paint::{GlyphBitmap, Op, Painter, Rasterizer, Target};
 
 /// Pane header height in points (DESIGN.md, section 7).
@@ -61,8 +61,23 @@ const PALETTE_TEXT: f32 = 16.0;
 /// The one soft shadow of things that float (DESIGN.md, section 5).
 const SHADOW_BLUR: f32 = 14.0;
 const SHADOW_DROP: f32 = 6.0;
-/// Modifier symbols drawn as icons: the UI font has no ⌘, ⇧ or ⌥.
+/// Modifier symbols are drawn as icons when no face has ⌘, ⇧ or ⌥: Figtree lacks them, and
+/// the symbol fallback (macOS Keyboard.ttf) may be missing.
 const KEY_ICON: f32 = 12.0;
+
+/// The icon for a modifier symbol, or `None` when a face draws it as text.
+fn modifier_icon(c: char, metrics: &dyn TextMetrics) -> Option<Shape> {
+    let shape = match c {
+        '⌘' => Shape::Command,
+        '⇧' => Shape::Shift,
+        '⌥' => Shape::Option,
+        _ => return None,
+    };
+    let drawn = metrics
+        .glyph(c, FontKey::UI)
+        .is_some_and(|(_, glyph)| glyph != 0);
+    (!drawn).then_some(shape)
+}
 
 /// Profile colors (DESIGN.md, section 3, "Profile colors"), each checked to 4.5:1 on `canvas`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -167,7 +182,7 @@ pub enum SidebarItem {
     CloseRow(usize),
     /// The line after the list ("+ New tab").
     Footer,
-    /// A section label (a tab group: clicking folds it).
+    /// A section label or a bookmark folder: clicking folds it.
     Label(usize),
     /// The sidebar's right edge, which resizes it.
     Edge,
@@ -212,7 +227,7 @@ pub fn sidebar_hit(
     }
     let row = ((y - TABS_TOP + scroll) / TAB_ROW) as usize;
     match rows.get(row) {
-        Some(ListRow::Label(_)) => Some(SidebarItem::Label(row)),
+        Some(ListRow::Label(_) | ListRow::Folder { .. }) => Some(SidebarItem::Label(row)),
         Some(ListRow::Item { closable, .. }) => {
             let on_close = x >= width - ROW_INSET - CLOSE_SIZE;
             Some(if *closable && on_close {
@@ -231,6 +246,18 @@ pub fn sidebar_drop(y: f32, scroll: f32, rows: usize) -> usize {
     (((y - TABS_TOP + scroll) / TAB_ROW).round().max(0.0) as usize).min(rows)
 }
 
+/// The numbered box marking a tab shown in a pane, in points.
+const BADGE: f32 = 16.0;
+/// How far each level of bookmark folders moves its rows right, in points.
+const INDENT: f32 = 10.0;
+/// Levels drawn indented; deeper ones line up with this one, so names keep their room.
+const MAX_INDENT: u8 = 6;
+
+/// The x of a row's text at `depth`, in points.
+fn indent(depth: u8) -> f32 {
+    ROW_TEXT + INDENT * f32::from(depth.min(MAX_INDENT))
+}
+
 /// A row of the sidebar's list.
 pub enum ListRow<'a> {
     /// A section label, 12px semibold in `muted` (DESIGN.md, section 4): "Pinned", a tab
@@ -242,6 +269,17 @@ pub enum ListRow<'a> {
         muted: bool,
         /// With a close button at its right end.
         closable: bool,
+        /// Shown in this pane of a split (from 1): a numbered badge, not only a color.
+        pane: Option<u8>,
+        /// Bookmark folder levels above it (0 for tabs).
+        depth: u8,
+    },
+    /// A bookmark folder: a chevron that points right when folded, down when open, then its
+    /// name in the section label style. Its bookmarks are at `depth + 1`.
+    Folder {
+        name: Cow<'a, str>,
+        depth: u8,
+        folded: bool,
     },
 }
 
@@ -324,6 +362,74 @@ pub fn menu_hit(x: f32, y: f32, pane_width: f32, items: usize) -> Option<Option<
     }
     let row = ((y - my - MENU_PAD) / MENU_ROW).floor();
     Some((row >= 0.0 && (row as usize) < items).then_some(row as usize))
+}
+
+/// How a row of a floating list reads.
+#[derive(Clone, Copy, PartialEq)]
+enum RowStyle {
+    Plain,
+    /// A select's current choice: semibold, so it is not marked by color alone.
+    Chosen,
+    Disabled,
+    /// An `<optgroup>` label: 12px semibold `muted`, not choosable.
+    Label,
+}
+
+/// Rows a dropdown shows at once; the list scrolls past that.
+pub const DROPDOWN_ROWS: usize = 10;
+
+pub enum DropRow<'a> {
+    Label(&'a str),
+    Item {
+        text: &'a str,
+        disabled: bool,
+        chosen: bool,
+    },
+}
+
+/// A select's dropdown, in pane points: under the control (`below` is its bottom edge), or
+/// above it (`top`) when there is no room below.
+pub struct DropdownView<'a> {
+    pub x: f32,
+    pub top: f32,
+    pub below: f32,
+    pub width: f32,
+    /// The pane's height in points, to choose below or above.
+    pub height: f32,
+    pub rows: &'a [DropRow<'a>],
+    pub highlight: Option<usize>,
+    /// The first row shown.
+    pub first: usize,
+}
+
+/// Where a dropdown is drawn: (x, y, width, height) in pane points.
+pub fn dropdown_rect(view: &DropdownView, pane_width: f32) -> (f32, f32, f32, f32) {
+    let shown = view
+        .rows
+        .len()
+        .saturating_sub(view.first)
+        .min(DROPDOWN_ROWS);
+    let h = 2.0 * MENU_PAD + MENU_ROW * shown as f32;
+    let w = view.width.max(160.0).min(pane_width - 8.0);
+    let x = view.x.clamp(4.0, (pane_width - w - 4.0).max(4.0));
+    let y = if view.below + 4.0 + h <= view.height || view.top - 4.0 - h < HEADER_HEIGHT {
+        view.below + 4.0
+    } else {
+        view.top - 4.0 - h
+    };
+    (x, y, w, h)
+}
+
+/// The dropdown row at (x, y): `Some(Some(row))` on a row (an index into `view.rows`),
+/// `Some(None)` on the panel's edge, `None` outside it.
+pub fn dropdown_hit(view: &DropdownView, pane_width: f32, x: f32, y: f32) -> Option<Option<usize>> {
+    let (rx, ry, w, h) = dropdown_rect(view, pane_width);
+    if x < rx || x > rx + w || y < ry || y > ry + h {
+        return None;
+    }
+    let k = ((y - ry - MENU_PAD) / MENU_ROW).floor();
+    let row = view.first + k.max(0.0) as usize;
+    Some((k >= 0.0 && row < view.rows.len() && k < DROPDOWN_ROWS as f32).then_some(row))
 }
 
 pub struct MenuView<'a> {
@@ -421,6 +527,21 @@ pub struct FieldView<'a> {
     /// Byte offset of the caret.
     pub cursor: usize,
     pub all_selected: bool,
+    /// Shown, muted, while the field is empty ("Find in page").
+    pub placeholder: Option<&'a str>,
+    /// Shown, muted, at the field's right end ("2 of 5").
+    pub hint: Option<&'a str>,
+}
+
+/// How strongly a mark over page text is drawn.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MarkKind {
+    /// A find match.
+    Match,
+    /// The find match Enter moved to.
+    Current,
+    /// Selected text.
+    Selection,
 }
 
 pub struct HeaderView<'a> {
@@ -454,6 +575,9 @@ enum Shape {
     Panel,
     /// A blurred, faint panel under the palette.
     Shadow,
+    /// A bookmark folder's chevron: folded (pointing right) and open (pointing down).
+    Folded,
+    Unfolded,
 }
 
 pub struct Chrome {
@@ -488,7 +612,6 @@ impl Chrome {
         &mut self,
         painter: &mut Painter,
         frame: Frame,
-        fonts: Option<&FontSet>,
         metrics: &dyn TextMetrics,
         view: &HeaderView,
     ) {
@@ -636,8 +759,10 @@ impl Chrome {
         });
 
         let mut text_ops = Vec::new();
+        let mut ops_after = Vec::new();
         let mut text_clip = (px(FIELD_LEFT + 4.0), px(width_pt - FIELD_RIGHT_GAP));
         let field_text;
+        let hint_text;
         // Always say which profile this pane uses, in words (DESIGN.md, principle 2).
         let label = if view.host.is_empty() {
             view.profile.to_string()
@@ -651,7 +776,7 @@ impl Chrome {
                     baseline: px(22.5) as f32,
                     text: &label,
                     size: 12.5 * s,
-                    bold: false,
+                    font: FontKey::UI,
                     color: t.text_2,
                 });
             }
@@ -672,9 +797,22 @@ impl Chrome {
 
                 let size = 13.0 * s;
                 let left = (FIELD_LEFT + FIELD_PADDING) * s;
-                let right = (width_pt - FIELD_RIGHT_GAP - FIELD_PADDING) * s;
-                let caret = metrics.width(&field.text[..field.cursor], size, false);
-                let full = metrics.width(field.text, size, false);
+                let mut right = (width_pt - FIELD_RIGHT_GAP - FIELD_PADDING) * s;
+                if let Some(hint) = field.hint {
+                    let w = metrics.width(hint, 12.0 * s, FontKey::UI);
+                    hint_text = hint;
+                    ops_after.push(Op::Text {
+                        x: right - w,
+                        baseline: px(FIELD_TOP + 17.5) as f32,
+                        text: hint_text,
+                        size: 12.0 * s,
+                        font: FontKey::UI,
+                        color: t.muted,
+                    });
+                    right -= w + 8.0 * s;
+                }
+                let caret = metrics.width(&field.text[..field.cursor], size, FontKey::UI);
+                let full = metrics.width(field.text, size, FontKey::UI);
                 // Scroll the text left so the caret stays inside the field.
                 let shift = (left + caret - right).max(0.0);
                 let x = left - shift;
@@ -689,13 +827,17 @@ impl Chrome {
                     });
                 }
                 field_text = field.text;
+                let (shown, color) = match field.placeholder {
+                    Some(p) if field.text.is_empty() => (p, t.muted),
+                    _ => (field_text, t.text),
+                };
                 text_ops.push(Op::Text {
                     x,
                     baseline: px(FIELD_TOP + 17.5) as f32,
-                    text: field_text,
+                    text: shown,
                     size,
-                    bold: false,
-                    color: t.text,
+                    font: FontKey::UI,
+                    color,
                 });
                 if !field.all_selected {
                     let cx = (x + caret).round() as i32;
@@ -721,7 +863,6 @@ impl Chrome {
             },
             frame.width,
             (0, w),
-            fonts,
             metrics,
             &ops,
         );
@@ -734,9 +875,65 @@ impl Chrome {
             },
             frame.width,
             text_clip,
-            fonts,
             metrics,
             &text_ops,
+        );
+        if !ops_after.is_empty() {
+            painter.overlay(
+                Target {
+                    pixels: frame.pixels,
+                    stride,
+                    bgra: true,
+                    left,
+                },
+                frame.width,
+                (0, w),
+                metrics,
+                &ops_after,
+            );
+        }
+    }
+
+    /// Marks over page text (selection, find matches) in pane points: translucent `accent`,
+    /// so the text stays readable on any page background.
+    pub fn draw_marks(
+        &self,
+        painter: &mut Painter,
+        frame: Frame,
+        marks: &[(f32, f32, f32, f32, MarkKind)],
+    ) {
+        let s = frame.scale;
+        let px = |v: f32| (v * s).round() as i32;
+        let a = self.theme.accent;
+        let ops: Vec<Op> = marks
+            .iter()
+            .map(|&(x, y, w, h, kind)| Op::Fill {
+                x0: px(x),
+                y0: px(y),
+                x1: px(x + w).max(px(x) + 1),
+                y1: px(y + h),
+                color: Color {
+                    a: match kind {
+                        MarkKind::Match => 60,
+                        MarkKind::Current => 130,
+                        MarkKind::Selection => 100,
+                    },
+                    ..a
+                },
+            })
+            .collect();
+        let (stride, left, width) = (frame.stride, frame.left, frame.width);
+        painter.overlay(
+            Target {
+                pixels: frame.pixels,
+                stride,
+                bgra: true,
+                left,
+            },
+            width,
+            (0, width as i32),
+            &font::Approximate,
+            &ops,
         );
     }
 
@@ -746,7 +943,6 @@ impl Chrome {
         &mut self,
         painter: &mut Painter,
         frame: Frame,
-        fonts: Option<&FontSet>,
         metrics: &dyn TextMetrics,
         view: &SidebarView,
     ) {
@@ -763,9 +959,11 @@ impl Chrome {
         let key_px = px(KEY_ICON) as u32;
         let search = (row_w, px(SEARCH_HEIGHT) as u32);
         let search_inner = (search.0 - 2 * hair as u32, search.1 - 2 * hair as u32);
-        self.masks
-            .entry((Shape::Close, icon_px, icon_px))
-            .or_insert_with(|| icon(Shape::Close, s));
+        for shape in [Shape::Close, Shape::Folded, Shape::Unfolded] {
+            self.masks
+                .entry((shape, icon_px, icon_px))
+                .or_insert_with(|| icon(shape, s));
+        }
         self.masks
             .entry((Shape::Command, key_px, key_px))
             .or_insert_with(|| key_icon(Shape::Command, s));
@@ -787,13 +985,22 @@ impl Chrome {
                 _ if !visible(i) => Cow::Borrowed(""),
                 ListRow::Label(text) => {
                     let room = (sw - ROW_INSET - 8.0 - ROW_TEXT) * s;
-                    fit_in(text, room, 12.0 * s, true, metrics)
+                    fit_in(text, room, 12.0 * s, FontKey::UI_SEMIBOLD, metrics)
+                }
+                ListRow::Folder { name, depth, .. } => {
+                    let room = (sw - ROW_INSET - 8.0 - indent(depth.saturating_add(1))) * s;
+                    fit_in(name, room, 12.0 * s, FontKey::UI_SEMIBOLD, metrics)
                 }
                 ListRow::Item {
-                    title, closable, ..
+                    title,
+                    closable,
+                    pane,
+                    depth,
+                    ..
                 } => {
-                    let right = if *closable { CLOSE_SIZE } else { 8.0 };
-                    let room = (sw - ROW_INSET - right - ROW_TEXT) * s;
+                    let badge = if pane.is_some() { BADGE + 4.0 } else { 0.0 };
+                    let right = if *closable { CLOSE_SIZE } else { 8.0 } + badge;
+                    let room = (sw - ROW_INSET - right - indent(*depth)) * s;
                     fit(title, room, 13.0 * s, metrics)
                 }
             })
@@ -817,18 +1024,88 @@ impl Chrome {
                     baseline: px(row_top(i) + 20.0) as f32,
                     text,
                     size: 12.0 * s,
-                    bold: true,
+                    font: FontKey::UI_SEMIBOLD,
                     color: t.muted,
                 }),
-                ListRow::Item {
-                    muted, closable, ..
-                } => {
+                ListRow::Folder { depth, folded, .. } => {
                     if selected {
                         list.push(Op::Mask {
                             x: px(ROW_INSET),
                             y: px(row_top(i) + 1.0),
                             mask: &masks[&(Shape::Rounded, row_w, row_h)],
                             color: t.selected,
+                        });
+                    }
+                    // `muted` never sits on `selected` (DESIGN.md, section 3).
+                    let color = if selected { t.text_2 } else { t.muted };
+                    let shape = if *folded {
+                        Shape::Folded
+                    } else {
+                        Shape::Unfolded
+                    };
+                    // The chevron's centre lines up with the text of the level above.
+                    list.push(Op::Mask {
+                        x: px(indent(*depth) - ICON / 2.0),
+                        y: px(row_top(i) + (TAB_ROW - ICON) / 2.0),
+                        mask: &masks[&(shape, icon_px, icon_px)],
+                        color,
+                    });
+                    list_text.push(Op::Text {
+                        x: indent(depth.saturating_add(1)) * s,
+                        baseline: px(row_top(i) + 20.0) as f32,
+                        text,
+                        size: 12.0 * s,
+                        font: FontKey::UI_SEMIBOLD,
+                        color,
+                    });
+                }
+                ListRow::Item {
+                    muted,
+                    closable,
+                    pane,
+                    depth,
+                    ..
+                } => {
+                    // The row's background first: the pane badge's outline goes over it.
+                    if selected {
+                        list.push(Op::Mask {
+                            x: px(ROW_INSET),
+                            y: px(row_top(i) + 1.0),
+                            mask: &masks[&(Shape::Rounded, row_w, row_h)],
+                            color: t.selected,
+                        });
+                    }
+                    if let Some(n) = pane {
+                        // A small outlined box with the pane's number, left of the close
+                        // button's place.
+                        let right = sw - ROW_INSET - if *closable { CLOSE_SIZE } else { 8.0 };
+                        let (bx, by) = (right - BADGE, row_top(i) + (TAB_ROW - BADGE) / 2.0);
+                        let (b0, b1) = (px(bx), px(bx + BADGE));
+                        let (t0, t1) = (px(by), px(by + BADGE));
+                        let edge = px(1.0).max(1);
+                        for (x0, y0, x1, y1) in [
+                            (b0, t0, b1, t0 + edge),
+                            (b0, t1 - edge, b1, t1),
+                            (b0, t0, b0 + edge, t1),
+                            (b1 - edge, t0, b1, t1),
+                        ] {
+                            list.push(Op::Fill {
+                                x0,
+                                y0,
+                                x1,
+                                y1,
+                                color: t.text_2,
+                            });
+                        }
+                        let label = ["1", "2", "3", "4"][usize::from(n.clamp(&1, &4) - 1)];
+                        let w = metrics.width(label, 11.0 * s, FontKey::UI_SEMIBOLD);
+                        list_text.push(Op::Text {
+                            x: px(bx + BADGE / 2.0) as f32 - w / 2.0,
+                            baseline: px(by + BADGE - 4.5) as f32,
+                            text: label,
+                            size: 11.0 * s,
+                            font: FontKey::UI_SEMIBOLD,
+                            color: t.text_2,
                         });
                     }
                     if *closable {
@@ -842,11 +1119,11 @@ impl Chrome {
                     // `muted` never sits on `selected` (DESIGN.md, section 3).
                     let color = if *muted && !selected { t.muted } else { t.text };
                     list_text.push(Op::Text {
-                        x: ROW_TEXT * s,
+                        x: indent(*depth) * s,
                         baseline: px(row_top(i) + 19.5) as f32,
                         text,
                         size: 13.0 * s,
-                        bold: false,
+                        font: FontKey::UI,
                         color,
                     });
                 }
@@ -858,7 +1135,7 @@ impl Chrome {
                 baseline: px(row_top(0) + 19.5) as f32,
                 text: line,
                 size: 13.0 * s,
-                bold: false,
+                font: FontKey::UI,
                 color: t.text_2,
             });
             push_keys(
@@ -877,7 +1154,7 @@ impl Chrome {
                 baseline: px(row_top(view.rows.len()) + 19.5) as f32,
                 text: footer,
                 size: 13.0 * s,
-                bold: false,
+                font: FontKey::UI,
                 color: t.text_2,
             });
         }
@@ -946,7 +1223,7 @@ impl Chrome {
                 baseline: px(26.0) as f32,
                 text: view.profile,
                 size: 13.0 * s,
-                bold: true,
+                font: FontKey::UI_SEMIBOLD,
                 color: t.text,
             },
             Op::Text {
@@ -954,7 +1231,7 @@ impl Chrome {
                 baseline: px(SEARCH_TOP + 19.5) as f32,
                 text: "Search or go to",
                 size: 13.0 * s,
-                bold: false,
+                font: FontKey::UI,
                 color: t.text_2,
             },
         ];
@@ -976,7 +1253,6 @@ impl Chrome {
                 },
                 frame.width,
                 clip,
-                fonts,
                 metrics,
                 ops,
             );
@@ -989,7 +1265,6 @@ impl Chrome {
         &mut self,
         painter: &mut Painter,
         frame: Frame,
-        fonts: Option<&FontSet>,
         metrics: &dyn TextMetrics,
         view: &PaletteView,
     ) {
@@ -1028,7 +1303,7 @@ impl Chrome {
         let right = px(x + w - PALETTE_TEXT) as f32;
         let row_top = |i: usize| y + PALETTE_INPUT + 1.0 + PALETTE_PAD + PALETTE_ROW * i as f32;
         let hint_width = |hint: &HintView| match hint {
-            HintView::Label(label) => metrics.width(label, 12.0 * s, false),
+            HintView::Label(label) => metrics.width(label, 12.0 * s, FontKey::UI),
             HintView::Keys(keys) => keys_width(keys, s, 12.0, metrics),
         };
         let fitted: Vec<(Cow<str>, Cow<str>, f32)> = view
@@ -1090,7 +1365,7 @@ impl Chrome {
         let mut text = Vec::new();
         // The query, scrolled left so the caret stays visible, with its caret.
         let size = 14.0 * s;
-        let caret = metrics.width(&view.query[..view.cursor], size, false);
+        let caret = metrics.width(&view.query[..view.cursor], size, FontKey::UI);
         let shift = (left + caret - right).max(0.0);
         let baseline = px(y + 27.0) as f32;
         if view.query.is_empty() {
@@ -1099,7 +1374,7 @@ impl Chrome {
                 baseline,
                 text: "Search tabs, history and commands",
                 size,
-                bold: false,
+                font: FontKey::UI,
                 color: t.muted,
             });
         } else {
@@ -1108,7 +1383,7 @@ impl Chrome {
                 baseline,
                 text: view.query,
                 size,
-                bold: false,
+                font: FontKey::UI,
                 color: t.text,
             });
         }
@@ -1127,7 +1402,7 @@ impl Chrome {
                 baseline: px(top + 19.0) as f32,
                 text: title,
                 size: 13.5 * s,
-                bold: false,
+                font: FontKey::UI,
                 color: t.text,
             });
             text.push(Op::Text {
@@ -1135,7 +1410,7 @@ impl Chrome {
                 baseline: px(top + 35.0) as f32,
                 text: detail,
                 size: 12.0 * s,
-                bold: false,
+                font: FontKey::UI,
                 color: t.text_2,
             });
             // `text-2`, not `muted`: a hint may sit on `selected` (DESIGN.md, section 3).
@@ -1145,7 +1420,7 @@ impl Chrome {
                     baseline: px(top + 27.0) as f32,
                     text: label,
                     size: 12.0 * s,
-                    bold: false,
+                    font: FontKey::UI,
                     color: t.text_2,
                 }),
                 HintView::Keys(keys) => push_keys(
@@ -1166,7 +1441,7 @@ impl Chrome {
                 baseline: px(top + 19.0) as f32,
                 text: line,
                 size: 13.5 * s,
-                bold: false,
+                font: FontKey::UI,
                 color: t.text,
             });
             text.push(Op::Text {
@@ -1174,7 +1449,7 @@ impl Chrome {
                 baseline: px(top + 35.0) as f32,
                 text: second,
                 size: 12.0 * s,
-                bold: false,
+                font: FontKey::UI,
                 color: t.text_2,
             });
         }
@@ -1189,7 +1464,6 @@ impl Chrome {
             },
             width,
             (0, width as i32),
-            fonts,
             metrics,
             &shapes,
         );
@@ -1202,7 +1476,6 @@ impl Chrome {
             },
             width,
             (px(x + PALETTE_TEXT / 2.0), px(x + w - PALETTE_TEXT / 2.0)),
-            fonts,
             metrics,
             &text,
         );
@@ -1249,7 +1522,75 @@ impl Chrome {
             },
             width,
             (0, width as i32),
-            None,
+            &font::Approximate,
+            &ops,
+        );
+    }
+
+    /// A pane whose page is not shown yet: the tab's title in the middle of a blank pane,
+    /// until the pane gets focus.
+    pub fn draw_placeholder(
+        &self,
+        painter: &mut Painter,
+        frame: Frame,
+        metrics: &dyn TextMetrics,
+        title: &str,
+    ) {
+        let s = frame.scale;
+        let size = 13.0 * s;
+        let height = frame.pixels.len() / frame.stride.max(1);
+        let max = frame.width as f32 - 32.0 * s;
+        let text = fit(title, max.max(0.0), size, metrics);
+        let width: f32 = text
+            .chars()
+            .map(|c| metrics.advance_em(c, FontKey::UI) * size)
+            .sum();
+        let ops = [Op::Text {
+            x: ((frame.width as f32 - width) / 2.0).max(0.0),
+            baseline: (height as f32 / 2.0).round(),
+            text: &text,
+            size,
+            font: FontKey::UI,
+            color: self.theme.text_2,
+        }];
+        let (stride, left, width) = (frame.stride, frame.left, frame.width);
+        painter.overlay(
+            Target {
+                pixels: frame.pixels,
+                stride,
+                bgra: true,
+                left,
+            },
+            width,
+            (0, width as i32),
+            metrics,
+            &ops,
+        );
+    }
+
+    /// The caret of a focused form field: (x, top, height) in points from the pane's top
+    /// left, one device pixel wide (at least).
+    pub fn draw_caret(&self, painter: &mut Painter, frame: Frame, caret: (f32, f32, f32)) {
+        let s = frame.scale;
+        let px = |v: f32| (v * s).round() as i32;
+        let (x, y, h) = caret;
+        let ops = [Op::Fill {
+            x0: px(x),
+            y0: px(y),
+            x1: px(x) + px(1.0).max(1),
+            y1: px(y + h),
+            color: Color::rgb(0, 0, 0),
+        }];
+        let (stride, left, width) = (frame.stride, frame.left, frame.width);
+        painter.overlay(
+            Target {
+                pixels: frame.pixels,
+                stride,
+                bgra: true,
+                left,
+            },
+            width,
+            (0, width as i32),
             &font::Approximate,
             &ops,
         );
@@ -1287,7 +1628,6 @@ impl Chrome {
         &mut self,
         painter: &mut Painter,
         frame: Frame,
-        fonts: Option<&FontSet>,
         metrics: &dyn TextMetrics,
         view: &DialogView,
     ) {
@@ -1338,7 +1678,7 @@ impl Chrome {
             baseline: px(y + 30.0) as f32,
             text: view.heading,
             size: 14.0 * s,
-            bold: true,
+            font: FontKey::UI_SEMIBOLD,
             color: t.text,
         }];
         let size = 13.0 * s;
@@ -1351,7 +1691,7 @@ impl Chrome {
                 baseline: px(top + 12.0) as f32,
                 text: label,
                 size: 12.0 * s,
-                bold: false,
+                font: FontKey::UI,
                 color: t.text_2,
             });
             let box_y = top + 18.0;
@@ -1378,7 +1718,7 @@ impl Chrome {
                 )],
                 color: t.canvas,
             });
-            let caret = metrics.width(&value[..*cursor], size, false);
+            let caret = metrics.width(&value[..*cursor], size, FontKey::UI);
             let shift = if active {
                 (left + caret - right).max(0.0)
             } else {
@@ -1389,7 +1729,7 @@ impl Chrome {
                 baseline: px(box_y + 20.5) as f32,
                 text: value,
                 size,
-                bold: false,
+                font: FontKey::UI,
                 color: t.text,
             });
             if active {
@@ -1408,7 +1748,7 @@ impl Chrome {
             baseline: px(y + h - DIALOG_PAD) as f32,
             text: view.help,
             size: 12.0 * s,
-            bold: false,
+            font: FontKey::UI,
             color: t.text_2,
         });
         let (stride, frame_left, width) = (frame.stride, frame.left, frame.width);
@@ -1421,7 +1761,6 @@ impl Chrome {
             },
             width,
             (0, width as i32),
-            fonts,
             metrics,
             &shapes,
         );
@@ -1434,7 +1773,6 @@ impl Chrome {
             },
             width,
             (px(x + DIALOG_PAD), px(x + w - DIALOG_PAD)),
-            fonts,
             metrics,
             &text,
         );
@@ -1446,14 +1784,67 @@ impl Chrome {
         &mut self,
         painter: &mut Painter,
         frame: Frame,
-        fonts: Option<&FontSet>,
         metrics: &dyn TextMetrics,
         view: &MenuView,
+    ) {
+        let s = frame.scale;
+        let rect = menu_rect(frame.width as f32 / s, view.items.len());
+        let rows: Vec<(&str, RowStyle)> =
+            view.items.iter().map(|i| (*i, RowStyle::Plain)).collect();
+        self.draw_panel_list(painter, frame, metrics, rect, &rows, view.selected);
+    }
+
+    /// A select's dropdown: its options under their group labels, the chosen one in
+    /// semibold, the highlighted one on `selected`, as the menus look (DESIGN.md).
+    pub fn draw_dropdown(
+        &mut self,
+        painter: &mut Painter,
+        frame: Frame,
+        metrics: &dyn TextMetrics,
+        view: &DropdownView,
+    ) {
+        let s = frame.scale;
+        let rect = dropdown_rect(view, frame.width as f32 / s);
+        let shown = view
+            .rows
+            .len()
+            .saturating_sub(view.first)
+            .min(DROPDOWN_ROWS);
+        let rows: Vec<(&str, RowStyle)> = view.rows[view.first..view.first + shown]
+            .iter()
+            .map(|r| match r {
+                DropRow::Label(t) => (*t, RowStyle::Label),
+                DropRow::Item {
+                    text,
+                    disabled: true,
+                    ..
+                } => (*text, RowStyle::Disabled),
+                DropRow::Item {
+                    text, chosen: true, ..
+                } => (*text, RowStyle::Chosen),
+                DropRow::Item { text, .. } => (*text, RowStyle::Plain),
+            })
+            .collect();
+        let highlight = view
+            .highlight
+            .and_then(|h| h.checked_sub(view.first))
+            .filter(|&h| h < shown);
+        self.draw_panel_list(painter, frame, metrics, rect, &rows, highlight);
+    }
+
+    /// A floating panel at `rect` (frame points) listing `rows`, row `selected` highlighted.
+    fn draw_panel_list(
+        &mut self,
+        painter: &mut Painter,
+        frame: Frame,
+        metrics: &dyn TextMetrics,
+        (x, y, w, h): (f32, f32, f32, f32),
+        rows: &[(&str, RowStyle)],
+        selected: Option<usize>,
     ) {
         let t = self.theme;
         let s = frame.scale;
         let px = |v: f32| (v * s).round() as i32;
-        let (x, y, w, h) = menu_rect(frame.width as f32 / s, view.items.len());
         let hair = px(1.0).max(1);
         let panel = (px(w) as u32, px(h) as u32);
         let inner = (panel.0 - 2 * hair as u32, panel.1 - 2 * hair as u32);
@@ -1484,7 +1875,7 @@ impl Chrome {
                 color: t.surface,
             },
         ];
-        if let Some(i) = view.selected.filter(|&i| i < view.items.len()) {
+        if let Some(i) = selected.filter(|&i| i < rows.len()) {
             shapes.push(Op::Mask {
                 x: px(x + MENU_PAD),
                 y: px(y + MENU_PAD + MENU_ROW * i as f32 + 1.0),
@@ -1493,21 +1884,29 @@ impl Chrome {
             });
         }
         let room = (w - 2.0 * MENU_PAD - 20.0) * s;
-        let fitted: Vec<Cow<str>> = view
-            .items
+        let fitted: Vec<Cow<str>> = rows
             .iter()
-            .map(|item| fit(item, room, 13.0 * s, metrics))
+            .map(|(item, _)| fit(item, room, 13.0 * s, metrics))
             .collect();
         let text: Vec<Op> = fitted
             .iter()
+            .zip(rows)
             .enumerate()
-            .map(|(i, item)| Op::Text {
-                x: px(x + MENU_PAD + 10.0) as f32,
-                baseline: px(y + MENU_PAD + MENU_ROW * i as f32 + 19.5) as f32,
-                text: item,
-                size: 13.0 * s,
-                bold: false,
-                color: t.text,
+            .map(|(i, (item, (_, style)))| {
+                let (size, font, color, indent) = match style {
+                    RowStyle::Plain => (13.0, FontKey::UI, t.text, 10.0),
+                    RowStyle::Chosen => (13.0, FontKey::UI_SEMIBOLD, t.text, 10.0),
+                    RowStyle::Disabled => (13.0, FontKey::UI, t.muted, 10.0),
+                    RowStyle::Label => (12.0, FontKey::UI_SEMIBOLD, t.muted, 4.0),
+                };
+                Op::Text {
+                    x: px(x + MENU_PAD + indent) as f32,
+                    baseline: px(y + MENU_PAD + MENU_ROW * i as f32 + 19.5) as f32,
+                    text: item,
+                    size: size * s,
+                    font,
+                    color,
+                }
             })
             .collect();
         let (stride, left, width) = (frame.stride, frame.left, frame.width);
@@ -1524,7 +1923,6 @@ impl Chrome {
                 },
                 width,
                 clip,
-                fonts,
                 metrics,
                 ops,
             );
@@ -1537,26 +1935,17 @@ impl Chrome {
         &mut self,
         painter: &mut Painter,
         frame: Frame,
-        fonts: Option<&FontSet>,
         metrics: &dyn TextMetrics,
         (x, y): (f32, f32),
         text: &str,
     ) {
-        let t = self.theme;
         let s = frame.scale;
-        let px = |v: f32| (v * s).round() as i32;
         let window = (
             frame.width as f32 / s,
             (frame.pixels.len() / frame.stride) as f32 / s,
         );
-        let key_px = px(KEY_ICON) as u32;
-        for shape in [Shape::Command, Shape::Shift, Shape::Option] {
-            self.masks
-                .entry((shape, key_px, key_px))
-                .or_insert_with(|| key_icon(shape, s));
-        }
         let w = keys_width(text, s, 12.0, metrics) / s + 16.0;
-        let h = 24.0;
+        let h = PANEL_HEIGHT;
         // Below and right of the pointer, or above / left of it near the window's edges.
         let tx = (x + 12.0).min(window.0 - w - 4.0).max(4.0);
         let ty = if y + 20.0 + h < window.1 {
@@ -1564,6 +1953,57 @@ impl Chrome {
         } else {
             (y - h - 8.0).max(4.0)
         };
+        self.draw_panel(painter, frame, metrics, (tx, ty, w), text);
+    }
+
+    /// The address of the link under the pointer, in a small panel at the bottom left of the
+    /// page area (`frame`), shortened in the middle to fit half the pane. Moves to the right
+    /// when the pointer (`at`, in the frame's points) is over where it would be.
+    pub fn draw_link_preview(
+        &mut self,
+        painter: &mut Painter,
+        frame: Frame,
+        metrics: &dyn TextMetrics,
+        at: Option<(f32, f32)>,
+        url: &str,
+    ) {
+        let s = frame.scale;
+        let area = (
+            frame.width as f32 / s,
+            (frame.pixels.len() / frame.stride) as f32 / s,
+        );
+        let room = (area.0 / 2.0).max(120.0).min(area.0 - 8.0) - 16.0;
+        if room <= 0.0 || area.1 < PANEL_HEIGHT + 8.0 {
+            return;
+        }
+        let text = fit_middle(url, room * s, |t| keys_width(t, s, 12.0, metrics));
+        let w = keys_width(&text, s, 12.0, metrics) / s + 16.0;
+        let ty = area.1 - PANEL_HEIGHT - 4.0;
+        let covered = at.is_some_and(|(x, y)| x < w + 8.0 && y >= ty - 4.0);
+        let tx = if covered { area.0 - w - 4.0 } else { 4.0 };
+        self.draw_panel(painter, frame, metrics, (tx, ty, w), &text);
+    }
+
+    /// A one-line panel with `text` (⌘ ⇧ ⌥ as icons), outlined in `line` on `surface`; its
+    /// top left at (x, y) and `w` wide, in points from the frame's top left.
+    fn draw_panel(
+        &mut self,
+        painter: &mut Painter,
+        frame: Frame,
+        metrics: &dyn TextMetrics,
+        (tx, ty, w): (f32, f32, f32),
+        text: &str,
+    ) {
+        let t = self.theme;
+        let s = frame.scale;
+        let px = |v: f32| (v * s).round() as i32;
+        let key_px = px(KEY_ICON) as u32;
+        for shape in [Shape::Command, Shape::Shift, Shape::Option] {
+            self.masks
+                .entry((shape, key_px, key_px))
+                .or_insert_with(|| key_icon(shape, s));
+        }
+        let h = PANEL_HEIGHT;
         let hair = px(1.0).max(1);
         let size = (px(w) as u32, px(h) as u32);
         let inner = (size.0 - 2 * hair as u32, size.1 - 2 * hair as u32);
@@ -1606,7 +2046,6 @@ impl Chrome {
             },
             width,
             (0, width as i32),
-            fonts,
             metrics,
             &ops,
         );
@@ -1631,20 +2070,20 @@ pub fn fill(pixels: &mut [u8], stride: usize, left: usize, width: usize, color: 
 
 /// `text` cut to fit `max` device pixels at `size`, ending with "…" when cut.
 fn fit<'t>(text: &'t str, max: f32, size: f32, metrics: &dyn TextMetrics) -> Cow<'t, str> {
-    fit_in(text, max, size, false, metrics)
+    fit_in(text, max, size, FontKey::UI, metrics)
 }
 
 fn fit_in<'t>(
     text: &'t str,
     max: f32,
     size: f32,
-    bold: bool,
+    font: FontKey,
     metrics: &dyn TextMetrics,
 ) -> Cow<'t, str> {
-    if metrics.width(text, size, bold) <= max {
+    if metrics.width(text, size, font) <= max {
         return Cow::Borrowed(text);
     }
-    let room = max - metrics.width("…", size, bold);
+    let room = max - metrics.width("…", size, font);
     // The most characters, ending on a char boundary, that leave room for the ellipsis.
     // `ends[k - 1]` is the byte length of the first `k` characters.
     let ends: Vec<usize> = text
@@ -1656,7 +2095,7 @@ fn fit_in<'t>(
     let (mut lo, mut hi) = (0, ends.len());
     while lo < hi {
         let mid = (lo + hi).div_ceil(2);
-        if metrics.width(&text[..ends[mid - 1]], size, bold) <= room {
+        if metrics.width(&text[..ends[mid - 1]], size, font) <= room {
             lo = mid;
         } else {
             hi = mid - 1;
@@ -1667,11 +2106,45 @@ fn fit_in<'t>(
 }
 
 /// Width in device pixels of a shortcut such as "⌘⇧T" at `size` points.
+/// Height of a tooltip or the link preview, in points.
+const PANEL_HEIGHT: f32 = 24.0;
+
+/// `text`, or its start and end around an ellipsis, so that `width` of it is at most `room`.
+pub(crate) fn fit_middle(text: &str, room: f32, width: impl Fn(&str) -> f32) -> String {
+    if width(text) <= room {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    // Keep more of the start: the host says most about where a link goes.
+    let (mut lo, mut hi) = (0, chars.len());
+    while lo < hi {
+        let keep = (lo + hi).div_ceil(2);
+        let head = keep * 2 / 3;
+        let tail = keep - head;
+        let candidate: String = chars[..head]
+            .iter()
+            .chain(std::iter::once(&'…'))
+            .chain(&chars[chars.len() - tail..])
+            .collect();
+        if width(&candidate) <= room {
+            lo = keep;
+        } else {
+            hi = keep - 1;
+        }
+    }
+    let head = lo * 2 / 3;
+    chars[..head]
+        .iter()
+        .chain(std::iter::once(&'…'))
+        .chain(&chars[chars.len() - (lo - head)..])
+        .collect()
+}
+
 fn keys_width(keys: &str, scale: f32, size: f32, metrics: &dyn TextMetrics) -> f32 {
     keys.chars()
-        .map(|c| match c {
-            '⌘' | '⇧' | '⌥' => ((KEY_ICON + 1.0) * scale).round(),
-            _ => metrics.width(c.encode_utf8(&mut [0; 4]), size * scale, false),
+        .map(|c| match modifier_icon(c, metrics) {
+            Some(_) => ((KEY_ICON + 1.0) * scale).round(),
+            None => metrics.width(c.encode_utf8(&mut [0; 4]), size * scale, FontKey::UI),
         })
         .sum()
 }
@@ -1689,12 +2162,7 @@ fn push_keys<'m>(
 ) {
     let icon_px = (KEY_ICON * scale).round() as u32;
     for (i, c) in keys.char_indices() {
-        let shape = match c {
-            '⌘' => Some(Shape::Command),
-            '⇧' => Some(Shape::Shift),
-            '⌥' => Some(Shape::Option),
-            _ => None,
-        };
+        let shape = modifier_icon(c, metrics);
         match shape.and_then(|shape| masks.get(&(shape, icon_px, icon_px))) {
             Some(mask) => {
                 out.push(Op::Mask {
@@ -1712,10 +2180,10 @@ fn push_keys<'m>(
                     baseline,
                     text: key,
                     size: size * scale,
-                    bold: false,
+                    font: FontKey::UI,
                     color,
                 });
-                x += metrics.width(key, size * scale, false);
+                x += metrics.width(key, size * scale, FontKey::UI);
             }
         }
     }
@@ -1844,6 +2312,9 @@ fn icon(shape: Shape, scale: f32) -> GlyphBitmap {
             vec![(4.5, 4.5), (11.5, 11.5)],
             vec![(11.5, 4.5), (4.5, 11.5)],
         ],
+        // Smaller than the header's arrows: it sits beside 12px labels.
+        Shape::Folded => vec![vec![(6.5, 5.0), (9.5, 8.0), (6.5, 11.0)]],
+        Shape::Unfolded => vec![vec![(5.0, 6.5), (8.0, 9.5), (11.0, 6.5)]],
         _ => Vec::new(),
     };
     stroke(&paths, ICON, 1.5, scale)
@@ -1945,6 +2416,8 @@ mod tests {
             title,
             muted: false,
             closable: false,
+            pane: None,
+            depth: 0,
         };
         let rows = [
             item("a"),
@@ -1952,6 +2425,8 @@ mod tests {
                 title: "b",
                 muted: false,
                 closable: true,
+                pane: None,
+                depth: 0,
             },
             ListRow::Label("Folder".into()),
             item("c"),
@@ -2021,7 +2496,7 @@ mod tests {
         assert_eq!(fit("short", 100.0, 20.0, &m), "short");
         let cut = fit("a long title", 60.0, 20.0, &m);
         assert!(
-            cut.ends_with('…') && m.width(&cut, 20.0, false) <= 60.0,
+            cut.ends_with('…') && m.width(&cut, 20.0, FontKey::UI) <= 60.0,
             "{cut}"
         );
         assert_eq!(

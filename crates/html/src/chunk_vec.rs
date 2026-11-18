@@ -54,6 +54,37 @@ impl<T> ChunkVec<T> {
         self.chunks.iter().flatten()
     }
 
+    /// Replace the items in `range` with `items`. Everything after the range is moved once
+    /// (in place when the count stays the same).
+    pub fn splice(&mut self, range: std::ops::Range<usize>, items: Vec<T>) {
+        let range = range.start.min(self.len)..range.end.min(self.len);
+        if items.len() == range.len() {
+            for (i, item) in range.zip(items) {
+                self[i] = item;
+            }
+            return;
+        }
+        let tail = self.split_off(range.end);
+        drop(self.split_off(range.start));
+        for item in items.into_iter().chain(tail) {
+            self.push(item);
+        }
+    }
+
+    /// Take the items from `at` on.
+    fn split_off(&mut self, at: usize) -> Vec<T> {
+        let mut out = Vec::with_capacity(self.len.saturating_sub(at));
+        let first = at / CHUNK;
+        for (c, chunk) in self.chunks.iter_mut().enumerate().skip(first) {
+            let from = if c == first { at % CHUNK } else { 0 };
+            out.extend(chunk.drain(from.min(chunk.len())..));
+        }
+        self.chunks
+            .truncate(first + usize::from(!at.is_multiple_of(CHUNK)));
+        self.len = self.len.min(at);
+        out
+    }
+
     /// Release the unused tail of the last chunk.
     pub fn shrink_to_fit(&mut self) {
         if let Some(last) = self.chunks.last_mut() {
@@ -118,6 +149,31 @@ mod tests {
         assert_eq!(v.iter().count(), CHUNK * 2 + 5);
         *v.last_mut().unwrap() = 1;
         assert_eq!(v[CHUNK * 2 + 4], 1);
+    }
+
+    #[test]
+    fn splices_like_a_vec() {
+        for (start, end, count) in [
+            (0, 0, 3),
+            (5, 9, 4),
+            (CHUNK - 2, CHUNK + 3, 0),
+            (CHUNK, CHUNK, 1),
+            (10, CHUNK * 2, 7),
+            (CHUNK * 2 + 1, CHUNK * 2 + 5, 9),
+        ] {
+            let mut v = ChunkVec::new();
+            let mut expected: Vec<usize> = (0..CHUNK * 2 + 5).collect();
+            for &i in &expected {
+                v.push(i);
+            }
+            let items: Vec<usize> = (0..count).map(|i| 100_000 + i).collect();
+            v.splice(start..end, items.clone());
+            expected.splice(start..end, items);
+            assert_eq!(v.iter().copied().collect::<Vec<_>>(), expected);
+            assert_eq!(v.len(), expected.len());
+            v.push(1);
+            assert_eq!(v[expected.len()], 1, "pushing after a splice");
+        }
     }
 
     #[test]

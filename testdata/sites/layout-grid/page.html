@@ -1,0 +1,21 @@
+<!doctype html><html><head><title>Grid</title><style>
+body { margin: 16px; font: 14px/1.4 sans-serif }
+.g { display: grid; gap: 8px; margin-bottom: 16px; background: #f4efe6; padding: 8px }
+.g > div { background: #b5651d; color: #fff; padding: 8px }
+.cols { grid-template-columns: 100px 1fr 2fr }
+.repeat { grid-template-columns: repeat(4, 1fr) }
+.minmax { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)) }
+.areas { grid-template-columns: 160px 1fr; grid-template-rows: auto 120px auto;
+  grid-template-areas: "head head" "side main" "foot foot" }
+.areas .h { grid-area: head } .areas .s { grid-area: side } .areas .m { grid-area: main } .areas .f { grid-area: foot }
+.span > :first-child { grid-column: span 2 } .span > :nth-child(4) { grid-row: span 2 }
+.place { grid-template-columns: repeat(3, 120px); grid-auto-rows: 70px; justify-items: center; align-items: end }
+</style></head><body>
+<h2>Grid containers</h2>
+<div class="g cols"><div>100px</div><div>1fr</div><div>2fr</div><div>next row</div></div>
+<div class="g repeat"><div>1</div><div>2</div><div>3</div><div>4</div><div>5</div><div>6</div></div>
+<div class="g minmax"><div>auto</div><div>fill</div><div>minmax</div><div>150px</div><div>1fr</div><div>six</div><div>seven</div></div>
+<div class="g areas"><div class="h">header</div><div class="s">sidebar</div><div class="m">main</div><div class="f">footer</div></div>
+<div class="g span repeat"><div>span 2 columns</div><div>b</div><div>c</div><div>row span 2</div><div>e</div><div>f</div><div>g</div><div>h</div></div>
+<div class="g place"><div>centered</div><div>end</div><div>items</div><div>4</div></div>
+</body></html>

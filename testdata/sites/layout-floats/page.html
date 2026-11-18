@@ -1,0 +1,16 @@
+<!doctype html><html><head><title>Floats</title><style>
+body { margin: 16px; font: 15px/1.5 sans-serif; color: #222 }
+.box { width: 140px; height: 90px; background: #cfe3f7; border: 2px solid #3a6ea5; margin: 0 12px 8px 0 }
+.left { float: left } .right { float: right; margin: 0 0 8px 12px; background: #f7dcc8; border-color: #b0602a }
+.clear { clear: both; border-top: 1px solid #999; padding-top: 8px }
+.narrow { width: 420px; border: 1px dashed #888; padding: 8px; overflow: hidden }
+.tall { height: 200px }
+</style></head><body>
+<h1>Floats and clearing</h1>
+<div class="box left"></div><div class="box right tall"></div>
+<p>Text wraps beside a left float and a taller right float. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.</p>
+<p>Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.</p>
+<div class="clear">Cleared below both floats.</div>
+<div class="narrow"><div class="box left"></div><div class="box left"></div><div class="box left"></div><div class="box left"></div>Four floats in a narrow box wrap onto a second row; overflow hidden makes the box contain them.</div>
+<p><span class="box left" style="width:60px;height:60px"></span>A float inside an inline span starts at the line it appears on, the rest of the paragraph flows around it and continues below once it ends. Sed ut perspiciatis unde omnis iste natus error sit voluptatem accusantium doloremque laudantium.</p>
+</body></html>

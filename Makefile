@@ -1,4 +1,4 @@
-.PHONY: run test check budget release
+.PHONY: run test check budget sites release
 
 URL ?= https://example.com
 
@@ -14,9 +14,13 @@ check:
 	cargo clippy --all-targets -- -D warnings
 	cargo test
 	./scripts/budget.sh
+	./scripts/sites.sh
 
 budget:
 	./scripts/budget.sh
+
+sites:
+	./scripts/sites.sh
 
 release:
 	cargo build --release

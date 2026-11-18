@@ -1,0 +1,15 @@
+<!doctype html><html><head><title>Images</title><style>
+body { margin: 16px; font: 14px/1.4 sans-serif } img { border: 1px solid #999; margin: 4px; image-rendering: auto }
+.bg { width: 300px; height: 100px; margin: 8px 0; border: 1px solid #333 }
+.tile { background: url(rgba8.png) } .cover { background: #333 url(jprog.jpg) center / cover no-repeat }
+.pos { background: #eee url(rgba_lossy.webp) no-repeat right 10px bottom 10px }
+figure { display: inline-block; margin: 8px; text-align: center } figcaption { font-size: 12px; color: #555 }
+</style></head><body>
+<figure><img src="jprog.jpg" width="96" height="80"><figcaption>progressive JPEG, 2x</figcaption></figure>
+<figure><img src="jprog.jpg" width="24"><figcaption>scaled down</figcaption></figure>
+<figure><img src="rgba8.png" width="65" height="45"><figcaption>PNG with alpha</figcaption></figure>
+<figure><img src="rgba_lossy.webp" width="64"><figcaption>lossy WebP</figcaption></figure>
+<figure><img src="shape.svg" width="120" height="80"><figcaption>SVG</figcaption></figure>
+<figure><img src="missing.png" alt="missing image" width="80" height="40"><figcaption>missing</figcaption></figure>
+<div class="bg tile"></div><div class="bg cover"></div><div class="bg pos"></div>
+</body></html>

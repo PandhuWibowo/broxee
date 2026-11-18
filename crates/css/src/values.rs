@@ -108,6 +108,8 @@ pub enum Display {
     TableCaption,
     /// `table-column` and `table-column-group`: they carry widths in browsers, nothing here.
     TableColumn,
+    /// `flow-root`: only while parsing; it computes to `Block` with `flow_root` set.
+    FlowRoot,
     None,
 }
 
@@ -215,6 +217,35 @@ impl Position {
     }
 }
 
+/// `float`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Float {
+    None,
+    Left,
+    Right,
+}
+
+/// `clear`: which floats a box must sit below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Clear {
+    None,
+    Left,
+    Right,
+    Both,
+}
+
+impl Clear {
+    /// Whether floats on this side (left when `left`) must be cleared.
+    pub fn clears(self, left: bool) -> bool {
+        match self {
+            Clear::None => false,
+            Clear::Left => left,
+            Clear::Right => !left,
+            Clear::Both => true,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FontStyle {
     Normal,
@@ -276,9 +307,18 @@ pub struct ComputedStyle {
     pub visible: bool,
     /// `overflow: hidden` or `clip`: descendants are clipped to the padding box.
     pub clips: bool,
+    /// `display: flow-root` or `overflow` other than `visible`: the box starts a block
+    /// formatting context, so floats outside it do not enter and floats inside stay in.
+    pub flow_root: bool,
+    pub float: Float,
+    pub clear: Clear,
     /// `opacity: 0`: the element and everything in it are not drawn (still laid out).
-    /// Partial opacity is drawn opaque for now.
     pub transparent: bool,
+    /// `opacity` from 0 to 255: below 255 the element and its content are drawn as one
+    /// group, then blended at this opacity. Not inherited.
+    pub opacity: u8,
+    /// `z-index`, `None` for `auto`. Positioned boxes with one paint in its order.
+    pub z_index: Option<i16>,
     /// `box-sizing: border-box`: `width`, `height` and their min/max include padding and border.
     pub border_box: bool,
     pub flex_direction: FlexDirection,
@@ -302,6 +342,8 @@ pub struct ComputedStyle {
     pub border_collapse: bool,
     /// `caption-side: bottom` (inherited).
     pub caption_bottom: bool,
+    /// `font-family` (inherited), an index into `StyleMap::families` (0: the default).
+    pub font_family: u16,
     /// Grid container template, an index into `StyleMap`'s grid tables (0: none).
     pub grid: u32,
     /// Grid item placement, an index into `StyleMap`'s grid tables (0: auto).
@@ -315,6 +357,19 @@ pub struct ComputedStyle {
     /// Zero when the side's border style is `none`.
     pub border_width: [Px; 4],
     pub border_color: [Color; 4],
+    /// Corner radii, an index into `StyleMap::radii` (0: square corners). Interned: most
+    /// elements have none, and four pairs of lengths would add 64 bytes to every style.
+    pub radii: u16,
+    /// `box-shadow`, an index into `StyleMap::shadows` (0: none).
+    pub box_shadow: u16,
+    /// The layers of `background-image`, an index into `StyleMap::backgrounds` (0: none).
+    pub background_image: u16,
+    /// `transform` with its origin, an index into `StyleMap::transforms` (0: none).
+    pub transform: u16,
+    /// Zero when `outline-style` is `none`. Drawn outside the border box, taking no space.
+    pub outline_width: Px,
+    pub outline_color: Color,
+    pub outline_offset: Px,
 }
 
 impl ComputedStyle {
@@ -340,7 +395,12 @@ impl ComputedStyle {
             inset: [Length::Auto; 4],
             visible: true,
             clips: false,
+            flow_root: false,
+            float: Float::None,
+            clear: Clear::None,
             transparent: false,
+            opacity: 255,
+            z_index: None,
             border_box: false,
             flex_direction: FlexDirection::Row,
             flex_wrap: false,
@@ -356,6 +416,7 @@ impl ComputedStyle {
             border_spacing: [Px::ZERO; 2],
             border_collapse: false,
             caption_bottom: false,
+            font_family: 0,
             grid: 0,
             grid_item: 0,
             custom: 0,
@@ -363,6 +424,13 @@ impl ComputedStyle {
             padding: [Length::ZERO; 4],
             border_width: [Px::ZERO; 4],
             border_color: [Color::BLACK; 4],
+            radii: 0,
+            box_shadow: 0,
+            background_image: 0,
+            transform: 0,
+            outline_width: Px::ZERO,
+            outline_color: Color::BLACK,
+            outline_offset: Px::ZERO,
         }
     }
 }
@@ -371,6 +439,21 @@ impl Default for ComputedStyle {
     fn default() -> Self {
         ComputedStyle::initial()
     }
+}
+
+/// `content` on `::before` / `::after`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Content {
+    /// `none` or `normal`: no box is generated.
+    None,
+    Parts(Vec<ContentPart>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ContentPart {
+    Text(Box<str>),
+    /// `attr(name)`: the element's attribute, or nothing.
+    Attr(Box<str>),
 }
 
 /// A length as written, before font sizes are known.
@@ -412,7 +495,16 @@ pub enum Value {
     Underline(bool),
     Position(Position),
     Visible(bool),
-    Clips(bool),
+    /// `clip: rect()` leaving at most one pixel either way: the "visually hidden" pattern of
+    /// skip links and screen-reader text. Other rectangles are not applied.
+    ClipHides(bool),
+    /// `overflow`: whether it clips, and whether it is anything but `visible`.
+    Overflow {
+        clips: bool,
+        visible: bool,
+    },
+    Float(Float),
+    Clear(Clear),
     BorderBox(bool),
     FlexDirection(FlexDirection),
     Wrap(bool),
@@ -421,6 +513,13 @@ pub enum Value {
     VAlign(VAlign),
     Collapse(bool),
     CaptionBottom(bool),
+    /// A corner's radii: horizontal, vertical.
+    Radius(SpecLength, SpecLength),
+    /// `transform-origin` or `background-position`: horizontal, vertical.
+    Origin(SpecLength, SpecLength),
+    BgSize(crate::effects::SizeSpec),
+    /// `background-repeat`: across, down.
+    Repeat(bool, bool),
 }
 
 /// Longhand properties Broxee understands. Shorthands expand into these while parsing.
@@ -450,6 +549,8 @@ pub enum Prop {
     Visibility,
     Overflow,
     Opacity,
+    /// `clip: rect(...)`, only as far as whether it hides the box (`Value::ClipHides`).
+    Clip,
     BoxSizing,
     FlexDirection,
     FlexWrap,
@@ -467,6 +568,21 @@ pub enum Prop {
     BorderSpacingV,
     BorderCollapse,
     CaptionSide,
+    Float,
+    Clear,
+    OutlineWidth,
+    OutlineStyle,
+    OutlineColor,
+    OutlineOffset,
+    ZIndex,
+    TransformOrigin,
+    BackgroundSize,
+    BackgroundPosition,
+    BackgroundRepeat,
+    BorderTopLeftRadius,
+    BorderTopRightRadius,
+    BorderBottomRightRadius,
+    BorderBottomLeftRadius,
     MarginTop,
     MarginRight,
     MarginBottom,
@@ -644,6 +760,9 @@ mod tests {
         // Styles are deduplicated (a page has hundreds, nodes hold a 4-byte index), so size is
         // not a per-node cost; it is still hashed once per style computed. Grow it deliberately.
         let size = std::mem::size_of::<ComputedStyle>();
-        assert!(size <= 272, "ComputedStyle grew to {size} bytes");
+        // 284 since floats (`float`, `clear`, `flow_root`) and `outline` (width, color, offset);
+        // 292 with the indices of radii, shadows and gradients (2 bytes each, then alignment);
+        // 296 with `opacity` and `z-index`.
+        assert!(size <= 296, "ComputedStyle grew to {size} bytes");
     }
 }

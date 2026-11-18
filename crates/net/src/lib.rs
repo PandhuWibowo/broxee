@@ -4,16 +4,38 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+pub mod archive;
+mod cache;
 mod cookies;
+mod failure;
 mod psl;
+mod referrer;
 
+pub use cache::Cache;
 pub use cookies::{Context, Cookie, Cookies, SameSite};
+pub use failure::{classify, online, Failure};
+pub use referrer::{referer, Policy as ReferrerPolicy, Referrer};
+
+/// Bytes of response bodies read from the network (not from a cache or a file), as they
+/// arrived (compressed or not).
+static RECEIVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn bytes_received() -> u64 {
+    RECEIVED.load(std::sync::atomic::Ordering::Relaxed)
+}
 pub use psl::site;
 
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
-const USER_AGENT: &str = "Broxee/0.1";
+/// How Broxee names itself to servers. It starts like every browser's (`Mozilla/5.0` and the
+/// platform) because some sites treat anything else as a robot: Bing answered `Broxee/0.1`
+/// with unrelated results. It claims no other engine (no WebKit, Safari or Chrome), so sites
+/// do not send code written for one. `navigator.userAgent` says the same (js `builtins.rs`).
+#[cfg(target_os = "macos")]
+pub const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Broxee/0.1";
+#[cfg(not(target_os = "macos"))]
+pub const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) Broxee/0.1";
 const MAX_REDIRECTS: usize = 10;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -350,7 +372,7 @@ fn io_error(e: std::io::Error) -> FetchError {
         ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof => {
             FetchError::Retryable(e.to_string())
         }
-        _ => FetchError::Fatal(e.to_string()),
+        _ => FetchError::Fatal(failure::describe(&e)),
     }
 }
 
@@ -372,13 +394,103 @@ pub fn fetch(url: &Url) -> Result<Response, String> {
 /// GET a URL, following redirects, sending and storing cookies of a profile's jar when given.
 /// A request that fails on a reused or reset connection is retried once on a fresh one.
 pub fn fetch_in(url: &Url, cookies: Option<(&Cookies, &Context)>) -> Result<Response, String> {
+    send_in(url, None, cookies)
+}
+
+/// A request body: what a form sends with POST.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Body {
+    /// Without CR or LF (`application/x-www-form-urlencoded` for forms).
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+}
+
+/// GET `url`, or POST `body` to it, following redirects as `fetch_in` does. After a 301,
+/// 302 or 303 the body is dropped and the next request is a GET, as browsers do; 307 and 308
+/// send it again. A POST is not repeated on a fresh connection unless the first one was a
+/// reused connection the server had already closed.
+pub fn send_in(
+    url: &Url,
+    body: Option<&Body>,
+    cookies: Option<(&Cookies, &Context)>,
+) -> Result<Response, String> {
+    send_with(url, body, None, cookies)
+}
+
+/// What a script's request adds to a plain GET or POST: its method and its own headers.
+#[derive(Clone, Debug, Default)]
+pub struct Extra {
+    /// Uppercase, a token (`PUT`, `DELETE`…).
+    pub method: String,
+    /// Already checked by the caller: no forbidden names, no CR or LF.
+    pub headers: Vec<(String, String)>,
+}
+
+/// As `send_in`, with a script's method and headers. A 301, 302 or 303 turns the request
+/// into a plain GET.
+pub fn send_with(
+    url: &Url,
+    body: Option<&Body>,
+    extra: Option<&Extra>,
+    cookies: Option<(&Cookies, &Context)>,
+) -> Result<Response, String> {
     let mut url = url.clone();
+    let mut body = body;
+    let mut extra = extra;
+    let cache = cookies.and_then(|(jar, _)| jar.cache());
+    // A redirect's own `Referrer-Policy` applies to the hops after it.
+    let mut referrer = cookies.and_then(|(_, context)| context.referrer.clone());
     for _ in 0..MAX_REDIRECTS {
-        let header = cookies.and_then(|(jar, context)| jar.header(&url, context));
-        let resp = match fetch_once(&url, header.as_deref()) {
-            Err(FetchError::Retryable(_)) => fetch_once(&url, header.as_deref())?,
+        // A plain GET (no body, no credentials of its own) may come from the cache.
+        let cacheable = body.is_none()
+            && matches!(url.scheme.as_str(), "http" | "https")
+            && extra.is_none_or(|e| {
+                e.method == "GET"
+                    && !e
+                        .headers
+                        .iter()
+                        .any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+            });
+        let stored = cache.filter(|_| cacheable).and_then(|c| c.get(&url));
+        if stored.as_ref().is_some_and(|e| e.fresh(cache::now())) {
+            return stored.expect("checked above").into_response(&url);
+        }
+        // A stale entry asks whether it still holds.
+        let conditional;
+        let ask = match &stored {
+            Some(entry) if entry.etag.is_some() || entry.last_modified.is_some() => {
+                let mut headers = extra.map(|e| e.headers.clone()).unwrap_or_default();
+                if let Some(tag) = &entry.etag {
+                    headers.push(("If-None-Match".into(), tag.replace(['\r', '\n'], "")));
+                }
+                if let Some(date) = &entry.last_modified {
+                    headers.push(("If-Modified-Since".into(), date.replace(['\r', '\n'], "")));
+                }
+                conditional = Extra {
+                    method: "GET".into(),
+                    headers,
+                };
+                Some(&conditional)
+            }
+            _ => extra,
+        };
+        let sent = Sent {
+            cookie: cookies.and_then(|(jar, context)| jar.header(&url, context)),
+            referer: referrer.as_ref().and_then(|r| r.header_for(&url)),
+        };
+        let resp = match fetch_once(&url, &sent, body, ask) {
+            Err(FetchError::Retryable(_)) if body.is_none() => fetch_once(&url, &sent, None, ask)?,
             other => other?,
         };
+        if let (Some(c), Some(entry)) = (cache, stored) {
+            if resp.status == 304 {
+                return c.refresh(&url, entry, &resp.headers).into_response(&url);
+            }
+            c.remove(&url);
+        }
+        if let (Some(c), true) = (cache, cacheable) {
+            c.put(&url, &resp);
+        }
         if let Some((jar, context)) = cookies {
             for (name, value) in &resp.headers {
                 if name.eq_ignore_ascii_case("set-cookie") {
@@ -388,7 +500,18 @@ pub fn fetch_in(url: &Url, cookies: Option<(&Cookies, &Context)>) -> Result<Resp
         }
         if (300..400).contains(&resp.status) {
             if let Some(location) = resp.header("location") {
+                if let (Some(r), Some(policy)) = (
+                    referrer.as_mut(),
+                    resp.header("referrer-policy")
+                        .and_then(ReferrerPolicy::from_list),
+                ) {
+                    r.policy = policy;
+                }
                 url = url.join(location)?;
+                if !matches!(resp.status, 307 | 308) {
+                    body = None;
+                    extra = None;
+                }
                 continue;
             }
         }
@@ -397,7 +520,18 @@ pub fn fetch_in(url: &Url, cookies: Option<(&Cookies, &Context)>) -> Result<Resp
     Err(format!("too many redirects ending at {url}"))
 }
 
-fn fetch_once(url: &Url, cookie: Option<&str>) -> Result<Response, FetchError> {
+/// Headers that depend on who asks: the profile's cookies and the referring page.
+struct Sent {
+    cookie: Option<String>,
+    referer: Option<String>,
+}
+
+fn fetch_once(
+    url: &Url,
+    sent: &Sent,
+    body: Option<&Body>,
+    extra: Option<&Extra>,
+) -> Result<Response, FetchError> {
     if url.scheme == "file" {
         let path = url.decoded_path();
         let body = std::fs::read(&path).map_err(|e| format!("{path}: {e}"))?;
@@ -409,26 +543,39 @@ fn fetch_once(url: &Url, cookie: Option<&str>) -> Result<Response, FetchError> {
             wire: Wire::default(),
         });
     }
+    if let Some(saved) = archive::answer(url) {
+        return Ok(saved?);
+    }
     let key = (url.scheme.clone(), url.host.clone(), url.port);
     let (mut conn, reused) = match take_idle(&key) {
         Some(conn) => (conn, true),
         None => (Conn::open(url)?, false),
     };
-    match request(&mut conn, url, cookie) {
+    let counted = |resp: Response| {
+        let n = if resp.wire.bytes.is_empty() {
+            resp.body.len()
+        } else {
+            resp.wire.bytes.len()
+        };
+        RECEIVED.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        archive::keep(url, &resp);
+        resp
+    };
+    match request(&mut conn, url, sent, body, extra) {
         Ok((resp, reusable)) => {
             if reusable {
                 put_idle(key, conn);
             }
-            Ok(resp)
+            Ok(counted(resp))
         }
         // A pooled connection the server already closed: not the server's answer.
         Err(FetchError::Retryable(_)) if reused => {
             let mut conn = Conn::open(url)?;
-            let (resp, reusable) = request(&mut conn, url, cookie)?;
+            let (resp, reusable) = request(&mut conn, url, sent, body, extra)?;
             if reusable {
                 put_idle(key, conn);
             }
-            Ok(resp)
+            Ok(counted(resp))
         }
         Err(e) => Err(e),
     }
@@ -437,7 +584,9 @@ fn fetch_once(url: &Url, cookie: Option<&str>) -> Result<Response, FetchError> {
 fn request(
     conn: &mut Conn,
     url: &Url,
-    cookie: Option<&str>,
+    sent: &Sent,
+    body: Option<&Body>,
+    extra: Option<&Extra>,
 ) -> Result<(Response, bool), FetchError> {
     let host_header = if Some(url.port) == default_port(&url.scheme) {
         url.host.clone()
@@ -445,16 +594,52 @@ fn request(
         format!("{}:{}", url.host, url.port)
     };
     // Cookie values never hold CR or LF: the jar refuses them when storing.
-    let cookie = cookie.map_or(String::new(), |c| format!("Cookie: {c}\r\n"));
-    let request = format!(
-        "GET {} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: {USER_AGENT}\r\n\
-         Accept: text/html,*/*;q=0.8\r\nAccept-Encoding: br, gzip, deflate\r\n\
-         {cookie}Connection: keep-alive\r\n\r\n",
+    let mut asker = sent
+        .cookie
+        .as_ref()
+        .map_or(String::new(), |c| format!("Cookie: {c}\r\n"));
+    // A referrer is a parsed `Url`, which never holds CR or LF; checked again all the same.
+    if let Some(r) = sent.referer.as_ref().filter(|r| !r.contains(['\r', '\n'])) {
+        asker.push_str(&format!("Referer: {r}\r\n"));
+    }
+    let (method, content) = match body {
+        Some(b) => (
+            "POST",
+            format!(
+                "Content-Type: {}\r\nContent-Length: {}\r\n",
+                b.content_type.replace(['\r', '\n'], ""),
+                b.bytes.len()
+            ),
+        ),
+        None => ("GET", String::new()),
+    };
+    let method = extra.map_or(method, |e| e.method.as_str());
+    let mut own = String::new();
+    let mut accept = "text/html,*/*;q=0.8";
+    for (name, value) in extra.map_or(&[][..], |e| &e.headers[..]) {
+        if name.eq_ignore_ascii_case("accept") {
+            accept = value;
+        } else {
+            own.push_str(&format!("{name}: {value}\r\n"));
+        }
+    }
+    let content = match (body, extra) {
+        (None, Some(e)) if !matches!(e.method.as_str(), "GET" | "HEAD") => {
+            "Content-Length: 0\r\n".to_string()
+        }
+        _ => content,
+    };
+    let mut request = format!(
+        "{method} {} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: {USER_AGENT}\r\n\
+         Accept: {accept}\r\nAccept-Encoding: br, gzip, deflate\r\n\
+         {asker}{own}{content}Connection: keep-alive\r\n\r\n",
         url.path
-    );
-    conn.stream
-        .write_all(request.as_bytes())
-        .map_err(io_error)?;
+    )
+    .into_bytes();
+    if let Some(b) = body {
+        request.extend_from_slice(&b.bytes);
+    }
+    conn.stream.write_all(&request).map_err(io_error)?;
     conn.stream.flush().map_err(io_error)?;
     let raw = read_response(&mut conn.reader())?;
     let reusable = raw.reusable;
@@ -700,6 +885,7 @@ impl Conn {
                 |addr| match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
                     Ok(tcp) => Some(tcp),
                     Err(e) => {
+                        let e = failure::describe(&e);
                         last = format!("connect {}:{}: {e}", url.host, url.port);
                         None
                     }
@@ -798,6 +984,153 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
 
+    /// A server answering `answer(path, request head)` with (status, headers, body), counting
+    /// the requests it gets.
+    fn cache_server(
+        answer: impl Fn(&str, &str) -> (u16, String, String) + Send + 'static,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                counter.fetch_add(1, Ordering::SeqCst);
+                let path = head.split(' ').nth(1).unwrap_or("").to_string();
+                let (status, headers, body) = answer(&path, &head);
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\n{headers}Connection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), hits)
+    }
+
+    #[test]
+    fn caches_per_profile_with_freshness_revalidation_and_no_store() {
+        use std::sync::atomic::Ordering;
+        let (base, hits) = cache_server(|path, head| match path {
+            "/fresh" => (
+                200,
+                "Cache-Control: max-age=600\r\n".into(),
+                "fresh body".into(),
+            ),
+            "/etag" if head.contains("If-None-Match: \"v1\"") => (
+                304,
+                "ETag: \"v1\"\r\nCache-Control: no-cache\r\n".into(),
+                String::new(),
+            ),
+            "/etag" => (
+                200,
+                "ETag: \"v1\"\r\nCache-Control: no-cache\r\n".into(),
+                "tagged body".into(),
+            ),
+            "/secret" => (
+                200,
+                "Cache-Control: no-store, max-age=600\r\n".into(),
+                "secret".into(),
+            ),
+            "/cookie" => (
+                200,
+                "Cache-Control: max-age=600\r\nSet-Cookie: s=1\r\n".into(),
+                "cookie".into(),
+            ),
+            _ => (404, String::new(), String::new()),
+        });
+        let root = std::env::temp_dir().join(format!("broxee-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let work = Cookies::new();
+        work.attach_cache(Cache::open(root.join("work"), 1 << 20));
+        let personal = Cookies::new();
+        personal.attach_cache(Cache::open(root.join("personal"), 1 << 20));
+        let page = Url::parse(&format!("{base}/")).unwrap();
+        let ctx = Context::subresource(&page);
+        let get = |jar: &Cookies, path: &str| {
+            let url = Url::parse(&format!("{base}{path}")).unwrap();
+            let r = fetch_in(&url, Some((jar, &ctx))).unwrap();
+            (r.status, String::from_utf8(r.body).unwrap())
+        };
+        let count = || hits.load(Ordering::SeqCst);
+
+        assert_eq!(get(&work, "/fresh"), (200, "fresh body".into()));
+        assert_eq!(count(), 1);
+        assert_eq!(get(&work, "/fresh"), (200, "fresh body".into()));
+        assert_eq!(count(), 1, "a fresh entry makes no request");
+        assert_eq!(get(&personal, "/fresh"), (200, "fresh body".into()));
+        assert_eq!(count(), 2, "the other profile has its own cache");
+
+        assert_eq!(get(&work, "/etag"), (200, "tagged body".into()));
+        assert_eq!(
+            get(&work, "/etag"),
+            (200, "tagged body".into()),
+            "304 gives the stored body"
+        );
+        assert_eq!(count(), 4, "no-cache revalidates every time");
+
+        for path in ["/secret", "/cookie"] {
+            get(&work, path);
+            get(&work, path);
+        }
+        assert_eq!(count(), 8, "no-store and Set-Cookie are never reused");
+        let files = |dir: &str| {
+            std::fs::read_dir(root.join(dir))
+                .map(|d| d.flatten().count())
+                .unwrap_or(0)
+        };
+        assert_eq!(files("work"), 2, "only /fresh and /etag were written");
+        assert_eq!(files("personal"), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let entry = std::fs::read_dir(root.join("work"))
+                .unwrap()
+                .flatten()
+                .next()
+                .unwrap();
+            assert_eq!(
+                entry.metadata().unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        // Without a profile (the command line), nothing is cached.
+        let url = Url::parse(&format!("{base}/fresh")).unwrap();
+        fetch(&url).unwrap();
+        assert_eq!(count(), 9);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn evicts_the_least_recently_used_past_its_limit() {
+        let (base, _) = cache_server(|path, _| {
+            (
+                200,
+                "Cache-Control: max-age=600\r\n".into(),
+                format!("{path}{}", "x".repeat(400)),
+            )
+        });
+        let root = std::env::temp_dir().join(format!("broxee-cache-lru-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let jar = Cookies::new();
+        jar.attach_cache(Cache::open(root.clone(), 1500));
+        let page = Url::parse(&format!("{base}/")).unwrap();
+        let ctx = Context::subresource(&page);
+        for path in ["/a", "/b", "/c", "/d"] {
+            let url = Url::parse(&format!("{base}{path}")).unwrap();
+            fetch_in(&url, Some((&jar, &ctx))).unwrap();
+        }
+        let size = jar.cache().unwrap().size();
+        assert!(size <= 1500, "{size} bytes stored");
+        assert!(size > 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn parses_urls() {
         let u = Url::parse("https://Example.com/a/b?x=1#frag").unwrap();
@@ -859,6 +1192,48 @@ mod tests {
         assert_eq!(percent_decode("%41%zz"), b"A%zz");
     }
 
+    #[test]
+    fn sends_the_referer_its_policy_allows_on_every_hop() {
+        let (base, _) = cache_server(|path, head| {
+            let referer = head
+                .lines()
+                .find_map(|l| l.strip_prefix("Referer: "))
+                .unwrap_or("none")
+                .to_string();
+            match path {
+                "/quiet" => (
+                    302,
+                    "Location: /echo\r\nReferrer-Policy: no-referrer\r\n".into(),
+                    String::new(),
+                ),
+                "/plain" => (302, "Location: /echo\r\n".into(), String::new()),
+                _ => (200, String::new(), referer),
+            }
+        });
+        let jar = Cookies::new();
+        let get = |path: &str, context: &Context| {
+            let url = Url::parse(&format!("{base}{path}")).unwrap();
+            String::from_utf8(fetch_in(&url, Some((&jar, context))).unwrap().body).unwrap()
+        };
+        let page = Url::parse(&format!("{base}/docs/a?q=1")).unwrap();
+        let mine = Context::subresource(&page);
+        assert_eq!(get("/echo", &mine), format!("{base}/docs/a?q=1"));
+        assert_eq!(get("/plain", &mine), format!("{base}/docs/a?q=1"));
+        // The redirect's own policy holds for the hops after it.
+        assert_eq!(get("/quiet", &mine), "none");
+        // Another origin hears only the origin; `no-referrer` sends nothing at all.
+        let other = Url::parse(&base.replace("127.0.0.1", "localhost")).unwrap();
+        let theirs = Context::subresource(&other.join("/private/path").unwrap());
+        assert_eq!(
+            get("/echo", &theirs),
+            format!("{}/", other.to_string().trim_end_matches('/'))
+        );
+        let silent = Context::subresource(&page).with_policy(ReferrerPolicy::NoReferrer);
+        assert_eq!(get("/echo", &silent), "none");
+        // What the person typed carries none.
+        assert_eq!(get("/echo", &Context::top_level(true)), "none");
+    }
+
     /// A local server that closes the first `drops` connections right after reading the
     /// request, then answers; returns its URL.
     fn dropping_server(drops: usize) -> Url {
@@ -878,6 +1253,64 @@ mod tests {
             }
         });
         Url::parse(&format!("http://{address}/")).unwrap()
+    }
+
+    #[test]
+    fn posts_a_body_and_follows_a_see_other_with_get() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for stream in listener.incoming().take(2) {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                // Read the head, then as many body bytes as Content-Length says.
+                loop {
+                    let n = stream.read(&mut chunk).unwrap_or(0);
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len = text
+                            .lines()
+                            .find_map(|l| l.strip_prefix("Content-Length: "))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + len || n == 0 {
+                            break;
+                        }
+                    }
+                    if n == 0 {
+                        break;
+                    }
+                }
+                let text = String::from_utf8_lossy(&buf).to_string();
+                let reply: &[u8] = if text.starts_with("POST") {
+                    b"HTTP/1.1 303 See Other\r\nLocation: /done\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndone"
+                };
+                let _ = stream.write_all(reply);
+                seen.push(text);
+            }
+            seen
+        });
+        let url = Url::parse(&format!("http://{address}/login")).unwrap();
+        let body = Body {
+            content_type: "application/x-www-form-urlencoded".into(),
+            bytes: b"user=a&pass=b+c".to_vec(),
+        };
+        let resp = send_in(&url, Some(&body), None).expect("posted");
+        assert_eq!((resp.status, resp.body.as_slice()), (200, &b"done"[..]));
+        let seen = server.join().unwrap();
+        assert!(seen[0].starts_with("POST /login HTTP/1.1"), "{}", seen[0]);
+        assert!(seen[0].contains("Content-Type: application/x-www-form-urlencoded\r\n"));
+        assert!(seen[0].contains("Content-Length: 15\r\n"));
+        assert!(seen[0].ends_with("\r\n\r\nuser=a&pass=b+c"));
+        assert!(
+            seen[1].starts_with("GET /done HTTP/1.1"),
+            "303 turns into a GET"
+        );
     }
 
     #[test]

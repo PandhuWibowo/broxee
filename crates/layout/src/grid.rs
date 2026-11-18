@@ -249,7 +249,7 @@ impl Engine<'_> {
         };
         let mut items = Vec::new();
         let mut run: Option<(NodeId, usize, bool)> = None;
-        for child in dom.children(container) {
+        for child in crate::kids(dom, container) {
             match dom.kind(child) {
                 NodeKind::Text(text) => {
                     let visible = !text.trim_ascii().is_empty();
@@ -315,6 +315,7 @@ impl Engine<'_> {
             return;
         }
         self.out.boxes[i].rect.height = border_height;
+        self.moved(i..i + 1);
         for c in clips {
             if self.out.clips[c].boxes.0 as usize == i + 1 {
                 self.out.clips[c].rect.height = (self.out.clips[c].rect.height + delta).max(0.0);

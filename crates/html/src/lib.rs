@@ -12,7 +12,8 @@ use std::hash::{BuildHasherDefault, Hasher};
 
 pub use chunk_vec::ChunkVec;
 pub use entities::decode_entities;
-use tokenizer::{Token, Tokenizer};
+/// The tokenizer alone, for formats read token by token (bookmark exports).
+pub use tokenizer::{Token, Tokenizer};
 
 pub type NodeId = u32;
 /// Interned tag or attribute name.
@@ -117,7 +118,32 @@ pub struct Dom {
     values: String,
     atoms: Vec<Box<str>>,
     atom_index: HashMap<Box<str>, Atom, FastBuildHasher>,
+    /// Boxes CSS generates (`::before`, `::after`) per element: an element whose parent is
+    /// that element but which is not among its children, so the tree as selectors and
+    /// scripts see it never changes. Layout adds them around the children. Each element's
+    /// pair is kept and reused from one restyle to the next; `bool` says it is shown now.
+    generated: HashMap<NodeId, [(NodeId, bool); 2], FastBuildHasher>,
+    /// How many generated boxes are shown: zero lets `generated()` skip the lookup.
+    shown_generated: usize,
+    /// What scripts and form controls changed since `take_changes`, for incremental restyle
+    /// and relayout. `None` once there were too many to be worth tracking.
+    changes: Option<Vec<Change>>,
 }
+
+/// One change to the tree since the page was last styled and laid out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Change {
+    /// The text of this text node.
+    Text(NodeId),
+    /// An attribute or the tag of this element.
+    Element(NodeId),
+    /// The children of this node: one was added, removed or moved.
+    Children(NodeId),
+}
+
+/// Past this many changes a page is restyled and laid out whole: tracking more costs more
+/// than it saves.
+const MAX_CHANGES: usize = 1024;
 
 /// Hasher for engine tables keyed by page data (tags, classes, computed styles, glyph keys).
 /// std's SipHash resists collision attacks, which costs more than it protects here: a page can
@@ -206,6 +232,9 @@ impl Dom {
             values: String::new(),
             atoms: Vec::new(),
             atom_index: HashMap::default(),
+            generated: HashMap::default(),
+            shown_generated: 0,
+            changes: Some(Vec::new()),
         }
     }
 
@@ -247,6 +276,14 @@ impl Dom {
         Children {
             dom: self,
             next: self.nodes[id as usize].first_child,
+        }
+    }
+
+    /// An iterator over no nodes.
+    pub fn no_children(&self) -> Children<'_> {
+        Children {
+            dom: self,
+            next: NONE,
         }
     }
 
@@ -354,6 +391,306 @@ impl Dom {
         id
     }
 
+    /// Append a new element without attributes as the last child of `parent`. Used to give
+    /// form controls the parts they draw (a value, a placeholder, a check mark); the page's
+    /// own nodes keep their ids.
+    pub fn append_element(&mut self, parent: NodeId, tag: &str) -> NodeId {
+        self.record(Change::Children(parent));
+        let atom = self.intern(tag);
+        let first = self.attrs.len() as u32;
+        self.append(parent, Kind::Element, atom, first, 0)
+    }
+
+    /// Append a text node as the last child of `parent`.
+    pub fn append_text(&mut self, parent: NodeId, text: &str) -> NodeId {
+        self.record(Change::Children(parent));
+        let (start, len) = self.push_text(text);
+        self.append(parent, Kind::Text, start, len, 0)
+    }
+
+    /// Record that what `id` shows changed though the node did not (an image it names
+    /// arrived), so the next update lays it out again.
+    pub fn touch(&mut self, id: NodeId) {
+        self.record(Change::Element(id));
+    }
+
+    fn record(&mut self, change: Change) {
+        if let Some(list) = &mut self.changes {
+            if list.last() == Some(&change) {
+                return;
+            }
+            if list.len() < MAX_CHANGES {
+                list.push(change);
+            } else {
+                self.changes = None;
+            }
+        }
+    }
+
+    /// The changes made since the last call, in order (repeats of the last one left out), or
+    /// `None` when there were too many: then anything may have changed.
+    pub fn take_changes(&mut self) -> Option<Vec<Change>> {
+        self.changes.replace(Vec::new())
+    }
+
+    /// Replace the text of text node `id`. The old text stays in the buffer unused, so this
+    /// is for small values that change rarely (what is typed into a form field).
+    pub fn set_text(&mut self, id: NodeId, text: &str) {
+        if self.nodes[id as usize].kind != Kind::Text {
+            return;
+        }
+        if matches!(self.kind(id), NodeKind::Text(t) if t == text) {
+            return;
+        }
+        self.record(Change::Text(id));
+        self.replace_text(id, text);
+    }
+
+    fn replace_text(&mut self, id: NodeId, text: &str) {
+        let (start, len) = self.push_text(text);
+        let n = &mut self.nodes[id as usize];
+        n.a = start;
+        n.b = len;
+    }
+
+    /// The boxes generated before and after the children of `owner`, when shown.
+    #[inline]
+    pub fn generated(&self, owner: NodeId) -> [Option<NodeId>; 2] {
+        if self.shown_generated == 0 {
+            return [None, None];
+        }
+        match self.generated.get(&owner) {
+            Some(pair) => pair.map(|(node, shown)| (shown && node != NONE).then_some(node)),
+            None => [None, None],
+        }
+    }
+
+    /// Hide every generated box, before the cascade's new set is shown.
+    pub fn hide_generated(&mut self) {
+        for pair in self.generated.values_mut() {
+            pair[0].1 = false;
+            pair[1].1 = false;
+        }
+        self.shown_generated = 0;
+    }
+
+    /// Show the box generated before (or `after`) the children of `owner`, holding `text`.
+    /// Returns the generated element and its text node, made once per element and reused.
+    pub fn show_generated(&mut self, owner: NodeId, after: bool, text: &str) -> (NodeId, NodeId) {
+        let slot = usize::from(after);
+        let existing = self.generated.get(&owner).map(|pair| pair[slot].0);
+        let element = match existing {
+            Some(node) if node != NONE => node,
+            _ => {
+                let node = self.create_element(if after { "::after" } else { "::before" });
+                // The parent link without a place among the children.
+                self.nodes[node as usize].parent = owner;
+                let (start, len) = self.push_text("");
+                self.append(node, Kind::Text, start, len, 0);
+                node
+            }
+        };
+        let text_node = self.nodes[element as usize].first_child;
+        if !matches!(self.kind(text_node), NodeKind::Text(t) if t == text) {
+            // The cascade shows these; the change is not one it has to be told about.
+            self.replace_text(text_node, text);
+        }
+        let pair = self.generated.entry(owner).or_insert([(NONE, false); 2]);
+        if !pair[slot].1 {
+            self.shown_generated += 1;
+        }
+        pair[slot] = (element, true);
+        (element, text_node)
+    }
+
+    /// Whether `id` is a box CSS generated (whose parent is the element it belongs to).
+    pub fn is_generated(&self, id: NodeId) -> bool {
+        matches!(self.tag_name(id), Some("::before" | "::after"))
+    }
+
+    /// A new element with no parent, for a script to insert later (`createElement`).
+    pub fn create_element(&mut self, tag: &str) -> NodeId {
+        let atom = self.intern(tag);
+        let id = self.nodes.len() as NodeId;
+        self.nodes.push(Node {
+            parent: NONE,
+            first_child: NONE,
+            last_child: NONE,
+            next_sibling: NONE,
+            a: atom,
+            b: self.attrs.len() as u32,
+            attr_count: 0,
+            kind: Kind::Element,
+        });
+        id
+    }
+
+    /// A new text node with no parent (`createTextNode`).
+    pub fn create_text(&mut self, text: &str) -> NodeId {
+        let (start, len) = self.push_text(text);
+        let id = self.nodes.len() as NodeId;
+        self.nodes.push(Node {
+            parent: NONE,
+            first_child: NONE,
+            last_child: NONE,
+            next_sibling: NONE,
+            a: start,
+            b: len,
+            attr_count: 0,
+            kind: Kind::Text,
+        });
+        id
+    }
+
+    /// Take `id` out of its parent's children; it keeps its own subtree.
+    pub fn detach(&mut self, id: NodeId) {
+        let parent = self.nodes[id as usize].parent;
+        if parent == NONE {
+            return;
+        }
+        self.record(Change::Children(parent));
+        let next = self.nodes[id as usize].next_sibling;
+        let p = &self.nodes[parent as usize];
+        if p.first_child == id {
+            self.nodes[parent as usize].first_child = next;
+            if next == NONE {
+                self.nodes[parent as usize].last_child = NONE;
+            }
+        } else {
+            let mut prev = p.first_child;
+            while prev != NONE && self.nodes[prev as usize].next_sibling != id {
+                prev = self.nodes[prev as usize].next_sibling;
+            }
+            if prev != NONE {
+                self.nodes[prev as usize].next_sibling = next;
+                if next == NONE {
+                    self.nodes[parent as usize].last_child = prev;
+                }
+            }
+        }
+        let n = &mut self.nodes[id as usize];
+        n.parent = NONE;
+        n.next_sibling = NONE;
+    }
+
+    /// Make `child` the last child of `parent`, taking it from where it was. Refused when
+    /// `child` is `parent` or one of its ancestors (it would make a cycle).
+    pub fn append_child(&mut self, parent: NodeId, child: NodeId) -> bool {
+        let mut a = Some(parent);
+        while let Some(n) = a {
+            if n == child {
+                return false;
+            }
+            a = self.parent(n);
+        }
+        self.detach(child);
+        self.record(Change::Children(parent));
+        let prev_last = self.nodes[parent as usize].last_child;
+        self.nodes[child as usize].parent = parent;
+        self.nodes[parent as usize].last_child = child;
+        if prev_last == NONE {
+            self.nodes[parent as usize].first_child = child;
+        } else {
+            self.nodes[prev_last as usize].next_sibling = child;
+        }
+        true
+    }
+
+    /// Put `child` right before `before`, a child of `parent`.
+    pub fn insert_before(&mut self, parent: NodeId, child: NodeId, before: NodeId) -> bool {
+        if self.parent(before) != Some(parent) || child == before {
+            return self.append_child(parent, child);
+        }
+        if !self.append_child(parent, child) {
+            return false;
+        }
+        // Move it from the end to its place: unlink the last child, relink before `before`.
+        self.detach(child);
+        self.nodes[child as usize].parent = parent;
+        if self.nodes[parent as usize].first_child == before {
+            self.nodes[parent as usize].first_child = child;
+        } else {
+            let mut prev = self.nodes[parent as usize].first_child;
+            while self.nodes[prev as usize].next_sibling != before {
+                prev = self.nodes[prev as usize].next_sibling;
+            }
+            self.nodes[prev as usize].next_sibling = child;
+        }
+        self.nodes[child as usize].next_sibling = before;
+        true
+    }
+
+    /// Set attribute `name` of element `id`. Its attributes move to the end of the shared
+    /// list (they are stored together), so this is for the few changes scripts make.
+    pub fn set_attr(&mut self, id: NodeId, name: &str, value: &str) {
+        if self.nodes[id as usize].kind != Kind::Element {
+            return;
+        }
+        if self.attr(id, name) == Some(value) {
+            return;
+        }
+        self.record(Change::Element(id));
+        let atom = self.intern(name);
+        let n = &self.nodes[id as usize];
+        let (first, count) = (n.b as usize, usize::from(n.attr_count));
+        let mut attrs: Vec<Attr> = self.attrs[first..first + count].to_vec();
+        let start = self.values.len() as u32;
+        self.values.push_str(value);
+        let new = Attr {
+            name: atom,
+            start,
+            len: value.len() as u32,
+        };
+        match attrs.iter().position(|a| a.name == atom) {
+            Some(i) => attrs[i] = new,
+            None if attrs.len() < usize::from(u16::MAX) => attrs.push(new),
+            None => return,
+        }
+        let at = self.attrs.len() as u32;
+        self.attrs.extend_from_slice(&attrs);
+        let n = &mut self.nodes[id as usize];
+        n.b = at;
+        n.attr_count = attrs.len() as u16;
+    }
+
+    /// Remove attribute `name` from element `id`.
+    pub fn remove_attr(&mut self, id: NodeId, name: &str) {
+        let Some(atom) = self.atom(name) else {
+            return;
+        };
+        let n = &self.nodes[id as usize];
+        if n.kind != Kind::Element {
+            return;
+        }
+        let (first, count) = (n.b as usize, usize::from(n.attr_count));
+        let attrs: Vec<Attr> = self.attrs[first..first + count]
+            .iter()
+            .filter(|a| a.name != atom)
+            .copied()
+            .collect();
+        if attrs.len() == count {
+            return;
+        }
+        self.record(Change::Element(id));
+        let at = self.attrs.len() as u32;
+        self.attrs.extend_from_slice(&attrs);
+        let n = &mut self.nodes[id as usize];
+        n.b = at;
+        n.attr_count = attrs.len() as u16;
+    }
+
+    /// Rename element `id` (its attributes stay).
+    pub fn set_tag(&mut self, id: NodeId, tag: &str) {
+        if self.nodes[id as usize].kind != Kind::Element {
+            return;
+        }
+        let atom = self.intern(tag);
+        if self.nodes[id as usize].a != atom {
+            self.record(Change::Element(id));
+        }
+        self.nodes[id as usize].a = atom;
+    }
+
     /// Indented tree for debugging, skipping comments and whitespace-only text.
     pub fn dump(&self, max_depth: usize) -> String {
         let mut out = String::new();
@@ -453,18 +790,125 @@ impl Iterator for Descendants<'_> {
     }
 }
 
+/// Parse a document. As HTML does, a page that leaves out `<html>`, `<head>` or `<body>` gets
+/// them: head elements (`<title>`, `<meta>`, `<link>`, `<style>`, `<script>`…) before the
+/// first body content go in the head, everything else in the body, and `</body>` or `</html>`
+/// closes nothing (content after them stays in the body).
 pub fn parse(input: &str) -> Dom {
+    build(input, true)
+}
+
+/// Parse a fragment (`innerHTML`): its nodes stay under the root, with no `<html>`, `<head>`
+/// or `<body>` added.
+pub fn parse_fragment(input: &str) -> Dom {
+    build(input, false)
+}
+
+type Attrs<'a> = [(std::borrow::Cow<'a, str>, std::borrow::Cow<'a, str>)];
+
+/// The document's own elements, created as the parser meets them or needs them.
+#[derive(Default)]
+struct Frame {
+    html: Option<NodeId>,
+    head: Option<NodeId>,
+    body: Option<NodeId>,
+}
+
+/// Elements that belong in the head when they come before any body content.
+fn in_head(tag: &str) -> bool {
+    matches!(
+        tag,
+        "base"
+            | "basefont"
+            | "bgsound"
+            | "link"
+            | "meta"
+            | "noframes"
+            | "noscript"
+            | "script"
+            | "style"
+            | "template"
+            | "title"
+    )
+}
+
+impl Frame {
+    fn html(&mut self, dom: &mut Dom, attrs: &Attrs) -> NodeId {
+        *self
+            .html
+            .get_or_insert_with(|| new_element(dom, Dom::ROOT, "html", attrs))
+    }
+
+    fn head(&mut self, dom: &mut Dom, attrs: &Attrs) -> NodeId {
+        let html = self.html(dom, &[]);
+        *self
+            .head
+            .get_or_insert_with(|| new_element(dom, html, "head", attrs))
+    }
+
+    /// Open the body (and the head before it, empty if the page had none): from here on the
+    /// stack is html, body and whatever opens inside it.
+    fn body(&mut self, dom: &mut Dom, stack: &mut Vec<NodeId>, attrs: &Attrs) {
+        if self.body.is_some() {
+            return;
+        }
+        let html = self.html(dom, &[]);
+        self.head(dom, &[]);
+        let body = new_element(dom, html, "body", attrs);
+        self.body = Some(body);
+        stack.truncate(1);
+        stack.extend([html, body]);
+    }
+
+    /// Where the parser stands outside any element of its own: at the root, in `<html>` or
+    /// directly in the head. Text and tags there decide which element comes next.
+    fn at_top(&self, stack: &[NodeId]) -> bool {
+        let top = *stack.last().expect("root is never popped");
+        top == Dom::ROOT || Some(top) == self.html || Some(top) == self.head
+    }
+}
+
+#[inline]
+fn new_element(dom: &mut Dom, parent: NodeId, tag: &str, attrs: &Attrs) -> NodeId {
+    let tag_atom = dom.intern(tag);
+    let first = dom.attrs.len() as u32;
+    let mut count = 0u16;
+    for (name, value) in attrs.iter().take(usize::from(u16::MAX)) {
+        let name = dom.intern(name);
+        let start = dom.values.len() as u32;
+        dom.values.push_str(value);
+        dom.attrs.push(Attr {
+            name,
+            start,
+            len: value.len() as u32,
+        });
+        count += 1;
+    }
+    dom.append(parent, Kind::Element, tag_atom, first, count)
+}
+
+fn build(input: &str, document: bool) -> Dom {
     let mut dom = Dom::new();
     let mut stack: Vec<NodeId> = vec![Dom::ROOT];
     // Adjacent text tokens merge here, then land in the shared text buffer once.
     let mut pending_text = String::new();
+    // A fragment starts as if inside an open body.
+    let mut frame = Frame::default();
+    if !document {
+        frame.body = Some(Dom::ROOT);
+    }
 
     for token in Tokenizer::new(input) {
         if let Token::Text(text) = &token {
             pending_text.push_str(text);
             continue;
         }
-        flush_text(&mut dom, &stack, &mut pending_text);
+        flush(&mut dom, &mut stack, &mut frame, &mut pending_text);
+
+        // Before the body, the document's own elements come first.
+        if frame.body.is_none() && before_body(&mut dom, &mut stack, &mut frame, &token) {
+            continue;
+        }
 
         let current = *stack.last().expect("root is never popped");
         match token {
@@ -482,23 +926,14 @@ pub fn parse(input: &str) -> Dom {
                 attrs,
                 self_closing,
             } => {
+                // A second `<html>`, `<head>` or `<body>` adds nothing (their end tags close
+                // nothing either: they sit below `floor`).
+                if document && tag.len() == 4 && matches!(tag.as_ref(), "html" | "head" | "body") {
+                    continue;
+                }
                 close_implied(&dom, &mut stack, &tag);
                 let parent = *stack.last().expect("root is never popped");
-                let tag_atom = dom.intern(&tag);
-                let first = dom.attrs.len() as u32;
-                let mut count = 0u16;
-                for (name, value) in attrs.iter().take(usize::from(u16::MAX)) {
-                    let name = dom.intern(name);
-                    let start = dom.values.len() as u32;
-                    dom.values.push_str(value);
-                    dom.attrs.push(Attr {
-                        name,
-                        start,
-                        len: value.len() as u32,
-                    });
-                    count += 1;
-                }
-                let id = dom.append(parent, Kind::Element, tag_atom, first, count);
+                let id = new_element(&mut dom, parent, &tag, &attrs);
                 if !self_closing && !is_void(&tag) {
                     stack.push(id);
                 }
@@ -506,22 +941,101 @@ pub fn parse(input: &str) -> Dom {
             Token::EndTag(tag) => {
                 // An end tag for a name never seen as a start tag closes nothing.
                 let Some(atom) = dom.atom(&tag) else { continue };
-                // Index 0 is the document, which has no tag, so `pos` is always >= 1.
+                // Index 0 is the document, which has no tag, so `pos` is always >= 1. The
+                // document's html and body stay open.
+                let floor = if document && frame.body.is_some() {
+                    3 // the document, its html and its body
+                } else {
+                    1
+                };
                 let open = stack
                     .iter()
                     .rposition(|&id| dom.element(id).is_some_and(|e| e.tag == atom));
-                if let Some(pos) = open {
+                if let Some(pos) = open.filter(|&p| p >= floor) {
                     stack.truncate(pos);
                 }
             }
         }
     }
-    flush_text(&mut dom, &stack, &mut pending_text);
+    flush(&mut dom, &mut stack, &mut frame, &mut pending_text);
+    if document {
+        frame.body(&mut dom, &mut stack, &[]);
+    }
     dom.nodes.shrink_to_fit();
     dom.text.shrink_to_fit();
     dom.attrs.shrink_to_fit();
     dom.values.shrink_to_fit();
     dom
+}
+
+/// A token before the body: the document's own elements come first, opened as the token
+/// needs them. Returns whether the token is used up (`<html>`, `<head>`, `<body>`, `</head>`,
+/// `</body>`, `</html>`). Kept out of the loop: a page spends few tokens here.
+#[cold]
+fn before_body(dom: &mut Dom, stack: &mut Vec<NodeId>, frame: &mut Frame, token: &Token) -> bool {
+    match token {
+        Token::StartTag { tag, attrs, .. } => match tag.as_ref() {
+            // A second `<html>`, `<head>` or `<body>` adds nothing.
+            "html" => {
+                frame.html(dom, attrs);
+                true
+            }
+            "head" if frame.head.is_none() => {
+                let head = frame.head(dom, attrs);
+                stack.truncate(1);
+                stack.extend([frame.html.expect("made with the head"), head]);
+                true
+            }
+            "head" => true,
+            "body" => {
+                frame.body(dom, stack, attrs);
+                true
+            }
+            t if frame.at_top(stack) && in_head(t) => {
+                // After `</head>` too: HTML puts them back in the head.
+                let head = frame.head(dom, &[]);
+                stack.truncate(1);
+                stack.extend([frame.html.expect("made with the head"), head]);
+                false
+            }
+            _ if frame.at_top(stack) => {
+                frame.body(dom, stack, &[]);
+                false
+            }
+            _ => false,
+        },
+        Token::EndTag(tag) if tag == "head" => {
+            if let Some(html) = frame.html.filter(|_| frame.head.is_some()) {
+                stack.truncate(1);
+                stack.push(html);
+            }
+            true
+        }
+        Token::EndTag(tag) => matches!(tag.as_ref(), "body" | "html"),
+        Token::Doctype(_) | Token::Comment(_) | Token::Text(_) => false,
+    }
+}
+
+/// Text before the body: spaces between the document's own elements are dropped (kept in
+/// the head), and anything else opens the body, starting at its first non-space character.
+#[inline]
+fn flush(dom: &mut Dom, stack: &mut Vec<NodeId>, frame: &mut Frame, pending: &mut String) {
+    if pending.is_empty() {
+        return;
+    }
+    if frame.body.is_none() && frame.at_top(stack) {
+        let rest = pending.trim_start_matches(['\t', '\n', '\x0c', '\r', ' ']);
+        if rest.is_empty() {
+            if stack.last() != frame.head.as_ref() {
+                pending.clear();
+            }
+        } else {
+            let skip = pending.len() - rest.len();
+            pending.drain(..skip);
+            frame.body(dom, stack, &[]);
+        }
+    }
+    flush_text(dom, stack, pending);
 }
 
 fn flush_text(dom: &mut Dom, stack: &[NodeId], pending: &mut String) {
@@ -607,6 +1121,92 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn records_changes_for_incremental_layout() {
+        let mut dom = parse("<p id=a>one</p><div></div>");
+        assert_eq!(dom.take_changes(), Some(vec![]), "parsing is not a change");
+        let p = dom
+            .descendants(Dom::ROOT)
+            .find(|&n| dom.tag_name(n) == Some("p"))
+            .unwrap();
+        let div = dom.siblings_from(p).nth(1).unwrap();
+        let text = dom.children(p).next().unwrap();
+        dom.set_text(text, "one");
+        dom.set_attr(p, "id", "a");
+        assert_eq!(
+            dom.take_changes(),
+            Some(vec![]),
+            "setting what is there changes nothing"
+        );
+        dom.set_text(text, "two");
+        dom.set_attr(p, "class", "x");
+        dom.append_child(div, text);
+        dom.show_generated(div, false, "*");
+        assert_eq!(
+            dom.take_changes(),
+            Some(vec![
+                Change::Text(text),
+                Change::Element(p),
+                Change::Children(p),
+                Change::Children(div),
+            ]),
+            "generated boxes are the cascade's, not changes"
+        );
+        for i in 0..=MAX_CHANGES {
+            dom.set_text(text, &i.to_string());
+            dom.set_attr(div, "n", &i.to_string());
+        }
+        assert_eq!(dom.take_changes(), None, "too many to track");
+        assert_eq!(dom.take_changes(), Some(vec![]), "tracking starts again");
+    }
+
+    #[test]
+    fn appends_and_edits_nodes_keeping_ids() {
+        let mut dom = parse("<p>a</p><input name=q>");
+        let before = dom.len();
+        let input = dom.find_first("input").unwrap();
+        let part = dom.append_element(input, "broxee-value");
+        let text = dom.append_text(part, "hello");
+        assert_eq!(part as usize, before, "new nodes go at the end");
+        assert_eq!(dom.text_content(input), "hello");
+        dom.set_text(text, "héllo wörld");
+        assert_eq!(dom.text_content(input), "héllo wörld");
+        dom.set_tag(part, "broxee-other");
+        assert_eq!(dom.tag_name(part), Some("broxee-other"));
+        assert_eq!(dom.attr(input, "name"), Some("q"));
+        assert_eq!(dom.children(input).collect::<Vec<_>>(), [part]);
+    }
+
+    #[test]
+    fn scripts_can_move_nodes_and_change_attributes() {
+        let mut dom = parse("<ul><li id=a>1<li id=b>2</ul>");
+        let ul = dom.find_first("ul").unwrap();
+        let items: Vec<NodeId> = dom.children(ul).collect();
+        let li = dom.create_element("li");
+        let text = dom.create_text("3");
+        assert!(dom.append_child(li, text));
+        assert!(dom.append_child(ul, li));
+        assert_eq!(dom.text_content(ul), "123");
+        assert!(dom.insert_before(ul, li, items[0]));
+        assert_eq!(dom.text_content(ul), "312");
+        dom.detach(items[1]);
+        assert_eq!(dom.text_content(ul), "31");
+        assert!(dom.append_child(ul, items[1]));
+        assert_eq!(dom.text_content(ul), "312");
+        assert!(!dom.append_child(li, ul), "no cycles");
+        dom.set_attr(items[0], "class", "on big");
+        dom.set_attr(items[0], "id", "first");
+        assert_eq!(dom.attr(items[0], "class"), Some("on big"));
+        assert_eq!(dom.attr(items[0], "id"), Some("first"));
+        dom.remove_attr(items[0], "class");
+        assert_eq!(dom.attr(items[0], "class"), None);
+        assert_eq!(
+            dom.attr(items[1], "id"),
+            Some("b"),
+            "other elements untouched"
+        );
+    }
+
     fn tags_under(dom: &Dom, id: NodeId) -> Vec<String> {
         dom.children(id)
             .filter_map(|c| dom.tag_name(c).map(str::to_string))
@@ -649,6 +1249,78 @@ mod tests {
     }
 
     #[test]
+    fn adds_the_html_head_and_body_a_page_leaves_out() {
+        let dom = parse("<!DOCTYPE html>\n<title>T</title><meta charset=utf-8>\n  Hello <p>x");
+        assert_eq!(tags_under(&dom, Dom::ROOT), ["html"]);
+        let html = dom.find_first("html").unwrap();
+        assert_eq!(tags_under(&dom, html), ["head", "body"]);
+        let head = dom.find_first("head").unwrap();
+        assert_eq!(tags_under(&dom, head), ["title", "meta"]);
+        assert_eq!(dom.title().as_deref(), Some("T"));
+        let body = dom.find_first("body").unwrap();
+        assert_eq!(tags_under(&dom, body), ["p"]);
+        assert_eq!(
+            dom.text_content(body),
+            "Hello x",
+            "text starts at its first letter"
+        );
+
+        for empty in ["", "  \n", "<!-- only a comment -->"] {
+            let dom = parse(empty);
+            let order: Vec<&str> = dom
+                .descendants(Dom::ROOT)
+                .filter_map(|id| dom.tag_name(id))
+                .collect();
+            assert_eq!(order, ["html", "head", "body"], "{empty:?}");
+        }
+    }
+
+    #[test]
+    fn keeps_the_pages_own_html_head_and_body_once() {
+        let dom = parse(
+            "<html lang=id><head><style>p{}</style></head>\
+             <body class=a><p>one</p><body class=b></body><p>two</p></html><p>three",
+        );
+        let html = dom.find_first("html").unwrap();
+        assert_eq!(dom.attr(html, "lang"), Some("id"));
+        assert_eq!(tags_under(&dom, html), ["head", "body"]);
+        let body = dom.find_first("body").unwrap();
+        assert_eq!(
+            dom.attr(body, "class"),
+            Some("a"),
+            "the first body's attributes"
+        );
+        assert_eq!(
+            tags_under(&dom, body),
+            ["p", "p", "p"],
+            "</body> and </html> close nothing"
+        );
+        assert_eq!(tags_under(&dom, dom.find_first("head").unwrap()), ["style"]);
+    }
+
+    #[test]
+    fn head_elements_go_where_they_appear() {
+        // After </head> they still join the head; after body content they stay in the body.
+        let dom = parse(
+            "<head></head><link rel=x><noscript><link rel=y></noscript><div>a</div><style></style>",
+        );
+        let head = dom.find_first("head").unwrap();
+        assert_eq!(tags_under(&dom, head), ["link", "noscript"]);
+        let body = dom.find_first("body").unwrap();
+        assert_eq!(tags_under(&dom, body), ["div", "style"]);
+        // A stray end tag before the body does not lose what follows.
+        let dom = parse("</p></div><b>x</b>");
+        assert_eq!(dom.text_content(dom.find_first("body").unwrap()), "x");
+    }
+
+    #[test]
+    fn fragments_get_no_document_elements() {
+        let dom = parse_fragment("<style>a{}</style><b>x</b></body>y");
+        assert_eq!(tags_under(&dom, Dom::ROOT), ["style", "b"]);
+        assert_eq!(dom.text_content(Dom::ROOT), "a{}xy");
+    }
+
+    #[test]
     fn handles_void_and_self_closing() {
         let dom = parse("<div><img src='a.png'><br/><span>x</span></div>");
         let div = dom.find_first("div").unwrap();
@@ -660,7 +1332,8 @@ mod tests {
         let dom = parse("<ul><li>a<li>b<li>c</ul><p>one<p>two<div>three</div>");
         let ul = dom.find_first("ul").unwrap();
         assert_eq!(tags_under(&dom, ul), ["li", "li", "li"]);
-        assert_eq!(tags_under(&dom, Dom::ROOT), ["ul", "p", "p", "div"]);
+        let body = dom.find_first("body").unwrap();
+        assert_eq!(tags_under(&dom, body), ["ul", "p", "p", "div"]);
     }
 
     #[test]
@@ -695,7 +1368,7 @@ mod tests {
             .descendants(Dom::ROOT)
             .filter_map(|id| dom.tag_name(id))
             .collect();
-        assert_eq!(order, ["a", "b", "c", "d", "e"]);
+        assert_eq!(order, ["html", "head", "body", "a", "b", "c", "d", "e"]);
         let b = dom.find_first("b").unwrap();
         let under_b: Vec<&str> = dom
             .descendants(b)
@@ -713,5 +1386,37 @@ mod tests {
         assert_eq!(dom.attr(a, "hidden"), Some(""));
         assert_eq!(dom.attr(a, "target"), Some("_blank"));
         assert_eq!(dom.attr(a, "missing"), None);
+    }
+
+    #[test]
+    fn generated_boxes_stay_outside_the_tree_and_are_reused() {
+        let mut dom = parse("<p>a</p>");
+        let p = dom.find_first("p").unwrap();
+        let count = dom.descendants(Dom::ROOT).count();
+        assert_eq!(dom.generated(p), [None, None]);
+        let (before, text) = dom.show_generated(p, false, "x");
+        assert_eq!(dom.generated(p), [Some(before), None]);
+        assert_eq!(
+            (dom.parent(before), dom.tag_name(before)),
+            (Some(p), Some("::before"))
+        );
+        assert!(dom.is_generated(before));
+        assert!(matches!(dom.kind(text), NodeKind::Text("x")));
+        assert_eq!(
+            dom.descendants(Dom::ROOT).count(),
+            count,
+            "not among the descendants"
+        );
+        assert_eq!(dom.children(p).count(), 1);
+
+        let len = dom.len();
+        dom.hide_generated();
+        assert_eq!(dom.generated(p), [None, None]);
+        let (again, text) = dom.show_generated(p, false, "y");
+        assert_eq!(again, before, "the same node comes back");
+        assert!(matches!(dom.kind(text), NodeKind::Text("y")));
+        assert_eq!(dom.len(), len, "no new nodes");
+        let (after, _) = dom.show_generated(p, true, "");
+        assert_eq!(dom.generated(p), [Some(before), Some(after)]);
     }
 }

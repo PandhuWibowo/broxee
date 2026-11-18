@@ -24,6 +24,8 @@ pub struct Vocabulary {
     pairs: HashSet<u64, FastBuildHasher>,
     /// The same with values lowercased, for `[a=v i]`.
     lowercase_pairs: HashSet<u64, FastBuildHasher>,
+    /// Keep every rule: the document runs scripts, which can add any name later.
+    everything: bool,
 }
 
 fn pair(name: &str, value: &str) -> u64 {
@@ -31,6 +33,14 @@ fn pair(name: &str, value: &str) -> u64 {
 }
 
 impl Vocabulary {
+    /// A vocabulary that drops nothing, for documents whose scripts can change their names.
+    pub fn everything() -> Vocabulary {
+        Vocabulary {
+            everything: true,
+            ..Vocabulary::default()
+        }
+    }
+
     pub fn of(dom: &Dom) -> Vocabulary {
         let mut v = Vocabulary::default();
         for id in dom.descendants(Dom::ROOT) {
@@ -78,6 +88,9 @@ impl Vocabulary {
     /// never rejects a list `could_match` would keep; it saves building selectors for the many
     /// rules that are dropped anyway.
     pub fn text_could_match(&self, list: &str) -> bool {
+        if self.everything {
+            return true;
+        }
         let b = list.as_bytes();
         let (mut depth, mut i, mut start) = (0usize, 0, 0);
         let mut quote = None;
@@ -154,10 +167,11 @@ impl Vocabulary {
 
     /// False when the selector needs a tag, id or class the document does not have.
     pub fn could_match(&self, selector: &Selector) -> bool {
-        selector
-            .parts
-            .iter()
-            .all(|(compound, _)| self.compound_possible(compound))
+        self.everything
+            || selector
+                .parts
+                .iter()
+                .all(|(compound, _)| self.compound_possible(compound))
     }
 
     fn compound_possible(&self, c: &Compound) -> bool {

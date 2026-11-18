@@ -1,0 +1,756 @@
+//! A page's scripts: which `<script>` elements run, the DOM as the interpreter sees it
+//! (`js::Host`), and running script work on a thread with the stack it needs.
+//!
+//! Scripts run once the document is parsed and its form controls prepared, before styles,
+//! so what they change is styled like the rest. They can change the DOM later too (events,
+//! timers); then the page is styled and laid out again. Stylesheets of a page with scripts
+//! are parsed without dropping rules for names the document lacks, since scripts can add
+//! them (see CLAUDE.md, CSS invariants).
+//!
+//! Scripts fetch through `scriptnet` (same origin, CORS, the profile's cookies) and read and
+//! write `document.cookie` for the page's own site, never `HttpOnly` cookies. They cannot
+//! navigate, and nothing they store reaches disk.
+
+use std::time::Instant;
+
+use html::{Dom, NodeId, NodeKind};
+
+use crate::forms::Forms;
+
+/// Scripts per page, and bytes of script source run per page.
+const MAX_SCRIPTS: usize = 64;
+const MAX_SCRIPT_BYTES: usize = 4 << 20;
+
+/// The scripts of a live page.
+pub struct PageScript {
+    pub runtime: js::Runtime,
+    /// Requests the scripts made.
+    pub net: crate::scriptnet::ScriptNet,
+    started: Instant,
+    epoch_ms: f64,
+}
+
+/// A clock that stands still at this time (ms since 1970) for every page of the process:
+/// `--replay` sets it to when the site was saved, so `Date` and `Math.random` give the same
+/// values on every run.
+static FROZEN_AT: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+
+pub fn freeze_clock(epoch_ms: f64) {
+    let _ = FROZEN_AT.set(epoch_ms);
+}
+
+/// `location`'s parts of a page address.
+fn location_of(url: &net::Url) -> js::Location {
+    let default_port = matches!(
+        (url.scheme.as_str(), url.port),
+        ("http", 80) | ("https", 443) | ("file", _)
+    );
+    let port = if default_port {
+        String::new()
+    } else {
+        url.port.to_string()
+    };
+    let host = if port.is_empty() {
+        url.host.clone()
+    } else {
+        format!("{}:{port}", url.host)
+    };
+    let (pathname, search) = match url.path.split_once('?') {
+        Some((p, q)) if !q.is_empty() => (p.to_string(), format!("?{q}")),
+        Some((p, _)) => (p.to_string(), String::new()),
+        None => (url.path.clone(), String::new()),
+    };
+    let origin = if url.scheme == "file" {
+        "null".to_string()
+    } else {
+        format!("{}://{host}", url.scheme)
+    };
+    js::Location {
+        href: url.to_string(),
+        origin,
+        protocol: format!("{}:", url.scheme),
+        host,
+        hostname: url.host.clone(),
+        port,
+        pathname,
+        search,
+        hash: String::new(),
+    }
+}
+
+/// The system time zone's offset at UTC time `t` (ms since 1970), in milliseconds to add:
+/// `localtime_r` knows the zone's rules, daylight saving included.
+fn system_offset(t: f64) -> f64 {
+    #[cfg(unix)]
+    {
+        use std::os::raw::{c_char, c_int, c_long};
+        /// `struct tm` from <time.h>: the same fields in the same order on macOS and Linux.
+        #[repr(C)]
+        struct Tm {
+            sec: c_int,
+            min: c_int,
+            hour: c_int,
+            mday: c_int,
+            mon: c_int,
+            year: c_int,
+            wday: c_int,
+            yday: c_int,
+            isdst: c_int,
+            gmtoff: c_long,
+            zone: *const c_char,
+        }
+        extern "C" {
+            fn localtime_r(time: *const i64, out: *mut Tm) -> *mut Tm;
+        }
+        if !t.is_finite() {
+            return 0.0;
+        }
+        let secs = (t / 1000.0).floor() as i64;
+        let mut tm = std::mem::MaybeUninit::<Tm>::zeroed();
+        // SAFETY: localtime_r(const time_t *, struct tm *) fills `tm` and returns it, or null
+        // on failure; time_t is 64-bit on both systems, and `Tm` matches their struct tm.
+        let filled = unsafe { localtime_r(&secs, tm.as_mut_ptr()) };
+        if filled.is_null() {
+            return 0.0;
+        }
+        // SAFETY: localtime_r returned non-null, so it wrote every field.
+        unsafe { tm.assume_init() }.gmtoff as f64 * 1000.0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = t;
+        0.0
+    }
+}
+
+impl PageScript {
+    fn new(page: &net::Url, base: &net::Url) -> PageScript {
+        let epoch_ms = FROZEN_AT.get().copied().unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0.0, |d| d.as_secs_f64() * 1000.0)
+        });
+        let mut runtime = js::Runtime::new();
+        runtime.set_location(&location_of(page));
+        // Replays keep UTC: a saved page renders the same in every time zone.
+        if FROZEN_AT.get().is_none() {
+            runtime.set_time_zone(system_offset);
+        }
+        PageScript {
+            runtime,
+            net: crate::scriptnet::ScriptNet::new(page.clone(), base.clone()),
+            started: Instant::now(),
+            epoch_ms,
+        }
+    }
+
+    fn tick(&mut self) {
+        let now = match FROZEN_AT.get() {
+            Some(_) => 0.0,
+            None => self.started.elapsed().as_secs_f64() * 1000.0,
+        };
+        self.runtime.set_time(now, self.epoch_ms);
+    }
+
+    /// How long until the next timer is due, if any.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
+    pub fn next_timer(&self) -> Option<std::time::Duration> {
+        let due = self.runtime.next_timer()?;
+        let now = self.started.elapsed().as_secs_f64() * 1000.0;
+        Some(std::time::Duration::from_secs_f64(
+            ((due - now).max(0.0)) / 1000.0,
+        ))
+    }
+}
+
+/// Run `f` on a thread with the stack scripts need, waiting for it.
+pub fn on_script_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|s| {
+        std::thread::Builder::new()
+            .name("script".into())
+            .stack_size(js::STACK_SIZE)
+            .spawn_scoped(s, f)
+            .expect("spawn a script thread")
+            .join()
+            .unwrap_or_else(|e| std::panic::resume_unwind(e))
+    })
+}
+
+/// The DOM and form state, as scripts see them.
+pub struct DomHost<'a> {
+    pub dom: &'a mut Dom,
+    pub forms: &'a mut Forms,
+    pub url: String,
+    /// Where requests go; `None` where scripts cannot fetch (tests of the DOM alone).
+    pub net: Option<&'a mut crate::scriptnet::ScriptNet>,
+    /// The profile's cookies while the page loads (once shown, `net` holds them).
+    pub load_jar: Option<&'a net::Cookies>,
+    /// Something scripts did changes what the page shows.
+    pub changed: bool,
+}
+
+impl DomHost<'_> {
+    fn control(&self, node: u32) -> Option<usize> {
+        self.forms
+            .controls
+            .binary_search_by_key(&node, |c| c.node)
+            .ok()
+    }
+
+    /// Copy `node` of `from` (a parsed fragment) and its subtree into this document.
+    fn graft(&mut self, from: &Dom, node: NodeId) -> Option<NodeId> {
+        let copy = match from.kind(node) {
+            NodeKind::Text(t) => self.dom.create_text(t),
+            NodeKind::Element(e) => {
+                let tag = from.atom_name(e.tag).to_string();
+                let c = self.dom.create_element(&tag);
+                for (name, value) in e.attrs() {
+                    let name = from.atom_name(name).to_string();
+                    self.dom.set_attr(c, &name, value);
+                }
+                for child in from.children(node) {
+                    if let Some(g) = self.graft(from, child) {
+                        self.dom.append_child(c, g);
+                    }
+                }
+                c
+            }
+            _ => return None,
+        };
+        Some(copy)
+    }
+
+    fn clear(&mut self, node: u32) {
+        let children: Vec<NodeId> = self.dom.children(node).collect();
+        for c in children {
+            self.dom.detach(c);
+        }
+    }
+}
+
+impl js::Host for DomHost<'_> {
+    fn fetch(&mut self, request: js::Request) -> Option<u32> {
+        self.net.as_mut()?.request(request)
+    }
+
+    fn navigate(&mut self, url: &str, replace: bool) {
+        // The last request in a task wins, as in browsers.
+        if let Some(net) = self.net.as_deref_mut() {
+            net.navigation = Some((url.to_string(), replace));
+        }
+    }
+
+    fn cookie(&self) -> String {
+        let Some(net) = self.net.as_deref() else {
+            return String::new();
+        };
+        let page = net.page();
+        match net.jar().or(self.load_jar) {
+            Some(jar) => jar.script_view(page, &net::Context::subresource(page)),
+            None => String::new(),
+        }
+    }
+
+    fn set_cookie(&mut self, text: &str) {
+        let load_jar = self.load_jar;
+        let Some(net) = self.net.as_deref_mut() else {
+            return;
+        };
+        let page = net.page().clone();
+        match net.jar().or(load_jar) {
+            Some(jar) => jar.store_from_script(&page, text, &net::Context::subresource(&page)),
+            None => net.hold_cookie(text),
+        }
+    }
+
+    fn select(&mut self, root: Option<u32>, selector: &str) -> Vec<u32> {
+        css::select(self.dom, root.unwrap_or(Dom::ROOT), selector)
+    }
+
+    fn matches(&mut self, node: u32, selector: &str) -> bool {
+        css::matches_selector(self.dom, node, selector)
+    }
+
+    fn tag(&self, node: u32) -> Option<String> {
+        self.dom.tag_name(node).map(str::to_ascii_lowercase)
+    }
+
+    fn is_text(&self, node: u32) -> bool {
+        matches!(self.dom.kind(node), NodeKind::Text(_))
+    }
+
+    fn text(&self, node: u32) -> String {
+        match self.dom.kind(node) {
+            NodeKind::Text(t) => t.to_string(),
+            _ => self.dom.text_content(node),
+        }
+    }
+
+    fn set_text(&mut self, node: u32, text: &str) {
+        self.changed = true;
+        if self.is_text(node) {
+            self.dom.set_text(node, text);
+            return;
+        }
+        self.clear(node);
+        if !text.is_empty() {
+            let t = self.dom.create_text(text);
+            self.dom.append_child(node, t);
+        }
+    }
+
+    fn set_html(&mut self, node: u32, source: &str) {
+        self.changed = true;
+        self.clear(node);
+        let fragment = html::parse_fragment(source);
+        let children: Vec<NodeId> = fragment.children(Dom::ROOT).collect();
+        for child in children {
+            if let Some(g) = self.graft(&fragment, child) {
+                self.dom.append_child(node, g);
+            }
+        }
+    }
+
+    fn attr(&self, node: u32, name: &str) -> Option<String> {
+        self.dom.attr(node, name).map(str::to_string)
+    }
+
+    fn set_attr(&mut self, node: u32, name: &str, value: &str) {
+        self.changed = true;
+        self.dom.set_attr(node, name, value);
+    }
+
+    fn remove_attr(&mut self, node: u32, name: &str) {
+        self.changed = true;
+        self.dom.remove_attr(node, name);
+    }
+
+    fn parent(&self, node: u32) -> Option<u32> {
+        self.dom.parent(node)
+    }
+
+    fn children(&self, node: u32) -> Vec<u32> {
+        self.dom.children(node).collect()
+    }
+
+    fn create_element(&mut self, tag: &str) -> u32 {
+        self.dom.create_element(tag)
+    }
+
+    fn create_text(&mut self, text: &str) -> u32 {
+        self.dom.create_text(text)
+    }
+
+    fn append(&mut self, parent: u32, child: u32) -> bool {
+        self.changed = true;
+        self.dom.append_child(parent, child)
+    }
+
+    fn insert_before(&mut self, parent: u32, child: u32, before: u32) -> bool {
+        self.changed = true;
+        self.dom.insert_before(parent, child, before)
+    }
+
+    fn remove(&mut self, node: u32) {
+        self.changed = true;
+        self.dom.detach(node);
+    }
+
+    fn value(&self, node: u32) -> Option<String> {
+        self.control(node).map(|i| self.forms.value_of(self.dom, i))
+    }
+
+    fn set_value(&mut self, node: u32, value: &str) {
+        if let Some(i) = self.control(node) {
+            self.changed = true;
+            self.forms.set_value(self.dom, i, value);
+        }
+    }
+
+    fn checked(&self, node: u32) -> Option<bool> {
+        self.control(node).map(|i| self.forms.controls[i].checked)
+    }
+
+    fn set_checked(&mut self, node: u32, checked: bool) {
+        if let Some(i) = self.control(node) {
+            if self.forms.controls[i].checked != checked {
+                self.changed = true;
+                self.forms.toggle(self.dom, i);
+            }
+        }
+    }
+
+    fn url(&self) -> String {
+        self.url.clone()
+    }
+
+    fn log(&mut self, line: &str) {
+        eprintln!("console: {line}");
+    }
+}
+
+/// Where a page's external scripts come from.
+pub enum ScriptFrom<'a> {
+    Network(Option<(&'a net::Cookies, &'a net::Context)>),
+    /// A sleeping page waking: the scripts as stored with it.
+    Stored(&'a [(String, net::Wire)]),
+    /// Inline scripts only.
+    Inline,
+}
+
+/// Whether a `<script>` is classic JavaScript Broxee runs (not a module, JSON or template).
+fn runs(dom: &Dom, node: NodeId) -> bool {
+    match dom
+        .attr(node, "type")
+        .map(|t| t.trim().to_ascii_lowercase())
+    {
+        None => true,
+        Some(t) => matches!(
+            t.as_str(),
+            "" | "text/javascript"
+                | "application/javascript"
+                | "text/ecmascript"
+                | "application/ecmascript"
+        ),
+    }
+}
+
+/// Whether some element has an event handler attribute (`onclick`, `onsubmit`…).
+fn has_inline_handlers(dom: &Dom) -> bool {
+    dom.descendants(Dom::ROOT).any(|id| {
+        dom.element(id).is_some_and(|e| {
+            e.attrs().any(|(name, _)| {
+                let name = dom.atom_name(name);
+                name.len() > 2 && name.starts_with("on")
+            })
+        })
+    })
+}
+
+/// Run the page's scripts in document order, then `DOMContentLoaded` and `load`. Returns the
+/// live scripts (`None` when the page has none) and the external scripts as they arrived,
+/// for a sleeping tab.
+pub fn run_page_scripts(
+    dom: &mut Dom,
+    forms: &mut Forms,
+    (url, base): (&net::Url, &net::Url),
+    from: ScriptFrom,
+    run: bool,
+) -> (Option<Box<PageScript>>, Vec<(String, net::Wire)>) {
+    let nodes: Vec<NodeId> = dom
+        .descendants(Dom::ROOT)
+        .filter(|&n| {
+            dom.tag_name(n) == Some("script") && runs(dom, n) && !crate::engine::in_noscript(dom, n)
+        })
+        .take(MAX_SCRIPTS)
+        .collect();
+    // Inline handlers (`onclick="…"`) need a runtime even on a page without <script>.
+    if nodes.is_empty() && run && has_inline_handlers(dom) {
+        return (Some(Box::new(PageScript::new(url, base))), Vec::new());
+    }
+    if nodes.is_empty() {
+        return (None, Vec::new());
+    }
+    enum Source {
+        Inline(String),
+        External(net::Url),
+    }
+    let sources: Vec<Source> = nodes
+        .iter()
+        .filter_map(|&n| match dom.attr(n, "src") {
+            Some(src) => base.join(src.trim()).ok().map(Source::External),
+            None => Some(Source::Inline(dom.text_content(n))),
+        })
+        .collect();
+    let mut wires = Vec::new();
+    let mut texts: Vec<(String, String)> = Vec::new();
+    let mut total = 0;
+    for source in sources {
+        let (name, text) = match source {
+            Source::Inline(text) => ("inline script".to_string(), Some(text)),
+            Source::External(u) => {
+                let key = u.to_string();
+                let bytes = match &from {
+                    ScriptFrom::Network(jar) => match net::fetch_in(&u, *jar) {
+                        Ok(mut resp) if resp.status == 200 => {
+                            let wire = if resp.wire.bytes.is_empty() {
+                                net::Wire {
+                                    encoding: net::Encoding::Identity,
+                                    bytes: resp.body.clone(),
+                                }
+                            } else {
+                                std::mem::take(&mut resp.wire)
+                            };
+                            wires.push((key.clone(), wire));
+                            Some(resp.body)
+                        }
+                        _ => None,
+                    },
+                    ScriptFrom::Stored(stored) => {
+                        stored.iter().find(|(k, _)| *k == key).and_then(|(k, w)| {
+                            wires.push((k.clone(), w.clone()));
+                            w.decode(net::MAX_BODY).ok()
+                        })
+                    }
+                    ScriptFrom::Inline => None,
+                };
+                (key, bytes.map(|b| String::from_utf8_lossy(&b).into_owned()))
+            }
+        };
+        let Some(text) = text else { continue };
+        total += text.len();
+        if total > MAX_SCRIPT_BYTES {
+            break;
+        }
+        texts.push((name, text));
+    }
+    if !run {
+        // Fetched for later (a page downloading in the background): nothing runs now.
+        return (None, wires);
+    }
+    let mut script = Box::new(PageScript::new(url, base));
+    let page_url = url.to_string();
+    let jar = match &from {
+        ScriptFrom::Network(Some((jar, _))) => Some(*jar),
+        _ => None,
+    };
+    on_script_stack(|| {
+        script.tick();
+        let PageScript { runtime, net, .. } = &mut *script;
+        let mut host = DomHost {
+            dom,
+            forms,
+            url: page_url,
+            net: Some(net),
+            load_jar: jar,
+            changed: false,
+        };
+        for (name, text) in &texts {
+            runtime.run(&mut host, text, name);
+        }
+        runtime.loaded(&mut host);
+    });
+    (Some(script), wires)
+}
+
+/// Fire `kind` at `node` (a click). Returns (the page changed, a listener prevented the
+/// default action).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
+pub fn dispatch(
+    script: &mut PageScript,
+    dom: &mut Dom,
+    forms: &mut Forms,
+    url: &net::Url,
+    node: NodeId,
+    kind: &str,
+) -> (bool, bool) {
+    {
+        let host = DomHost {
+            dom,
+            forms,
+            url: String::new(),
+            net: None,
+            load_jar: None,
+            changed: false,
+        };
+        if !script.runtime.listens(&host, node, kind) {
+            return (false, false);
+        }
+    }
+    let page_url = url.to_string();
+    on_script_stack(|| {
+        script.tick();
+        let PageScript { runtime, net, .. } = &mut *script;
+        let mut host = host_for(dom, forms, page_url, net);
+        let prevented = runtime.dispatch(&mut host, node, kind);
+        (host.changed, prevented)
+    })
+}
+
+/// Run the timers that are due. Returns whether the page changed.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
+pub fn run_timers(
+    script: &mut PageScript,
+    dom: &mut Dom,
+    forms: &mut Forms,
+    url: &net::Url,
+) -> bool {
+    let page_url = url.to_string();
+    on_script_stack(|| {
+        script.tick();
+        let PageScript { runtime, net, .. } = &mut *script;
+        let mut host = host_for(dom, forms, page_url, net);
+        runtime.run_timers(&mut host);
+        host.changed
+    })
+}
+
+/// Hand the answers to the scripts' requests over, each as a task. Returns whether the page
+/// changed.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
+pub fn deliver(
+    script: &mut PageScript,
+    dom: &mut Dom,
+    forms: &mut Forms,
+    url: &net::Url,
+    answers: Vec<(u32, Result<js::Reply, String>)>,
+) -> bool {
+    let page_url = url.to_string();
+    on_script_stack(|| {
+        script.tick();
+        let PageScript { runtime, net, .. } = &mut *script;
+        let mut host = host_for(dom, forms, page_url, net);
+        for (id, answer) in answers {
+            if let Err(why) = &answer {
+                // Why a request failed, never what it carried (cookies stay out of logs).
+                js::Host::log(&mut host, &format!("request failed: {why}"));
+            }
+            runtime.deliver(&mut host, id, answer);
+        }
+        host.changed
+    })
+}
+
+/// The host for later tasks: the page's requests and, once it is shown, its profile's cookies.
+fn host_for<'a>(
+    dom: &'a mut Dom,
+    forms: &'a mut Forms,
+    url: String,
+    net: &'a mut crate::scriptnet::ScriptNet,
+) -> DomHost<'a> {
+    DomHost {
+        dom,
+        forms,
+        url,
+        net: Some(net),
+        load_jar: None,
+        changed: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn page(src: &str) -> (Dom, Forms, Option<Box<PageScript>>) {
+        let mut dom = html::parse(src);
+        let mut forms = Forms::prepare(&mut dom);
+        let url = net::Url::parse("https://example.org/").unwrap();
+        let (script, _) =
+            run_page_scripts(&mut dom, &mut forms, (&url, &url), ScriptFrom::Inline, true);
+        (dom, forms, script)
+    }
+
+    #[test]
+    fn scripts_change_the_document_before_it_is_styled() {
+        let (dom, _, script) = page(
+            "<p id=a>old</p><ul></ul><script>\
+             document.querySelector('#a').textContent = 'new';\
+             const ul = document.querySelector('ul');\
+             for (const t of ['x', 'y']) { const li = document.createElement('li'); li.textContent = t; ul.appendChild(li) }\
+             document.getElementById('a').classList.add('on', 'big');\
+             document.querySelector('p').style.color = 'red';\
+             document.querySelector('ul').insertAdjacentHTML('beforeend', '<li>z</li>');\
+             </script><div id=h></div><script>document.getElementById('h').innerHTML = '<b class=k>bold</b> text'</script>",
+        );
+        assert!(script.is_some());
+        let p = dom.find_first("p").unwrap();
+        assert_eq!(dom.text_content(p), "new");
+        assert_eq!(dom.attr(p, "class"), Some("on big"));
+        assert_eq!(dom.attr(p, "style"), Some("color: red"));
+        assert_eq!(dom.text_content(dom.find_first("ul").unwrap()), "xyz");
+        let b = css::select(&dom, Dom::ROOT, "#h > b.k");
+        assert_eq!(b.len(), 1, "innerHTML is parsed");
+        assert_eq!(dom.text_content(b[0]), "bold");
+    }
+
+    #[test]
+    fn clicks_and_timers_run_listeners() {
+        let (mut dom, mut forms, script) = page(
+            "<button id=b>0</button><a href=/x id=l>link</a><input id=i value=v>\
+             <script>\
+             let n = 0; const b = document.getElementById('b');\
+             b.addEventListener('click', e => { n++; b.textContent = n; document.getElementById('i').value = 'clicked' });\
+             document.getElementById('l').onclick = e => e.preventDefault();\
+             setTimeout(() => { b.textContent = 'timer' }, 0);\
+             </script>",
+        );
+        let mut script = script.unwrap();
+        let url = net::Url::parse("https://example.org/").unwrap();
+        let b = dom.find_first("button").unwrap();
+        let text = dom.children(b).next().unwrap();
+        // A click on the button's text bubbles to the button.
+        assert_eq!(
+            dispatch(&mut script, &mut dom, &mut forms, &url, text, "click"),
+            (true, false)
+        );
+        assert_eq!(dom.text_content(b), "1");
+        let input = forms
+            .controls
+            .iter()
+            .find(|c| c.kind == crate::forms::Kind::Text)
+            .unwrap();
+        assert_eq!(input.value, "clicked", "value goes through the form state");
+        let link = dom.find_first("a").unwrap();
+        assert_eq!(
+            dispatch(&mut script, &mut dom, &mut forms, &url, link, "click"),
+            (false, true)
+        );
+        let p = dom.find_first("input").unwrap();
+        assert!(!dispatch(&mut script, &mut dom, &mut forms, &url, p, "click").1);
+        assert!(script.next_timer().is_some());
+        assert!(run_timers(&mut script, &mut dom, &mut forms, &url));
+        assert_eq!(dom.text_content(b), "timer");
+        assert!(script.next_timer().is_none());
+    }
+
+    #[test]
+    fn pages_without_scripts_have_none() {
+        let (_, _, script) = page("<p>x</p><script type=application/json>{}</script>");
+        assert!(script.is_none());
+    }
+
+    #[test]
+    fn the_system_time_zone_is_a_real_offset() {
+        // Whatever zone the machine is in: within ±14 hours, in whole quarter hours.
+        for t in [0.0, 1_794_923_640_000.0, 1_782_000_000_000.0] {
+            let off = system_offset(t);
+            assert!(off.abs() <= 14.0 * 3_600_000.0, "{off}");
+            assert_eq!(off % (15.0 * 60_000.0), 0.0, "{off}");
+        }
+        assert_eq!(system_offset(f64::NAN), 0.0);
+    }
+
+    #[test]
+    fn location_splits_the_address() {
+        let url = net::Url::parse("https://www.bing.com:8443/search?q=meta&x=1").unwrap();
+        let l = location_of(&url);
+        assert_eq!(l.href, "https://www.bing.com:8443/search?q=meta&x=1");
+        assert_eq!(l.origin, "https://www.bing.com:8443");
+        assert_eq!(
+            (l.protocol.as_str(), l.host.as_str()),
+            ("https:", "www.bing.com:8443")
+        );
+        assert_eq!(
+            (l.hostname.as_str(), l.port.as_str()),
+            ("www.bing.com", "8443")
+        );
+        assert_eq!(
+            (l.pathname.as_str(), l.search.as_str()),
+            ("/search", "?q=meta&x=1")
+        );
+        let plain = location_of(&net::Url::parse("https://e.com/a").unwrap());
+        assert_eq!(
+            (
+                plain.port.as_str(),
+                plain.search.as_str(),
+                plain.host.as_str()
+            ),
+            ("", "", "e.com")
+        );
+        assert_eq!(
+            location_of(&net::Url::parse("file:///tmp/a.html").unwrap()).origin,
+            "null"
+        );
+    }
+}

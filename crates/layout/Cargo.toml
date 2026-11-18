@@ -7,3 +7,4 @@ edition.workspace = true
 html = { path = "../html" }
 css = { path = "../css" }
 font = { path = "../font" }
+math = { path = "../math" }

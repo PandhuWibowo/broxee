@@ -4,7 +4,13 @@ Broxee is a web browser with its own engine, written in Rust. Hard budget: **und
 
 ## Screenshots
 
-Rendered by Broxee itself with `--png` at 1280x800 (fonts: DejaVu Sans on Linux), no other browser involved.
+The window (macOS), with its tab sidebar and pane header around Hacker News. Every pixel, chrome included, is
+drawn by Broxee:
+
+![Broxee's window: the tab sidebar, the pane header and Hacker News](docs/screenshots/history/2026-11-17-window.webp)
+
+Pages rendered by Broxee itself with `--png` at 1280x800 (fonts: DejaVu Sans on Linux), no other browser
+involved.
 
 | Wikipedia (15.7 MB peak RAM) | Hacker News (14.0 MB peak RAM) |
 |---|---|
@@ -14,6 +20,30 @@ Rendered by Broxee itself with `--png` at 1280x800 (fonts: DejaVu Sans on Linux)
 cargo run --release -- https://en.wikipedia.org/wiki/Web_browser --png docs/screenshots/wikipedia.png --width 1280 --height 800 --scale 1
 cargo run --release -- https://news.ycombinator.com --png docs/screenshots/hacker-news.png --width 1280 --height 800 --scale 1
 ```
+
+### Progress over time
+
+The same page, Hacker News on 2026-11-17, rendered by Broxee as it was at each milestone: every commit below was
+built and run with `--png --width 1280 --height 800 --scale 1` on the same day, so only the engine changes.
+
+| Date | Commit | What changed on this page |
+|---|---|---|
+| 2026-11-07 | `24de485`, the first commit | Text, links and colours; no table layout yet, so every row is centred |
+| 2026-11-08 | `46198f6` | Tables and presentational attributes (`cd25b52`): the orange bar, columns and cream background. The "Y" logo is a GIF, which Broxee cannot decode yet |
+| 2026-11-10 | `89e603e` (#22) | GIF decoding: the logo appears |
+| 2026-11-14 | `f65c7d1` | CSS background images: the vote arrows |
+| 2026-11-17 | `c1268cf` (#154, #155) | This page draws as on 2026-11-15; the work since is around it (links in background tabs, link preview, search, background loads) |
+
+| 2026-11-07 | 2026-11-08 |
+|---|---|
+| ![Hacker News rendered by Broxee on 2026-11-07](docs/screenshots/history/2026-11-07-hacker-news.webp) | ![Hacker News rendered by Broxee on 2026-11-08](docs/screenshots/history/2026-11-08-hacker-news.webp) |
+| **2026-11-10** | **2026-11-14** |
+| ![Hacker News rendered by Broxee on 2026-11-10](docs/screenshots/history/2026-11-10-hacker-news.webp) | ![Hacker News rendered by Broxee on 2026-11-14](docs/screenshots/history/2026-11-14-hacker-news.webp) |
+| **2026-11-17** | **2026-11-17, the window** |
+| ![Hacker News rendered by Broxee on 2026-11-17](docs/screenshots/history/2026-11-17-hacker-news.webp) | ![Broxee's window on 2026-11-17](docs/screenshots/history/2026-11-17-window.webp) |
+
+The [Screenshot History](https://github.com/PandhuWibowo/broxee/wiki/Screenshot-History) wiki page tells the
+story behind each step.
 
 ## Download
 
@@ -43,6 +73,7 @@ cargo run --release -- https://example.com --styles    # the tree with computed 
 cargo run --release -- https://example.com --layout    # every box and line with its position
 cargo run --release -- page.html --width 400           # local files, any viewport width
 cargo test
+./scripts/sites.sh                                     # site regression suite (below)
 ```
 
 Every run prints fetch, parse, CSS, cascade, layout and paint timings plus peak RAM, so budget regressions show
@@ -55,6 +86,7 @@ In the window:
 | Palette: open tabs (every profile), this profile's history, commands, a typed address | ⌘K or "Search or go to" in the sidebar; type to filter, ↑ ↓ or Tab, Enter, Esc |
 | Scroll | trackpad or wheel, ↑ ↓, Space / Shift+Space, Page Up / Page Down, Home / End |
 | Follow a link | click it |
+| Fill in a form | click a field or Tab to it; type, paste, ← → Home End Backspace; Enter submits (in a text area it adds a line); Space checks a box, picks a radio button or presses a button; ↑ ↓ change a select; Esc leaves the field |
 | Back / forward / reload | the header buttons, or ⌘[ / ⌘] / ⌘R |
 | Stop loading | Esc, or the × that replaces reload while a page loads |
 | Page menu: copy the address, open in another profile, bookmark, reload, close | ⋯ at the right of the header, or Tab to it and Enter; ↑ ↓ Enter, Esc |
@@ -67,8 +99,10 @@ In the window:
 | Switch profile | ⌘⇧P (cycles), a click on the profile name at the top of the sidebar, or "Switch to …" in the palette |
 | Add, rename, recolor or remove a profile | palette: "New profile", "Rename this profile", "Change this profile's color", "Remove this profile" (asks for its name; its tabs, history, cookies and bookmarks are deleted) |
 | Show or hide the sidebar | ⌘\\ |
-| Bookmark this page (or edit its bookmark) | ⌘D: name and folder, the last folder preselected; Tab between them, Enter saves, Esc cancels |
-| Bookmarks panel, in place of the tab list | ⌘⌥B: folders in name order; ↑ ↓ and Enter or a click opens, Esc goes back to tabs. Every bookmark is a ⌘K result too |
+| One pane, two side by side, four in a grid | ⌘⇧1 / ⌘⇧2 / ⌘⇧4, or `--panes 2` with several addresses; click a pane to give it focus. Each pane keeps its own profile |
+| Bookmark this page (or edit its bookmark) | ⌘D: name and folder, the last folder preselected; Tab between them, Enter saves, Esc cancels. In the folder field ↑ ↓ step through saved folders, and `Reading / Rust` files it in Rust inside Reading |
+| Bookmarks panel, in place of the tab list | ⌘⌥B: a tree, subfolders by name then bookmarks as saved. ↑ ↓ move, Enter or a click opens a bookmark or folds a folder, → unfolds, ← folds or goes to the enclosing folder, Backspace removes a bookmark, Esc goes back to tabs. Folds are kept. Every bookmark is a ⌘K result too |
+| Import bookmarks from another browser | palette: "Import bookmarks from another browser", then the path of the file (the newest `bookmarks…html` in Downloads is filled in). Reads the HTML export every browser makes (Chrome, Firefox, Safari, Edge) and Chrome's own `Bookmarks` file; folders are kept under a folder named Imported, in the visible profile only. Addresses already saved are skipped, and only http, https and file bookmarks are kept |
 | Address field | ⌘L or click the host; type or paste (⌘V), Enter to open, Esc to cancel |
 | Move between header controls and the page's links | Tab / Shift+Tab (a 2px ring marks the focused link; the page scrolls to it), Enter to activate or follow, Esc to leave |
 | Quit | ⌘Q or close the window |
@@ -89,6 +123,11 @@ Tabs and profiles:
   `~/Library/Application Support/Broxee/profiles/<profile>/cookies` (0600, written atomically); session cookies
   never touch the disk. "Clear this profile's cookies" is in the palette. Limits: 4 KB per cookie, 60 per
   site, 3,000 per profile.
+- The `Referer` header follows `Referrer-Policy` (default `strict-origin-when-cross-origin`: the whole
+  address to the page's own origin, only the origin to other sites, nothing from https to http). A page
+  sets it with the header or `<meta name=referrer>`; a link with `referrerpolicy` or `rel=noreferrer`, an
+  `<img>` with `referrerpolicy`. A redirect's own policy holds for the hops after it. What you type or choose
+  in Broxee (address field, palette, bookmarks) tells no page where you came from.
 - Only the visible tab is a live page. The others sleep: the HTML and stylesheets as they arrived (usually
   Brotli or gzip) and the compressed images go to a private file in `~/Library/Caches/Broxee/tabs` (folder
   0700, files 0600). Selecting the tab rebuilds it from that file, without the network, at its old scroll
@@ -96,14 +135,24 @@ Tabs and profiles:
   there are. The files total at most 256 MB; past that the tabs seen longest ago keep only their history and
   reload when selected. The folder is removed on exit, or at the next start when the browser was killed.
 - The session (profiles, tabs, history, scroll positions; no page contents) is written to
-  `~/Library/Application Support/Broxee/session` after each change. On start every tab comes back asleep and
-  only the visible one loads.
+  `~/Library/Application Support/Broxee/session` after each change, through a temporary file and a rename,
+  so a crash leaves the old file or the new one; scroll positions go in a second after scrolling stops. On
+  start every tab comes back asleep and only the visible one loads.
+- Crash recovery: a page whose loading or later work panics shows "Broxee couldn't show this page" with
+  **Try again**, and every other tab keeps working. If Broxee itself crashed or was killed (a running
+  browser leaves `session.running` with its process id; a normal quit removes it), the next start brings back
+  the profiles, tabs, history and split, but the visible tab waits ("Broxee quit unexpectedly", **Open the
+  page**), so a page that brings Broxee down cannot do it again in a loop. Each caught panic adds one line to
+  `crash.log` next to the session (0600, newest 64 KB): the time, the page's host and the source location of
+  the panic, never the address, the panic message or page contents. Nothing is sent anywhere.
 
 ## Written from scratch
 
 Everything is written in this repository against the operating system's own interfaces, with one
 exception: **TLS** uses `rustls` (and its `ring` crypto backend), because hand-written cryptography puts users
-at risk. That is the only dependency; `libc` appears in the build only as a dependency of `ring`.
+at risk, with `webpki-roots` (Mozilla's list of trusted certificate authorities, as data). Everything else in
+`Cargo.lock` comes in through those two: `libc`, `getrandom` and friends at run time, `cc` only to build
+`ring`.
 
 The window layer calls AppKit through the Objective-C runtime (`objc_msgSend`) and shows frames through
 `IOSurface`; process memory is read with a hand-declared `getrusage`.
@@ -112,7 +161,8 @@ Data taken from elsewhere, as data: the Brotli dictionary and tables (RFC 7932, 
 **Public Suffix List** (publicsuffix.org, Mozilla Public License 2.0), stored as
 `crates/net/src/public_suffix_list.gz`: its 10,406 rules, punycode for internationalised labels, 46 KB in the
 binary and about 150 KB in memory once a cookie first needs it. `scripts/update-public-suffixes.sh`
-refreshes it.
+refreshes it. **Figtree** (SIL Open Font License 1.1), the interface font, is stored as its two WOFF2 files
+(46 KB) in `crates/font/src/figtree/` and decoded by Broxee's own WOFF2 decoder.
 
 ## Crates
 
@@ -122,36 +172,48 @@ refreshes it.
 | `net` | URL parsing/joining, HTTP/1.1 over TCP, keep-alive connection pool, chunked and gzip bodies, redirects, `file://`, one retry on a reset or stale connection | ✅ |
 | `html` | Tokenizer, entity decoding, tree builder with implied end tags, chunked arena DOM of 28-byte nodes | ✅ |
 | `css` | Parser, `@media`, selector matching, cascade, computed styles, custom properties, grid values | ✅ |
-| `font` | TrueType/OpenType reader: advances, vertical metrics, cmap formats 4 and 12, `.ttc`, glyph outlines (simple and composite) | ✅ |
+| `font` | TrueType/OpenType reader: advances, vertical metrics, cmap formats 4 and 12, `.ttc`, glyph outlines (simple and composite); WOFF and WOFF2 (Brotli, with the `glyf`/`loca`/`hmtx` transforms rebuilt); face matching by family, weight and style with fallback per character | ✅ |
 | `layout` | Block, inline, inline-block, flex and grid layout, positioning, line breaking, white-space, text-align, baselines | ✅ |
 | `paint` | Display list, anti-aliased glyph rasterizer, glyph cache, image cache with parallel decoding, parallel band compositing, streaming PNG writer | ✅ |
-| `image` | PNG (all color types and depths, `tRNS`, Adam7) and JPEG, baseline and progressive (any subsampling, restarts, Adobe RGB), decoded straight to the drawn size with a scaled inverse DCT; header sizes for PNG, JPEG, GIF, WebP | ✅ |
+| `image` | PNG (all color types and depths, `tRNS`, Adam7), JPEG baseline and progressive (any subsampling, restarts, Adobe RGB) with a scaled inverse DCT, GIF (first frame, interlaced, transparency), WebP lossy, lossless, alpha and the first animation frame, and an SVG subset rasterized at the drawn size; all decoded straight to the drawn size | ✅ |
 | `platform` | macOS window, menu, app delegate, main-thread hand-off, zero-copy frames through `IOSurface` | ✅ (macOS) |
-| `shell` | The `broxee` binary: CLI, the page pipeline (`engine.rs`), the browser (`browser.rs`: history, navigation, scrolling, links, address field) and its header (`chrome.rs`) | ✅ |
+| `js` | JavaScript interpreter: lexer, parser, tree-walking evaluation over a per-page arena heap with step and object limits; builtins (Object, Array, String, Number, Math, JSON, Map, Set, RegExp with its own engine, Date, timers, console, storage) and DOM bindings (querySelector, textContent, innerHTML, classList, style, attributes, tree changes, addEventListener, form values) | ✅ (first milestone) |
+| `shell` | The `broxee` binary: CLI, the page pipeline (`engine.rs`), the browser (`browser.rs`: history, navigation, scrolling, links, address field), form controls and submission (`forms.rs`) and its header (`chrome.rs`) | ✅ |
 
 How the stages run (sequential, parallel, which thread) is documented in [`docs/pipeline.md`](docs/pipeline.md).
 
-Text is measured and drawn with Arial (macOS) or DejaVu Sans (Linux) until Figtree is bundled (see
-`DESIGN.md`); without either, layout uses a fixed half-em approximation and text is not drawn.
+Pages are drawn in their own `@font-face` fonts, then Arial (macOS) or DejaVu Sans (Linux), character by
+character; Broxee's interface uses Figtree (bundled, see `DESIGN.md`). Characters none of those have fall back
+to the system's symbol font (macOS `Keyboard.ttf` for ⌘ ⇧ ⌥). Without a page font, pages use Figtree; tests use
+a fixed half-em approximation.
+
+Web fonts: only the faces that some text on the page uses are fetched (rust-lang.org declares 45 and loads 4),
+each from the first `src` that loads, after the cascade and before layout. A page may load 24 faces of up to 4 MB
+each, holding at most 8 MB together. Fonts are kept as they arrived with the page's sources, so a sleeping tab
+wakes with them. Not yet: CFF outlines (`.otf` and CFF-flavored WOFF2 fall back to the next font), variable
+font axes (the default instance draws), synthetic bold and italic, `font-display` (text waits for its fonts),
+fonts for text that scripts add after loading.
 
 ## Layout support
 
 | Supported | Not yet |
 |---|---|
-| Block boxes: width, height, min/max, `margin: auto`, percentages, padding, borders, `box-sizing`, `<center>` centering narrower blocks | floats |
+| Block boxes: width, height, min/max, `margin: auto`, percentages, padding, borders, `box-sizing`, `<center>` centering narrower blocks | margin collapsing through parents |
+| Floats: `float: left`/`right` (shrink-to-fit, stacking, moving down until they fit), `clear` and `<br clear>`, `align=left`/`right` on images and tables, lines shortened beside floats, `display: flow-root`, `overflow` other than `visible`, inline blocks, flex and grid items and table cells sitting beside floats and holding their own | floats painting under later blocks' backgrounds (they paint in document order), line height other than the container's when testing room beside a float |
 | Tables: automatic column widths from cell content, px and % cell widths, `colspan`/`rowspan`, `thead`/`tfoot` order, rows and cells without their wrappers, `border-spacing`, row backgrounds, `vertical-align` top/middle/bottom, `inline-table`, `caption-side`, non-table content in anonymous cells | `table-layout: fixed`, collapsed border drawing, `<col>` widths, bottom captions |
 | Grid: track lists (lengths, %, `fr`, `auto`, `min-content`, `max-content`, `minmax()`, `fit-content()`, `repeat()` with `auto-fill`/`auto-fit`), `grid-template-areas` and `grid-area`, line numbers and `span`, sparse auto-placement, implicit tracks, gaps, `align-self`, `order` | column auto-flow and `dense`, named lines, `justify-items`/`-self`, `align-content`/`justify-content`, subgrid, intrinsic size of a grid container |
 | Flex: rows and columns (and reverses), wrapping rows, grow/shrink/basis with min/max and automatic minimums, auto margins, `justify-content`, `align-items`/`align-self`, `gap`, `order`, text as anonymous items | `align-content`, wrapping columns, baseline alignment (as start), cross-axis auto margins |
 | `inline-block` and `inline-flex`: shrink-to-fit, unbreakable on the line, aligned on their last baseline | `vertical-align` |
-| `position: relative` (shifts the box and its content), `absolute` (against the nearest positioned ancestor, insets, shrink-to-fit width, static position when no inset), `fixed` (stays put while scrolling, no scroll height) | `z-index` (positioned boxes paint in document order, over normal flow), `sticky` (treated as relative) |
-| `overflow: hidden`/`clip` clips descendants to the padding box; `visibility: hidden`; `opacity: 0` | scrolling inside boxes (`auto`/`scroll` show everything), partial opacity (drawn opaque) |
+| `position: relative` (shifts the box and its content), `absolute` (against the nearest positioned ancestor, insets, shrink-to-fit width, static position when no inset), `fixed` (stays put while scrolling, no scroll height); `z-index` on positioned boxes, relative ones included, ordering their layers (the outermost stacking context's z-index, then the box's own), and clicks follow the same order | stacking contexts deeper than two levels, negative `z-index` painting above the root background, `sticky` (treated as relative) |
+| `overflow: hidden`/`clip` clips descendants to the padding box, to its rounded corners with `border-radius`; `visibility: hidden`; `opacity`, the element and its content blended as one group | scrolling inside boxes (`auto`/`scroll` show everything); positioned descendants of a translucent or rounded box are drawn outside its group |
 | Sibling margin collapsing | collapsing through parents and empty boxes |
 | Anonymous blocks around inline runs; an inline holding a block becomes a block | |
 | Line breaking, collapsed white space, `pre`, `nowrap`, `pre-wrap`, `<br>` | `justify`, hyphenation, bidi, `word-break`/`overflow-wrap` |
 | Half-leading baselines, `line-height` normal/number/length | `vertical-align` outside table cells |
 | Inline elements with margins, padding, borders and backgrounds (one box per line they span; plain inline elements cost nothing) | `box-decoration-break` (every piece draws all four borders) |
-| `<img>` as a replaced element: CSS size, `width`/`height` attributes, the file's natural size and ratio, `max-width` keeping proportions, in inline, block, flex and grid | `object-fit`, `<picture>`, `srcset` density selection (first candidate is used), `loading=lazy` |
-| Scrollable height includes overflow | padding, borders and margins on inline elements |
+| `<img>` as a replaced element: CSS size, `width`/`height` attributes, the file's natural size and ratio, `max-width` keeping proportions, in inline, block, flex and grid; `srcset` (`x` and `w` descriptors, `sizes` with media conditions and px/em/rem/vw/vh lengths) and `<picture>` (`<source media type srcset sizes width height>`), chosen by drawn width and device scale, the file drawn at its density | `object-fit`, `loading=lazy`, `calc()` in `sizes`, choosing again after a resize or a move to another display |
+| Scrollable height includes overflow, except what a box with `overflow` other than `visible` hides (the root's and `<body>`'s still scrolls, as browsers apply theirs to the viewport) | padding, borders and margins on inline elements |
+| Changes from scripts, form controls and `:hover`/`:focus` lay out again only inside the nearest box that clips its overflow, sits in normal flow and keeps its size (typing in a field: the field); text-only changes skip the cascade unless a rule uses `:empty` | restyling only the changed subtree (the whole page is restyled, then compared); moving what follows a box whose height changed (the page is laid out again) |
 
 TLS uses `rustls` (ring backend). Everything else is written here; crypto is the one thing we do not hand-roll.
 
@@ -159,9 +221,10 @@ TLS uses `rustls` (ring backend). Everything else is written here; crypto is the
 
 | Area | Supported | Not yet |
 |---|---|---|
-| Selectors | type, `.class`, `#id`, `*`, attributes (`=`, `~=`, `\|=`, `^=`, `$=`, `*=`, `i` flag), `:root`, descendant, `>`, `+`, `~`, `:first-child`/`:last-child`/`:only-child`, `:nth-child()`/`:nth-last-child()`, `:not()` with simple arguments, `:checked`, `:disabled`/`:enabled`, `:empty`, `:link` | `:is()`/`:where()`/`:has()`, complex `:not()` arguments; `:hover`/`:focus`/`:visited` and `::before`/`::after` never match (dropped) |
-| At-rules | `@media` (type, min/max width and height, range syntax, `calc(a ± b)`, `prefers-color-scheme`, orientation, reduced motion), `@supports` and `@layer` contents | `@container`, `@import`, `@font-face`, `@keyframes` (skipped) |
-| Properties | display (incl. `flex`, `inline-flex`), color, background(-color), font, font-size/weight/style, line-height, text-align, white-space, text-decoration, width, height, min/max, `box-sizing`, margin, padding, border (+ sides, width/style/color), position, inset (`top`/`right`/`bottom`/`left`), visibility, overflow, opacity (0 or visible), flex-direction/-wrap/-flow, justify-content, align-items/-self, flex/-grow/-shrink/-basis, gap/row-gap/column-gap, order, `vw`/`vh`/`vmin`/`vmax` | everything else, `light-dark()`, `calc()` in property values |
+| Selectors | type, `.class`, `#id`, `*`, attributes (`=`, `~=`, `\|=`, `^=`, `$=`, `*=`, `i` flag), `:root`, descendant, `>`, `+`, `~`, `:first-child`/`:last-child`/`:only-child`, `:nth-child()`/`:nth-last-child()`, `:not()` with simple arguments, `:checked`, `:disabled`/`:enabled`, `:empty`, `:link`, `:hover`, `:active`, `:focus`, `:focus-visible`, `:focus-within` | `:is()`/`:where()`/`:has()`, complex `:not()` arguments; `:visited`, `:target` and validation states never match (dropped) |
+| Generated content | `::before`/`::after` (and `:before`/`:after`) with `content` as strings (escapes such as `"\f101"`), `attr()` and `none`; styled and laid out like any inline or block box | counters, quotes, `url()` in `content` (the declaration is dropped), `::marker`, `::first-line`, `::placeholder` |
+| At-rules | `@media` (type, min/max width and height, range syntax, `calc(a ± b)`, `prefers-color-scheme`, orientation, reduced motion), `@supports` and `@layer` contents, `@font-face` (`font-family`, `src` with `url()` and `format()`, `font-weight` and its ranges, `font-style`, `unicode-range`; `data:` URLs) | `@container`, `@import`, `@keyframes` (skipped), `local()` sources |
+| Properties | display (incl. `flex`, `inline-flex`), color, background(-color), font (with its family), font-family (and `<font face>`), font-size/weight/style, line-height, text-align, white-space, text-decoration, width, height, min/max, `box-sizing`, margin, padding, border (+ sides, width/style/color), position, inset (`top`/`right`/`bottom`/`left`), visibility, overflow, opacity (0 or visible), `outline` (+ `-width`/`-style`/`-color`/`-offset`), `border-radius` (+ the four corners, elliptical `a / b`, percentages), `box-shadow` (several, `inset`, blur, spread), `transform` (`translate`, `scale`, `rotate`, `skew`, `matrix` and their axis forms; 3D functions as identity) and `transform-origin`, `background-image` and `background` with `url()` images (relative to their stylesheet), `linear-gradient`/`radial-gradient` and their `repeating-` forms, layered; `background-size` (`cover`, `contain`, lengths), `background-position`, `background-repeat` (`repeat-x`/`-y`, `no-repeat`; `space` and `round` repeat) (angles, `to` sides and corners, radial shapes, sizes and `at`, stops with one or two positions), flex-direction/-wrap/-flow, justify-content, align-items/-self, flex/-grow/-shrink/-basis, gap/row-gap/column-gap, order, `vw`/`vh`/`vmin`/`vmax` | everything else, `light-dark()`, `calc()` in property values, 3D transforms, `background-size`/`-position`/`-repeat` per layer (the first layer's apply to all), positions with edge offsets (`right 10px top 20%` uses the edges), gradients sized by `background-size`, `background-attachment`, `background-clip`/`-origin`, `conic-gradient`, gradient color hints (skipped), outlines following `border-radius` |
 | Grid | `display: grid`/`inline-grid`, `grid-template-columns`/`-rows`/`-areas`, `grid-template`, `grid` (template forms), `grid-auto-rows`/`-columns`/`-flow`, `grid-row`/`-column` (+ `-start`/`-end`), `grid-area` | `grid: auto-flow ...`, `span <name>`, `<name> <n>` |
 | Custom properties | `--name` declarations (inherited), `var(--name, fallback)` in any property including shorthands, nested `var()`, cycle detection, inline `style` variables | `@property` |
 | Cascade | UA → presentational hints (`bgcolor`, `width`, `align`, `valign`, `cellpadding`, `cellspacing`, `border`, `<font color size>`, `nowrap`) → author → inline, specificity, order, `!important`, inheritance, `inherit`/`initial`; quirks-mode table reset for documents without a doctype | cascade layers order, `unset` treated as `initial` |
@@ -192,9 +255,9 @@ time something reads it (most theme variables never are). A `var()` value is sub
 4. ✅ Layout: block, inline, text wrapping
 5. ✅ Painting to a window: the first visible page
 6. ✅ Scrolling, links, back/forward, address bar
-7. JavaScript (Boa) + a subset of the DOM API
-8. Product features: ✅ profiles, ✅ tabs that sleep to disk, ✅ session restore, ✅ ⌘K palette; next cookies,
-   split view, bookmarks, tab groups
+7. ✅ JavaScript, written here (not Boa: no engine crate, the owner's rule) + a subset of the DOM API
+8. Product features: ✅ profiles, ✅ tabs that sleep to disk, ✅ session restore, ✅ ⌘K palette, ✅ cookies,
+   ✅ bookmarks, ✅ tab groups, ✅ split view, ✅ forms
 
 ## Budget log
 
@@ -223,6 +286,48 @@ time something reads it (most theme variables never are). A `var()` value is sub
 | 2026-11-07 | Rules dropped from their selector text (#16) | 2.2 MB | 49.3 MB peak painted at 2x | GitHub's 30 sheets (3.4 MB): 15.0 → 11.7 ms, 155,109 → 34,167 allocations, same 820 rules |
 | 2026-11-08 | Display list skips runs of fragments out of view (#17) | 2.2 MB | 49.4 MB peak painted at 2x | Stress page: display list 0.65 → 0.01 ms a frame at any scroll; layout +0.8 ms once to index |
 | 2026-11-08 | Glyphs on quarter pixels (#18) | 2.2 MB | 49.5 MB peak painted at 2x | Repeated "i" at 13px, 1x: gaps 4/3/4/3 px (stdev 0.50) → 3.5 ± 0.15 px; GitHub glyph cache 46 → 88 KB |
+| 2026-11-10 | GIF, WebP and SVG drawn (#14) | 2.4 MB | 49.4 MB peak painted at 2x | 4000x4000 lossy WebP at 400 px: 17.9 MB peak (empty page 16.7), 296 ms; 4000x3000 lossless: 20.5 MB, 154 ms |
+| 2026-11-10 | Header in its own layer (#15) | 2.4 MB | 49.4 MB peak painted at 2x | Typing and the loading line paint a 36-point strip, not the 16 MB frame; GitHub load in a window: 37 MB idle, peak 48 to 54 MB, 0.3 s CPU (before: 37 MB, 51 to 53 MB, 0.3 s) |
+| 2026-11-10 | Forms: controls, editing, GET and POST (#13) | 2.4 MB | 49.4 MB peak painted at 2x | Wikipedia's search form submits from the keyboard; a keystroke lays the page out again (no incremental layout yet) |
+| 2026-11-10 | Split view, 1/2/4 panes (#7) | 2.4 MB | 49.4 MB peak painted at 2x | Window with GitHub, Wikipedia, HN, example.com: 1 pane 30 MB idle / 44 MB peak, 2 panes 33 / 47 MB, 4 panes 31 / 45 MB |
+| 2026-11-10 | JavaScript, written here (#12) | 2.9 MB | 49.6 MB peak painted at 2x | example.com 20 MB, HN 22 MB, Wikipedia 27 MB, GitHub 32 MB peak with their scripts run; scripts that use unsupported syntax are skipped and logged |
+| 2026-11-12 | Floats and clear (#23) | 2.9 MB (+16 KB) | 49.6 MB peak painted at 2x; layout 14.1 → 14.7 ms (+4%) | Rust article: infobox and thumbnails on the right with text beside them, 34.0 MB peak (unchanged) |
+| 2026-11-12 | `::before`/`::after`, `:hover`/`:focus`/`:focus-visible`/`:focus-within`/`:active`, `outline` (#24) | 2.9 MB | 49.6 MB peak painted at 2x; layout unchanged | Cascade on saved copies (200 runs, minimum): Wikipedia 2.9 → 4.1 ms (it now matches its `::before`/`::after` rules on `a`, `span`, `li`), MDN 1.60 → 1.64 ms. A pointer move restyles only when a rule can see the change |
+| 2026-11-13 | Web fonts: `@font-face`, WOFF/WOFF2, matching with fallback per character; Figtree bundled (#25) | 3.0 MB (3,071,888 → 3,171,088 bytes, +99 KB, Figtree 46 KB of it) | 49.6–49.7 → 49.7 MB peak painted at 2x; layout 14.7 → 15.6 ms (+6%, a bench of 300 layouts) | rust-lang.org: 4 of 45 faces (136 KB in memory, 31 ms). MDN: 2 of 13 faces, peak 22.6 → 24.0 MB. Font Awesome's site draws its icons (7 of 8 faces, 195 KB). Wikipedia (no web fonts): 24.3 → 24.6 MB |
+| 2026-11-13 | `border-radius`, `box-shadow`, linear and radial gradients (part of #33) | 3.1 MB (3,171,088 → 3,220,768 bytes, +49.7 KB) | 49.7 → 49.8 MB peak painted at 2x; composite 1.30 → 1.32 ms (6 runs each, +1.5%) | GitHub repository page at 2x: composite 2.2 → 4.2 ms, its loading skeletons (translucent gradients over a third of the frame) now drawn; gradients use a 1,024-color table, axis-aligned ones copy rows, and corners alone cost per-pixel work |
+| 2026-11-13 | Partial `opacity` as a group, `z-index`, children clipped to rounded corners (part of #33) | 3.1 MB (3,237,296 → 3,286,896 bytes, +49.6 KB) | 49.8 MB peak painted at 2x; composite 1.32 → 1.27 ms, layout 16.1 → 16.4 ms (5 runs each) | singapay.id at 2x: 6.8 → 8 to 10 ms, now drawing its translucent shapes behind its content and its fixed banner over the header (z-index 60 over 50); BBC 3.2 → 2.9 ms. Six other sites pixel-identical. Groups copy their backdrop 32 rows at a time and only within their bounds; most need none (a rounded clip whose content stays off the corners, opacity over a single item) |
+| 2026-11-13 | 2D transforms, drawn and hit tested (part of #33) | 3.2 MB (3,286,896 → 3,303,456 bytes, +16.6 KB) | 49.6 MB peak painted at 2x; composite 1.34 → 1.23 ms, layout unchanged (5 runs each) | A transform that only moves is drawn by shifting; others render offscreen (at most 512K pixels a layer, 1M a frame) and are sampled through the matrix. Ancestors' clips stay put (a carousel's track). A page of rotated, scaled, skewed and tilted boxes: 4.2 ms at 2x, 21.6 MB peak. Eight sites pixel-identical |
+| 2026-11-13 | CSS background images: `url()` layers with size, position and repeat (#33) | 3.2 MB (3,303,456 → 3,336,544 bytes, +33 KB) | 49.8 MB peak painted at 2x; composite 1.33 → 1.31 ms, layout unchanged (5 runs each) | Found after the cascade for displayed elements, fetched while web fonts load, kept by URL in the page's image budget and in sleeping tabs (tab file 4). Decoded at the tile's drawn size; a repeat is one item, however many tiles. Hacker News now shows its vote arrows, Wikipedia its small icons; six other sites pixel-identical |
+
+| 2026-11-14 | Incremental layout after DOM changes (part of #26) | 3.4 MB (3,336,544 → 3,369,616 bytes, +33 KB) | 49.8 MB peak painted at 2x (unchanged) | Typing into a field above the stress page's 20,000 rows: 0.09 ms a key, against 38.4 ms for a full restyle and layout (release, `typing_cost_on_the_stress_page`). A box rebuilt alone matches a full pass exactly (1,600 random changes, 4 seeds). BBC is 14,041 → 12,633 px tall: a collapsed 1 px wide panel no longer adds its hidden text to the scroll height; seven other sites keep their height |
+
+| 2026-11-14 | JavaScript: classes, getters and setters, iterators, regex lookaround and backreferences (part of #27) | 3.4 MB (3,369,616 → 3,402,704 bytes, +33 KB) | 49.8 MB peak painted at 2x (unchanged) | rust-lang.org's highlight.js parsed, registered its languages and ran with no errors (it was skipped at `class`, then hit lookaround, `Symbol`, `isFrozen` and a backreference). Peak RAM with scripts: GitHub repository page 20.0 → 21.0 MB, Wikipedia 22.3 → 22.4 MB, HN 14.9 → 14.8 MB. BBC's paywall script now parses past its getters |
+
+| 2026-11-14 | JavaScript: generators, lazy `for…of`, destructuring assignment (part of #27) | 3.5 MB (3,452,336 → 3,468,880 bytes, +16.5 KB) | 49.9 MB peak painted at 2x | Generators reuse the `async` statement machine: `yield` is a second pause point. Same five sites run with no console errors; peak RAM unchanged within 0.3 MB |
+| 2026-11-14 | JavaScript: promises, microtasks, `async`/`await` (part of #27) | 3.5 MB (3,402,704 → 3,452,336 bytes, +49.6 KB) | 49.8 MB peak painted at 2x (unchanged) | An `async` body runs on a statement machine that pauses between statements; statements without `await` still run whole on the recursive evaluator. Peak RAM with scripts: rust-lang.org 17.5 MB, GitHub 20.2 MB, Wikipedia 22.2 MB, HN 14.8 MB, MDN 16.7 MB (unchanged) |
+
+| 2026-11-14 | `fetch`, `XMLHttpRequest`, `document.cookie` (#28) | 3.6 MB (3,468,880 → 3,551,600 bytes, +82.7 KB) | 49.7 MB peak painted at 2x | Requests run on their own threads (6 at once per page) and answer as tasks; CORS with preflight; cookies only for the page's site. Tested against local servers: GET, POST with JSON, an allowed and a blocked cross-origin read, a preflighted header, cookies kept from another site |
+
+| 2026-11-14 | Select and copy page text, find in page (#29) | 3.6 MB (3,551,600 → 3,584,656 bytes, +33 KB) | 49.9 MB peak painted at 2x | Drag, double click (word), triple click (paragraph), Shift+click, ⌘A and ⌘C, with line breaks between blocks; ⌘F finds case-insensitively across inline elements, Enter / Shift+Enter move and scroll. Positions are (text node, offset), so they survive relayout |
+
+| 2026-11-14 | HTTP disk cache, one per profile (#30) | 3.6 MB (3,584,656 → 3,617,808 bytes, +33 KB) | 50.0 MB peak painted at 2x | GitHub repository page, reloaded with a warm cache (`--cache DIR`): 2,294 → 248 ms in all, 700 → 52 KB received (only the HTML, which sets cookies, is fetched again; 23 stylesheets and 9 images come from disk). Entries keep the encoding they arrived in; `max-age`, `Expires`, heuristic freshness, `ETag`/`Last-Modified` revalidation, `no-store`, `Vary: Accept-Encoding` |
+
+| 2026-11-14 | Split view: panes saved with the session, numbered badges on tabs in panes, drag a tab onto a pane, resize panes (#31) | 3.6 MB (unchanged, 3,617,808 bytes) | 49.8 MB peak painted at 2x | Window with GitHub, Wikipedia, HN and example.com in 4 panes (`footprint`): 29 MB idle, 61 MB peak, the same as `main`. It was 31 MB idle and 45 MB peak at #7: pages now run scripts and load web fonts while the panes fill |
+
+| 2026-11-14 | Forms: `multiple` and `size` selects as list boxes (#32) | 3.7 MB (unchanged, 3,650,896 bytes) | 49.9 MB peak painted at 2x | Rows are nodes the browser adds (`broxee-row`, `broxee-chosen`, `broxee-out` past `size`), drawn by the page's own layout like the other controls |
+| 2026-11-14 | Forms: selection, copy, cut and paste in fields; validation; multipart (part of #32) | 3.7 MB (3,634,352 → 3,650,896 bytes, +16.5 KB) | 49.9 MB peak painted at 2x | Messages are tooltips under the control that stops a form; an edit that breaks `readonly` or `maxlength` is undone in one place, for typing, paste and cut alike |
+| 2026-11-14 | Forms: select dropdown, fields that scroll to the caret (part of #32) | 3.6 MB (3,617,808 → 3,634,352 bytes, +16.5 KB) | 49.8 MB peak painted at 2x | The dropdown is the menus' panel (one list painter for both); a field's runs shift left after layout and back before the next, so incremental layout never sees them moved |
+
+| 2026-11-15 | Function bodies parsed on their first call (#51) | 3.7 MB (3,650,896 → 3,667,440 bytes, +16.5 KB) | 49.9 MB peak painted at 2x | singapay.id (868 KB of Next.js script): 40.3 → 27.0 MB peak on the CLI; in a window 63 → 52 MB peak and 46 → 33 MB idle. Four panes with singapay.id, GitHub, Wikipedia and HN: 51 MB peak; GitHub, Wikipedia, HN and example.com: 47 MB (measured from an empty home folder). Names in scripts are shared per script (−2 MB on singapay.id). The 61 MB of #51 came from a heavy page woken from the session at start-up, not from the panes |
+
+| 2026-11-15 | Sleeping tabs share stylesheets, scripts, fonts and images (#51) | 3.7 MB | 49.9 MB peak painted at 2x | Disk: six tabs (three Wikipedia articles, two GitHub repositories, example.com) sleep in 1.7 MB instead of 2.9 MB; GitHub's 428 KB of stylesheets is stored once |
+| 2026-11-15 | Site regression suite: `--record`/`--replay`, `--tiles`, 22 saved pages in CI (#148) | 3.7 MB (3,651,136 → 3,667,520 bytes, +16.0 KB, Rust 1.100) | 49.9 MB peak painted at 2x (unchanged) | Replays are exact and agree between macOS arm64 and Linux x86_64. Peak RAM over the 22 pages 26.7 to 38.7 MB (rust-std-vec, 1x at 1280x2400); the 44 renders take about 3 s once built. A 1 px change of the UA list indent fails 6 pages |
+| 2026-11-18 | `Referer` by `Referrer-Policy` (#125) | 3.8 MB (3,783,520 → 3,783,536 bytes, +16 bytes) | 49.9 MB peak painted at 2x (unchanged) | Header, `<meta name=referrer>` (legacy names too), link and `<img>` `referrerpolicy`, `rel=noreferrer`, redirects; the header's policy is kept with sleeping tabs (tab file 7). The 22 saved pages render the same |
+| 2026-11-18 | `<html>`, `<head>` and `<body>` added when a page leaves them out | 3.8 MB (3,783,536 → 3,800,064 bytes, +16.5 KB: one more 16 KB page) | 49.8 MB peak painted at 2x; parse 18.0 → 18.3 ms (median of 12, +1.3%) | Head elements before body content go in the head, the rest in the body; `</body>` and `</html>` close nothing; `innerHTML` parses a fragment (`html::parse_fragment`). A page of `<title>` and `<p>` now gets its 8px margin and `body` rules. The 22 saved pages render the same |
+| 2026-11-18 | `srcset` and `<picture>` by drawn width and scale (part of #59) | 3.8 MB (3,800,080 → 3,816,608 bytes, +16.5 KB) | 49.9 MB peak painted at 2x (unchanged) | The HTML candidate parser, `sizes`, `<source media type>`; the smallest density at least the scale, else the largest, drawn at its density (a 2x file of 440 px is 220 CSS px). A chosen `<source>`'s `width`/`height` size the `<img>`. Wikipedia "Rust" (replay): 1x 379 → 392 KB of images (the footer's wide logos), 2x 379 → 704 KB (2x thumbnails), peak 35.6 → 36.1 MB at 2x. `--fill DIR` adds what an archive lacks: 21 image responses for wikipedia-rust and arch-install; wikipedia-rust 2x changes 10 tiles (sharper logo and icon), the other 43 renders are the same |
+| 2026-11-18 | Pages show before their images | 3.8 MB (3,800,064 → 3,800,080 bytes, +16 bytes) | 49.9 MB peak painted at 2x (the CLI still waits for images) | singapay.id in the window (`FakeScreen`, 3 runs): on screen after 3.8 to 6.1 s → 0.6 to 3.1 s; its 61 images arrive one by one after that. `<img>` files and CSS backgrounds go to `pending_images`, fetched once the page is shown, six at once, each laid out as it arrives; a tab that slept first fetches what it lacks when it wakes. Loads in the background still take their images along. The 22 saved pages render the same |
+| 2026-11-18 | Crash recovery (#146): `panic = "unwind"`, panics contained per page, the session back after a crash | 4.4 MB (3,800,080 → 4,445,104 bytes, +630 KB: unwinding tables +612 KB, the code +16 KB) | 50.0 MB peak painted at 2x (49.9 before, within run-to-run noise) | Loader threads and each turn of the engine thread's loop run under `catch_unwind`; a panic ends as an error page in its tab. A marker holding the process id tells the next start that the last run crashed, and the visible tab then waits to be opened. The 22 saved pages render the same |
+| 2026-11-18 | Bookmarks: nested folders, import from other browsers (HTML export, Chrome JSON) | 4.3 MB (4,461,632 → 4,511,280 bytes, +48 KB) | 50.0 MB peak painted at 2x (no bookmark code runs there) | An import holds the file (16 MB at most) while it is read; bookmarks themselves are a few hundred bytes each, 10,000 at most per profile |
 
 Other pages after the layout milestone: GitHub home 22.7 MB peak (8,170 rules); Hacker News 11.5 MB.
 
@@ -273,7 +378,11 @@ scans need it), instead of 36 MB of coefficients; one decodes at a time.
 
 Images never exist at full size: a decoder hands rows to a box filter that shrinks them to the size they
 are drawn at, PNG data streams through a 32 KiB inflate window and JPEG is decoded one row of blocks at a
-time. Only images in view are decoded (in parallel); decoded pixels live in a 8 MB cache that evicts what
+time. GIF rows come straight out of LZW (interlaced frames are assembled at one byte per pixel first, as
+interlaced PNGs are), lossy WebP is decoded one macroblock row at a time with the loop filter one row
+behind, and lossless WebP keeps a ring of the last million pixels, the farthest a backward reference can
+reach, so a 4000x3000 file costs about 4 MB to decode instead of 48. SVG is rasterized at the drawn size with
+one row of coverage. Only images in view are decoded (in parallel); decoded pixels live in a 8 MB cache that evicts what
 has not been drawn recently, and the page keeps only compressed bytes (12 MB cap). The debugging PNG writer
 used to hold three copies of a frame (69 MB for a 1280x3000 render); it now writes rows straight into the
 file (48 MB).
@@ -285,6 +394,41 @@ and 3.3 MB of CSS arrives as about a sixth of that.
 Timings taken right after network waits are inflated: on Apple Silicon the CPU clocks down while idle, so
 GitHub's cascade measures 10 ms just after its stylesheets download and 2.8 ms when warm (same code, same
 rules). Compare warm numbers when hunting regressions.
+
+## Site regression suite
+
+`./scripts/sites.sh` (CI runs it on Linux and macOS) renders the 22 pages in `testdata/sites` at 1x
+(1280x2400) and 2x (1280x800) and compares each frame with the stored one, then prints parse, cascade,
+layout, composite and peak RAM per page. 12 are saved copies of openly licensed sites (Wikipedia, MDN,
+rust-lang.org, the Rust book and `std` docs, Python and Go docs, SQLite, WHATWG, ArchWiki, GNU,
+Bootstrap); 10 are pages written to exercise one area each (floats, flex, grid, tables, positioning,
+inline text, effects, images, forms, scripts).
+
+- **Saved, not live.** `broxee URL --record DIR` writes every response the page loads into `DIR`
+  (`net::archive`); `--replay DIR` answers every request from it and never opens a connection.
+  `--fill DIR` answers from it what it has and fetches and appends the rest, for a page that now asks
+  for more than it did when it was recorded (its 2x `srcset` files).
+- **Exact.** A replay uses the bundled Figtree for every page and freezes the scripts' clock at the
+  recording time, so a render is the same bytes on every run and on both CI systems (macOS arm64 and
+  Linux x86_64 agree). Any change is a real one: no threshold to tune. For that the engine computes sine,
+  cosine, tangent, arctangent and `exp` itself (`crates/math`, f64 series rounded once): Apple's libm and
+  glibc differ in the last bit, which moved a few pixels of SVG arcs between the two systems.
+- **Small.** Each frame is stored as one hash per 64 CSS px tile (`--tiles`, a few KB), not as a PNG: our
+  PNG writer stores pixels uncompressed, about 9 MB a frame, so 44 reference images would be 400 MB in the
+  repository. `--base REV` builds REV beside the current tree, renders the changed pages with both and
+  writes the new frame faded with every differing pixel in red (`target/sites/diff`). On a CI failure the
+  renders of changed pages are uploaded with the run.
+
+A one-pixel change of the UA list indent (`padding-left: 40px` → `41px`) fails 6 of the 22 pages; the diffs
+show the list items moved.
+
+| Command | What it does |
+|---|---|
+| `./scripts/sites.sh` | check every page (`--only NAME` for one) |
+| `./scripts/sites.sh --base main` | also draw what moved since `main` |
+| `./scripts/sites.sh --update` | store the current renders as the reference |
+| `./scripts/sites.sh --record NAME URL LICENSE` | save a page and everything it loads |
+| `./scripts/sites.sh --fill NAME` | render a saved page at 1x and 2x, fetching and saving what its archive lacks |
 
 ## Compression
 
@@ -298,27 +442,77 @@ Where data lives, and what compression does for it (measured 2026-11-07):
 | Memory: images | Keep compressed files; decode only what is on screen, at its drawn size | Re-decoding from the file is the cheapest compressed form: 1 to 30 ms even for a 12 MP photo. A compressed pixel cache would add code and save little. |
 | Memory: page | Not compressed while open | Layout and paint read text and styles constantly; compressing them would cost every frame. |
 | Memory: tabs | A sleeping tab is its sources as received plus compressed images, in a file on disk | GitHub 2.5 MB (92 KB of gzip HTML, 712 KB of CSS, 1.75 MB of images), Wikipedia "Cat" 1.2 MB, MDN 57 KB. Waking takes 5 to 45 ms without the network. In RAM, even a few of them would fill the headroom under 60 MB. |
+| Disk: binary | `panic = "unwind"` (#146) | +0.6 MB (3.80 → 4.43 MB) of unwinding tables. With `abort`, a bug that one page hits closed every tab; now it ends as an error page in that tab. |
 | Disk: binary | Keep `opt-level = 3` | `"s"` saves 0.31 MB (1.95 → 1.64) but layout is 55% slower and cascade 25%; `"z"` is 3x slower. |
 | Disk: caches (later) | Store responses in the encoding they arrived in | No re-compression work, and already the smallest form. |
 
 ## Known issues
 
-- No table layout and no presentational attributes (`bgcolor`, `align`): Hacker News renders centred without its
-  orange bar.
-- The palette cannot search the web: with no search engine chosen, a query that matches nothing says
-  "Broxee can't search the web yet." Bookmarks will join its results when they exist.
-- The UI font (Arial, until Figtree is bundled) has no ⌘ ⇧ ⌥ glyphs, so the chrome draws those three as
-  icons; page text that uses them shows nothing for them.
-- Bookmarks cannot be imported from other browsers yet, and folders are flat (no folders inside folders).
-  They are saved per profile in `profiles/<profile>/bookmarks` (0600).
+- Searching uses Bing (words typed in the address field, or Enter in ⌘K when nothing matches), with no
+  setting to choose another engine yet. Google's results page needs far more JavaScript than Broxee runs;
+  DuckDuckGo is blocked on some networks.
+- A page waits for its stylesheets, scripts and web fonts before it appears (images come after). An image
+  without `width`/`height` moves the content below it when it arrives.
+- Figtree has no ⌘ ⇧ ⌥: they come from the system's symbol font, and the chrome draws them as icons on systems
+  without one.
+- Bookmarks are saved per profile in `profiles/<profile>/bookmarks` (0600), at most 10,000 per profile.
+  Imports read files of up to 16 MB; Firefox's and Safari's own files (`places.sqlite`, `Bookmarks.plist`) are
+  not read, export to HTML from those browsers instead. There is no file picker yet: the path is typed or
+  pasted. Folders exist while they hold a bookmark (empty folders in an export are dropped), cannot be renamed
+  or removed as a whole, and bookmarks cannot be reordered. A folder name cannot contain `/`: one from an
+  import or an older file shows as `∕`. Addresses lose their `#fragment` when saved, as everywhere in Broxee.
+- While a page's form control has focus, ↑ ↓ go to it rather than to the bookmarks panel.
 - Sidebar rows have no keyboard focus of their own: tabs are reached with ⌘1 … ⌘9 and the palette, which
   also runs every sidebar action. Dragging needs the mouse.
-- Not built yet, so not shown: split view.
+- Split view: a pane that has not had focus since the layout changed (or since its divider moved) shows its
+  tab's title until it is clicked.
 - A tooltip can stay on screen when the pointer leaves the window over it, until the next input: the
   window does not track the pointer leaving yet.
 - Profiles start as Personal and Work; up to 12, each with its own folder in `profiles/` (named by a fixed
   id, so renaming moves nothing). Four colors exist (emerald, amber, rose, violet), so profiles past four
   share them; their names always tell them apart.
-- GIF, WebP and SVG are sized from their headers but not drawn yet. Failed images draw nothing.
+- Forms: text fields, passwords, text areas, checkboxes, radio buttons, selects and buttons. A select opens
+  a dropdown (groups, disabled options, ↑ ↓ Enter Esc, typing to jump, the wheel past ten rows) and its
+  page hears `input` and `change`; ↑ ↓ on a closed select still step. One-line fields scroll to keep the
+  caret in view, and select with Shift+arrows, a drag or ⌘A; ⌘C, ⌘X and paste work on the selection
+  (never on passwords). `required`, `type=email`, `url` and `number` (with `min`/`max`) stop a form from
+  being sent and say why under the control (`novalidate` skips it); `maxlength`, `readonly`, `disabled` and
+  `autofocus` are kept; ↑ ↓ step a number field. GET and POST as `application/x-www-form-urlencoded` or
+  `multipart/form-data`; file inputs cannot pick files yet (they say so, and send an empty part). `multiple`
+  and `size` selects are list boxes (four rows unless `size` says): a click or ↑ ↓ chooses, Space turns
+  a row of a `multiple` list on or off, and every chosen value is sent. Typed values live with the page: a tab that sleeps forgets them, and
+  passwords are never written to disk or copied.
+- JavaScript: classic scripts (inline and `src`) run, with classes (fields, `static`, `extends`, `super`,
+  `#private` names read as plain properties), getters and setters, the iterator protocol (`for…of` and spread
+  over Maps, Sets and `[Symbol.iterator]()`), regex lookaround and backreferences. `Symbol` values are unique
+  strings (`typeof` says "string"); `WeakMap`/`WeakSet` are `Map`/`Set`; `Object.freeze` is recorded, not
+  enforced. Promises run with a microtask queue drained after every task (uncaught rejections are logged);
+  `async` functions pause at `await` and resume when the promise settles. An `await` in a conditional
+  position (`a && await b`, a ternary branch) only reads already settled promises. Generators
+  (`function*`, `yield`, `yield*`, `next`/`return`/`throw`) pause the same way; `for…of` takes their values
+  one at a time, so an endless one can be left with `break` (`return()` ends a generator without running
+  its `finally`). Destructuring assignment (`[a, b] = [b, a]`). `fetch` (text and JSON
+  bodies, `Headers`, `Response`) and `XMLHttpRequest` go out once the page is shown, with the same-origin
+  policy and CORS, and the profile's cookies for the page's own site only; `document.cookie` reads and writes
+  them, never `HttpOnly` ones. Typing in a field fires `input`, then `keyup`, so search boxes can
+  suggest. Modules and async generators do not run yet. A script using unsupported syntax is skipped as a whole and the reason
+  goes to stderr (`console:`), with what scripts log. Events: `click` (bubbling, `preventDefault`, `onclick`
+  attributes and properties), `DOMContentLoaded`, `load`; timers and `requestAnimationFrame`. highlight.js runs but
+  colors keywords only: its rules for strings and comments never match yet, and one code block on
+  rust-lang.org/what/cli fails ("undefined is not iterable").
+- GIF animations and animated WebP show their first frame. SVG draws shapes, strokes, `use`, simple `<style>`
+  rules and transforms; gradients are drawn as the average of their stops, and text, filters, masks and clip
+  paths are skipped. Failed images draw nothing.
+- `srcset` and `<picture>` choose when the page is built (and when a script changes an `<img>` or its
+  `<source>`): resizing the window or moving it to another display keeps the files until the page is
+  built again (reload, or a sleeping tab waking). `sizes` entries with `calc()` are skipped.
+- `Referer`: back, forward and reload send none (browsers resend the first one); `<link>`, `<script>`
+  and `fetch()`'s own `referrerPolicy` are not read, so they use the page's policy; images and fonts named
+  by a stylesheet name the page as their referrer, not the stylesheet; the CLI sends none unless it has a
+  cookie jar (`--cache`).
+- Crash recovery covers panics in Rust code. A stack overflow, an abort or a crash in AppKit still closes
+  the window; the next start restores the session as above. After any crash or kill the visible tab waits
+  to be opened again, even when its page was not the cause. The session file is not flushed to disk with
+  `fsync`, so a power cut (unlike a crash) can lose its latest write.
 - Painting will add a window framebuffer (about 16 MB at 2x for 1280x800). The stress page sits at 37 MB, so
   paint must stay within roughly 20 MB including glyph caches.
