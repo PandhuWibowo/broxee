@@ -206,7 +206,7 @@ fn remove_stale(root: &Path) {
 }
 
 #[cfg(unix)]
-fn running(pid: u32) -> bool {
+pub(crate) fn running(pid: u32) -> bool {
     extern "C" {
         /// POSIX `int kill(pid_t pid, int sig)`; signal 0 only checks that the process exists.
         fn kill(pid: i32, sig: i32) -> i32;
@@ -221,7 +221,7 @@ fn running(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-fn running(_pid: u32) -> bool {
+pub(crate) fn running(_pid: u32) -> bool {
     true
 }
 

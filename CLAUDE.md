@@ -55,7 +55,8 @@ crates/
            browser.rs (profiles, tabs, history, navigation, input, session file, Screen trait),
            forms.rs (form controls: injected parts, state, submission),
            script.rs (which scripts run, `js::Host` over the DOM, dispatch and timers),
-           hibernate.rs (sleeping tabs on disk), palette.rs (⌘K results and ranking),
+           hibernate.rs (sleeping tabs on disk), crash.rs (running marker, crash log, panic hook),
+           palette.rs (⌘K results and ranking),
            chrome.rs (sidebar, header and palette drawing from DESIGN.md),
            pool.rs (fetch pool), webfonts.rs (`@font-face`: which faces the text uses, fetching)
 scripts/
@@ -162,6 +163,16 @@ casts), not taken from binding crates. Ask before proposing any dependency.
   DOM. Typed values live in `Loaded::forms` only; passwords are never logged or written to disk.
 - **Session and tab files are data, never trusted**: every length and count is checked against what is left,
   and damage gives a reload, not a panic.
+- **A panic costs one page, not the browser** (`crash.rs`, #146). Release builds unwind (`panic = "unwind"`;
+  `abort` would close every tab). Loader threads run their work through `contain`, which turns a panic into
+  `crash::PAGE_CRASHED` (an error page); each turn of the engine loop runs in `Browser::guarded`, whose
+  `recover` drops the page, its painter and everything made from it, and keeps tabs, history and sleeping
+  files. New threads that do page work must be contained the same way. A panic while recovering aborts.
+  Mutexes shared with page work take a poisoned lock as it is (`unwrap_or_else(|e| e.into_inner())`).
+- **A marker says the browser is running** (`session.running`, its pid, removed by `Drop` and `atexit`).
+  A marker whose process is gone means the last run crashed: `start` restores the session but leaves the
+  visible tab unloaded (a page that crashes Broxee must not do it in a loop). The crash log holds the time,
+  host and panic location only: never URLs, panic messages or page contents.
 
 ### Testing the browser
 

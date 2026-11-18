@@ -1,4 +1,6 @@
 mod backgrounds;
+#[cfg(any(target_os = "macos", test))]
+mod crash;
 mod engine;
 mod forms;
 #[cfg(any(target_os = "macos", test))]
