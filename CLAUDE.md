@@ -58,9 +58,12 @@ crates/
            hibernate.rs (sleeping tabs on disk), crash.rs (running marker, crash log, panic hook),
            palette.rs (⌘K results and ranking),
            chrome.rs (sidebar, header and palette drawing from DESIGN.md),
-           pool.rs (fetch pool), webfonts.rs (`@font-face`: which faces the text uses, fetching)
+           pool.rs (fetch pool), webfonts.rs (`@font-face`: which faces the text uses, fetching),
+           startup.rs (`BROXEE_STARTUP` milestones, printed for `scripts/startup.sh`)
 scripts/
   budget.sh  60 MB check: binary size + peak RAM on a generated 2.6 MB page with a <style> block
+  startup.sh startup time budget: cold and warm launches of `--offscreen` (the window's startup drawn
+             into memory), process start to first frame and to an interactive page with the session restored
   sites.sh   site regression suite over testdata/sites: replays saved pages (net::archive), compares
              tile hashes of each render (paint::compare), reports timings and peak RAM per page
 ```

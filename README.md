@@ -74,6 +74,8 @@ cargo run --release -- https://example.com --layout    # every box and line with
 cargo run --release -- page.html --width 400           # local files, any viewport width
 cargo test
 ./scripts/sites.sh                                     # site regression suite (below)
+./scripts/startup.sh                                   # startup time budget (below)
+BROXEE_STARTUP=1 cargo run --release -- --window       # print startup milestones (any mode)
 ```
 
 Every run prints fetch, parse, CSS, cascade, layout and paint timings plus peak RAM, so budget regressions show
@@ -328,6 +330,7 @@ time something reads it (most theme variables never are). A `var()` value is sub
 | 2026-11-18 | Pages show before their images | 3.8 MB (3,800,064 → 3,800,080 bytes, +16 bytes) | 49.9 MB peak painted at 2x (the CLI still waits for images) | singapay.id in the window (`FakeScreen`, 3 runs): on screen after 3.8 to 6.1 s → 0.6 to 3.1 s; its 61 images arrive one by one after that. `<img>` files and CSS backgrounds go to `pending_images`, fetched once the page is shown, six at once, each laid out as it arrives; a tab that slept first fetches what it lacks when it wakes. Loads in the background still take their images along. The 22 saved pages render the same |
 | 2026-11-18 | Crash recovery (#146): `panic = "unwind"`, panics contained per page, the session back after a crash | 4.4 MB (3,800,080 → 4,445,104 bytes, +630 KB: unwinding tables +612 KB, the code +16 KB) | 50.0 MB peak painted at 2x (49.9 before, within run-to-run noise) | Loader threads and each turn of the engine thread's loop run under `catch_unwind`; a panic ends as an error page in its tab. A marker holding the process id tells the next start that the last run crashed, and the visible tab then waits to be opened. The 22 saved pages render the same |
 | 2026-11-18 | Bookmarks: nested folders, import from other browsers (HTML export, Chrome JSON) | 4.3 MB (4,461,632 → 4,511,280 bytes, +48 KB) | 50.0 MB peak painted at 2x (no bookmark code runs there) | An import holds the file (16 MB at most) while it is read; bookmarks themselves are a few hundred bytes each, 10,000 at most per profile |
+| 2026-11-18 | Startup time budget (#147): `--offscreen`, `BROXEE_STARTUP` milestones, `scripts/startup.sh` in CI; the palette's shadow blurred row-wise | 4.3 MB (4,511,280 → 4,527,856 bytes, +16.5 KB; the window and `--offscreen` share one `Browser<Box<dyn Screen>>`, a second instantiation was +180 KB) | 50.0 MB peak painted at 2x (unchanged) | Warm launch, session restored: first frame 17 to 28 ms, interactive 26 to 44 ms; cold (a never-run binary, empty HOME): interactive 250 to 520 ms, nearly all before `main`. First launch to the new-tab palette 39 to 64 → 34 to 36 ms. Linux builds now include the window's code to run it offscreen. The 22 saved pages render the same |
 
 Other pages after the layout milestone: GitHub home 22.7 MB peak (8,170 rules); Hacker News 11.5 MB.
 
@@ -429,6 +432,45 @@ show the list items moved.
 | `./scripts/sites.sh --update` | store the current renders as the reference |
 | `./scripts/sites.sh --record NAME URL LICENSE` | save a page and everything it loads |
 | `./scripts/sites.sh --fill NAME` | render a saved page at 1x and 2x, fetching and saving what its archive lacks |
+
+## Startup
+
+`./scripts/startup.sh` (CI runs it on Linux and macOS, `make check` too) times a launch from the moment the
+binary is executed to two milestones: **first frame** (sidebar and header painted) and **interactive** (the
+visible tab's page laid out and painted, answering input). It runs the window's own startup drawn into memory
+(`--offscreen`, 1280x800 points at 2x, the same `Browser` with an in-memory screen, so no display is needed)
+with `BROXEE_STARTUP` set to the launch time; `broxee` then prints `startup <milestone> <ms>` lines to stderr
+(`main`, `window`, `fonts`, `first-frame`, `interactive`). Unset, a milestone costs one branch. `--offscreen`
+reads and writes the session where the window does (on Linux under `~/.local/share/broxee` and
+`~/.cache/broxee`), so the script gives it a HOME of its own. The clock
+includes loading the binary and, on macOS, its restart with `MallocSpaceEfficient` (about 5 ms).
+
+- **Cold**: the first launch ever of a fresh copy of the binary, in an empty HOME (no session, tab files,
+  cookies or cache), with a 178 KB local article as its address. The OS file cache is not flushed (that needs
+  root). Limit 1.5 s, interactive.
+- **Warm**: a launch without an address in the HOME the cold one left (three tabs, two profiles): the session
+  is restored and its visible tab, the same article, loads again. Median of 5. Limits 100 ms to the first
+  frame and 250 ms to interactive.
+
+Apple M-series laptop, macOS, release build, 2026-11-18 (seven runs of the script, the slower ones while other
+builds ran on the machine):
+
+| Launch | `main` | First frame | Interactive |
+|---|---|---|---|
+| Cold | 230 to 500 ms | 240 to 510 ms | 250 to 520 ms |
+| Warm (session restored) | 11 to 19 ms | 17 to 28 ms | 26 to 44 ms |
+
+A cold launch is almost all the system checking a binary it has never run, before `main`; Broxee's own part is
+about 15 ms, as warm. That is why its limit is loose; the warm limits (4x and 6x the slowest run here)
+are the ones that catch regressions on slower CI machines. Linking AppKit costs about 1.7 ms per `exec`
+(a C program with and without it), paid twice on macOS because of the restart: loading it lazily is the next
+saving if startup ever needs one. The real window adds AppKit's setup and the first `IOSurface` on top of
+these numbers; `BROXEE_STARTUP=1` prints the same milestones there.
+
+While measuring: the palette's shadow was blurred down each column with a stride of a whole row. Blurring
+the rows of columns together (the same sums, so the same pixels) took the palette's first paint at 2x from
+40 to 20 ms. A first launch shows a new tab with the palette open: interactive 39 to 64 → 34 to 36 ms
+(median of 11, twice), and every ⌘K or ⌘T with a new palette size is that much faster.
 
 ## Compression
 
