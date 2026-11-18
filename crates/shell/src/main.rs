@@ -1,26 +1,20 @@
 mod backgrounds;
-#[cfg(any(target_os = "macos", test))]
 mod crash;
 mod engine;
 mod forms;
-#[cfg(any(target_os = "macos", test))]
 mod hibernate;
 mod images;
 mod pool;
 mod script;
 mod scriptnet;
-// Used by the window (browser.rs), which only macOS builds; its tests run everywhere.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod selection;
+mod startup;
 mod webfonts;
 
-#[cfg(any(target_os = "macos", test))]
+// The window. Other systems have no window yet, but run it into memory (`--offscreen`).
 mod bookmarks;
-#[cfg(any(target_os = "macos", test))]
 mod browser;
-#[cfg(any(target_os = "macos", test))]
 mod chrome;
-#[cfg(any(target_os = "macos", test))]
 mod palette;
 
 use std::process::ExitCode;
@@ -33,7 +27,7 @@ use paint::{Painter, Viewport};
 use engine::{FontStore, Settings};
 
 const USAGE: &str =
-    "usage: broxee [<url-or-file>...] [--window | --png FILE | --paint] [--tree | --styles | --layout] \
+    "usage: broxee [<url-or-file>...] [--window | --offscreen | --png FILE | --paint] [--tree | --styles | --layout] \
                      [--tiles FILE] [--depth N] [--width PX] [--height PX] [--scale N] [--no-css-fetch] [--panes 1|2|4] [--cache DIR] \
                      [--record DIR | --replay DIR | --fill DIR]";
 
@@ -70,6 +64,8 @@ struct Options {
 fn main() -> ExitCode {
     #[cfg(target_os = "macos")]
     space_efficient_malloc();
+    startup::Milestones::from_env().mark("main");
+    let mut offscreen = false;
     let mut targets: Vec<String> = Vec::new();
     let mut opts = Options {
         target: String::new(),
@@ -107,6 +103,7 @@ fn main() -> ExitCode {
             "--layout" => opts.layout = true,
             "--paint" => opts.paint = true,
             "--window" => opts.window = true,
+            "--offscreen" => offscreen = true,
             "--no-css-fetch" => opts.fetch_css = false,
             "--png" => opts.png = args.next(),
             "--tiles" => opts.tiles = args.next(),
@@ -150,12 +147,15 @@ fn main() -> ExitCode {
     if cfg!(target_os = "macos") && targets.is_empty() && !cli_output {
         opts.window = true;
     }
-    if opts.window {
+    if offscreen || opts.window {
         // Without an address the window brings back the last session; with several, each
         // gets a tab and the last one is shown.
         let mut targets = targets.into_iter();
         opts.target = targets.next().unwrap_or_default();
         opts.more = targets.collect();
+        if offscreen {
+            return browser::run_offscreen(opts);
+        }
         return run_window(opts);
     }
     if targets.len() > 1 {
@@ -197,11 +197,14 @@ fn space_efficient_malloc() {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
+    let mut command = std::process::Command::new(exe);
+    command.args(std::env::args_os().skip(1)).env(VAR, "1");
+    // Startup milestones go on counting from this process's start.
+    if let Some(origin) = startup::origin_value() {
+        command.env(startup::VAR, origin);
+    }
     // `exec` only returns on failure; then carry on in this process with the default malloc.
-    let _ = std::process::Command::new(exe)
-        .args(std::env::args_os().skip(1))
-        .env(VAR, "1")
-        .exec();
+    let _ = command.exec();
 }
 
 #[cfg(target_os = "macos")]
