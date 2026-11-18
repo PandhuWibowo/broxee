@@ -22,31 +22,34 @@ pub enum BackgroundFrom<'a> {
     Inline,
 }
 
+/// What `load` gave: files fetched (key, bytes or `None`), and keys left for the window to
+/// fetch once the page is shown.
+pub type Loaded = (Vec<(String, Option<Vec<u8>>)>, Vec<String>);
+
 /// The background files the page needs and does not have, and the `<img>` sources in
-/// `extra` (absolute URLs: images scripts added), as (key, bytes or `None`). Backgrounds are
-/// keyed by the URL as the style holds it.
+/// `extra` (absolute URLs: images scripts added). Backgrounds are keyed by the URL as the
+/// style holds it. With `later`, nothing goes to the network: those keys come back to be
+/// fetched after the page is on screen, and a waking page names the files it still lacks
+/// (it went to sleep before they arrived).
 pub fn load(
     dom: &Dom,
     styles: &StyleMap,
     (context, base): (&net::Context, &net::Url),
     from: BackgroundFrom,
     store: &ImageStore,
-    extra: Vec<String>,
-) -> Vec<(String, Option<Vec<u8>>)> {
-    if matches!(from, BackgroundFrom::Stored) {
-        return Vec::new();
+    (extra, later): (Vec<String>, bool),
+) -> Loaded {
+    let network = matches!(from, BackgroundFrom::Network(_));
+    if matches!(from, BackgroundFrom::Stored) && !later {
+        return Default::default();
     }
     // Without the network only `data:` backgrounds load; `<img>` sources stay pending for
     // the window to fetch, rather than being kept as failed.
-    let extra = if matches!(from, BackgroundFrom::Network(_)) {
-        extra
-    } else {
-        Vec::new()
-    };
+    let extra = if network { extra } else { Vec::new() };
     let room = MAX_IMAGES.saturating_sub(store.len());
     let mut wanted: Vec<String> = wanted(dom, styles)
         .into_iter()
-        .filter(|u| !store.has_background(u))
+        .filter(|u| store.wants(u))
         .collect();
     for url in extra {
         if !wanted.contains(&url) {
@@ -55,13 +58,23 @@ pub fn load(
     }
     wanted.truncate(room);
     if wanted.is_empty() {
-        return Vec::new();
+        return Default::default();
+    }
+    let mut pending = Vec::new();
+    if later || matches!(from, BackgroundFrom::Stored) {
+        let (inline, rest): (Vec<String>, Vec<String>) =
+            wanted.into_iter().partition(|u| u.starts_with("data:"));
+        wanted = inline;
+        pending = if matches!(from, BackgroundFrom::Inline) {
+            Vec::new()
+        } else {
+            rest
+        };
     }
     let jar = match from {
         BackgroundFrom::Network(cookies) => cookies.map(|c| (c, context)),
         _ => None,
     };
-    let network = matches!(from, BackgroundFrom::Network(_));
     let bytes = pool::map_ordered(wanted.clone(), FETCH_WORKERS, |url| {
         if url.starts_with("data:") {
             return net::decode_data_url(&url);
@@ -74,7 +87,7 @@ pub fn load(
         let resp = net::fetch_in(&absolute, jar).ok()?;
         (resp.status == 200).then_some(resp.body)
     });
-    wanted.into_iter().zip(bytes).collect()
+    (wanted.into_iter().zip(bytes).collect(), pending)
 }
 
 /// Background URLs of displayed elements, in document order, each once.

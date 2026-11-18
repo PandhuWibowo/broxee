@@ -46,6 +46,10 @@ pub struct Settings {
     pub height: f32,
     pub dark: bool,
     pub fetch_css: bool,
+    /// Build the page without waiting for `<img>` files and CSS background images: they
+    /// go to `Loaded::pending_images`, for the window to fetch once the page is on screen.
+    /// The CLI and replays wait, so a render stays the same every run.
+    pub images_later: bool,
 }
 
 impl Settings {
@@ -497,6 +501,7 @@ pub fn page_from_html(
     let dom = html::parse(source);
     let settings = Settings {
         fetch_css: false,
+        images_later: false,
         ..settings
     };
     let origin = Source {
@@ -581,11 +586,14 @@ fn finish(
             script_from,
             !downloading(),
         );
+    // A page someone is waiting for shows before its images; one downloading in the
+    // background takes them along.
+    let later = settings.images_later && !downloading();
     let (css, mut images, stylesheets) = load_subresources(
         &dom,
         (&context, &base),
         from,
-        script.is_some(),
+        (script.is_some(), later),
         parser_nodes,
     );
     if !progress(0.75) {
@@ -629,15 +637,22 @@ fn finish(
                 (&context, &base),
                 background_from,
                 &images,
-                added,
+                (added, later),
             )
         });
         let fonts = webfonts::load(&dom, &styles, &css.sheets, &context, font_from, fonts);
         (fonts, backgrounds.join().unwrap_or_default())
     });
+    let (backgrounds, background_later) = backgrounds;
     images.add_backgrounds(backgrounds);
-    // What is still missing (a woken page whose scripts named other files) loads later.
-    let pending_images = images.bind(&dom, &base, images::img_nodes(&dom, Dom::ROOT));
+    // What is still missing (a woken page whose scripts named other files, or everything
+    // with `later`) loads once the page is shown.
+    let mut pending_images = images.bind(&dom, &base, images::img_nodes(&dom, Dom::ROOT));
+    for key in background_later {
+        if !pending_images.contains(&key) {
+            pending_images.push(key);
+        }
+    }
     if !progress(0.85) {
         return None;
     }
@@ -1039,7 +1054,7 @@ fn load_subresources(
     dom: &Dom,
     (context, base): (&net::Context, &net::Url),
     from: From,
-    scripted: bool,
+    (scripted, later): (bool, bool),
     parser_nodes: usize,
 ) -> (LoadedCss, ImageStore, Vec<(String, net::Wire)>) {
     let external = !matches!(from, From::Nowhere);
@@ -1073,11 +1088,17 @@ fn load_subresources(
         From::Snapshot(sources, images, _) => (Some(sources.stylesheets), Some(images)),
         _ => (None, None),
     };
-    let (image_sources, image_uses) = if external && stored_images.is_none() {
+    let (mut image_sources, mut image_uses) = if external && stored_images.is_none() {
         images::discover(dom, base, parser_nodes)
     } else {
         Default::default()
     };
+    if later {
+        // Only `data:` files now; `finish` binds every `<img>` once the backgrounds are in,
+        // and what is missing then is the window's to fetch.
+        image_sources.retain(|(_, s)| matches!(s, images::Source::Inline(_)));
+        image_uses.clear();
+    }
     let image_keys: Vec<String> = image_sources.iter().map(|(k, _)| k.clone()).collect();
     let own_policies = if image_sources.is_empty() {
         std::collections::HashMap::new()
@@ -1282,6 +1303,7 @@ mod tests {
             height: 300.0,
             dark: false,
             fetch_css: false,
+            images_later: false,
         };
         let page = load(&url, settings, &FontStore::default(), None, &mut |_| true).unwrap();
         assert_eq!(page.dom.title().as_deref(), Some("Spaced"));
@@ -1302,6 +1324,7 @@ mod tests {
             height: 300.0,
             dark: false,
             fetch_css: false,
+            images_later: false,
         };
         let after = restore(snapshot, settings, &FontStore::default(), None).expect("restores");
         assert_eq!(
@@ -1341,6 +1364,7 @@ mod tests {
             height: 300.0,
             dark: false,
             fetch_css: true,
+            images_later: false,
         };
         let fonts = FontStore::default();
         let page = load(&url, settings, &fonts, None, &mut |_| true).unwrap();
@@ -1403,6 +1427,7 @@ mod tests {
             height: 300.0,
             dark: false,
             fetch_css: true,
+            images_later: false,
         };
         let fonts = FontStore::default();
         let page = load(&url, settings, &fonts, None, &mut |_| true).unwrap();
@@ -1436,6 +1461,7 @@ mod tests {
             height: 300.0,
             dark: false,
             fetch_css: false,
+            images_later: false,
         };
         let url = net::Url::parse("file:///test.html").expect("valid URL");
         page_from_html(url, src, settings, &FontStore::default())

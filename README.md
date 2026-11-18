@@ -315,6 +315,7 @@ time something reads it (most theme variables never are). A `var()` value is sub
 | 2026-11-15 | Site regression suite: `--record`/`--replay`, `--tiles`, 22 saved pages in CI (#148) | 3.7 MB (3,651,136 → 3,667,520 bytes, +16.0 KB, Rust 1.100) | 49.9 MB peak painted at 2x (unchanged) | Replays are exact and agree between macOS arm64 and Linux x86_64. Peak RAM over the 22 pages 26.7 to 38.7 MB (rust-std-vec, 1x at 1280x2400); the 44 renders take about 3 s once built. A 1 px change of the UA list indent fails 6 pages |
 | 2026-11-18 | `Referer` by `Referrer-Policy` (#125) | 3.8 MB (3,783,520 → 3,783,536 bytes, +16 bytes) | 49.9 MB peak painted at 2x (unchanged) | Header, `<meta name=referrer>` (legacy names too), link and `<img>` `referrerpolicy`, `rel=noreferrer`, redirects; the header's policy is kept with sleeping tabs (tab file 7). The 22 saved pages render the same |
 | 2026-11-18 | `<html>`, `<head>` and `<body>` added when a page leaves them out | 3.8 MB (3,783,536 → 3,800,064 bytes, +16.5 KB: one more 16 KB page) | 49.8 MB peak painted at 2x; parse 18.0 → 18.3 ms (median of 12, +1.3%) | Head elements before body content go in the head, the rest in the body; `</body>` and `</html>` close nothing; `innerHTML` parses a fragment (`html::parse_fragment`). A page of `<title>` and `<p>` now gets its 8px margin and `body` rules. The 22 saved pages render the same |
+| 2026-11-18 | Pages show before their images | 3.8 MB (3,800,064 → 3,800,080 bytes, +16 bytes) | 49.9 MB peak painted at 2x (the CLI still waits for images) | singapay.id in the window (`FakeScreen`, 3 runs): on screen after 3.8 to 6.1 s → 0.6 to 3.1 s; its 61 images arrive one by one after that. `<img>` files and CSS backgrounds go to `pending_images`, fetched once the page is shown, six at once, each laid out as it arrives; a tab that slept first fetches what it lacks when it wakes. Loads in the background still take their images along. The 22 saved pages render the same |
 
 Other pages after the layout milestone: GitHub home 22.7 MB peak (8,170 rules); Hacker News 11.5 MB.
 
@@ -434,8 +435,8 @@ Where data lives, and what compression does for it (measured 2026-11-07):
 - Searching uses Bing (words typed in the address field, or Enter in ⌘K when nothing matches), with no
   setting to choose another engine yet. Google's results page needs far more JavaScript than Broxee runs;
   DuckDuckGo is blocked on some networks.
-- A page appears only once every image has arrived: image-heavy pages are slow to show (singapay.id about
-  6 s, of which Broxee's own work is under 0.2 s).
+- A page waits for its stylesheets, scripts and web fonts before it appears (images come after). An image
+  without `width`/`height` moves the content below it when it arrives.
 - Figtree has no ⌘ ⇧ ⌥: they come from the system's symbol font, and the chrome draws them as icons on systems
   without one.
 - Bookmarks cannot be imported from other browsers yet, and folders are flat (no folders inside folders).
