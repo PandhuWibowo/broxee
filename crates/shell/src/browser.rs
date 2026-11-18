@@ -1031,6 +1031,7 @@ impl<S: Screen> Browser<S> {
         Settings {
             width: self.pane_width(),
             height: self.page_height(),
+            scale: self.scale,
             dark: self.dark,
             fetch_css: self.opts.fetch_css,
             images_later: true,
@@ -4876,7 +4877,7 @@ impl<S: Screen> Browser<S> {
         let urls = std::mem::take(&mut page.pending_images);
         let (page_url, base) = (page.url.clone(), page.base.clone());
         let policy = page.referrer_policy;
-        let own_policies = crate::images::own_policies(&page.dom, &page.base);
+        let own_policies = crate::images::own_policies(&page.dom, &page.base, &page.device);
         let cookies = Arc::clone(&self.profiles[self.profile].cookies);
         let (sender, receiver) = mpsc::channel();
         let spawned = std::thread::Builder::new()
@@ -4935,13 +4936,14 @@ impl<S: Screen> Browser<S> {
         page.images.add_backgrounds(arrived);
         let nodes: Vec<NodeId> = crate::images::img_nodes(&page.dom, html::Dom::ROOT)
             .filter(|&n| {
-                crate::images::key_of(&page.dom, &page.base, n).is_some_and(|k| keys.contains(&k))
+                crate::images::key_of(&page.dom, &page.base, &page.device, n)
+                    .is_some_and(|k| keys.contains(&k))
             })
             .collect();
         for &n in &nodes {
             page.dom.touch(n);
         }
-        page.images.bind(&page.dom, &page.base, nodes);
+        page.images.bind(&page.dom, &page.base, &page.device, nodes);
         self.update_page(false);
         true
     }
@@ -6908,6 +6910,7 @@ mod tests {
             cache: None,
             record: None,
             replay: None,
+            fill: None,
         };
         let mut b = Browser::new(opts, FakeScreen::default(), session, Some(store));
         b.start();
@@ -10895,6 +10898,7 @@ mod tests {
             cache: None,
             record: None,
             replay: None,
+            fill: None,
         };
         let screen = FakeScreen::default();
         screen.dark.set(dark);
@@ -11095,6 +11099,7 @@ mod tests {
             cache: None,
             record: None,
             replay: None,
+            fill: None,
         };
         let mut b = Browser::new(
             opts,

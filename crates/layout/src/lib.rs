@@ -472,8 +472,27 @@ const FLOW_LAYER: Layer = Layer {
 };
 
 /// Lay out the document for a viewport of `width` by `height` CSS px.
-/// Natural size of an image element in CSS px, when its file is loaded and readable.
-pub type NaturalSize<'a> = &'a dyn Fn(NodeId) -> Option<(f32, f32)>;
+/// What layout needs to know about image elements beyond their styles.
+pub trait Images {
+    /// Natural size of an image element in CSS px, when its file is loaded and readable.
+    fn natural(&self, node: NodeId) -> Option<(f32, f32)>;
+
+    /// The element whose `width` and `height` attributes size the image: the `<source>` a
+    /// `<picture>` chose, when it has either, else the image itself.
+    fn sized_by(&self, node: NodeId) -> NodeId {
+        node
+    }
+}
+
+/// A function giving natural sizes: images sized by their own attributes.
+impl<F: Fn(NodeId) -> Option<(f32, f32)>> Images for F {
+    fn natural(&self, node: NodeId) -> Option<(f32, f32)> {
+        self(node)
+    }
+}
+
+/// The page's images, as layout sees them.
+pub type NaturalSize<'a> = &'a dyn Images;
 
 /// `NaturalSize` for documents without images.
 pub fn no_images(_: NodeId) -> Option<(f32, f32)> {
@@ -1404,17 +1423,19 @@ impl<'a> Engine<'a> {
             .is_some_and(|img| self.dom.element(id).is_some_and(|e| e.tag == img))
     }
 
-    /// A `width`/`height` attribute in px.
+    /// A `width`/`height` attribute in px, of the image or of the `<source>` it shows.
     fn attr_px(&self, id: NodeId, name: &str) -> Option<f32> {
         self.dom
-            .attr(id, name)
+            .attr(self.natural.sized_by(id), name)
             .and_then(|v| v.trim().trim_end_matches("px").parse::<f32>().ok())
             .filter(|v| v.is_finite() && *v >= 0.0)
     }
 
     /// Natural width / height: from the loaded file, else from both size attributes.
     fn aspect_ratio(&self, id: NodeId) -> Option<f32> {
-        let (w, h) = (self.natural)(id)
+        let (w, h) = self
+            .natural
+            .natural(id)
             .or_else(|| Some((self.attr_px(id, "width")?, self.attr_px(id, "height")?)))?;
         (w > 0.0 && h > 0.0).then_some(w / h)
     }
@@ -1432,7 +1453,7 @@ impl<'a> Engine<'a> {
     ) -> (f32, f32) {
         let edges = Edges::of(s, cb_width.unwrap_or(0.0));
         let (ex, ey) = (edges.x(), edges.y());
-        let natural = (self.natural)(id);
+        let natural = self.natural.natural(id);
         let ratio = self.aspect_ratio(id);
         let css_height = content_size(s, s.height, cb_height, ey);
         let w = content_size(s, s.width, cb_width, ex).or_else(|| self.attr_px(id, "width"));
@@ -3329,6 +3350,40 @@ mod tests {
             (30.0, 30.0),
             "both sides given: stretched"
         );
+    }
+
+    #[test]
+    fn a_chosen_source_gives_its_size_attributes() {
+        // The `<picture>` chose its `<source>`: its 88x31 replace the img's 25x25.
+        struct Chosen;
+        impl Images for Chosen {
+            fn natural(&self, _: NodeId) -> Option<(f32, f32)> {
+                None
+            }
+            fn sized_by(&self, node: NodeId) -> NodeId {
+                node - 1
+            }
+        }
+        let dom = html::parse(
+            "<picture><source srcset=a.svg width=88 height=31><img id=i width=25 height=25>\
+             </picture>",
+        );
+        let img = dom
+            .descendants(Dom::ROOT)
+            .find(|&n| dom.tag_name(n) == Some("img"))
+            .unwrap();
+        assert_eq!(dom.tag_name(img - 1), Some("source"));
+        let styles = cascade(
+            &dom,
+            &[(Origin::UserAgent, user_agent_stylesheet())],
+            &Media::default(),
+        );
+        let l = layout(&dom, &styles, &Approximate, &Chosen, 400.0, 600.0);
+        let r = by_id(&dom, &l, "i");
+        assert_eq!((r.width, r.height), (88.0, 31.0));
+        let l = layout(&dom, &styles, &Approximate, &no_images, 400.0, 600.0);
+        let r = by_id(&dom, &l, "i");
+        assert_eq!((r.width, r.height), (25.0, 25.0));
     }
 
     #[test]

@@ -1,7 +1,9 @@
 //! Saved responses for the site regression suite (`scripts/sites.sh`). `record` writes every
 //! HTTP(S) response this process receives into a folder; `replay` answers every HTTP(S)
 //! request from such a folder and never opens a connection, so a saved site renders the same
-//! way on every machine and every day.
+//! way on every machine and every day. `fill` answers from a folder when it has the URL and
+//! otherwise fetches and appends the response to it: a page that asks for more than it did
+//! when it was recorded (its 2x images) gets those files without recording it again.
 //!
 //! A folder holds `index.tsv` and one file per body, decoded (no `Content-Encoding`), named by
 //! a hash of its URL. Each index line is `status, content type, location, file, URL`,
@@ -20,6 +22,8 @@ pub const INDEX: &str = "index.tsv";
 enum Mode {
     Record(Recorder),
     Replay(Replay),
+    /// Saved answers where there are any, the network and the folder for the rest.
+    Fill(Replay, Recorder),
 }
 
 static MODE: OnceLock<Mode> = OnceLock::new();
@@ -41,20 +45,34 @@ pub fn replay(dir: &Path) -> Result<u64, String> {
     Ok(at)
 }
 
-/// The saved answer when replaying (`None` when not).
+/// Answer from `dir` what it has; fetch the rest and append it to `dir`, in the same format
+/// as `record`. Returns when the folder was recorded, like `replay`.
+pub fn fill(dir: &Path) -> Result<u64, String> {
+    let replay = Replay::open(dir)?;
+    let at = replay.recorded;
+    let recorder = Recorder::append(dir, replay.entries.keys().cloned().collect());
+    MODE.set(Mode::Fill(replay, recorder))
+        .map_err(|_| "an archive is already open".to_string())?;
+    Ok(at)
+}
+
+/// The saved answer when replaying, or filling and the folder has it (`None` otherwise).
 pub(crate) fn answer(url: &Url) -> Option<Result<Response, String>> {
     match MODE.get()? {
         Mode::Replay(replay) => Some(replay.answer(url)),
-        Mode::Record(_) => None,
+        Mode::Fill(replay, _) if replay.has(url) => Some(replay.answer(url)),
+        Mode::Fill(..) | Mode::Record(_) => None,
     }
 }
 
-/// Keep a response that came from the network, when recording.
+/// Keep a response that came from the network, when recording or filling.
 pub(crate) fn keep(url: &Url, resp: &Response) {
-    if let Some(Mode::Record(recorder)) = MODE.get() {
-        if let Err(e) = recorder.keep(url, resp) {
-            eprintln!("archive: {e}");
-        }
+    let recorder = match MODE.get() {
+        Some(Mode::Record(recorder) | Mode::Fill(_, recorder)) => recorder,
+        _ => return,
+    };
+    if let Err(e) = recorder.keep(url, resp) {
+        eprintln!("archive: {e}");
     }
 }
 
@@ -79,6 +97,14 @@ impl Recorder {
             dir: dir.to_path_buf(),
             seen: Mutex::new(HashSet::new()),
         })
+    }
+
+    /// Add to the folder `dir` (its index must exist), skipping the URLs it already has.
+    pub fn append(dir: &Path, saved: HashSet<String>) -> Recorder {
+        Recorder {
+            dir: dir.to_path_buf(),
+            seen: Mutex::new(saved),
+        }
     }
 
     pub fn keep(&self, url: &Url, resp: &Response) -> Result<(), String> {
@@ -201,6 +227,10 @@ impl Replay {
         })
     }
 
+    pub fn has(&self, url: &Url) -> bool {
+        self.entries.contains_key(&url.to_string())
+    }
+
     pub fn answer(&self, url: &Url) -> Result<Response, String> {
         let address = url.to_string();
         let entry = self
@@ -311,6 +341,39 @@ mod tests {
         assert_eq!(replay.answer(&css).unwrap().body, b"p{}");
         let missing = Url::parse("https://example.com/other").unwrap();
         assert!(replay.answer(&missing).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fills_what_a_folder_lacks() {
+        let dir = std::env::temp_dir().join(format!("broxee-archive-fill-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let page = Url::parse("https://example.com/").unwrap();
+        let image = Url::parse("https://example.com/a-2x.png").unwrap();
+        let html = [("content-type", "text/html")];
+        Recorder::open(&dir)
+            .unwrap()
+            .keep(&page, &response(&page, 200, &html, b"<img>"))
+            .unwrap();
+        let before = Replay::open(&dir).unwrap();
+        assert!(before.has(&page) && !before.has(&image));
+        let filler = Recorder::append(&dir, before.entries.keys().cloned().collect());
+        // What the folder has is not written again; what it lacks is appended.
+        filler
+            .keep(&page, &response(&page, 200, &html, b"changed"))
+            .unwrap();
+        let png = [("content-type", "image/png")];
+        filler
+            .keep(&image, &response(&image, 200, &png, b"png"))
+            .unwrap();
+        let after = Replay::open(&dir).unwrap();
+        assert_eq!(after.recorded, before.recorded, "the recording time stays");
+        assert_eq!(after.answer(&page).unwrap().body, b"<img>");
+        let r = after.answer(&image).unwrap();
+        assert_eq!((r.status, &r.body[..]), (200, &b"png"[..]));
+        assert_eq!(r.header("content-type"), Some("image/png"));
+        let index = std::fs::read_to_string(dir.join(INDEX)).unwrap();
+        assert_eq!(index.lines().count(), 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

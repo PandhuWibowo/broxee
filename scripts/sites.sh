@@ -9,6 +9,8 @@
 #                                           pages that changed (target/sites/diff)
 #   ./scripts/sites.sh --record NAME URL LICENSE
 #                                           save a live page and everything it loads
+#   ./scripts/sites.sh --fill NAME          render a saved page at 1x and 2x, fetching what
+#                                           its archive lacks (2x images) and adding it
 #
 # A page is a folder testdata/sites/NAME with `site` (url=, license=), `archive/` (the saved
 # responses, see crates/net/src/archive.rs) and `1x.tiles` / `2x.tiles`. A `url=` without a
@@ -44,7 +46,28 @@ case "${1:-}" in
     exit 0
     ;;
   "") ;;
-  *) sed -n '2,20p' "$0"; exit 2 ;;
+  --fill)
+    name=${2:?--fill NAME}
+    dir="$SITES/$name"
+    [ -f "$dir/site" ] || { echo "no page $dir"; exit 2; }
+    cargo build --release --quiet
+    url=$(sed -n 's/^url=//p' "$dir/site")
+    case "$url" in
+      *://*) ;;
+      *) url="file://$PWD/$dir/$url" ;;
+    esac
+    before=$(wc -l < "$dir/archive/index.tsv")
+    for scale in 1 2; do
+      height=2400
+      [ "$scale" = 2 ] && height=800
+      ./target/release/broxee "$url" --fill "$dir/archive" --width 1280 --height "$height" \
+        --scale "$scale" --paint > /dev/null
+    done
+    echo "$name: $(($(wc -l < "$dir/archive/index.tsv") - before)) responses added"
+    echo "now run: ./scripts/sites.sh --update --only $name"
+    exit 0
+    ;;
+  *) sed -n '2,21p' "$0"; exit 2 ;;
 esac
 if [ "${2:-}" = --only ] && [ $mode = update ]; then only=${3:?--only NAME}; fi
 
