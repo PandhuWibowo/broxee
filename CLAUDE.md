@@ -336,6 +336,9 @@ casts), not taken from binding crates. Ask before proposing any dependency.
   `NodeKind` / `Element` are borrowed views. Do not introduce per-node `Box`, `String` or `Rc<RefCell<…>>`.
 - **Slices on ASCII boundaries.** The tokenizer slices `&str` only at ASCII delimiters, which keeps UTF-8 slicing
   valid without per-char decoding. Keep that invariant when extending it.
+- **A parsed document always has `<html>`, `<head>` and `<body>`** (`html::parse`, as HTML builds them;
+  `</body>` and `</html>` close nothing). Fragments (`innerHTML`) use `html::parse_fragment`, which adds none.
+  Tests that look at the root's children want `parse_fragment` or `find_first("body")`.
 - **Never panic on bad input.** Real pages are malformed. Truncated tags, stray end tags and unknown entities must
   parse to something sensible (see `survives_truncated_input`).
 

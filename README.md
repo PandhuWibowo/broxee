@@ -314,6 +314,7 @@ time something reads it (most theme variables never are). A `var()` value is sub
 | 2026-11-15 | Sleeping tabs share stylesheets, scripts, fonts and images (#51) | 3.7 MB | 49.9 MB peak painted at 2x | Disk: six tabs (three Wikipedia articles, two GitHub repositories, example.com) sleep in 1.7 MB instead of 2.9 MB; GitHub's 428 KB of stylesheets is stored once |
 | 2026-11-15 | Site regression suite: `--record`/`--replay`, `--tiles`, 22 saved pages in CI (#148) | 3.7 MB (3,651,136 → 3,667,520 bytes, +16.0 KB, Rust 1.100) | 49.9 MB peak painted at 2x (unchanged) | Replays are exact and agree between macOS arm64 and Linux x86_64. Peak RAM over the 22 pages 26.7 to 38.7 MB (rust-std-vec, 1x at 1280x2400); the 44 renders take about 3 s once built. A 1 px change of the UA list indent fails 6 pages |
 | 2026-11-18 | `Referer` by `Referrer-Policy` (#125) | 3.8 MB (3,783,520 → 3,783,536 bytes, +16 bytes) | 49.9 MB peak painted at 2x (unchanged) | Header, `<meta name=referrer>` (legacy names too), link and `<img>` `referrerpolicy`, `rel=noreferrer`, redirects; the header's policy is kept with sleeping tabs (tab file 7). The 22 saved pages render the same |
+| 2026-11-18 | `<html>`, `<head>` and `<body>` added when a page leaves them out | 3.8 MB (3,783,536 → 3,800,064 bytes, +16.5 KB: one more 16 KB page) | 49.8 MB peak painted at 2x; parse 18.0 → 18.3 ms (median of 12, +1.3%) | Head elements before body content go in the head, the rest in the body; `</body>` and `</html>` close nothing; `innerHTML` parses a fragment (`html::parse_fragment`). A page of `<title>` and `<p>` now gets its 8px margin and `body` rules. The 22 saved pages render the same |
 
 Other pages after the layout milestone: GitHub home 22.7 MB peak (8,170 rules); Hacker News 11.5 MB.
 
@@ -435,8 +436,6 @@ Where data lives, and what compression does for it (measured 2026-11-07):
   DuckDuckGo is blocked on some networks.
 - A page appears only once every image has arrived: image-heavy pages are slow to show (singapay.id about
   6 s, of which Broxee's own work is under 0.2 s).
-- The parser does not add `<html>`, `<head>` or `<body>` when a page leaves them out, so such pages miss
-  `body` rules and the default 8px margin.
 - Figtree has no ⌘ ⇧ ⌥: they come from the system's symbol font, and the chrome draws them as icons on systems
   without one.
 - Bookmarks cannot be imported from other browsers yet, and folders are flat (no folders inside folders).

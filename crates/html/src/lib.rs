@@ -789,18 +789,125 @@ impl Iterator for Descendants<'_> {
     }
 }
 
+/// Parse a document. As HTML does, a page that leaves out `<html>`, `<head>` or `<body>` gets
+/// them: head elements (`<title>`, `<meta>`, `<link>`, `<style>`, `<script>`…) before the
+/// first body content go in the head, everything else in the body, and `</body>` or `</html>`
+/// closes nothing (content after them stays in the body).
 pub fn parse(input: &str) -> Dom {
+    build(input, true)
+}
+
+/// Parse a fragment (`innerHTML`): its nodes stay under the root, with no `<html>`, `<head>`
+/// or `<body>` added.
+pub fn parse_fragment(input: &str) -> Dom {
+    build(input, false)
+}
+
+type Attrs<'a> = [(std::borrow::Cow<'a, str>, std::borrow::Cow<'a, str>)];
+
+/// The document's own elements, created as the parser meets them or needs them.
+#[derive(Default)]
+struct Frame {
+    html: Option<NodeId>,
+    head: Option<NodeId>,
+    body: Option<NodeId>,
+}
+
+/// Elements that belong in the head when they come before any body content.
+fn in_head(tag: &str) -> bool {
+    matches!(
+        tag,
+        "base"
+            | "basefont"
+            | "bgsound"
+            | "link"
+            | "meta"
+            | "noframes"
+            | "noscript"
+            | "script"
+            | "style"
+            | "template"
+            | "title"
+    )
+}
+
+impl Frame {
+    fn html(&mut self, dom: &mut Dom, attrs: &Attrs) -> NodeId {
+        *self
+            .html
+            .get_or_insert_with(|| new_element(dom, Dom::ROOT, "html", attrs))
+    }
+
+    fn head(&mut self, dom: &mut Dom, attrs: &Attrs) -> NodeId {
+        let html = self.html(dom, &[]);
+        *self
+            .head
+            .get_or_insert_with(|| new_element(dom, html, "head", attrs))
+    }
+
+    /// Open the body (and the head before it, empty if the page had none): from here on the
+    /// stack is html, body and whatever opens inside it.
+    fn body(&mut self, dom: &mut Dom, stack: &mut Vec<NodeId>, attrs: &Attrs) {
+        if self.body.is_some() {
+            return;
+        }
+        let html = self.html(dom, &[]);
+        self.head(dom, &[]);
+        let body = new_element(dom, html, "body", attrs);
+        self.body = Some(body);
+        stack.truncate(1);
+        stack.extend([html, body]);
+    }
+
+    /// Where the parser stands outside any element of its own: at the root, in `<html>` or
+    /// directly in the head. Text and tags there decide which element comes next.
+    fn at_top(&self, stack: &[NodeId]) -> bool {
+        let top = *stack.last().expect("root is never popped");
+        top == Dom::ROOT || Some(top) == self.html || Some(top) == self.head
+    }
+}
+
+#[inline]
+fn new_element(dom: &mut Dom, parent: NodeId, tag: &str, attrs: &Attrs) -> NodeId {
+    let tag_atom = dom.intern(tag);
+    let first = dom.attrs.len() as u32;
+    let mut count = 0u16;
+    for (name, value) in attrs.iter().take(usize::from(u16::MAX)) {
+        let name = dom.intern(name);
+        let start = dom.values.len() as u32;
+        dom.values.push_str(value);
+        dom.attrs.push(Attr {
+            name,
+            start,
+            len: value.len() as u32,
+        });
+        count += 1;
+    }
+    dom.append(parent, Kind::Element, tag_atom, first, count)
+}
+
+fn build(input: &str, document: bool) -> Dom {
     let mut dom = Dom::new();
     let mut stack: Vec<NodeId> = vec![Dom::ROOT];
     // Adjacent text tokens merge here, then land in the shared text buffer once.
     let mut pending_text = String::new();
+    // A fragment starts as if inside an open body.
+    let mut frame = Frame::default();
+    if !document {
+        frame.body = Some(Dom::ROOT);
+    }
 
     for token in Tokenizer::new(input) {
         if let Token::Text(text) = &token {
             pending_text.push_str(text);
             continue;
         }
-        flush_text(&mut dom, &stack, &mut pending_text);
+        flush(&mut dom, &mut stack, &mut frame, &mut pending_text);
+
+        // Before the body, the document's own elements come first.
+        if frame.body.is_none() && before_body(&mut dom, &mut stack, &mut frame, &token) {
+            continue;
+        }
 
         let current = *stack.last().expect("root is never popped");
         match token {
@@ -818,23 +925,14 @@ pub fn parse(input: &str) -> Dom {
                 attrs,
                 self_closing,
             } => {
+                // A second `<html>`, `<head>` or `<body>` adds nothing (their end tags close
+                // nothing either: they sit below `floor`).
+                if document && tag.len() == 4 && matches!(tag.as_ref(), "html" | "head" | "body") {
+                    continue;
+                }
                 close_implied(&dom, &mut stack, &tag);
                 let parent = *stack.last().expect("root is never popped");
-                let tag_atom = dom.intern(&tag);
-                let first = dom.attrs.len() as u32;
-                let mut count = 0u16;
-                for (name, value) in attrs.iter().take(usize::from(u16::MAX)) {
-                    let name = dom.intern(name);
-                    let start = dom.values.len() as u32;
-                    dom.values.push_str(value);
-                    dom.attrs.push(Attr {
-                        name,
-                        start,
-                        len: value.len() as u32,
-                    });
-                    count += 1;
-                }
-                let id = dom.append(parent, Kind::Element, tag_atom, first, count);
+                let id = new_element(&mut dom, parent, &tag, &attrs);
                 if !self_closing && !is_void(&tag) {
                     stack.push(id);
                 }
@@ -842,22 +940,101 @@ pub fn parse(input: &str) -> Dom {
             Token::EndTag(tag) => {
                 // An end tag for a name never seen as a start tag closes nothing.
                 let Some(atom) = dom.atom(&tag) else { continue };
-                // Index 0 is the document, which has no tag, so `pos` is always >= 1.
+                // Index 0 is the document, which has no tag, so `pos` is always >= 1. The
+                // document's html and body stay open.
+                let floor = if document && frame.body.is_some() {
+                    3 // the document, its html and its body
+                } else {
+                    1
+                };
                 let open = stack
                     .iter()
                     .rposition(|&id| dom.element(id).is_some_and(|e| e.tag == atom));
-                if let Some(pos) = open {
+                if let Some(pos) = open.filter(|&p| p >= floor) {
                     stack.truncate(pos);
                 }
             }
         }
     }
-    flush_text(&mut dom, &stack, &mut pending_text);
+    flush(&mut dom, &mut stack, &mut frame, &mut pending_text);
+    if document {
+        frame.body(&mut dom, &mut stack, &[]);
+    }
     dom.nodes.shrink_to_fit();
     dom.text.shrink_to_fit();
     dom.attrs.shrink_to_fit();
     dom.values.shrink_to_fit();
     dom
+}
+
+/// A token before the body: the document's own elements come first, opened as the token
+/// needs them. Returns whether the token is used up (`<html>`, `<head>`, `<body>`, `</head>`,
+/// `</body>`, `</html>`). Kept out of the loop: a page spends few tokens here.
+#[cold]
+fn before_body(dom: &mut Dom, stack: &mut Vec<NodeId>, frame: &mut Frame, token: &Token) -> bool {
+    match token {
+        Token::StartTag { tag, attrs, .. } => match tag.as_ref() {
+            // A second `<html>`, `<head>` or `<body>` adds nothing.
+            "html" => {
+                frame.html(dom, attrs);
+                true
+            }
+            "head" if frame.head.is_none() => {
+                let head = frame.head(dom, attrs);
+                stack.truncate(1);
+                stack.extend([frame.html.expect("made with the head"), head]);
+                true
+            }
+            "head" => true,
+            "body" => {
+                frame.body(dom, stack, attrs);
+                true
+            }
+            t if frame.at_top(stack) && in_head(t) => {
+                // After `</head>` too: HTML puts them back in the head.
+                let head = frame.head(dom, &[]);
+                stack.truncate(1);
+                stack.extend([frame.html.expect("made with the head"), head]);
+                false
+            }
+            _ if frame.at_top(stack) => {
+                frame.body(dom, stack, &[]);
+                false
+            }
+            _ => false,
+        },
+        Token::EndTag(tag) if tag == "head" => {
+            if let Some(html) = frame.html.filter(|_| frame.head.is_some()) {
+                stack.truncate(1);
+                stack.push(html);
+            }
+            true
+        }
+        Token::EndTag(tag) => matches!(tag.as_ref(), "body" | "html"),
+        Token::Doctype(_) | Token::Comment(_) | Token::Text(_) => false,
+    }
+}
+
+/// Text before the body: spaces between the document's own elements are dropped (kept in
+/// the head), and anything else opens the body, starting at its first non-space character.
+#[inline]
+fn flush(dom: &mut Dom, stack: &mut Vec<NodeId>, frame: &mut Frame, pending: &mut String) {
+    if pending.is_empty() {
+        return;
+    }
+    if frame.body.is_none() && frame.at_top(stack) {
+        let rest = pending.trim_start_matches(['\t', '\n', '\x0c', '\r', ' ']);
+        if rest.is_empty() {
+            if stack.last() != frame.head.as_ref() {
+                pending.clear();
+            }
+        } else {
+            let skip = pending.len() - rest.len();
+            pending.drain(..skip);
+            frame.body(dom, stack, &[]);
+        }
+    }
+    flush_text(dom, stack, pending);
 }
 
 fn flush_text(dom: &mut Dom, stack: &[NodeId], pending: &mut String) {
@@ -1071,6 +1248,78 @@ mod tests {
     }
 
     #[test]
+    fn adds_the_html_head_and_body_a_page_leaves_out() {
+        let dom = parse("<!DOCTYPE html>\n<title>T</title><meta charset=utf-8>\n  Hello <p>x");
+        assert_eq!(tags_under(&dom, Dom::ROOT), ["html"]);
+        let html = dom.find_first("html").unwrap();
+        assert_eq!(tags_under(&dom, html), ["head", "body"]);
+        let head = dom.find_first("head").unwrap();
+        assert_eq!(tags_under(&dom, head), ["title", "meta"]);
+        assert_eq!(dom.title().as_deref(), Some("T"));
+        let body = dom.find_first("body").unwrap();
+        assert_eq!(tags_under(&dom, body), ["p"]);
+        assert_eq!(
+            dom.text_content(body),
+            "Hello x",
+            "text starts at its first letter"
+        );
+
+        for empty in ["", "  \n", "<!-- only a comment -->"] {
+            let dom = parse(empty);
+            let order: Vec<&str> = dom
+                .descendants(Dom::ROOT)
+                .filter_map(|id| dom.tag_name(id))
+                .collect();
+            assert_eq!(order, ["html", "head", "body"], "{empty:?}");
+        }
+    }
+
+    #[test]
+    fn keeps_the_pages_own_html_head_and_body_once() {
+        let dom = parse(
+            "<html lang=id><head><style>p{}</style></head>\
+             <body class=a><p>one</p><body class=b></body><p>two</p></html><p>three",
+        );
+        let html = dom.find_first("html").unwrap();
+        assert_eq!(dom.attr(html, "lang"), Some("id"));
+        assert_eq!(tags_under(&dom, html), ["head", "body"]);
+        let body = dom.find_first("body").unwrap();
+        assert_eq!(
+            dom.attr(body, "class"),
+            Some("a"),
+            "the first body's attributes"
+        );
+        assert_eq!(
+            tags_under(&dom, body),
+            ["p", "p", "p"],
+            "</body> and </html> close nothing"
+        );
+        assert_eq!(tags_under(&dom, dom.find_first("head").unwrap()), ["style"]);
+    }
+
+    #[test]
+    fn head_elements_go_where_they_appear() {
+        // After </head> they still join the head; after body content they stay in the body.
+        let dom = parse(
+            "<head></head><link rel=x><noscript><link rel=y></noscript><div>a</div><style></style>",
+        );
+        let head = dom.find_first("head").unwrap();
+        assert_eq!(tags_under(&dom, head), ["link", "noscript"]);
+        let body = dom.find_first("body").unwrap();
+        assert_eq!(tags_under(&dom, body), ["div", "style"]);
+        // A stray end tag before the body does not lose what follows.
+        let dom = parse("</p></div><b>x</b>");
+        assert_eq!(dom.text_content(dom.find_first("body").unwrap()), "x");
+    }
+
+    #[test]
+    fn fragments_get_no_document_elements() {
+        let dom = parse_fragment("<style>a{}</style><b>x</b></body>y");
+        assert_eq!(tags_under(&dom, Dom::ROOT), ["style", "b"]);
+        assert_eq!(dom.text_content(Dom::ROOT), "a{}xy");
+    }
+
+    #[test]
     fn handles_void_and_self_closing() {
         let dom = parse("<div><img src='a.png'><br/><span>x</span></div>");
         let div = dom.find_first("div").unwrap();
@@ -1082,7 +1331,8 @@ mod tests {
         let dom = parse("<ul><li>a<li>b<li>c</ul><p>one<p>two<div>three</div>");
         let ul = dom.find_first("ul").unwrap();
         assert_eq!(tags_under(&dom, ul), ["li", "li", "li"]);
-        assert_eq!(tags_under(&dom, Dom::ROOT), ["ul", "p", "p", "div"]);
+        let body = dom.find_first("body").unwrap();
+        assert_eq!(tags_under(&dom, body), ["ul", "p", "p", "div"]);
     }
 
     #[test]
@@ -1117,7 +1367,7 @@ mod tests {
             .descendants(Dom::ROOT)
             .filter_map(|id| dom.tag_name(id))
             .collect();
-        assert_eq!(order, ["a", "b", "c", "d", "e"]);
+        assert_eq!(order, ["html", "head", "body", "a", "b", "c", "d", "e"]);
         let b = dom.find_first("b").unwrap();
         let under_b: Vec<&str> = dom
             .descendants(b)

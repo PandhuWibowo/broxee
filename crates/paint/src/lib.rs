@@ -3477,11 +3477,13 @@ mod tests {
     }
 
     /// Every `<img>` shows the same 13x9 test PNG (top-left pixel 0,0,40 with alpha 0).
-    struct OneImage;
+    /// The same file for every `<img>` of the document.
+    struct OneImage<'a>(&'a html::Dom);
 
-    impl ImageSource for OneImage {
-        fn image(&self, _: NodeId) -> Option<(u64, &[u8])> {
-            Some((7, include_bytes!("../../image/src/testdata/rgb8.png")))
+    impl ImageSource for OneImage<'_> {
+        fn image(&self, node: NodeId) -> Option<(u64, &[u8])> {
+            (self.0.tag_name(node) == Some("img"))
+                .then_some((7, include_bytes!("../../image/src/testdata/rgb8.png")))
         }
     }
 
@@ -3625,7 +3627,7 @@ mod tests {
             styles: &styles,
             layout: &laid_out,
             metrics: &Approximate,
-            images: Some(&OneImage),
+            images: Some(&OneImage(&dom)),
         };
         let view = Viewport {
             width: 40.0,

@@ -302,13 +302,8 @@ impl js::Host for DomHost<'_> {
     fn set_html(&mut self, node: u32, source: &str) {
         self.changed = true;
         self.clear(node);
-        let fragment = html::parse(source);
-        // The tree builder may or may not imply <html><body> around a fragment.
-        let body = fragment.find_first("body").unwrap_or(Dom::ROOT);
-        let children: Vec<NodeId> = fragment
-            .children(body)
-            .filter(|&c| !matches!(fragment.tag_name(c), Some("html" | "head")))
-            .collect();
+        let fragment = html::parse_fragment(source);
+        let children: Vec<NodeId> = fragment.children(Dom::ROOT).collect();
         for child in children {
             if let Some(g) = self.graft(&fragment, child) {
                 self.dom.append_child(node, g);
