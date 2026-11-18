@@ -92,9 +92,9 @@ pub fn own_policies(dom: &Dom, base: &net::Url) -> HashMap<String, net::Referrer
 /// Each source once, with its key, and which source each `<img>` node uses.
 pub type Discovered = (Vec<(String, Source)>, Vec<(NodeId, usize)>);
 
-/// Files fetched by source: (key, bytes or `None` for a failure).
+/// A file fetched by source: (key, bytes or `None` for a failure).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
-pub type Fetched = Vec<(String, Option<Vec<u8>>)>;
+pub type Fetched = (String, Option<Vec<u8>>);
 
 /// The `<img>` elements worth loading and their sources (with their keys), in document
 /// order. Several elements can share one source.
@@ -201,9 +201,9 @@ impl ImageStore {
         }
     }
 
-    /// Whether a source is kept already (a waking tab keeps its files).
-    pub fn has_background(&self, url: &str) -> bool {
-        self.by_url.contains_key(url)
+    /// Whether a source is neither kept nor known to fail.
+    pub fn wants(&self, url: &str) -> bool {
+        !self.by_url.contains_key(url) && !self.failed.contains(url)
     }
 
     /// Point each `<img>` among `nodes` at the file of its current source. Returns the

@@ -1033,6 +1033,7 @@ impl<S: Screen> Browser<S> {
             height: self.page_height(),
             dark: self.dark,
             fetch_css: self.opts.fetch_css,
+            images_later: true,
         }
     }
 
@@ -4808,8 +4809,9 @@ impl<S: Screen> Browser<S> {
         self.render();
     }
 
-    /// Start fetching the images the visible page named and has not got, with its profile's
-    /// cookies for its own site (one batch at a time, `FETCH_WORKERS` at once).
+    /// Start fetching the images the visible page named and has not got (its `<img>` files
+    /// and CSS backgrounds, in document order), with its profile's cookies for its own site:
+    /// one batch at a time, six at once, each handed over as it arrives.
     fn fetch_images(&mut self) {
         if self.image_fetch.is_some() {
             return;
@@ -4821,7 +4823,7 @@ impl<S: Screen> Browser<S> {
             return;
         }
         let urls = std::mem::take(&mut page.pending_images);
-        let page_url = page.url.clone();
+        let (page_url, base) = (page.url.clone(), page.base.clone());
         let policy = page.referrer_policy;
         let own_policies = crate::images::own_policies(&page.dom, &page.base);
         let cookies = Arc::clone(&self.profiles[self.profile].cookies);
@@ -4830,16 +4832,21 @@ impl<S: Screen> Browser<S> {
             .name("images".into())
             .spawn(move || {
                 let context = net::Context::subresource(&page_url).with_policy(policy);
-                let bytes = crate::pool::map_ordered(urls.clone(), 6, |url| {
+                crate::pool::map_ordered(urls, 6, |key| {
                     let own = own_policies
-                        .get(&url)
+                        .get(&key)
                         .map(|&p| context.clone().with_policy(p));
-                    let url = net::Url::parse(&url).ok()?;
                     let context = own.as_ref().unwrap_or(&context);
-                    let resp = net::fetch_in(&url, Some((&cookies, context))).ok()?;
-                    (resp.status == 200).then_some(resp.body)
+                    // A `style` attribute's background URLs are relative to the base.
+                    let bytes = net::Url::parse(&key)
+                        .or_else(|_| base.join(&key))
+                        .ok()
+                        .and_then(|url| net::fetch_in(&url, Some((&cookies, context))).ok())
+                        .filter(|resp| resp.status == 200)
+                        .map(|resp| resp.body);
+                    // The page went away: nobody is waiting.
+                    let _ = sender.send((key, bytes));
                 });
-                let _ = sender.send(urls.into_iter().zip(bytes).collect());
             });
         if spawned.is_ok() {
             self.image_fetch = Some(receiver);
@@ -4847,20 +4854,29 @@ impl<S: Screen> Browser<S> {
     }
 
     /// Images the visible page asked for have arrived: keep them, show them in every
-    /// `<img>` naming them, and lay those out again. Returns whether to repaint.
+    /// `<img>` naming them (and every background), and lay those out again. Returns whether
+    /// to repaint.
     fn poll_images(&mut self) -> bool {
         let Some(receiver) = &self.image_fetch else {
             return false;
         };
-        let arrived = match receiver.try_recv() {
-            Ok(arrived) => arrived,
-            Err(TryRecvError::Empty) => return false,
-            Err(TryRecvError::Disconnected) => {
-                self.image_fetch = None;
-                return false;
+        let mut arrived = Vec::new();
+        loop {
+            match receiver.try_recv() {
+                Ok(file) => arrived.push(file),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    // The batch is done: the next one may start.
+                    self.image_fetch = None;
+                    break;
+                }
             }
-        };
-        self.image_fetch = None;
+        }
+        if arrived.is_empty() {
+            // Sources found while the last batch ran go now.
+            self.fetch_images();
+            return false;
+        }
         let Some(page) = self.page.as_mut() else {
             return false;
         };
@@ -10453,6 +10469,81 @@ mod tests {
         assert_eq!(b.background.len(), 1);
         act(&mut b, command_shift('p'));
         assert!(b.background.is_empty(), "profiles share no connections");
+    }
+
+    #[test]
+    fn a_page_shows_before_its_images_arrive() {
+        // SVG: the test server sends text.
+        let svg = "<svg xmlns='http://www.w3.org/2000/svg' width='30' height='40'>\
+                   <rect width='30' height='40' fill='red'/></svg>";
+        let (release, gate) = mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new(gate);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let port = http_server(Arc::clone(&seen), move |_, path, _, _| match path {
+            "/" | "/?again" => (
+                200,
+                String::new(),
+                "<title>Pics</title><img src=/slow.png><p>after</p>\
+                 <div style='background-image: url(bg.png); width: 4px; height: 4px'></div>"
+                    .into(),
+            ),
+            "/slow.png" | "/bg.png" => {
+                if path == "/slow.png" {
+                    let _ = gate.lock().unwrap().recv_timeout(Duration::from_secs(5));
+                }
+                (200, "Content-Type: image/svg+xml\r\n".into(), svg.into())
+            }
+            _ => (404, String::new(), String::new()),
+        });
+        let (a, _) = site("images-later");
+        let mut b = browser(&a);
+        // Subresources from the network, as the real window loads them.
+        b.opts.fetch_css = true;
+        b.open_input(&format!("http://127.0.0.1:{port}/"));
+        b.wait_for_load();
+        assert_eq!(title(&b), "Pics", "on screen while the image is held back");
+        let page = b.page.as_ref().unwrap();
+        let img = page.dom.find_first("img").unwrap();
+        assert_eq!(page.images.natural_size(img), None);
+        assert!(b.image_fetch.is_some(), "the window fetches it now");
+        let p_top = |b: &Browser<FakeScreen>| {
+            let page = b.page.as_ref().unwrap();
+            let p = page.dom.find_first("p").unwrap();
+            page.layout
+                .boxes
+                .iter()
+                .find(|x| x.node == p)
+                .unwrap()
+                .rect
+                .y
+        };
+        let before = p_top(&b);
+
+        release.send(()).unwrap();
+        wait_for_images(&mut b);
+        let page = b.page.as_ref().unwrap();
+        assert!(
+            page.images.natural_size(img).is_some(),
+            "it arrived and is shown"
+        );
+        assert_eq!(page.images.len(), 2, "the background (a relative URL) too");
+        assert!(p_top(&b) > before, "the page made room for it");
+
+        // A tab put to sleep before its images came wakes and fetches what it lacks.
+        b.open_input(&format!("http://127.0.0.1:{port}/?again"));
+        b.wait_for_load();
+        // One for the fetch the sleep leaves behind, one for the waking page's.
+        release.send(()).unwrap();
+        release.send(()).unwrap();
+        act(&mut b, command('t'));
+        b.close_palette();
+        act(&mut b, command('1'));
+        assert_eq!(title(&b), "Pics");
+        wait_for_images(&mut b);
+        let page = b.page.as_ref().unwrap();
+        let img = page.dom.find_first("img").unwrap();
+        assert!(page.images.natural_size(img).is_some());
+        assert_eq!(page.images.len(), 2, "its background too");
     }
 
     /// Poll the visible page's image fetches until none is running or waiting.

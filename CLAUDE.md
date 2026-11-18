@@ -118,9 +118,11 @@ casts), not taken from binding crates. Ask before proposing any dependency.
   `Stylesheet::resolve_urls`; `style` attributes' stay relative and are fetched against the page), found after
   the cascade for displayed elements only. `<img>` files by `images::key_of` (absolute URL, or a hash of a
   `data:` URL), and an `<img>` shows the file of its *current* source (`ImageStore::bind`): images scripts add,
-  or whose `src` they set later (lazy loading), are fetched by source, at load with the backgrounds or later
-  by the window (`Loaded::pending_images`, `Browser::fetch_images`), which lays them out when they arrive
-  (`Dom::touch`). A source that failed is not asked for again. All are stored with a sleeping tab, so a waking
+  or whose `src` they set later (lazy loading), are fetched by source. The window builds a page without its
+  images (`Settings::images_later`): `<img>` files and CSS backgrounds go to `Loaded::pending_images` and
+  `Browser::fetch_images` fetches them once the page is shown, handing each over as it arrives and laying
+  it out (`Dom::touch`). The CLI, replays and loads in the background wait for them. A waking tab names what
+  it still lacks, backgrounds too. A source that failed is not asked for again. All are stored with a sleeping tab, so a waking
   tab finds them by source whatever ids its scripts' nodes get.
 - **A snapshot holds only what the page was built from**, as it arrived (`net::Wire`): rebuilding must give the
   same DOM, so `NodeId`s in the stored `ImageStore` stay valid. Do not store anything derived (styles, layout).

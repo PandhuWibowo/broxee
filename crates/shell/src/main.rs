@@ -228,6 +228,7 @@ fn run(opts: &Options) -> Result<(), String> {
         height: opts.height,
         dark: false,
         fetch_css: opts.fetch_css,
+        images_later: false,
     };
     // With --cache, a jar of its own carries the cache (and keeps this run's cookies).
     let jar = opts.cache.as_ref().map(|dir| {
