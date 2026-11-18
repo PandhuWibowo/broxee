@@ -35,6 +35,7 @@ use crate::forms;
 use crate::hibernate::{Stored, TabStore};
 use crate::palette::{self, Action, Command, Hint};
 use crate::selection::{self, Selection};
+use crate::startup::Milestones;
 use crate::Options;
 
 /// Pages may send the browser on by script this many times in a row without the person
@@ -140,6 +141,48 @@ impl Screen for platform::Window {
     }
 }
 
+/// The window and `--offscreen` both run a `Browser<Box<dyn Screen>>`: one copy of the
+/// browser's code in the binary, not one per screen (+180 KB).
+impl<T: Screen + ?Sized> Screen for Box<T> {
+    fn scale(&self) -> f64 {
+        (**self).scale()
+    }
+
+    fn size(&self) -> (f64, f64) {
+        (**self).size()
+    }
+
+    fn dark(&self) -> bool {
+        (**self).dark()
+    }
+
+    fn set_title(&self, title: &str) {
+        (**self).set_title(title);
+    }
+
+    fn render(&self, width: usize, height: usize, draw: &mut DrawFrame) -> Result<(), String> {
+        (**self).render(width, height, draw)
+    }
+
+    fn render_header(
+        &self,
+        at: (usize, usize),
+        width: usize,
+        height: usize,
+        draw: &mut dyn FnMut(&mut [u8], usize),
+    ) -> Result<bool, String> {
+        (**self).render_header(at, width, height, draw)
+    }
+
+    fn idle(&self) {
+        (**self).idle();
+    }
+
+    fn copy(&self, text: &str) {
+        (**self).copy(text);
+    }
+}
+
 /// Paints a frame: its pixels and stride, and the previous frame to copy from, if any.
 type DrawFrame<'a> = dyn FnMut(&mut [u8], usize, Option<&[u8]>) + 'a;
 
@@ -159,11 +202,7 @@ enum Repaint {
 #[cfg(target_os = "macos")]
 pub fn run(opts: Options) -> std::process::ExitCode {
     let (width, height) = (f64::from(opts.width), f64::from(opts.height));
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let session = home
-        .as_ref()
-        .map(|home| home.join("Library/Application Support/Broxee/session"));
-    let store = home.and_then(|home| TabStore::open(&home.join("Library/Caches/Broxee/tabs")).ok());
+    let (session, store) = home_files();
     if let Some(session) = &session {
         crash::clean_at_exit(crash::marker_for(session));
     }
@@ -172,12 +211,74 @@ pub fn run(opts: Options) -> std::process::ExitCode {
         // starting gets here. It ends the process with the marker left behind, so the next
         // start knows: a window without its engine thread would only hang.
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let window: Box<dyn Screen> = Box::new(window);
             Browser::new(opts, window, session, store).run(&events);
         }));
         if ran.is_err() {
             std::process::abort();
         }
     })
+}
+
+/// `--offscreen`: the window's startup drawn into memory, ending once the visible tab is
+/// interactive. Same session and sleeping tabs as the window, so it measures what a launch
+/// does (`scripts/startup.sh`) on any system, with or without a screen.
+pub fn run_offscreen(opts: Options) -> std::process::ExitCode {
+    let screen: Box<dyn Screen> = Box::new(Offscreen {
+        size: (f64::from(opts.width), f64::from(opts.height)),
+        scale: f64::from(opts.scale),
+        frame: Default::default(),
+    });
+    let (session, store) = home_files();
+    Browser::new(opts, screen, session, store).run_until_interactive();
+    std::process::ExitCode::SUCCESS
+}
+
+/// The session file and the sleeping tabs' folder, under `$HOME`.
+fn home_files() -> (Option<PathBuf>, Option<TabStore>) {
+    let (session, tabs) = if cfg!(target_os = "macos") {
+        (
+            "Library/Application Support/Broxee/session",
+            "Library/Caches/Broxee/tabs",
+        )
+    } else {
+        (".local/share/broxee/session", ".cache/broxee/tabs")
+    };
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let store = home
+        .as_ref()
+        .and_then(|home| TabStore::open(&home.join(tabs)).ok());
+    (home.map(|home| home.join(session)), store)
+}
+
+/// A screen in memory (`--offscreen`): one frame buffer, painted whole each time.
+struct Offscreen {
+    size: (f64, f64),
+    scale: f64,
+    frame: std::cell::RefCell<Vec<u8>>,
+}
+
+impl Screen for Offscreen {
+    fn scale(&self) -> f64 {
+        self.scale
+    }
+
+    fn size(&self) -> (f64, f64) {
+        self.size
+    }
+
+    fn dark(&self) -> bool {
+        false
+    }
+
+    fn set_title(&self, _title: &str) {}
+
+    fn render(&self, width: usize, height: usize, draw: &mut DrawFrame) -> Result<(), String> {
+        let mut frame = self.frame.borrow_mut();
+        frame.resize(width * 4 * height, 0);
+        draw(&mut frame, width * 4, None);
+        Ok(())
+    }
 }
 
 /// How a load fetches and builds its page (`engine::load_in_tab`; tests put in their own).
@@ -880,6 +981,8 @@ struct Browser<S: Screen> {
     /// A hash of the session as last written, so an unchanged session is not written again.
     saved: std::cell::Cell<u64>,
     load_page: LoadPage,
+    /// How far this launch has come (`BROXEE_STARTUP`).
+    startup: Milestones,
 }
 
 impl<S: Screen> Browser<S> {
@@ -889,6 +992,8 @@ impl<S: Screen> Browser<S> {
         session: Option<PathBuf>,
         store: Option<TabStore>,
     ) -> Browser<S> {
+        let mut startup = Milestones::from_env();
+        startup.mark("window");
         let (width, height) = window.size();
         let (scale, dark) = (window.scale() as f32, window.dark());
         crash::install_hook();
@@ -984,6 +1089,7 @@ impl<S: Screen> Browser<S> {
             focused: 0,
             header_change: false,
             frame_geometry: None,
+            startup,
         }
     }
 
@@ -1109,7 +1215,14 @@ impl<S: Screen> Browser<S> {
         (self.pane_height() - HEADER_HEIGHT).max(1.0)
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// `run` with no input to come: the first frame, the session restored, then the visible
+    /// tab loaded and shown.
+    fn run_until_interactive(&mut self) {
+        let (_, events) = mpsc::channel();
+        self.run(&events);
+        self.guarded(Self::wait_for_load);
+    }
+
     fn run(&mut self, events: &Receiver<Event>) {
         self.guarded(Self::start);
         let mut trimmed = false;
@@ -1118,7 +1231,6 @@ impl<S: Screen> Browser<S> {
 
     /// One turn of the engine thread's loop: wait for events (or a timer, or a load's
     /// progress), handle them, paint. `false` once the window has gone.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn turn(&mut self, events: &Receiver<Event>, trimmed: &mut bool) -> bool {
         /// How long without events before the window frees its spare frame.
         const IDLE_AFTER: Duration = Duration::from_secs(1);
@@ -1189,7 +1301,9 @@ impl<S: Screen> Browser<S> {
     fn start(&mut self) {
         // The header needs fonts; they load in a few milliseconds, before the first frame.
         self.fonts.ready();
+        self.startup.mark("fonts");
         self.render();
+        self.startup.mark("first-frame");
         if let Some(session) = self.restored.take() {
             for (profile, saved) in self.profiles.iter_mut().zip(session.profiles) {
                 if !saved.tabs.is_empty() {
@@ -5462,6 +5576,7 @@ impl<S: Screen> Browser<S> {
                 self.open_palette();
                 self.save_session();
                 self.render();
+                self.startup.mark("interactive");
             }
         }
     }
@@ -5793,6 +5908,7 @@ impl<S: Screen> Browser<S> {
         #[cfg(target_os = "macos")]
         platform::release_free_memory();
         self.render();
+        self.startup.mark("interactive");
         title
     }
 
@@ -7368,9 +7484,19 @@ mod tests {
     }
 
     fn browser_with(target: &Path, session: Option<PathBuf>) -> Browser<FakeScreen> {
+        let mut b = Browser::new(options(target), FakeScreen::default(), session, tab_store());
+        b.start();
+        b.wait_for_load();
+        b
+    }
+
+    fn tab_store() -> Option<TabStore> {
         let root = std::env::temp_dir().join(format!("broxee-tabs-{}", std::process::id()));
-        let store = TabStore::open(&root).expect("a folder for sleeping tabs");
-        let opts = Options {
+        Some(TabStore::open(&root).expect("a folder for sleeping tabs"))
+    }
+
+    fn options(target: &Path) -> Options {
+        Options {
             target: target.display().to_string(),
             more: Vec::new(),
             tree: false,
@@ -7390,11 +7516,7 @@ mod tests {
             record: None,
             replay: None,
             fill: None,
-        };
-        let mut b = Browser::new(opts, FakeScreen::default(), session, Some(store));
-        b.start();
-        b.wait_for_load();
-        b
+        }
     }
 
     /// Apply an event and wait for any page it started loading, as a person would before
@@ -8157,6 +8279,55 @@ mod tests {
         let b = browser_with(&a, Some(path));
         assert_eq!(tab_titles(&b).len(), 2);
         assert_eq!((b.profiles[0].active, title(&b).as_str()), (0, "Page A"));
+    }
+
+    #[test]
+    fn startup_reaches_the_first_frame_then_the_restored_page() {
+        let (a, _) = site("startup");
+        let path = a.with_file_name("session");
+        let _ = std::fs::remove_file(&path);
+        drop(browser_with(&a, Some(path.clone())));
+
+        // A launch without an address, as `--offscreen` runs it.
+        let screen = Offscreen {
+            size: (640.0, 300.0),
+            scale: 2.0,
+            frame: Default::default(),
+        };
+        let mut b = Browser::new(options(Path::new("")), screen, Some(path), tab_store());
+        let launched = std::time::SystemTime::now();
+        b.startup = Milestones::quiet(launched);
+        b.run_until_interactive();
+        let names: Vec<&str> = b.startup.reached.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, ["fonts", "first-frame", "interactive"]);
+        assert!(b.startup.reached.windows(2).all(|w| w[0].1 <= w[1].1));
+        assert_eq!(
+            b.page.as_ref().and_then(|p| p.dom.title()).as_deref(),
+            Some("Page A"),
+            "interactive means the restored tab's page is shown"
+        );
+        assert_eq!(b.window.frame.borrow().len(), 1280 * 600 * 4, "a 2x frame");
+
+        // A first launch shows a new tab: interactive once the palette is up.
+        let (dir, _) = site("startup-new");
+        let fresh = dir.with_file_name("no-session");
+        let _ = std::fs::remove_file(&fresh);
+        let mut b = Browser::new(
+            options(Path::new("")),
+            FakeScreen::default(),
+            Some(fresh),
+            tab_store(),
+        );
+        b.startup = Milestones::quiet(launched);
+        b.run_until_interactive();
+        assert!(b.palette.is_some());
+        let names: Vec<&str> = b.startup.reached.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, ["fonts", "first-frame", "interactive"]);
+        assert_eq!(
+            b.window.frames.get(),
+            2,
+            "the first frame, then the palette"
+        );
     }
 
     #[test]

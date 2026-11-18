@@ -31,6 +31,8 @@ jobs:
         run: cargo test
       - name: 60 MB budget
         run: ./scripts/budget.sh
+      - name: Startup time
+        run: ./scripts/startup.sh
       - name: Site regressions
         run: ./scripts/sites.sh
       - name: Upload site renders

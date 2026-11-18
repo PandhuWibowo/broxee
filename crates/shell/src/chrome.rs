@@ -2245,7 +2245,7 @@ fn shadow(width: u32, height: u32, radius: f32, blur: u32) -> GlyphBitmap {
     let r = (b / 2).max(1);
     for _ in 0..2 {
         box_blur(&mut cov, ow, oh, r, 1, ow);
-        box_blur(&mut cov, oh, ow, r, ow, 1);
+        blur_columns(&mut cov, ow, oh, r);
     }
     GlyphBitmap {
         left: 0,
@@ -2276,6 +2276,36 @@ fn box_blur(data: &mut [f32], len: usize, lines: usize, r: usize, step: usize, s
             }
             if i >= r {
                 sum -= line[i - r];
+            }
+        }
+    }
+}
+
+/// `box_blur` down every column of a `width`-wide grid, a row at a time: the same sums in the
+/// same order per column, without striding through memory. Walking each column on its own made
+/// the palette's first frame 18 ms slower at 2x.
+fn blur_columns(data: &mut [f32], width: usize, height: usize, r: usize) {
+    let window = (2 * r + 1) as f32;
+    let source = data.to_vec();
+    let row = |y: usize| &source[y * width..(y + 1) * width];
+    let mut sum = vec![0f32; width];
+    for y in 0..(r + 1).min(height) {
+        for (s, v) in sum.iter_mut().zip(row(y)) {
+            *s += v;
+        }
+    }
+    for y in 0..height {
+        for (out, s) in data[y * width..(y + 1) * width].iter_mut().zip(&sum) {
+            *out = s / window;
+        }
+        if y + r + 1 < height {
+            for (s, v) in sum.iter_mut().zip(row(y + r + 1)) {
+                *s += v;
+            }
+        }
+        if y >= r {
+            for (s, v) in sum.iter_mut().zip(row(y - r)) {
+                *s -= v;
             }
         }
     }
@@ -2524,6 +2554,27 @@ mod tests {
         let mid = s.coverage[18 * 56 + 28];
         assert!(mid > 30 && mid <= 41, "faint in the middle: {mid}");
         assert!(s.coverage[0] < mid / 4, "fades out at the edges");
+    }
+
+    #[test]
+    fn blurs_columns_as_box_blur_does() {
+        let (w, h) = (37, 23);
+        let mut seed = 7u32;
+        let data: Vec<f32> = (0..w * h)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                (seed >> 16) as f32 / 65_536.0
+            })
+            .collect();
+        for r in [1, 3, 11, 30] {
+            let (mut a, mut b) = (data.clone(), data.clone());
+            box_blur(&mut a, h, w, r, w, 1);
+            blur_columns(&mut b, w, h, r);
+            assert!(
+                a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "r = {r}"
+            );
+        }
     }
 
     #[test]
