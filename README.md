@@ -100,8 +100,9 @@ In the window:
 | Add, rename, recolor or remove a profile | palette: "New profile", "Rename this profile", "Change this profile's color", "Remove this profile" (asks for its name; its tabs, history, cookies and bookmarks are deleted) |
 | Show or hide the sidebar | ⌘\\ |
 | One pane, two side by side, four in a grid | ⌘⇧1 / ⌘⇧2 / ⌘⇧4, or `--panes 2` with several addresses; click a pane to give it focus. Each pane keeps its own profile |
-| Bookmark this page (or edit its bookmark) | ⌘D: name and folder, the last folder preselected; Tab between them, Enter saves, Esc cancels |
-| Bookmarks panel, in place of the tab list | ⌘⌥B: folders in name order; ↑ ↓ and Enter or a click opens, Esc goes back to tabs. Every bookmark is a ⌘K result too |
+| Bookmark this page (or edit its bookmark) | ⌘D: name and folder, the last folder preselected; Tab between them, Enter saves, Esc cancels. In the folder field ↑ ↓ step through saved folders, and `Reading / Rust` files it in Rust inside Reading |
+| Bookmarks panel, in place of the tab list | ⌘⌥B: a tree, subfolders by name then bookmarks as saved. ↑ ↓ move, Enter or a click opens a bookmark or folds a folder, → unfolds, ← folds or goes to the enclosing folder, Backspace removes a bookmark, Esc goes back to tabs. Folds are kept. Every bookmark is a ⌘K result too |
+| Import bookmarks from another browser | palette: "Import bookmarks from another browser", then the path of the file (the newest `bookmarks…html` in Downloads is filled in). Reads the HTML export every browser makes (Chrome, Firefox, Safari, Edge) and Chrome's own `Bookmarks` file; folders are kept under a folder named Imported, in the visible profile only. Addresses already saved are skipped, and only http, https and file bookmarks are kept |
 | Address field | ⌘L or click the host; type or paste (⌘V), Enter to open, Esc to cancel |
 | Move between header controls and the page's links | Tab / Shift+Tab (a 2px ring marks the focused link; the page scrolls to it), Enter to activate or follow, Esc to leave |
 | Quit | ⌘Q or close the window |
@@ -326,6 +327,7 @@ time something reads it (most theme variables never are). A `var()` value is sub
 | 2026-11-18 | `srcset` and `<picture>` by drawn width and scale (part of #59) | 3.8 MB (3,800,080 → 3,816,608 bytes, +16.5 KB) | 49.9 MB peak painted at 2x (unchanged) | The HTML candidate parser, `sizes`, `<source media type>`; the smallest density at least the scale, else the largest, drawn at its density (a 2x file of 440 px is 220 CSS px). A chosen `<source>`'s `width`/`height` size the `<img>`. Wikipedia "Rust" (replay): 1x 379 → 392 KB of images (the footer's wide logos), 2x 379 → 704 KB (2x thumbnails), peak 35.6 → 36.1 MB at 2x. `--fill DIR` adds what an archive lacks: 21 image responses for wikipedia-rust and arch-install; wikipedia-rust 2x changes 10 tiles (sharper logo and icon), the other 43 renders are the same |
 | 2026-11-18 | Pages show before their images | 3.8 MB (3,800,064 → 3,800,080 bytes, +16 bytes) | 49.9 MB peak painted at 2x (the CLI still waits for images) | singapay.id in the window (`FakeScreen`, 3 runs): on screen after 3.8 to 6.1 s → 0.6 to 3.1 s; its 61 images arrive one by one after that. `<img>` files and CSS backgrounds go to `pending_images`, fetched once the page is shown, six at once, each laid out as it arrives; a tab that slept first fetches what it lacks when it wakes. Loads in the background still take their images along. The 22 saved pages render the same |
 | 2026-11-18 | Crash recovery (#146): `panic = "unwind"`, panics contained per page, the session back after a crash | 4.4 MB (3,800,080 → 4,445,104 bytes, +630 KB: unwinding tables +612 KB, the code +16 KB) | 50.0 MB peak painted at 2x (49.9 before, within run-to-run noise) | Loader threads and each turn of the engine thread's loop run under `catch_unwind`; a panic ends as an error page in its tab. A marker holding the process id tells the next start that the last run crashed, and the visible tab then waits to be opened. The 22 saved pages render the same |
+| 2026-11-18 | Bookmarks: nested folders, import from other browsers (HTML export, Chrome JSON) | 4.3 MB (4,461,632 → 4,511,280 bytes, +48 KB) | 50.0 MB peak painted at 2x (no bookmark code runs there) | An import holds the file (16 MB at most) while it is read; bookmarks themselves are a few hundred bytes each, 10,000 at most per profile |
 
 Other pages after the layout milestone: GitHub home 22.7 MB peak (8,170 rules); Hacker News 11.5 MB.
 
@@ -453,8 +455,13 @@ Where data lives, and what compression does for it (measured 2026-11-07):
   without `width`/`height` moves the content below it when it arrives.
 - Figtree has no ⌘ ⇧ ⌥: they come from the system's symbol font, and the chrome draws them as icons on systems
   without one.
-- Bookmarks cannot be imported from other browsers yet, and folders are flat (no folders inside folders).
-  They are saved per profile in `profiles/<profile>/bookmarks` (0600).
+- Bookmarks are saved per profile in `profiles/<profile>/bookmarks` (0600), at most 10,000 per profile.
+  Imports read files of up to 16 MB; Firefox's and Safari's own files (`places.sqlite`, `Bookmarks.plist`) are
+  not read, export to HTML from those browsers instead. There is no file picker yet: the path is typed or
+  pasted. Folders exist while they hold a bookmark (empty folders in an export are dropped), cannot be renamed
+  or removed as a whole, and bookmarks cannot be reordered. A folder name cannot contain `/`: one from an
+  import or an older file shows as `∕`. Addresses lose their `#fragment` when saved, as everywhere in Broxee.
+- While a page's form control has focus, ↑ ↓ go to it rather than to the bookmarks panel.
 - Sidebar rows have no keyboard focus of their own: tabs are reached with ⌘1 … ⌘9 and the palette, which
   also runs every sidebar action. Dragging needs the mouse.
 - Split view: a pane that has not had focus since the layout changed (or since its divider moved) shows its

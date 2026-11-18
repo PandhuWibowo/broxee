@@ -182,7 +182,7 @@ pub enum SidebarItem {
     CloseRow(usize),
     /// The line after the list ("+ New tab").
     Footer,
-    /// A section label (a tab group: clicking folds it).
+    /// A section label or a bookmark folder: clicking folds it.
     Label(usize),
     /// The sidebar's right edge, which resizes it.
     Edge,
@@ -227,7 +227,7 @@ pub fn sidebar_hit(
     }
     let row = ((y - TABS_TOP + scroll) / TAB_ROW) as usize;
     match rows.get(row) {
-        Some(ListRow::Label(_)) => Some(SidebarItem::Label(row)),
+        Some(ListRow::Label(_) | ListRow::Folder { .. }) => Some(SidebarItem::Label(row)),
         Some(ListRow::Item { closable, .. }) => {
             let on_close = x >= width - ROW_INSET - CLOSE_SIZE;
             Some(if *closable && on_close {
@@ -246,10 +246,19 @@ pub fn sidebar_drop(y: f32, scroll: f32, rows: usize) -> usize {
     (((y - TABS_TOP + scroll) / TAB_ROW).round().max(0.0) as usize).min(rows)
 }
 
-/// A row of the sidebar's list.
 /// The numbered box marking a tab shown in a pane, in points.
 const BADGE: f32 = 16.0;
+/// How far each level of bookmark folders moves its rows right, in points.
+const INDENT: f32 = 10.0;
+/// Levels drawn indented; deeper ones line up with this one, so names keep their room.
+const MAX_INDENT: u8 = 6;
 
+/// The x of a row's text at `depth`, in points.
+fn indent(depth: u8) -> f32 {
+    ROW_TEXT + INDENT * f32::from(depth.min(MAX_INDENT))
+}
+
+/// A row of the sidebar's list.
 pub enum ListRow<'a> {
     /// A section label, 12px semibold in `muted` (DESIGN.md, section 4): "Pinned", a tab
     /// group, a bookmark folder.
@@ -262,6 +271,15 @@ pub enum ListRow<'a> {
         closable: bool,
         /// Shown in this pane of a split (from 1): a numbered badge, not only a color.
         pane: Option<u8>,
+        /// Bookmark folder levels above it (0 for tabs).
+        depth: u8,
+    },
+    /// A bookmark folder: a chevron that points right when folded, down when open, then its
+    /// name in the section label style. Its bookmarks are at `depth + 1`.
+    Folder {
+        name: Cow<'a, str>,
+        depth: u8,
+        folded: bool,
     },
 }
 
@@ -557,6 +575,9 @@ enum Shape {
     Panel,
     /// A blurred, faint panel under the palette.
     Shadow,
+    /// A bookmark folder's chevron: folded (pointing right) and open (pointing down).
+    Folded,
+    Unfolded,
 }
 
 pub struct Chrome {
@@ -938,9 +959,11 @@ impl Chrome {
         let key_px = px(KEY_ICON) as u32;
         let search = (row_w, px(SEARCH_HEIGHT) as u32);
         let search_inner = (search.0 - 2 * hair as u32, search.1 - 2 * hair as u32);
-        self.masks
-            .entry((Shape::Close, icon_px, icon_px))
-            .or_insert_with(|| icon(Shape::Close, s));
+        for shape in [Shape::Close, Shape::Folded, Shape::Unfolded] {
+            self.masks
+                .entry((shape, icon_px, icon_px))
+                .or_insert_with(|| icon(shape, s));
+        }
         self.masks
             .entry((Shape::Command, key_px, key_px))
             .or_insert_with(|| key_icon(Shape::Command, s));
@@ -964,15 +987,20 @@ impl Chrome {
                     let room = (sw - ROW_INSET - 8.0 - ROW_TEXT) * s;
                     fit_in(text, room, 12.0 * s, FontKey::UI_SEMIBOLD, metrics)
                 }
+                ListRow::Folder { name, depth, .. } => {
+                    let room = (sw - ROW_INSET - 8.0 - indent(depth.saturating_add(1))) * s;
+                    fit_in(name, room, 12.0 * s, FontKey::UI_SEMIBOLD, metrics)
+                }
                 ListRow::Item {
                     title,
                     closable,
                     pane,
+                    depth,
                     ..
                 } => {
                     let badge = if pane.is_some() { BADGE + 4.0 } else { 0.0 };
                     let right = if *closable { CLOSE_SIZE } else { 8.0 } + badge;
-                    let room = (sw - ROW_INSET - right - ROW_TEXT) * s;
+                    let room = (sw - ROW_INSET - right - indent(*depth)) * s;
                     fit(title, room, 13.0 * s, metrics)
                 }
             })
@@ -999,10 +1027,43 @@ impl Chrome {
                     font: FontKey::UI_SEMIBOLD,
                     color: t.muted,
                 }),
+                ListRow::Folder { depth, folded, .. } => {
+                    if selected {
+                        list.push(Op::Mask {
+                            x: px(ROW_INSET),
+                            y: px(row_top(i) + 1.0),
+                            mask: &masks[&(Shape::Rounded, row_w, row_h)],
+                            color: t.selected,
+                        });
+                    }
+                    // `muted` never sits on `selected` (DESIGN.md, section 3).
+                    let color = if selected { t.text_2 } else { t.muted };
+                    let shape = if *folded {
+                        Shape::Folded
+                    } else {
+                        Shape::Unfolded
+                    };
+                    // The chevron's centre lines up with the text of the level above.
+                    list.push(Op::Mask {
+                        x: px(indent(*depth) - ICON / 2.0),
+                        y: px(row_top(i) + (TAB_ROW - ICON) / 2.0),
+                        mask: &masks[&(shape, icon_px, icon_px)],
+                        color,
+                    });
+                    list_text.push(Op::Text {
+                        x: indent(depth.saturating_add(1)) * s,
+                        baseline: px(row_top(i) + 20.0) as f32,
+                        text,
+                        size: 12.0 * s,
+                        font: FontKey::UI_SEMIBOLD,
+                        color,
+                    });
+                }
                 ListRow::Item {
                     muted,
                     closable,
                     pane,
+                    depth,
                     ..
                 } => {
                     // The row's background first: the pane badge's outline goes over it.
@@ -1058,7 +1119,7 @@ impl Chrome {
                     // `muted` never sits on `selected` (DESIGN.md, section 3).
                     let color = if *muted && !selected { t.muted } else { t.text };
                     list_text.push(Op::Text {
-                        x: ROW_TEXT * s,
+                        x: indent(*depth) * s,
                         baseline: px(row_top(i) + 19.5) as f32,
                         text,
                         size: 13.0 * s,
@@ -2251,6 +2312,9 @@ fn icon(shape: Shape, scale: f32) -> GlyphBitmap {
             vec![(4.5, 4.5), (11.5, 11.5)],
             vec![(11.5, 4.5), (4.5, 11.5)],
         ],
+        // Smaller than the header's arrows: it sits beside 12px labels.
+        Shape::Folded => vec![vec![(6.5, 5.0), (9.5, 8.0), (6.5, 11.0)]],
+        Shape::Unfolded => vec![vec![(5.0, 6.5), (8.0, 9.5), (11.0, 6.5)]],
         _ => Vec::new(),
     };
     stroke(&paths, ICON, 1.5, scale)
@@ -2353,6 +2417,7 @@ mod tests {
             muted: false,
             closable: false,
             pane: None,
+            depth: 0,
         };
         let rows = [
             item("a"),
@@ -2361,6 +2426,7 @@ mod tests {
                 muted: false,
                 closable: true,
                 pane: None,
+                depth: 0,
             },
             ListRow::Label("Folder".into()),
             item("c"),
