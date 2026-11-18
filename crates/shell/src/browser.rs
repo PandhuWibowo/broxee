@@ -23,6 +23,7 @@ use html::NodeId;
 use paint::{Painter, Target, Viewport};
 use platform::{Event, Key, KeyEvent};
 
+use crate::bookmarks::{self, Bookmark, DEFAULT_FOLDER};
 use crate::chrome::{
     self, Button, Chrome, DialogView, FieldView, Frame, HeaderView, HintView, Hue, ListRow,
     MarkKind, MenuView, PaletteHit, PaletteRow, PaletteView, SidebarItem, SidebarView,
@@ -54,10 +55,6 @@ const GLYPH_CACHE_LIMIT: usize = 8 << 20;
 /// Sleeping tabs' files together stay under this on disk; past it, the tabs used longest ago
 /// keep only their history and reload from the network when selected.
 const SNAPSHOT_BUDGET: u64 = 256 << 20;
-/// The folder of a first bookmark.
-const DEFAULT_FOLDER: &str = "Bookmarks";
-/// A bookmarks file past this many is cut there when read.
-const BOOKMARK_LIMIT: usize = 10_000;
 /// A tooltip shows after the pointer rests this long on something that has one.
 const TOOLTIP_DELAY: Duration = Duration::from_millis(600);
 /// How often the engine thread looks at a running load's progress: once per frame at 60 Hz.
@@ -366,14 +363,6 @@ struct LinkFocus {
     rects: Vec<(layout::Rect, bool)>,
 }
 
-/// A saved page.
-#[derive(Clone, Debug, PartialEq)]
-struct Bookmark {
-    title: String,
-    url: net::Url,
-    folder: String,
-}
-
 /// A small dialog over the pane: ⌘D's bookmark (name, folder) or a tab's group (name).
 struct Dialog {
     kind: DialogKind,
@@ -395,6 +384,10 @@ enum DialogKind {
     RenameProfile,
     /// Remove the visible profile once its name is typed.
     RemoveProfile,
+    /// Import another browser's bookmarks from the file whose path is typed.
+    ImportBookmarks,
+    /// What an import added: no fields, Enter or Esc closes it.
+    Imported(String),
 }
 
 /// A press in the sidebar that may become a drag, or a selection being dragged.
@@ -517,7 +510,8 @@ enum SidebarList {
 enum RowTarget {
     Tab(usize),
     Bookmark(usize),
-    Folder,
+    /// Folder `n` of `SidebarRows::folders`.
+    Folder(usize),
     /// A section label of the tab list.
     Section(Section),
 }
@@ -558,6 +552,8 @@ struct Profile {
     bookmarks: Vec<Bookmark>,
     /// Preselected in ⌘D's dialog (DESIGN.md, section 7).
     last_folder: String,
+    /// Bookmark folders shown folded in the panel, by path; kept in the bookmarks file.
+    bookmark_folds: Vec<String>,
     /// Tab groups shown folded, by name.
     folded: Vec<String>,
 }
@@ -578,9 +574,10 @@ impl Profile {
                 .attach_cache(net::Cache::open(dir, PROFILE_CACHE_BYTES));
         }
         if let Some(text) = read("bookmarks") {
-            let (bookmarks, last) = parse_bookmarks(&text);
-            self.bookmarks = bookmarks;
-            if let Some(last) = last {
+            let saved = bookmarks::parse(&text);
+            self.bookmarks = saved.bookmarks;
+            self.bookmark_folds = saved.folded;
+            if let Some(last) = saved.last {
                 self.last_folder = last;
             }
         }
@@ -628,6 +625,7 @@ impl Profile {
             cookies: Arc::new(net::Cookies::new()),
             bookmarks: Vec::new(),
             last_folder: DEFAULT_FOLDER.into(),
+            bookmark_folds: Vec::new(),
             folded: Vec::new(),
         }
     }
@@ -1398,6 +1396,13 @@ impl<S: Screen> Browser<S> {
             Event::Key(key) => self.key(key),
             Event::Paste(text) => {
                 let line = text.trim().lines().next().unwrap_or_default();
+                if let Some(d) = self.dialog.as_mut() {
+                    let Some(field) = d.fields.get_mut(d.active) else {
+                        return false;
+                    };
+                    field.insert(line);
+                    return true;
+                }
                 if let Some(palette) = self.palette.as_mut() {
                     palette.query.insert(line);
                     self.refresh_palette();
@@ -1864,6 +1869,10 @@ impl<S: Screen> Browser<S> {
                         }
                     }
                     Some((_, Some(RowTarget::Bookmark(i)))) => self.open_bookmark(i),
+                    Some((SidebarItem::Label(row), Some(RowTarget::Folder(_)))) => {
+                        self.bookmark_row = Some(row);
+                        self.fold_bookmark_folder(row)
+                    }
                     Some((_, Some(RowTarget::Section(Section::Group(i))))) => self.fold_group(i),
                     _ => false,
                 };
@@ -3550,6 +3559,12 @@ impl<S: Screen> Browser<S> {
                 }
                 true
             }
+            Command::ImportBookmarks => {
+                let home = std::env::var_os("HOME").map(PathBuf::from);
+                let guess = import_guess(home.as_deref());
+                self.open_dialog(DialogKind::ImportBookmarks, vec![guess]);
+                true
+            }
             Command::RemoveBookmark => {
                 let url = self.tab().entry().map(|e| e.url.clone());
                 let p = &mut self.profiles[self.profile];
@@ -3673,8 +3688,36 @@ impl<S: Screen> Browser<S> {
         let Some(d) = self.dialog.as_mut() else {
             return false;
         };
-        let field = &mut d.fields[d.active];
+        let folders = matches!(d.kind, DialogKind::Bookmark { .. }) && d.active == 1;
+        let Some(field) = d.fields.get_mut(d.active) else {
+            // A dialog without fields only tells something: Enter or Esc closes it.
+            if matches!(k.key, Key::Enter | Key::Escape) {
+                self.dialog = None;
+                self.chrome.forget_palette();
+            }
+            return true;
+        };
         match k.key {
+            // The folder field of the bookmark dialog: up and down step through saved folders.
+            Key::Up | Key::Down if folders => {
+                let p = &self.profiles[self.profile];
+                let all = bookmarks::folders(&p.bookmarks);
+                if all.is_empty() {
+                    return false;
+                }
+                let current = bookmarks::folder_path(&field.text);
+                let at = all.iter().position(|f| *f == current);
+                let next = match (at, k.key == Key::Down) {
+                    (None, true) => 0,
+                    (None, false) => all.len() - 1,
+                    (Some(i), true) => (i + 1) % all.len(),
+                    (Some(i), false) => (i + all.len() - 1) % all.len(),
+                };
+                field.text = all[next].to_string();
+                field.cursor = field.text.len();
+                field.all_selected = true;
+                field.anchor = None;
+            }
             Key::Char(c) => field.insert(c.encode_utf8(&mut [0; 4])),
             Key::Backspace => field.backspace(),
             Key::Left => field.left(),
@@ -3712,6 +3755,8 @@ impl<S: Screen> Browser<S> {
         let clean = |s: &str| s.trim().replace(['\t', '\n', '\r'], " ");
         let (url, existing) = match d.kind {
             DialogKind::Bookmark { url, existing } => (url, existing),
+            DialogKind::ImportBookmarks => return self.finish_import(d),
+            DialogKind::Imported(_) => return true,
             DialogKind::NewProfile | DialogKind::RenameProfile | DialogKind::RemoveProfile => {
                 return self.finish_profile_dialog(d);
             }
@@ -3727,11 +3772,12 @@ impl<S: Screen> Browser<S> {
                 return true;
             }
         };
-        let title = match clean(&d.fields[0].text) {
+        let title = match bookmarks::title(&d.fields[0].text) {
             t if t.is_empty() => url.to_string(),
             t => t,
         };
-        let folder = match clean(&d.fields[1].text) {
+        // "Reading / Rust" (or "Reading/Rust") files it in Rust inside Reading.
+        let folder = match bookmarks::folder_path(&d.fields[1].text) {
             f if f.is_empty() => DEFAULT_FOLDER.to_string(),
             f => f,
         };
@@ -3747,6 +3793,63 @@ impl<S: Screen> Browser<S> {
         }
         p.last_folder = folder;
         self.save_bookmarks();
+        true
+    }
+
+    /// Enter in the import dialog: read the file into the visible profile, under "Imported".
+    /// A file that cannot be imported keeps the dialog open and says why.
+    fn finish_import(&mut self, mut d: Dialog) -> bool {
+        let typed = d.fields[0].text.trim().trim_matches(['"', '\'']);
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let marks = match import_file(&expand_home(typed, home.as_deref())) {
+            Ok(marks) => marks,
+            Err(why) => {
+                d.error = Some(why);
+                self.dialog = Some(d);
+                return true;
+            }
+        };
+        let p = &mut self.profiles[self.profile];
+        let merged = bookmarks::merge(&mut p.bookmarks, marks, bookmarks::IMPORT_FOLDER);
+        p.bookmark_folds
+            .retain(|f| !bookmarks::within(bookmarks::IMPORT_FOLDER, f));
+        if merged.added > 0 {
+            self.save_bookmarks();
+        }
+        // Show where they went: the panel, on the Imported folder.
+        self.list = SidebarList::Bookmarks;
+        if !self.sidebar {
+            self.sidebar = true;
+            self.relayout();
+        }
+        self.bookmark_row = {
+            let rows = self.sidebar_rows();
+            let folder = rows
+                .folders
+                .iter()
+                .position(|f| *f == bookmarks::IMPORT_FOLDER);
+            folder.and_then(|f| rows.targets.iter().position(|t| *t == RowTarget::Folder(f)))
+        };
+        self.reveal_bookmark_row();
+        let plural = |n: usize| if n == 1 { "" } else { "s" };
+        let heading = match merged.added {
+            0 => "Nothing new to import".to_string(),
+            n => format!("Added {n} bookmark{} to Imported", plural(n)),
+        };
+        let mut notes = Vec::new();
+        if merged.duplicates > 0 {
+            let n = merged.duplicates;
+            notes.push(format!("{n} already saved, skipped"));
+        }
+        if merged.over > 0 {
+            let limit = bookmarks::BOOKMARK_LIMIT;
+            notes.push(format!("{} left out: a profile keeps {limit}", merged.over));
+        }
+        notes.push("Enter to close".to_string());
+        self.open_dialog(DialogKind::Imported(heading), Vec::new());
+        if let Some(d) = self.dialog.as_mut() {
+            d.error = Some(notes.join(" · "));
+        }
         true
     }
 
@@ -4246,32 +4349,85 @@ impl<S: Screen> Browser<S> {
         true
     }
 
-    /// ↑ ↓ Enter Esc while the bookmarks panel is open; `None` for keys it leaves alone.
+    /// Keys while the bookmarks panel is open; `None` for keys it leaves alone. ↑ ↓ move over
+    /// folders and bookmarks, Enter opens a bookmark or folds a folder, → unfolds, ← folds or
+    /// goes to the enclosing folder, Backspace removes a bookmark, Esc closes the panel.
     fn bookmarks_key(&mut self, key: Key) -> Option<bool> {
-        let targets = self.sidebar_rows().targets;
-        let items: Vec<usize> = (0..targets.len())
-            .filter(|&r| matches!(targets[r], RowTarget::Bookmark(_)))
-            .collect();
-        let at = self
-            .bookmark_row
-            .and_then(|r| items.iter().position(|&i| i == r));
+        let (count, target, parent_row) = {
+            let rows = self.sidebar_rows();
+            let target = self.bookmark_row.and_then(|r| rows.targets.get(r).copied());
+            // The row of the folder holding the selected row.
+            let parent = |path: Option<&str>| {
+                let path = path?;
+                let f = rows.folders.iter().position(|f| *f == path)?;
+                rows.targets.iter().position(|t| *t == RowTarget::Folder(f))
+            };
+            let profile = &self.profiles[self.profile];
+            let parent_row = match target {
+                Some(RowTarget::Folder(f)) => parent(bookmarks::parent(rows.folders[f])),
+                Some(RowTarget::Bookmark(i)) => {
+                    parent(profile.bookmarks.get(i).map(|b| b.folder.as_str()))
+                }
+                _ => None,
+            };
+            (rows.rows.len(), target, parent_row)
+        };
+        let folded = |b: &Self, row: usize| {
+            let rows = b.sidebar_rows();
+            matches!(
+                rows.rows.get(row),
+                Some(ListRow::Folder { folded: true, .. })
+            )
+        };
         match key {
-            Key::Down | Key::Up if !items.is_empty() => {
-                let next = match (at, key == Key::Down) {
+            Key::Down | Key::Up if count > 0 => {
+                self.bookmark_row = Some(match (self.bookmark_row, key == Key::Down) {
                     (None, true) => 0,
-                    (None, false) => items.len() - 1,
-                    (Some(i), true) => (i + 1).min(items.len() - 1),
-                    (Some(i), false) => i.saturating_sub(1),
-                };
-                self.bookmark_row = Some(items[next]);
+                    (None, false) => count - 1,
+                    (Some(r), true) => (r + 1).min(count - 1),
+                    (Some(r), false) => r.saturating_sub(1),
+                });
+                self.reveal_bookmark_row();
                 Some(true)
             }
-            Key::Enter => {
-                let row = self.bookmark_row?;
-                match targets.get(row) {
-                    Some(&RowTarget::Bookmark(i)) => Some(self.open_bookmark(i)),
-                    _ => None,
+            Key::Enter => match target? {
+                RowTarget::Bookmark(i) => Some(self.open_bookmark(i)),
+                RowTarget::Folder(_) => Some(self.fold_bookmark_folder(self.bookmark_row?)),
+                _ => None,
+            },
+            Key::Right => match target? {
+                RowTarget::Folder(_) => {
+                    let row = self.bookmark_row?;
+                    Some(folded(self, row) && self.fold_bookmark_folder(row))
                 }
+                _ => Some(false),
+            },
+            Key::Left => {
+                let row = self.bookmark_row?;
+                if matches!(target, Some(RowTarget::Folder(_))) && !folded(self, row) {
+                    return Some(self.fold_bookmark_folder(row));
+                }
+                self.bookmark_row = parent_row.or(Some(row));
+                self.reveal_bookmark_row();
+                Some(true)
+            }
+            Key::Backspace => {
+                let RowTarget::Bookmark(i) = target? else {
+                    return Some(false);
+                };
+                let p = &mut self.profiles[self.profile];
+                if i >= p.bookmarks.len() {
+                    return Some(false);
+                }
+                p.bookmarks.remove(i);
+                self.save_bookmarks();
+                // Stay on the row that took its place.
+                let count = self.sidebar_rows().rows.len();
+                self.bookmark_row = self
+                    .bookmark_row
+                    .filter(|_| count > 0)
+                    .map(|r| r.min(count - 1));
+                Some(true)
             }
             Key::Escape => {
                 self.list = SidebarList::Tabs;
@@ -4280,6 +4436,48 @@ impl<S: Screen> Browser<S> {
             }
             _ => None,
         }
+    }
+
+    /// Fold or unfold the bookmark folder on sidebar row `row`; folds are kept in the file.
+    fn fold_bookmark_folder(&mut self, row: usize) -> bool {
+        let path = {
+            let rows = self.sidebar_rows();
+            match rows.targets.get(row) {
+                Some(&RowTarget::Folder(f)) => rows.folders[f].to_string(),
+                _ => return false,
+            }
+        };
+        let p = &mut self.profiles[self.profile];
+        match p.bookmark_folds.iter().position(|f| *f == path) {
+            Some(i) => {
+                p.bookmark_folds.remove(i);
+            }
+            None => p.bookmark_folds.push(path),
+        }
+        self.save_bookmarks();
+        let max = {
+            let rows = self.sidebar_rows();
+            chrome::sidebar_max_scroll(rows.rows.len(), rows.footer.is_some(), self.height)
+        };
+        self.sidebar_scroll = self.sidebar_scroll.min(max);
+        true
+    }
+
+    /// Scroll the sidebar so the bookmark row chosen with the keyboard is in view.
+    fn reveal_bookmark_row(&mut self) {
+        let Some(row) = self.bookmark_row else {
+            return;
+        };
+        let count = self.sidebar_rows().rows.len();
+        let view = self.height - chrome::LIST_TOP;
+        let top = chrome::TAB_ROW * row as f32;
+        if top < self.sidebar_scroll {
+            self.sidebar_scroll = top;
+        } else if top + chrome::TAB_ROW > self.sidebar_scroll + view {
+            self.sidebar_scroll = top + chrome::TAB_ROW - view;
+        }
+        let max = chrome::sidebar_max_scroll(count, false, self.height);
+        self.sidebar_scroll = self.sidebar_scroll.clamp(0.0, max);
     }
 
     fn sidebar_rows(&self) -> SidebarRows<'_> {
@@ -4324,7 +4522,11 @@ impl<S: Screen> Browser<S> {
         let Some(path) = profile_file(self.session.as_deref(), &profile.id, "bookmarks") else {
             return;
         };
-        let text = write_bookmarks(&profile.bookmarks, &profile.last_folder);
+        let text = bookmarks::write(
+            &profile.bookmarks,
+            &profile.last_folder,
+            &profile.bookmark_folds,
+        );
         if let Err(e) = write_private(&path, text.as_bytes()) {
             self.window
                 .set_title(&format!("Broxee: couldn't save bookmarks ({e})"));
@@ -5820,18 +6022,23 @@ impl<S: Screen> Browser<S> {
         let remove_label = format!("Type {} to remove it", self.profiles[self.profile].name);
         let (labels, heading, help): (Vec<&str>, &str, &str) =
             match self.dialog.as_ref().map(|d| &d.kind) {
-                Some(DialogKind::Bookmark {
-                    existing: Some(_), ..
-                }) => (
+                Some(DialogKind::Bookmark { existing, .. }) => (
                     vec!["Name", "Folder"],
-                    "Edit bookmark",
-                    "Enter to save · Tab for the other field · Esc to cancel",
+                    match existing {
+                        Some(_) => "Edit bookmark",
+                        None => "Bookmark this page",
+                    },
+                    match self.dialog.as_ref().map_or(0, |d| d.active) {
+                        0 => "Enter to save · Tab for the folder · Esc to cancel",
+                        _ => "↑ ↓ for saved folders · Reading / Rust files it inside Reading",
+                    },
                 ),
-                Some(DialogKind::Bookmark { .. }) => (
-                    vec!["Name", "Folder"],
-                    "Bookmark this page",
-                    "Enter to save · Tab for the other field · Esc to cancel",
+                Some(DialogKind::ImportBookmarks) => (
+                    vec!["File exported from another browser"],
+                    "Import bookmarks into this profile",
+                    "An HTML export, or Chrome's Bookmarks file · Enter to import",
                 ),
+                Some(DialogKind::Imported(heading)) => (Vec::new(), heading.as_str(), ""),
                 Some(DialogKind::Group) => (
                     vec!["Group"],
                     "Move this tab to a group",
@@ -6280,6 +6487,7 @@ fn sidebar_rows<'a>(
                     muted: i != profile.active,
                     closable: i == profile.active,
                     pane: panes.iter().find(|(id, _)| *id == tab.id).map(|(_, n)| *n),
+                    depth: 0,
                 });
                 targets.push(RowTarget::Tab(i));
             }
@@ -6290,39 +6498,53 @@ fn sidebar_rows<'a>(
                 rows,
                 targets,
                 selected,
+                folders: Vec::new(),
                 footer: Some("+ New tab"),
                 empty: None,
             }
         }
         SidebarList::Bookmarks => {
-            // Folders in name order; bookmarks in the order they were saved.
-            let mut folders: Vec<&str> = profile
-                .bookmarks
-                .iter()
-                .map(|b| b.folder.as_str())
-                .collect();
-            folders.sort_by_key(|f| f.to_lowercase());
-            folders.dedup();
+            // A tree: in each folder its subfolders by name, then its bookmarks as saved.
             let mut rows = Vec::new();
             let mut targets = Vec::new();
-            for folder in folders {
-                rows.push(ListRow::Label(Cow::Borrowed(folder)));
-                targets.push(RowTarget::Folder);
-                for (i, b) in profile.bookmarks.iter().enumerate() {
-                    if b.folder == folder {
+            let mut folders = Vec::new();
+            for row in bookmarks::tree(&profile.bookmarks, &profile.bookmark_folds) {
+                match row {
+                    bookmarks::TreeRow::Folder {
+                        path,
+                        depth,
+                        folded,
+                        count,
+                    } => {
+                        let name = bookmarks::leaf(path);
+                        rows.push(ListRow::Folder {
+                            // Folded, it says how much it holds, as a folded tab group does.
+                            name: match folded {
+                                true => Cow::Owned(format!("{name} ({count})")),
+                                false => Cow::Borrowed(name),
+                            },
+                            depth: depth.min(u8::MAX.into()) as u8,
+                            folded,
+                        });
+                        targets.push(RowTarget::Folder(folders.len()));
+                        folders.push(path);
+                    }
+                    bookmarks::TreeRow::Mark { index, depth } => {
                         rows.push(ListRow::Item {
-                            title: &b.title,
+                            title: &profile.bookmarks[index].title,
                             muted: false,
                             closable: false,
                             pane: None,
+                            depth: depth.min(u8::MAX.into()) as u8,
                         });
-                        targets.push(RowTarget::Bookmark(i));
+                        targets.push(RowTarget::Bookmark(index));
                     }
                 }
             }
             SidebarRows {
                 rows,
                 targets,
+                folders,
                 selected: bookmark_row,
                 footer: None,
                 empty: Some(("No bookmarks yet.", "Press ⌘D on any page to save it.")),
@@ -6348,6 +6570,8 @@ fn valid_id(id: &str) -> bool {
 struct SidebarRows<'a> {
     rows: Vec<ListRow<'a>>,
     targets: Vec<RowTarget>,
+    /// The bookmark folders on screen, by path, as `RowTarget::Folder` numbers them.
+    folders: Vec<&'a str>,
     selected: Option<usize>,
     footer: Option<&'static str>,
     empty: Option<(&'static str, &'static str)>,
@@ -6359,44 +6583,71 @@ fn profile_file(session: Option<&std::path::Path>, profile: &str, file: &str) ->
     Some(session?.parent()?.join("profiles").join(profile).join(file))
 }
 
-/// Bookmarks as text: the last folder used, then one bookmark per line (folder, URL, title).
-fn write_bookmarks(bookmarks: &[Bookmark], last_folder: &str) -> String {
-    let mut out = format!("broxee-bookmarks 1\nlast\t{last_folder}\n");
-    for b in bookmarks {
-        out += &format!("mark\t{}\t{}\t{}\n", b.folder, b.url, b.title);
+/// What the import dialog starts with: the newest bookmarks export in Downloads (browsers name
+/// theirs "bookmarks…html"), or the Downloads folder.
+fn import_guess(home: Option<&std::path::Path>) -> String {
+    let newest = home.and_then(|home| {
+        std::fs::read_dir(home.join("Downloads"))
+            .ok()?
+            .take(5000)
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                let lower = name.to_lowercase();
+                let export = lower.contains("bookmark")
+                    && (lower.ends_with(".html") || lower.ends_with(".htm"));
+                let modified = e.metadata().ok()?.modified().ok()?;
+                export.then_some((modified, name))
+            })
+            .max()
+    });
+    match newest {
+        Some((_, name)) => format!("~/Downloads/{name}"),
+        None => "~/Downloads/".to_string(),
     }
-    out
 }
 
-/// Read `write_bookmarks` text; lines that do not parse are skipped.
-fn parse_bookmarks(text: &str) -> (Vec<Bookmark>, Option<String>) {
-    let mut lines = text.lines();
-    if lines.next() != Some("broxee-bookmarks 1") {
-        return (Vec::new(), None);
-    }
-    let (mut bookmarks, mut last) = (Vec::new(), None);
-    for line in lines {
-        let fields: Vec<&str> = line.splitn(4, '\t').collect();
-        match fields.as_slice() {
-            ["last", folder] if !folder.trim().is_empty() => last = Some(folder.to_string()),
-            ["mark", folder, url, title] if bookmarks.len() < BOOKMARK_LIMIT => {
-                if let Ok(url) = net::Url::parse(url) {
-                    let folder = if folder.trim().is_empty() {
-                        DEFAULT_FOLDER
-                    } else {
-                        folder
-                    };
-                    bookmarks.push(Bookmark {
-                        title: title.to_string(),
-                        url,
-                        folder: folder.to_string(),
-                    });
-                }
-            }
-            _ => {}
+/// A typed path with `~` for the home folder.
+fn expand_home(typed: &str, home: Option<&std::path::Path>) -> PathBuf {
+    match (typed.strip_prefix('~'), home) {
+        (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') => {
+            home.join(rest.trim_start_matches('/'))
         }
+        _ => PathBuf::from(typed),
     }
-    (bookmarks, last)
+}
+
+/// Read an export file for import, or say in a sentence why it cannot be.
+fn import_file(path: &std::path::Path) -> Result<Vec<Bookmark>, String> {
+    use std::io::Read;
+    let opened = std::fs::File::open(path).and_then(|f| Ok((f.metadata()?, f)));
+    let (meta, file) = opened.map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => "There's no file at that path.".to_string(),
+        _ => format!("Couldn't open that file ({e})."),
+    })?;
+    if meta.is_dir() {
+        return Err("That's a folder. Type the path of the exported file.".into());
+    }
+    let limit = bookmarks::IMPORT_BYTES;
+    if meta.len() > limit {
+        return Err(format!(
+            "That file is over {} MB, too big for a bookmarks export.",
+            limit >> 20
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(limit)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("Couldn't read that file ({e})."))?;
+    bookmarks::read_export(&String::from_utf8_lossy(&bytes)).map_err(|e| match e {
+        bookmarks::ImportError::NotBookmarks => {
+            "That isn't a bookmarks export. Export bookmarks as HTML from the other browser."
+                .to_string()
+        }
+        bookmarks::ImportError::Empty => {
+            "That file has no http, https or file bookmarks.".to_string()
+        }
+    })
 }
 
 /// Write `data` to `path` through a temporary file and a rename, readable by this user only.
@@ -9461,19 +9712,15 @@ mod tests {
         act(&mut b, key(Key::Escape));
         assert_eq!(b.profiles[0].bookmarks[1].title, "Second page");
 
-        // ⌘⌥B: folders in name order, as labels; ↓ Enter opens a bookmark.
+        // ⌘⌥B: folders in name order; ↓ ↓ Enter opens a bookmark.
         assert!(act(&mut b, command_option('b')));
-        let list = b.sidebar_rows();
-        let rows: Vec<String> = list
-            .rows
-            .iter()
-            .map(|r| match r {
-                ListRow::Label(l) => format!("[{l}]"),
-                ListRow::Item { title, .. } => title.to_string(),
-            })
-            .collect();
-        assert_eq!(rows, ["[Bookmarks]", "Page A", "[Reading]", "Second page"]);
+        assert_eq!(
+            sidebar_text(&b),
+            ["[Bookmarks]", "  Page A", "[Reading]", "  Second page"]
+        );
         b.render();
+        act(&mut b, key(Key::Down));
+        assert_eq!(b.bookmark_row, Some(0), "folders can be chosen too");
         act(&mut b, key(Key::Down));
         assert_eq!(b.bookmark_row, Some(1));
         act(&mut b, key(Key::Enter));
@@ -9533,31 +9780,335 @@ mod tests {
     }
 
     #[test]
-    fn reads_damaged_bookmark_files_safely() {
-        assert_eq!(parse_bookmarks(""), (Vec::new(), None));
-        let (marks, last) = parse_bookmarks(
-            "broxee-bookmarks 1\nlast\tWork stuff\nmark\t\thttps://a.example/\tA\n\
-             mark\tF\tnot a url\tB\nmark\tshort\nnonsense\nmark\tF\thttps://c.example/\tC\twith tab\n",
-        );
-        assert_eq!(last.as_deref(), Some("Work stuff"));
-        assert_eq!(marks.len(), 2);
+    fn bookmark_folders_nest_fold_and_survive_a_restart() {
+        let (a, _) = site("bookmark-tree");
+        let session = a.with_file_name("tree-session");
+        let _ = std::fs::remove_dir_all(a.with_file_name("profiles"));
+        let mut b = browser_with(&a, Some(session.clone()));
+
+        // ⌘D, folder "Reading/Rust": a folder inside a folder.
+        act(&mut b, command('d'));
+        act(&mut b, key(Key::Tab));
+        assert_eq!(b.dialog.as_ref().unwrap().active, 1);
+        type_text(&mut b, "Reading/Rust");
+        b.render();
+        act(&mut b, key(Key::Enter));
+        assert_eq!(b.profiles[0].bookmarks[0].folder, "Reading / Rust");
+        assert_eq!(b.profiles[0].last_folder, "Reading / Rust");
+
+        // Page B in "Reading": ↑ ↓ in the folder field step through saved folders.
+        click_text(&mut b, "Go to B");
+        act(&mut b, command('d'));
+        act(&mut b, key(Key::Tab));
+        let folder = |b: &Browser<FakeScreen>| b.dialog.as_ref().unwrap().fields[1].text.clone();
+        assert_eq!(folder(&b), "Reading / Rust");
+        act(&mut b, key(Key::Up));
+        assert_eq!(folder(&b), "Reading");
+        act(&mut b, key(Key::Up));
+        assert_eq!(folder(&b), "Reading / Rust", "it wraps");
+        act(&mut b, key(Key::Down));
+        assert_eq!(folder(&b), "Reading");
+        b.render();
+        act(&mut b, key(Key::Enter));
+
+        // The panel: a tree, subfolders before bookmarks.
+        act(&mut b, command_option('b'));
         assert_eq!(
-            marks[0].folder, DEFAULT_FOLDER,
-            "an empty folder becomes the default"
+            sidebar_text(&b),
+            ["[Reading]", "  [Rust]", "    Page A", "  Page B"]
         );
-        assert_eq!(marks[1].title, "C\twith tab");
-        let text = write_bookmarks(&marks, "F");
-        assert_eq!(parse_bookmarks(&text).0, marks);
+        // ← on a bookmark goes to its folder, ← again folds it, → unfolds it.
+        act(&mut b, key(Key::Up));
+        assert_eq!(b.bookmark_row, Some(3));
+        act(&mut b, key(Key::Left));
+        assert_eq!(b.bookmark_row, Some(0));
+        act(&mut b, key(Key::Left));
+        assert_eq!(sidebar_text(&b), [">[Reading (2)]"]);
+        act(&mut b, key(Key::Right));
+        assert_eq!(sidebar_text(&b).len(), 4);
+        // Enter on a folder folds it; a click on a folder row does too.
+        act(&mut b, key(Key::Down));
+        act(&mut b, key(Key::Enter));
+        assert_eq!(sidebar_text(&b), ["[Reading]", "  >[Rust (1)]", "  Page B"]);
+        assert!(act(
+            &mut b,
+            Event::Click {
+                x: 100.0,
+                y: row_center(1)
+            }
+        ));
+        assert_eq!(sidebar_text(&b).len(), 4);
+        assert!(act(
+            &mut b,
+            Event::Click {
+                x: 100.0,
+                y: row_center(0)
+            }
+        ));
+        assert_eq!(sidebar_text(&b), [">[Reading (2)]"]);
+        b.render();
+
+        // Folders and folds come back after a restart.
+        drop(b);
+        let mut b = browser_with(Path::new(""), Some(session.clone()));
+        if b.profiles[b.profile].name != "Personal" {
+            act(&mut b, command_shift('p'));
+        }
+        act(&mut b, command_option('b'));
+        assert_eq!(sidebar_text(&b), [">[Reading (2)]"]);
+        act(&mut b, key(Key::Down));
+        act(&mut b, key(Key::Right));
+        assert_eq!(
+            sidebar_text(&b),
+            ["[Reading]", "  [Rust]", "    Page A", "  Page B"]
+        );
+        // Backspace removes the chosen bookmark, and stays on the row after.
+        act(&mut b, key(Key::Down));
+        act(&mut b, key(Key::Down));
+        act(&mut b, key(Key::Backspace));
+        assert_eq!(sidebar_text(&b), ["[Reading]", "  Page B"]);
+        assert_eq!(b.bookmark_row, Some(1));
     }
 
-    /// The tab list as labels in brackets and tab titles, as drawn.
+    /// A bookmarks export the way Chrome writes one, with folders three deep.
+    fn chrome_export(dir: &Path) -> PathBuf {
+        let path = dir.join("bookmarks_11_18_26.html");
+        std::fs::write(
+            &path,
+            "<!DOCTYPE NETSCAPE-Bookmark-file-1>\n<META HTTP-EQUIV=\"Content-Type\" \
+             CONTENT=\"text/html; charset=UTF-8\">\n<TITLE>Bookmarks</TITLE>\n<H1>Bookmarks</H1>\n\
+             <DL><p>\n<DT><H3 PERSONAL_TOOLBAR_FOLDER=\"true\">Bookmarks bar</H3>\n<DL><p>\n\
+             <DT><A HREF=\"https://www.rust-lang.org/\">Rust</A>\n\
+             <DT><H3>Docs</H3>\n<DL><p>\n<DT><A HREF=\"https://doc.rust-lang.org/book/\">The Book</A>\n\
+             <DT><H3>Std</H3>\n<DL><p>\n<DT><A HREF=\"https://doc.rust-lang.org/std/\">std</A>\n\
+             </DL><p>\n</DL><p>\n</DL><p>\n<DT><A HREF=\"https://example.com/\">Example</A>\n</DL><p>\n",
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn imports_bookmarks_into_the_visible_profile_only() {
+        let (a, _) = site("bookmark-import");
+        let session = a.with_file_name("import-session");
+        let dir = a.parent().unwrap();
+        let _ = std::fs::remove_dir_all(dir.join("profiles"));
+        let export = chrome_export(dir);
+        let mut b = browser_with(&a, Some(session.clone()));
+        // One already saved: importing skips it.
+        act(&mut b, command('d'));
+        act(&mut b, key(Key::Tab));
+        type_text(&mut b, "Mine");
+        act(&mut b, key(Key::Enter));
+        let mine = b.profiles[0].bookmarks[0].url.clone();
+        let export_with_mine = dir.join("with-mine.html");
+        std::fs::write(
+            &export_with_mine,
+            format!("<DL><DT><A HREF=\"{mine}\">Already here</A></DL>"),
+        )
+        .unwrap();
+
+        // The palette's command opens the dialog; errors keep it open and say why.
+        act(&mut b, command('k'));
+        type_text(&mut b, "import bookmarks");
+        act(&mut b, key(Key::Enter));
+        assert!(matches!(
+            b.dialog.as_ref().unwrap().kind,
+            DialogKind::ImportBookmarks
+        ));
+        b.render();
+        let error = |b: &Browser<FakeScreen>| b.dialog.as_ref().and_then(|d| d.error.clone());
+        type_text(&mut b, "/no/such/broxee/file.html");
+        act(&mut b, key(Key::Enter));
+        assert_eq!(error(&b).as_deref(), Some("There's no file at that path."));
+        act(&mut b, key(Key::End));
+        for _ in 0.."/no/such/broxee/file.html".len() {
+            act(&mut b, key(Key::Backspace));
+        }
+        act(&mut b, Event::Paste(a.display().to_string()));
+        act(&mut b, key(Key::Enter));
+        assert!(error(&b)
+            .unwrap()
+            .starts_with("That isn't a bookmarks export"));
+        b.render();
+
+        // The real file: added under Imported, the panel opens on it.
+        b.dialog.as_mut().unwrap().fields[0].text = export.display().to_string();
+        act(&mut b, key(Key::Enter));
+        let d = b.dialog.as_ref().unwrap();
+        assert!(matches!(&d.kind, DialogKind::Imported(h) if h == "Added 4 bookmarks to Imported"));
+        assert!(d.fields.is_empty());
+        b.render();
+        act(&mut b, key(Key::Enter));
+        assert!(b.dialog.is_none());
+        assert_eq!(b.list, SidebarList::Bookmarks);
+        assert_eq!(
+            sidebar_text(&b),
+            [
+                "[Imported]",
+                "  [Bookmarks bar]",
+                "    [Docs]",
+                "      [Std]",
+                "        std",
+                "      The Book",
+                "    Rust",
+                "  Example",
+                "[Mine]",
+                "  Page A",
+            ]
+        );
+        assert_eq!(b.bookmark_row, Some(0), "on the Imported folder");
+
+        // Again: nothing new. A file holding a saved page: skipped, said so.
+        act(&mut b, command('k'));
+        type_text(&mut b, "import bookmarks");
+        act(&mut b, key(Key::Enter));
+        b.dialog.as_mut().unwrap().fields[0].text = export.display().to_string();
+        act(&mut b, key(Key::Enter));
+        let d = b.dialog.as_ref().unwrap();
+        assert!(matches!(&d.kind, DialogKind::Imported(h) if h == "Nothing new to import"));
+        assert_eq!(
+            d.error.as_deref(),
+            Some("4 already saved, skipped · Enter to close")
+        );
+        act(&mut b, key(Key::Escape));
+        act(&mut b, command('k'));
+        type_text(&mut b, "import bookmarks");
+        act(&mut b, key(Key::Enter));
+        b.dialog.as_mut().unwrap().fields[0].text = export_with_mine.display().to_string();
+        act(&mut b, key(Key::Enter));
+        assert_eq!(b.profiles[0].bookmarks.len(), 5);
+        act(&mut b, key(Key::Escape));
+
+        // The palette finds them, with their folder path.
+        act(&mut b, command('k'));
+        type_text(&mut b, "the book");
+        let p = b.palette.as_ref().unwrap();
+        assert_eq!(
+            p.items[0].hint,
+            Hint::Label("Bookmark · Imported / Bookmarks bar / Docs".into())
+        );
+        act(&mut b, key(Key::Escape));
+
+        // The other profile got nothing; the files say the same after a restart.
+        assert!(b.profiles[1].bookmarks.is_empty());
+        drop(b);
+        let b = browser_with(Path::new(""), Some(session));
+        let counts: Vec<(String, usize)> = b
+            .profiles
+            .iter()
+            .map(|p| (p.name.clone(), p.bookmarks.len()))
+            .collect();
+        assert_eq!(
+            counts,
+            [("Personal".to_string(), 5), ("Work".to_string(), 0)]
+        );
+        assert_eq!(
+            b.profiles[0].bookmarks[2].folder,
+            "Imported / Bookmarks bar / Docs"
+        );
+    }
+
+    #[test]
+    fn old_bookmark_files_still_load() {
+        let (a, _) = site("bookmark-old");
+        let session = a.with_file_name("old-session");
+        let dir = a.parent().unwrap();
+        let _ = std::fs::remove_dir_all(dir.join("profiles"));
+        let file = dir.join("profiles").join("Personal").join("bookmarks");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        // What Broxee wrote before folders could nest.
+        std::fs::write(
+            &file,
+            "broxee-bookmarks 1\nlast\tTV/Film\nmark\tTV/Film\thttps://a.example/\tA\n\
+             mark\tBookmarks\thttps://b.example/\tB\n",
+        )
+        .unwrap();
+        let mut b = browser_with(&a, Some(session));
+        if b.profiles[b.profile].name != "Personal" {
+            act(&mut b, command_shift('p'));
+        }
+        act(&mut b, command_option('b'));
+        assert_eq!(
+            sidebar_text(&b),
+            ["[Bookmarks]", "  B", "[TV\u{2215}Film]", "  A"],
+            "an old name with / stays one folder"
+        );
+        // Saving writes the new format, which reads back the same.
+        act(&mut b, key(Key::Down));
+        act(&mut b, key(Key::Enter));
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.starts_with("broxee-bookmarks 2\n"));
+        assert_eq!(bookmarks::parse(&text).bookmarks, b.profiles[0].bookmarks);
+    }
+
+    #[test]
+    fn import_paths_and_guesses() {
+        let home = std::env::temp_dir().join(format!("broxee-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(import_guess(Some(&home)), "~/Downloads/");
+        assert_eq!(import_guess(None), "~/Downloads/");
+        let downloads = home.join("Downloads");
+        std::fs::create_dir_all(&downloads).unwrap();
+        std::fs::write(downloads.join("notes.html"), "x").unwrap();
+        std::fs::write(downloads.join("Safari Bookmarks.html"), "x").unwrap();
+        assert_eq!(
+            import_guess(Some(&home)),
+            "~/Downloads/Safari Bookmarks.html"
+        );
+        assert_eq!(
+            expand_home("~/Downloads/x.html", Some(&home)),
+            downloads.join("x.html")
+        );
+        assert_eq!(expand_home("~", Some(&home)), home);
+        assert_eq!(expand_home("~bob/x", Some(&home)), PathBuf::from("~bob/x"));
+        assert_eq!(expand_home("/abs", None), PathBuf::from("/abs"));
+        assert_eq!(
+            import_file(&downloads),
+            Err("That's a folder. Type the path of the exported file.".to_string())
+        );
+        let big = downloads.join("big.html");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(bookmarks::IMPORT_BYTES + 1)
+            .unwrap();
+        assert!(import_file(&big).unwrap_err().contains("too big"));
+        let empty = downloads.join("empty.html");
+        std::fs::write(&empty, "<!DOCTYPE NETSCAPE-Bookmark-file-1><DL></DL>").unwrap();
+        assert_eq!(
+            import_file(&empty),
+            Err("That file has no http, https or file bookmarks.".to_string())
+        );
+        // Bytes that are not UTF-8 are replaced, not refused.
+        let latin = downloads.join("latin.html");
+        std::fs::write(
+            &latin,
+            b"<DL><DT><A HREF=\"https://l.example/\">Caf\xe9</A></DL>".as_slice(),
+        )
+        .unwrap();
+        assert_eq!(import_file(&latin).unwrap()[0].title, "Caf\u{fffd}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The sidebar's list as drawn: labels and folders in brackets, tab and bookmark titles,
+    /// two spaces per folder level, and `>` before a folded folder.
     fn sidebar_text(b: &Browser<FakeScreen>) -> Vec<String> {
         b.sidebar_rows()
             .rows
             .iter()
             .map(|r| match r {
                 ListRow::Label(l) => format!("[{l}]"),
-                ListRow::Item { title, .. } => title.to_string(),
+                ListRow::Folder {
+                    name,
+                    depth,
+                    folded,
+                } => {
+                    let mark = if *folded { ">" } else { "" };
+                    format!("{}{mark}[{name}]", "  ".repeat(usize::from(*depth)))
+                }
+                ListRow::Item { title, depth, .. } => {
+                    format!("{}{title}", "  ".repeat(usize::from(*depth)))
+                }
             })
             .collect()
     }
@@ -11219,6 +11770,35 @@ mod tests {
             }),
         );
         shot(&mut b, "11-bookmarks-panel");
+        // Import: the dialog, what it added, then the tree with nested folders.
+        act(&mut b, command('k'));
+        type_text(&mut b, "import bookmarks");
+        act(&mut b, key(Key::Enter));
+        let export = chrome_export(&root);
+        if let Some(d) = b.dialog.as_mut() {
+            d.fields[0].text = export.display().to_string();
+            d.fields[0].cursor = d.fields[0].text.len();
+            d.fields[0].all_selected = false;
+        }
+        shot(&mut b, "11a-import-dialog");
+        act(&mut b, key(Key::Enter));
+        shot(&mut b, "11b-import-done");
+        act(&mut b, key(Key::Enter));
+        // Std folded with a click, The Book chosen (the page's focused control keeps the
+        // arrow keys here).
+        act(
+            &mut b,
+            Event::Click {
+                x: 100.0,
+                y: row_center(5),
+            },
+        );
+        b.bookmark_row = Some(6);
+        shot(&mut b, "11c-bookmarks-tree");
+        act(&mut b, command('d'));
+        act(&mut b, key(Key::Tab));
+        shot(&mut b, "11d-bookmark-folder-field");
+        act(&mut b, key(Key::Escape));
         act(
             &mut b,
             Event::Key(KeyEvent {

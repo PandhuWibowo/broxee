@@ -15,6 +15,8 @@ mod selection;
 mod webfonts;
 
 #[cfg(any(target_os = "macos", test))]
+mod bookmarks;
+#[cfg(any(target_os = "macos", test))]
 mod browser;
 #[cfg(any(target_os = "macos", test))]
 mod chrome;

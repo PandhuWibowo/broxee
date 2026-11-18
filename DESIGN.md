@@ -192,8 +192,14 @@ right when the pointer is over it. `target=_blank` links open in a new tab in fr
   Panes can use different profiles.
 - **New tab:** the ⌘K palette, focused, over a blank `surface`. It lists real recent tabs and bookmarks. No speed
   dial tiles, no suggestions Broxee did not get from your own history.
-- **Bookmarks:** ⌘D saves the current page to a folder (last used folder preselected). ⌘⌥B opens the bookmarks
-  panel in place of the tab list. Every bookmark is also a ⌘K result, so most people never open the panel.
+- **Bookmarks:** ⌘D saves the current page to a folder (last used folder preselected; ↑ ↓ in the folder field
+  step through saved folders, `a / b` nests b in a). ⌘⌥B opens the bookmarks panel in place of the tab list:
+  a tree of folders, each a section label with a chevron (pointing right when folded, down when open) and, when
+  folded, its count in parentheses, so state is never shown by the chevron alone. Each level indents 10px, up to
+  six levels; a folder's bookmarks line up with its name. The row chosen with the keyboard sits on `selected`,
+  and its label turns `text-2` there. Importing (⌘K, "Import bookmarks from another browser") files everything
+  under one folder named Imported and says in a dialog what it added and skipped. Every bookmark is also a ⌘K
+  result, so most people never open the panel.
 - **Settings:** a Broxee page in a tab, not a modal: Profiles, Appearance, Privacy, Sleeping tabs, Shortcuts.
 
 ### Shortcuts

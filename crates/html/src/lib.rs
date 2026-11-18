@@ -12,7 +12,8 @@ use std::hash::{BuildHasherDefault, Hasher};
 
 pub use chunk_vec::ChunkVec;
 pub use entities::decode_entities;
-use tokenizer::{Token, Tokenizer};
+/// The tokenizer alone, for formats read token by token (bookmark exports).
+pub use tokenizer::{Token, Tokenizer};
 
 pub type NodeId = u32;
 /// Interned tag or attribute name.

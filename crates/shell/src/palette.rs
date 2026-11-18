@@ -15,6 +15,7 @@ pub enum Command {
     BookmarkPage,
     ShowBookmarks,
     RemoveBookmark,
+    ImportBookmarks,
     TogglePin,
     MoveToGroup,
     FoldGroup,
@@ -28,7 +29,7 @@ pub enum Command {
 }
 
 impl Command {
-    pub const ALL: [Command; 20] = [
+    pub const ALL: [Command; 21] = [
         Command::NewTab,
         Command::CloseTab,
         Command::ReopenTab,
@@ -39,6 +40,7 @@ impl Command {
         Command::BookmarkPage,
         Command::ShowBookmarks,
         Command::RemoveBookmark,
+        Command::ImportBookmarks,
         Command::TogglePin,
         Command::MoveToGroup,
         Command::FoldGroup,
@@ -63,6 +65,7 @@ impl Command {
             Command::BookmarkPage => "Bookmark this page",
             Command::ShowBookmarks => "Show or hide bookmarks",
             Command::RemoveBookmark => "Remove this page's bookmark",
+            Command::ImportBookmarks => "Import bookmarks from another browser",
             Command::TogglePin => "Pin or unpin this tab",
             Command::MoveToGroup => "Move this tab to a group",
             Command::FoldGroup => "Fold or unfold this tab's group",
@@ -88,6 +91,7 @@ impl Command {
             Command::FocusAddress => "⌘L",
             Command::ClearCookies
             | Command::RemoveBookmark
+            | Command::ImportBookmarks
             | Command::TogglePin
             | Command::MoveToGroup
             | Command::FoldGroup
