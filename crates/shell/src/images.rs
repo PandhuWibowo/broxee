@@ -74,6 +74,7 @@ pub fn img_nodes(dom: &Dom, root: NodeId) -> impl Iterator<Item = NodeId> + '_ {
 pub type Discovered = (Vec<(String, Source)>, Vec<(NodeId, usize)>);
 
 /// Files fetched by source: (key, bytes or `None` for a failure).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the window (browser.rs)
 pub type Fetched = Vec<(String, Option<Vec<u8>>)>;
 
 /// The `<img>` elements worth loading and their sources (with their keys), in document
