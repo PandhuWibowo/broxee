@@ -383,7 +383,11 @@ pub fn load_with(
 pub enum Outcome {
     /// Both boxed: the two are large, and different in size.
     Page(Box<Loaded>),
-    Downloaded(Box<Snapshot>, Option<String>),
+    // The title is read by the window (browser.rs).
+    Downloaded(
+        Box<Snapshot>,
+        #[cfg_attr(not(target_os = "macos"), allow(dead_code))] Option<String>,
+    ),
 }
 
 impl Outcome {
